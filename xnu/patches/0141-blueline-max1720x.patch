@@ -1,0 +1,742 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0141: battery from the MAX1720x fuel gauge (bluemax=1 log, 2 publish)
+
+The Pixel 3's gauge is a Maxim MAX1720x on qupv3_se12_i2c (i2c@a90000,
+Linux bus 4) at 0x36/0x0b, not the PMI8998 FG that 0130 reads. Read it
+with the touch driver's bit-banged I2C, now exported as
+blueline_bbi2c_open()/_xfer() (touch unchanged in behaviour), on GPIO
+49/50. Read-only: register pointers only, no register writes.
+
+bluemax=1: log the gauge (once at start, and every bluebatt=1 refresh).
+bluemax=2 (with bluebatt=1): publish its %, mV, mA, temperature,
+FullCapRep/RepCap, cycle count and TTE/TTF; 0130's charger/plug state stays.
+bluemax_rsense=N overrides Rsense (10 uOhm units; default nRSense, else 500).
+
+---
+ bsd/dev/blueline_touch.c         | 193 ++++++++++++------
+ iokit/Kernel/arm/BlueBattery.cpp | 316 ++++++++++++++++++++++++++++--
+ 2 files changed, 436 insertions(+), 73 deletions(-)
+
+diff --git a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+index 8009945..15a9bbd 100644
+--- a/bsd/dev/blueline_touch.c
++++ b/bsd/dev/blueline_touch.c
+@@ -97,118 +97,203 @@ wr(vm_offset_t a, uint32_t v)
+ 	*(volatile uint32_t *)a = v;
+ }
+ 
+-/* ---- I2C, bit-banged ---- */
++/*
++ * ---- I2C, bit-banged ----
++ *
++ * Shared with the battery (0141: the MAX1720x fuel gauge on SE12's pins,
++ * GPIO 49/50, TLMM north) through blueline_bbi2c_open()/_xfer(): a bus is a
++ * mapped TLMM tile plus its SDA and SCL pins. Each transfer runs with
++ * interrupts masked on its own CPU; callers serialize transfers on one bus.
++ */
++
++struct bbi2c {
++	vm_offset_t tlmm;	/* mapped TLMM tile holding both pins */
++	int sda, scl;
++};
++
++static struct bbi2c touch_bus;
+ 
+ static void
+-bb_pin(int pin, int high)
++bb_pin(const struct bbi2c *b, int pin, int high)
+ {
+ 	/* released: input with pull-up; low: output enabled, driving 0 */
+-	wr(east + GPIO_CFG(pin), (high ? 0u : (1u << 9)) | (2u << 6) | 3u);
++	wr(b->tlmm + GPIO_CFG(pin), (high ? 0u : (1u << 9)) | (2u << 6) | 3u);
+ }
+ 
+ static int
+-bb_get(int pin)
++bb_get(const struct bbi2c *b, int pin)
+ {
+-	return rd(east + GPIO_IO(pin)) & 1;
++	return rd(b->tlmm + GPIO_IO(pin)) & 1;
+ }
+ 
+ static void
+-bb_scl_high(void)
++bb_scl_high(const struct bbi2c *b)
+ {
+-	bb_pin(BB_SCL, 1);
+-	for (int i = 0; i < 1000 && !bb_get(BB_SCL); i++) {	/* clock stretching, 1 ms at most */
++	bb_pin(b, b->scl, 1);
++	for (int i = 0; i < 1000 && !bb_get(b, b->scl); i++) {	/* clock stretching, 1 ms at most */
+ 		delay(1);
+ 	}
+ }
+ 
+ static void
+-bb_start(void)
++bb_start(const struct bbi2c *b)
+ {
+-	bb_pin(BB_SDA, 1);
+-	bb_scl_high();
++	bb_pin(b, b->sda, 1);
++	bb_scl_high(b);
+ 	delay(5);
+-	bb_pin(BB_SDA, 0);
++	bb_pin(b, b->sda, 0);
+ 	delay(5);
+-	bb_pin(BB_SCL, 0);
++	bb_pin(b, b->scl, 0);
+ 	delay(5);
+ }
+ 
+ static void
+-bb_stop(void)
++bb_stop(const struct bbi2c *b)
+ {
+-	bb_pin(BB_SDA, 0);
++	bb_pin(b, b->sda, 0);
+ 	delay(5);
+-	bb_scl_high();
++	bb_scl_high(b);
+ 	delay(5);
+-	bb_pin(BB_SDA, 1);
++	bb_pin(b, b->sda, 1);
+ 	delay(5);
+ }
+ 
+ static int
+-bb_write(uint8_t b)
++bb_write(const struct bbi2c *b, uint8_t v)
+ {
+ 	for (int i = 7; i >= 0; i--) {
+-		bb_pin(BB_SDA, b >> i & 1);
++		bb_pin(b, b->sda, v >> i & 1);
+ 		delay(5);
+-		bb_scl_high();
++		bb_scl_high(b);
+ 		delay(5);
+-		bb_pin(BB_SCL, 0);
++		bb_pin(b, b->scl, 0);
+ 	}
+-	bb_pin(BB_SDA, 1);
++	bb_pin(b, b->sda, 1);
+ 	delay(5);
+-	bb_scl_high();
+-	int nack = bb_get(BB_SDA);
++	bb_scl_high(b);
++	int nack = bb_get(b, b->sda);
+ 	delay(5);
+-	bb_pin(BB_SCL, 0);
++	bb_pin(b, b->scl, 0);
+ 	return nack ? EIO : 0;
+ }
+ 
+ static uint8_t
+-bb_read(int ack)
++bb_read(const struct bbi2c *b, int ack)
+ {
+-	uint8_t b = 0;
++	uint8_t v = 0;
+ 
+-	bb_pin(BB_SDA, 1);
++	bb_pin(b, b->sda, 1);
+ 	for (int i = 0; i < 8; i++) {
+ 		delay(5);
+-		bb_scl_high();
+-		b = (uint8_t)(b << 1 | bb_get(BB_SDA));
++		bb_scl_high(b);
++		v = (uint8_t)(v << 1 | bb_get(b, b->sda));
+ 		delay(5);
+-		bb_pin(BB_SCL, 0);
++		bb_pin(b, b->scl, 0);
+ 	}
+-	bb_pin(BB_SDA, !ack);
++	bb_pin(b, b->sda, !ack);
+ 	delay(5);
+-	bb_scl_high();
++	bb_scl_high(b);
+ 	delay(5);
+-	bb_pin(BB_SCL, 0);
+-	bb_pin(BB_SDA, 1);
+-	return b;
++	bb_pin(b, b->scl, 0);
++	bb_pin(b, b->sda, 1);
++	return v;
+ }
+ 
+-/* Write cmd, then (if len) a repeated start and read len bytes. */
++/* Write cmd to 7-bit addr, then (if len) a repeated start and read len bytes. */
+ static int
+-fts_xfer(const uint8_t *cmd, uint32_t clen, uint8_t *out, uint32_t len)
++bb_xfer(const struct bbi2c *b, uint8_t addr, const uint8_t *cmd, uint32_t clen, uint8_t *out,
++    uint32_t len)
+ {
+ 	boolean_t intr = ml_set_interrupts_enabled(FALSE);
+ 	int err = 0;
+ 
+-	bb_start();
+-	err = bb_write(FTS_ADDR << 1);
++	bb_start(b);
++	err = bb_write(b, (uint8_t)(addr << 1));
+ 	for (uint32_t i = 0; i < clen && !err; i++) {
+-		err = bb_write(cmd[i]);
++		err = bb_write(b, cmd[i]);
+ 	}
+ 	if (!err && len) {
+-		bb_start();
+-		err = bb_write(FTS_ADDR << 1 | 1);
++		bb_start(b);
++		err = bb_write(b, (uint8_t)(addr << 1 | 1));
+ 		for (uint32_t i = 0; i < len && !err; i++) {
+-			out[i] = bb_read(i + 1 < len);
++			out[i] = bb_read(b, i + 1 < len);
+ 		}
+ 	}
+-	bb_stop();
++	bb_stop(b);
+ 	ml_set_interrupts_enabled(intr);
+ 	return err;
+ }
+ 
++/* Both pins as plain GPIOs (output value 0, released), then free a device stuck mid-byte. */
++static void
++bb_reset(const struct bbi2c *b)
++{
++	wr(b->tlmm + GPIO_IO(b->sda), 0);
++	wr(b->tlmm + GPIO_IO(b->scl), 0);
++	bb_pin(b, b->sda, 1);
++	bb_pin(b, b->scl, 1);
++	delay(1000);
++	for (int i = 0; i < 9; i++) {
++		bb_pin(b, b->scl, 0);
++		delay(5);
++		bb_scl_high(b);
++		delay(5);
++	}
++	bb_stop(b);
++}
++
++static int
++fts_xfer(const uint8_t *cmd, uint32_t clen, uint8_t *out, uint32_t len)
++{
++	return bb_xfer(&touch_bus, FTS_ADDR, cmd, clen, out, len);
++}
++
++/*
++ * Exported bit-banged buses for other drivers (C and C++), at most
++ * BBI2C_MAX_BUSES. tlmm_pa is the TLMM tile holding both pins (pin n's
++ * registers at + 0x1000 * n). Returns a handle, or NULL (bad pins, no slot,
++ * mapping failed). Opening switches both pins to the GPIO function (away
++ * from their QUP function) and sends 9 clocks and a stop with no start, so
++ * no device sees a command. Then: blueline_bbi2c_xfer(), 0 or EIO (NACK) /
++ * EINVAL. Thread context; one caller at a time per bus.
++ */
++#define BBI2C_MAX_BUSES	2
++void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);
++int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
++    uint32_t rlen);
++
++void *
++blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl)
++{
++	static struct bbi2c buses[BBI2C_MAX_BUSES];
++	static int nbuses;
++	int top = sda > scl ? sda : scl;
++
++	if (sda < 0 || scl < 0 || sda == scl || top > 149 || nbuses >= BBI2C_MAX_BUSES) {
++		return NULL;
++	}
++	vm_offset_t tlmm = ml_io_map(tlmm_pa, GPIO_CFG(top + 1));
++	if (!tlmm) {
++		return NULL;
++	}
++	struct bbi2c *b = &buses[nbuses++];
++	b->tlmm = tlmm;
++	b->sda = sda;
++	b->scl = scl;
++	bb_reset(b);
++	return b;
++}
++
++int
++blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
++    uint32_t rlen)
++{
++	if (!bus || addr > 0x7fu || (wlen && !w) || (rlen && !r) || wlen + rlen == 0) {
++		return EINVAL;
++	}
++	return bb_xfer((const struct bbi2c *)bus, addr, w, wlen, r, rlen);
++}
++
+ /* ---- RPMh: LDO19 from the AOP ---- */
+ 
+ static uint8_t
+@@ -551,19 +636,11 @@ blueline_touch_init(void)
+ 	/* bus to the AP: switch GPIO 136 driven high */
+ 	wr(north + GPIO_IO(TOUCH_SWITCH), 2u);
+ 	wr(north + GPIO_CFG(TOUCH_SWITCH), 1u << 9);
+-	/* SDA/SCL as plain GPIOs, output value 0, released */
+-	wr(east + GPIO_IO(BB_SDA), 0);
+-	wr(east + GPIO_IO(BB_SCL), 0);
+-	bb_pin(BB_SDA, 1);
+-	bb_pin(BB_SCL, 1);
+-	delay(1000);
+-	for (int i = 0; i < 9; i++) {			/* free a device stuck mid-byte */
+-		bb_pin(BB_SCL, 0);
+-		delay(5);
+-		bb_scl_high();
+-		delay(5);
+-	}
+-	bb_stop();
++	/* SDA/SCL as plain GPIOs, output value 0, released; free a device stuck mid-byte */
++	touch_bus.tlmm = east;
++	touch_bus.sda = BB_SDA;
++	touch_bus.scl = BB_SCL;
++	bb_reset(&touch_bus);
+ 
+ 	static const uint8_t id_cmd[5] = { 0xfa, 0x20, 0x00, 0x00, 0x00 };
+ 	uint8_t id[4] = { 0 };
+diff --git a/iokit/Kernel/arm/BlueBattery.cpp b/iokit/Kernel/arm/BlueBattery.cpp
+index e6c2e77..6acd22d 100644
+--- a/iokit/Kernel/arm/BlueBattery.cpp
++++ b/iokit/Kernel/arm/BlueBattery.cpp
+@@ -19,6 +19,28 @@
+  * bluebatt_secs=N (10..600), bluebatt_log=N (full logs for the first N
+  * reads, default 5; then one line when %, plug or charge state changes),
+  * bluebatt_dry=1 (read and log, but keep publishing the static values).
++ *
++ * Patch 0141: the Pixel 3's real gauge is a Maxim MAX1720x (MAX17201/17205,
++ * Linux "maxim,max1720x", recovery's "max1720x 4-0036"), not the PMI8998 FG,
++ * which Google leaves unused (google,batt_psy_is_bms; google_charger reads
++ * "maxfg"). It sits on qupv3_se12_i2c = i2c@a90000 (QUP wrapper 1 at 0xac0000,
++ * SE4; Linux bus 4), pins GPIO 49 (SDA) / 50 (SCL) in the TLMM north tile, at
++ * 0x36 (registers 0x00-0xff) and 0x0b (nonvolatile shadow 0x180-0x1ff), ALRT
++ * on GPIO 62. Read with the touch driver's bit-banged I2C
++ * (blueline_bbi2c_open/_xfer in bsd/dev/blueline_touch.c): only register
++ * pointers are sent, no register is written, no interrupt is used.
++ *   Status 0x00 (bit 3 BST: battery absent), RepCap 0x05, RepSOC 0x06 (1/256 %),
++ *   Temp 0x08 (1/256 C), VCell 0x09 (78.125 uV), Current 0x0A / AvgCurrent 0x0B
++ *   (1.5625 uV / Rsense, + = charging), FullCap 0x10, TTE 0x11 / TTF 0x20
++ *   (5.625 s, 0xffff = none), Cycles 0x17 (16 % of a cycle), DesignCap 0x18,
++ *   AvgVCell 0x19, DevName 0x21, FullCapRep 0x35; capacities 5 uVh / Rsense.
++ *   Rsense from nRSense (0x0b: 0x1CF, 10 uOhm units) as Google's driver does;
++ *   5 mOhm (500) if that is implausible (sdm845-b1-battery.dtsi: nDesignCap
++ *   0x0B80 = "2944 mAh", nIChgTerm 0x0300 = "240 mA", both only with 5 mOhm).
++ * Boot-args: bluemax=1 reads and logs only (once at start, and at every
++ * bluebatt=1 refresh); bluemax=2 also publishes %, mV, mA, temperature,
++ * capacities, cycle count and time remaining (needs bluebatt=1, whose charger
++ * and plug state stay); bluemax_rsense=N overrides Rsense (10 uOhm units).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <IOKit/IOLib.h>
+@@ -49,6 +71,39 @@ extern "C" int blueline_spmi_apid(uint8_t sid, uint8_t periph, uint16_t *apid, u
+ #define BT_MISS_RT_STS_BIT	0x08u	/* FG_BATT_INFO INT_RT_STS */
+ #define BAT_OV_STS_BIT		0x20u	/* BATTERY_CHARGER_STATUS_2 */
+ 
++/* 0141: MAX1720x on bit-banged SE12 pins (bsd/dev/blueline_touch.c) */
++extern "C" void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);
++extern "C" int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen,
++    uint8_t *r, uint32_t rlen);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define MAX_TLMM_NORTH_PA	0x03900000u	/* pinctrl-sdm845.c: GPIO 49/50 are NORTH */
++#define MAX_SDA			49
++#define MAX_SCL			50
++#define MAX_ADDR		0x36u	/* registers 0x00-0xff */
++#define MAX_ADDR_NV		0x0bu	/* 0x180-0x1ff as 0x80-0xff */
++#define MAX_NRSENSE		0xcfu
++#define MAX_RSENSE_DEFAULT	500u	/* 10 uOhm units: 5 mOhm */
++#define MAX_STATUS_BST		0x0008u
++#define MAX_NONE		0xffffu	/* TTE/TTF: not applicable */
++/* GCC (0x00100000): QUP wrapper 1 votes and SE4 branch, read only, for the log */
++#define GCC_VOTE_PA		0x0015200cu	/* APCS_CLOCK_BRANCH_ENA_VOTE_1 */
++#define GCC_QUP1_PA		0x00118000u	/* m_ahb CBCR +0x00c, s_ahb +0x010, s4 +0x4d4 */
++#define GCC_VOTE_S4		26u
++#define GCC_VOTE_MAHB1		20u
++#define GCC_VOTE_SAHB1		21u
++#define CBCR_CLK_OFF		0x80000000u
++
++struct BlueMaxReading {
++	uint16_t status, repCap, repSoc, age, temp, vcell, cur, avgCur, fullCap, tte;
++	uint16_t cycles, designCap, avgVcell, ttf, devName, fullCapRep;
++	unsigned percent, mV, avgMV, repMah, fullMah, fullCapMah, designMah, cycleCount;
++	int mA, avgMA;		/* Maxim sign: positive = into the battery */
++	int deciC;
++	int tteMin, ttfMin;	/* -1: none */
++	bool present, sane;
++};
++
+ struct BlueBattReading {
+ 	uint8_t soc[2], socRt, infoSts[2], infoRt, temp[2], vi[4], chg[2], usbin, dcin, icl, path;
+ 	unsigned percent, mV, chgState;
+@@ -65,13 +120,18 @@ public:
+ private:
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+-	void putLegacy(UInt32 mah, UInt32 mV, SInt32 mA, UInt32 flags);
++	void putLegacy(UInt32 mah, UInt32 capacity, UInt32 mV, SInt32 mA, UInt32 cycles,
++	    UInt32 flags);
+ 	bool pmicSetup(void);
+ 	bool pmicRead(const char *what, uint16_t ppid, uint8_t off, uint8_t *buf, unsigned len,
+ 	    bool trace);
+ 	bool readAll(BlueBattReading *r, bool trace);
+ 	bool refresh(void);
+-	void publish(const BlueBattReading *r);
++	void publish(const BlueBattReading *r, const BlueMaxReading *m);
++	bool maxSetup(void);
++	bool maxRegs(uint8_t addr, uint8_t reg, uint16_t *out, unsigned n, bool trace);
++	bool maxRead(BlueMaxReading *m, bool trace);
++	void maxLog(unsigned n, const BlueMaxReading *m);
+ 	void armRefresh(void);
+ 	static void refreshCallout(thread_call_param_t p0, thread_call_param_t p1);
+ 
+@@ -80,6 +140,12 @@ private:
+ 	bool dry, swapVI, logged;
+ 	unsigned lastPercent;
+ 	bool lastPlugged, lastCharging, lastFull;
++
++	void *maxBus;		/* 0141: NULL unless bluemax= and the gauge answered */
++	int maxMode;		/* 0 off, 1 log, 2 publish */
++	uint32_t maxRsense, maxErrors;
++	unsigned maxLastPercent;
++	bool maxLogged;
+ };
+ OSDefineMetaClassAndStructors(BlueBattery, IOPMPowerSource);
+ 
+@@ -131,7 +197,8 @@ BlueBattery::putBool(const char *key, bool value)
+ 
+ /* IOPMCopyBatteryInfo's per-source compatibility dictionary */
+ void
+-BlueBattery::putLegacy(UInt32 mah, UInt32 mV, SInt32 mA, UInt32 flags)
++BlueBattery::putLegacy(UInt32 mah, UInt32 capacity, UInt32 mV, SInt32 mA, UInt32 cycles,
++    UInt32 flags)
+ {
+ 	OSDictionary *legacy = OSDictionary::withCapacity(6);
+ 	if (!legacy) {
+@@ -140,7 +207,7 @@ BlueBattery::putLegacy(UInt32 mah, UInt32 mV, SInt32 mA, UInt32 flags)
+ 	const char *keys[] = { kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		               kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		               kIOBatteryFlagsKey };
+-	UInt32 values[] = { mah, BLUE_BATTERY_MAH, mV, (UInt32)mA, 0, flags };
++	UInt32 values[] = { mah, capacity, mV, (UInt32)mA, cycles, flags };
+ 	for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+ 		OSNumber *number = OSNumber::withNumber(values[i], 32);
+ 		if (number) {
+@@ -283,10 +350,12 @@ BlueBattery::readAll(BlueBattReading *r, bool trace)
+ }
+ 
+ void
+-BlueBattery::publish(const BlueBattReading *r)
++BlueBattery::publish(const BlueBattReading *r, const BlueMaxReading *m)
+ {
++	/* With the MAX1720x (0141): its learned full capacity, and real cycles/times. */
++	UInt32 full = m ? m->fullMah : BLUE_BATTERY_MAH;
+ 	/* Rounded up, so powerd's CurrentCapacity / MaxCapacity gives r->percent back. */
+-	UInt32 mah = (r->percent * BLUE_BATTERY_MAH + 99) / 100;
++	UInt32 mah = (r->percent * full + 99) / 100;
+ 	SInt32 amperage = -r->mA;	/* Apple sign: negative = discharging */
+ 	UInt32 flags = kIOBatteryInstalled;
+ 
+@@ -297,7 +366,7 @@ BlueBattery::publish(const BlueBattReading *r)
+ 		flags |= kIOBatteryCharge;
+ 	}
+ 	setCurrentCapacity(mah);
+-	setMaxCapacity(BLUE_BATTERY_MAH);
++	setMaxCapacity(full);
+ 	setExternalConnected(r->plugged);
+ 	setExternalChargeCapable(r->plugged);
+ 	setIsCharging(r->charging);
+@@ -307,10 +376,22 @@ BlueBattery::publish(const BlueBattReading *r)
+ 	setAmperage(amperage);
+ 	putBool("FullyCharged", r->full || (r->plugged && r->percent == 100 && !r->charging));
+ 	putBool("AppleRawExternalConnected", r->plugged);
+-	putNumber("AppleRawCurrentCapacity", mah);
++	putNumber("AppleRawCurrentCapacity", m ? m->repMah : mah);
+ 	putNumber("InstantAmperage", (UInt32)amperage);
+ 	putNumber("Temperature", (UInt32)(r->deciC * 10));	/* centidegrees */
+-	putLegacy(mah, r->mV, amperage, flags);
++	if (m) {
++		int minutes = r->charging ? m->ttfMin : r->plugged ? -1 : m->tteMin;
++		setCycleCount(m->cycleCount);
++		setTimeRemaining(minutes);
++		putNumber("AppleRawMaxCapacity", m->fullMah);
++		putNumber("NominalChargeCapacity", m->fullMah);
++		putNumber("AvgTimeToEmpty", m->tteMin < 0 ? 65535u : (UInt32)m->tteMin);
++		putNumber("AvgTimeToFull", m->ttfMin < 0 ? 65535u : (UInt32)m->ttfMin);
++		/* Maxim sign = Apple sign (negative = discharging): Amperage the average */
++		setAmperage(m->avgMA);
++		putNumber("InstantAmperage", (UInt32)(SInt32)m->mA);
++	}
++	putLegacy(mah, full, r->mV, amperage, m ? m->cycleCount : 0, flags);
+ 	updateStatus();
+ }
+ 
+@@ -324,7 +405,30 @@ BlueBattery::refresh(void)
+ 	if (!readAll(&r, trace)) {
+ 		return false;
+ 	}
+-	bool missing = (r.infoRt & BT_MISS_RT_STS_BIT) != 0;
++
++	/* 0141: the MAX1720x, logged (bluemax=1) or replacing the FG's numbers (bluemax=2) */
++	BlueMaxReading m;
++	bool haveMax = maxBus && maxRead(&m, trace);
++	bool useMax = haveMax && maxMode == 2 && m.sane;
++	if (haveMax && (n <= logCount || !maxLogged || m.percent != maxLastPercent || !m.sane)) {
++		maxLog(n, &m);
++		maxLogged = true;
++		maxLastPercent = m.percent;
++	}
++	if (maxMode == 2 && maxBus && !useMax) {
++		if (n <= logCount || (n % 20u) == 0) {
++			IOLog("BLUELINE BATTERY: #%u MAX1720x %s: nothing published this time\n", n,
++			    haveMax ? "implausible" : "read failed");
++		}
++		return false;	/* the PMI8998 FG's own SOC is not real on this phone */
++	}
++	if (useMax) {
++		r.percent = m.percent;
++		r.mV = m.mV;
++		r.mA = -m.mA;	/* back to the FG sign used below: + = discharging */
++		r.deciC = m.deciC;
++	}
++	bool missing = !useMax && (r.infoRt & BT_MISS_RT_STS_BIT) != 0;
+ 	bool sane = !missing && r.mV >= 2500 && r.mV <= 4800 && r.deciC > -400 && r.deciC < 900;
+ 	bool changed = !logged || r.percent != lastPercent || r.plugged != lastPlugged ||
+ 	    r.charging != lastCharging || r.full != lastFull;
+@@ -338,8 +442,9 @@ BlueBattery::refresh(void)
+ 		    r.chg[1], r.usbin, r.dcin, r.icl, r.path);
+ 	}
+ 	if (n <= logCount || changed || !sane) {
+-		IOLog("BLUELINE BATTERY: #%u %u%% %u mV %d mA (FG, + = discharging) %s%d.%d C, "
+-		    "%s%s, charger %s%s%s%s\n", n, r.percent, r.mV, r.mA, r.deciC < 0 ? "-" : "",
++		IOLog("BLUELINE BATTERY: #%u %u%% %u mV %d mA (%s, + = discharging) %s%d.%d C, "
++		    "%s%s, charger %s%s%s%s\n", n, r.percent, r.mV, r.mA, useMax ? "MAX1720x" : "FG",
++		    r.deciC < 0 ? "-" : "",
+ 		    absDeci / 10, absDeci % 10, (r.usbin & PLUGIN_RT_STS_BIT) ? "USB in" : "USB out",
+ 		    (r.dcin & PLUGIN_RT_STS_BIT) ? ", wireless in" : "", chgStateName[r.chgState],
+ 		    r.charging ? ", charging" : "", r.full ? ", full" : "",
+@@ -355,7 +460,7 @@ BlueBattery::refresh(void)
+ 	lastCharging = r.charging;
+ 	lastFull = r.full;
+ 	if (!dry) {
+-		publish(&r);
++		publish(&r, useMax ? &m : NULL);
+ 	}
+ 	return true;
+ }
+@@ -376,6 +481,163 @@ BlueBattery::refreshCallout(thread_call_param_t p0, __unused thread_call_param_t
+ 	self->armRefresh();
+ }
+ 
++/* ---- 0141: MAX1720x fuel gauge ---- */
++
++/* n (1..4) 16-bit little-endian registers from reg on, one transaction (~1 ms, IRQs off). */
++bool
++BlueBattery::maxRegs(uint8_t addr, uint8_t reg, uint16_t *out, unsigned n, bool trace)
++{
++	uint8_t buf[8];
++
++	if (n < 1 || n > 4) {
++		return false;
++	}
++	if (trace) {
++		IOLog("BLUELINE MAX1720X: about to read 0x%02x reg 0x%02x, %u word(s)\n", addr, reg, n);
++	}
++	int error = blueline_bbi2c_xfer(maxBus, addr, &reg, 1, buf, 2 * n);
++	if (error) {
++		maxErrors++;
++		if (maxErrors <= 5 || (maxErrors % 100) == 0) {
++			IOLog("BLUELINE MAX1720X: read 0x%02x reg 0x%02x failed: error %d (%u errors)\n",
++			    addr, reg, error, maxErrors);
++		}
++		return false;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		out[i] = (uint16_t)(buf[2 * i] | (buf[2 * i + 1] << 8));
++	}
++	return true;
++}
++
++/* Bus, clocks (logged only), identity, Rsense. false leaves maxBus NULL. */
++bool
++BlueBattery::maxSetup(void)
++{
++	/* What ABL left running on QUP wrapper 1 / SE4: GCC is always readable. */
++	vm_offset_t vote = ml_io_map(GCC_VOTE_PA & ~0xfffu, 0x1000);
++	vm_offset_t qup1 = ml_io_map(GCC_QUP1_PA, 0x1000);
++	if (vote && qup1) {
++		IOLog("BLUELINE MAX1720X: about to read GCC vote 0x%x and QUP1 CBCRs 0x%x\n",
++		    GCC_VOTE_PA, GCC_QUP1_PA);
++		uint32_t v = *(volatile uint32_t *)(vote + (GCC_VOTE_PA & 0xfffu));
++		uint32_t mahb = *(volatile uint32_t *)(qup1 + 0x00cu);
++		uint32_t sahb = *(volatile uint32_t *)(qup1 + 0x010u);
++		uint32_t s4 = *(volatile uint32_t *)(qup1 + 0x4d4u);
++		IOLog("BLUELINE MAX1720X: GCC vote 0x%08x (wrap1 s4 %u, m_ahb %u, s_ahb %u); CBCR "
++		    "m_ahb 0x%08x s_ahb 0x%08x s4 0x%08x: SE12 clock %s (not needed: bit-banged)\n", v,
++		    (v >> GCC_VOTE_S4) & 1u, (v >> GCC_VOTE_MAHB1) & 1u, (v >> GCC_VOTE_SAHB1) & 1u,
++		    mahb, sahb, s4, (s4 & CBCR_CLK_OFF) ? "off" : "on");
++	}
++
++	IOLog("BLUELINE MAX1720X: about to bit-bang I2C on GPIO %d SDA / %d SCL (TLMM 0x%x, "
++	    "qupv3_se12 pins, taken from function qup12)\n", MAX_SDA, MAX_SCL, MAX_TLMM_NORTH_PA);
++	maxBus = blueline_bbi2c_open(MAX_TLMM_NORTH_PA, MAX_SDA, MAX_SCL);
++	if (!maxBus) {
++		IOLog("BLUELINE MAX1720X: no bus (mapping or slots); gauge off\n");
++		return false;
++	}
++	uint16_t id[2] = { 0, 0 };	/* TTF 0x20, DevName 0x21 */
++	if (!maxRegs(MAX_ADDR, 0x20, id, 2, true)) {
++		IOLog("BLUELINE MAX1720X: no answer at 0x%02x; gauge off\n", MAX_ADDR);
++		maxBus = NULL;
++		return false;
++	}
++	uint16_t status = 0, nrsense = 0;
++	(void)maxRegs(MAX_ADDR, 0x00, &status, 1, true);
++	bool nvOk = maxRegs(MAX_ADDR_NV, MAX_NRSENSE, &nrsense, 1, true);
++	int forced = 0;
++	(void)PE_parse_boot_argn("bluemax_rsense", &forced, sizeof(forced));
++	if (forced >= 50 && forced <= 5000) {
++		maxRsense = (uint32_t)forced;
++	} else if (nvOk && nrsense >= 50 && nrsense <= 5000) {
++		maxRsense = nrsense;
++	} else {
++		maxRsense = MAX_RSENSE_DEFAULT;
++	}
++	IOLog("BLUELINE MAX1720X: DevName 0x%04x (low nibble 1 = MAX17201, 5 = MAX17205), "
++	    "Status 0x%04x%s, nRSense %s0x%04x -> Rsense %u.%02u mOhm%s\n", id[1], status,
++	    (status & MAX_STATUS_BST) ? " (BATTERY ABSENT)" : "", nvOk ? "" : "(read failed) ",
++	    nrsense, maxRsense / 100, maxRsense % 100, forced ? " (bluemax_rsense)" : "");
++	return true;
++}
++
++bool
++BlueBattery::maxRead(BlueMaxReading *m, bool trace)
++{
++	uint16_t a[4], b[3], c[2], d[3], e[2];
++
++	bzero(m, sizeof(*m));
++	if (!maxRegs(MAX_ADDR, 0x00, &m->status, 1, trace) ||
++	    !maxRegs(MAX_ADDR, 0x05, a, 4, trace) ||		/* RepCap RepSOC Age Temp */
++	    !maxRegs(MAX_ADDR, 0x09, b, 3, trace) ||		/* VCell Current AvgCurrent */
++	    !maxRegs(MAX_ADDR, 0x10, c, 2, trace) ||		/* FullCap TTE */
++	    !maxRegs(MAX_ADDR, 0x17, d, 3, trace) ||		/* Cycles DesignCap AvgVCell */
++	    !maxRegs(MAX_ADDR, 0x20, e, 2, trace) ||		/* TTF DevName */
++	    !maxRegs(MAX_ADDR, 0x35, &m->fullCapRep, 1, trace)) {
++		return false;
++	}
++	m->repCap = a[0];
++	m->repSoc = a[1];
++	m->age = a[2];
++	m->temp = a[3];
++	m->vcell = b[0];
++	m->cur = b[1];
++	m->avgCur = b[2];
++	m->fullCap = c[0];
++	m->tte = c[1];
++	m->cycles = d[0];
++	m->designCap = d[1];
++	m->avgVcell = d[2];
++	m->ttf = e[0];
++	m->devName = e[1];
++
++	/* Scaling as Google's max1720x_battery.c (crosshatch 862f51ba), Rsense in 10 uOhm */
++	uint64_t rs = maxRsense;
++	m->percent = m->repSoc >> 8;				/* reg_to_percentage() */
++	if (m->percent > 100) {
++		m->percent = 100;
++	}
++	m->mV = (unsigned)((uint64_t)m->vcell * 78125u / 1000000u);	/* reg_to_micro_volt() */
++	m->avgMV = (unsigned)((uint64_t)m->avgVcell * 78125u / 1000000u);
++	m->mA = (int)((int64_t)(int16_t)m->cur * 156250 / (int64_t)rs / 1000);	/* reg_to_micro_amp() */
++	m->avgMA = (int)((int64_t)(int16_t)m->avgCur * 156250 / (int64_t)rs / 1000);
++	m->repMah = (unsigned)((uint64_t)m->repCap * 500u / rs);	/* reg_to_micro_amp_h() */
++	m->fullMah = (unsigned)((uint64_t)m->fullCapRep * 500u / rs);
++	m->fullCapMah = (unsigned)((uint64_t)m->fullCap * 500u / rs);
++	m->designMah = (unsigned)((uint64_t)m->designCap * 500u / rs);
++	m->deciC = (int)(int16_t)m->temp * 10 / 256;		/* reg_to_deci_deg_cel() */
++	m->cycleCount = ((unsigned)m->cycles * 16u + 50u) / 100u;	/* reg_to_cycles(): 16 % LSB */
++	/* reg_to_seconds(): 5.625 s */
++	m->tteMin = m->tte == MAX_NONE ? -1 : (int)(((uint64_t)m->tte * 5625u / 1000u + 30u) / 60u);
++	m->ttfMin = m->ttf == MAX_NONE ? -1 : (int)(((uint64_t)m->ttf * 5625u / 1000u + 30u) / 60u);
++
++	m->present = !(m->status & MAX_STATUS_BST);
++	m->sane = m->present && m->repSoc <= 0x6480u /* 100.5 % */ && m->mV >= 2500 &&
++	    m->mV <= 4800 && m->deciC > -400 && m->deciC < 900 && m->fullMah >= 500 &&
++	    m->fullMah <= 4000;
++	return true;
++}
++
++void
++BlueBattery::maxLog(unsigned n, const BlueMaxReading *m)
++{
++	int absDeci = m->deciC < 0 ? -m->deciC : m->deciC;
++
++	IOLog("BLUELINE MAX1720X: #%u raw status %04x repcap %04x repsoc %04x age %04x temp %04x "
++	    "vcell %04x cur %04x avgcur %04x fullcap %04x tte %04x cycles %04x design %04x "
++	    "avgvcell %04x ttf %04x devname %04x fullcaprep %04x\n", n, m->status, m->repCap,
++	    m->repSoc, m->age, m->temp, m->vcell, m->cur, m->avgCur, m->fullCap, m->tte, m->cycles,
++	    m->designCap, m->avgVcell, m->ttf, m->devName, m->fullCapRep);
++	IOLog("BLUELINE MAX1720X: #%u %u%% %u mV (avg %u) %d mA (avg %d, + = charging) %s%d.%d C, "
++	    "RepCap %u / FullCapRep %u mAh (FullCap %u, design %u), %u cycles, TTE %d min, "
++	    "TTF %d min%s%s\n", n, m->percent, m->mV, m->avgMV, m->mA, m->avgMA,
++	    m->deciC < 0 ? "-" : "", absDeci / 10, absDeci % 10, m->repMah, m->fullMah,
++	    m->fullCapMah, m->designMah, m->cycleCount, m->tteMin, m->ttfMin,
++	    m->present ? "" : ", BATTERY ABSENT", !m->sane ? ", implausible: not published" :
++	    maxMode == 2 ? (dry ? " (dry run)" : " -> published") : " (log only, bluemax=1)");
++}
++
+ bool
+ BlueBattery::start(IOService *provider)
+ {
+@@ -403,12 +665,28 @@ BlueBattery::start(IOService *provider)
+ 	putNumber("DesignCapacity", BLUE_BATTERY_MAH);
+ 	putNumber("InstantAmperage", 0);
+ 	putNumber("Temperature", 2500);		/* centidegrees, fixed */
+-	putLegacy(BLUE_BATTERY_MAH, 4350, 0,
++	putLegacy(BLUE_BATTERY_MAH, BLUE_BATTERY_MAH, 4350, 0, 0,
+ 	    (UInt32)(kIOBatteryInstalled | kIOBatteryChargerConnect));
+ 
+ 	int mode = 0;
+ 	(void)PE_parse_boot_argn("bluebatt", &mode, sizeof(mode));
+ 	bool live = false;
++
++	/* 0141: before the PMI8998 setup, so the first refresh already has the gauge */
++	(void)PE_parse_boot_argn("bluemax", &maxMode, sizeof(maxMode));
++	if (maxMode == 2 && mode != 1) {
++		IOLog("BLUELINE MAX1720X: bluemax=2 needs bluebatt=1 (charger state); log only\n");
++		maxMode = 1;
++	}
++	if (maxMode == 1 || maxMode == 2) {
++		IOLog("BLUELINE MAX1720X: bluemax=%d: %s\n", maxMode,
++		    maxMode == 2 ? "read and publish" : "read and log only");
++		if (!maxSetup() && maxMode == 2) {
++			IOLog("BLUELINE MAX1720X: no gauge: bluebatt=1 publishes the PMI8998 FG as before\n");
++		}
++	} else {
++		maxMode = 0;
++	}
+ 	if (mode == 1) {
+ 		int secs = 30, logs = 5, dryArg = 0;
+ 		(void)PE_parse_boot_argn("bluebatt_secs", &secs, sizeof(secs));
+@@ -428,9 +706,17 @@ BlueBattery::start(IOService *provider)
+ 			}
+ 		}
+ 	}
++	if (maxBus && !live) {
++		/* No periodic refresh: one reading for the log */
++		BlueMaxReading m;
++		if (maxRead(&m, true)) {
++			maxLog(0, &m);
++		}
++	}
+ 	updateStatus();
+ 	if (live) {
+-		IOLog("BLUELINE BATTERY: AppleSmartBattery, from the PMI8998%s\n",
++		IOLog("BLUELINE BATTERY: AppleSmartBattery, from the PMI8998%s%s\n",
++		    maxBus && maxMode == 2 ? " charger + MAX1720x gauge" : "",
+ 		    dry ? " (dry run: static 100% published)" : "");
+ 	} else {
+ 		IOLog("BLUELINE BATTERY: AppleSmartBattery, static, 100%% on external power\n");
+-- 
+2.54.0 (Apple Git-157)
