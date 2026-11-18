@@ -59,6 +59,10 @@ fi
 # ABL counts each RAM boot as a failed slot-B boot and eventually falls back to
 # slot A (no tap-free adb there); re-marking B active resets its retry count.
 for _ in $(seq 1 60); do fastboot devices | grep -q fastboot && break; sleep 1; done
+if ! fastboot devices | grep -q fastboot; then	# fastboot would otherwise wait forever, silently
+	say "phone not visible to fastboot after 60 s; if its screen shows fastboot, replug the USB cable (or hold Power + Volume Down)"
+	exit 1
+fi
 fastboot --set-active=b > "$out/$name-slot.txt" 2>&1 || say "warning: set-active=b failed (see $out/$name-slot.txt)"
 say "RAM boot"
 tools/fbboot.sh "$out/$name-shim.img" 3 > "$out/$name-fastboot.txt" 2>&1 || { cat "$out/$name-fastboot.txt"; exit 1; }
