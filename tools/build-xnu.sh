@@ -99,13 +99,17 @@ if [ "$quick" = 1 ]; then
 	if [ "$first" -ge 0 ]; then
 		for ((i = ${#old[@]} - 1; i >= first; i--)); do
 			echo "take out ${old[i]}"
-			git -C "$x" apply -R "$work/dxb/patches/${old[i]}"
+			git -C "$x" apply -R "$work/dxb/patches/${old[i]}" || { echo "could not take out ${old[i]}; tree left as is" >&2; exit 1; }
+			printf '%s\n' "${old[@]:0:i}" > "$work/patch-list.txt"	# the list always matches the tree
+			awk '/^--- \/dev\/null/{n=1;next} n&&/^\+\+\+ b\//{print substr($0,7)} {n=0}' "$work/dxb/patches/${old[i]}" |
+				while read -r f; do [ -f "$x/$f" ] && [ ! -s "$x/$f" ] && rm -f "$x/$f"; done	# git apply -R can leave a created file behind, empty
 		done
 		for ((i = first; i < ${#new[@]}; i++)); do
 			n=${new[i]}
 			case $n in 01[0-9][0-9]-*) cp "$repo/xnu/patches/$n" "$work/dxb/patches/" ;; esac
 			echo "put in  $n"
-			git -C "$x" apply "$work/dxb/patches/$n"
+			git -C "$x" apply "$work/dxb/patches/$n" || { echo "could not put in $n; tree has the patches before it" >&2; exit 1; }
+			printf '%s\n' "${new[@]:0:i+1}" > "$work/patch-list.txt"
 		done
 		for n in "${old[@]}"; do printf '%s\n' "${new[@]}" | grep -qx "$n" || rm -f "$work/dxb/patches/$n"; done
 		printf '%s\n' "${new[@]}" > "$work/patch-list.txt"
