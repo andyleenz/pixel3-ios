@@ -1,0 +1,304 @@
+blueline: fake accelerometer + gyro HID services (boot-arg bluefakeaccel=1)
+
+Proves the iOS rotation path (locationd CLAccelerometer/CLGyro ->
+CoreMotion CMDeviceOrientationManager -> backboardd BKOrientationManager)
+without the SLPI. Two IOHIDEventService subclasses next to SweetHIDButtons:
+
+  BlueFakeAccel  PrimaryUsagePage/Usage (0xFF00, 0x03), kIOHIDEventTypeAccelerometer, g
+  BlueFakeGyro   PrimaryUsagePage/Usage (0xFF00, 0x09), kIOHIDEventTypeGyro, rad/s (zeros)
+
+Each sends a constant sample every 20 ms while a client has it open, and
+answers copyEvent. Accelerometer type is 0 (locationd discards type 1,
+"shake"). Orientation: bluefakeaccel_orient=0 portrait (0,-1,0),
+1 upside down (0,1,0), 2 landscape left (-1,0,0), 3 landscape right (1,0,0).
+Volume up + volume down together steps 0 -> 2 -> 1 -> 3 -> 0.
+ReportInterval/BatchInterval set by locationd are logged and stored, not obeyed.
+Without bluefakeaccel=1, start() fails and nothing is registered.
+Log prefix: "BLUELINE ACCEL:".
+
+--- a/iokit/Kernel/arm/hid/BlueFakeMotion.cpp
++++ b/iokit/Kernel/arm/hid/BlueFakeMotion.cpp
+@@ -0,0 +1,236 @@
++/*
++ * Pixel 3 (blueline): a fake accelerometer and gyro, to prove the iOS
++ * rotation path (locationd -> CoreMotion -> backboardd) before the SLPI
++ * sensors work. Boot-arg bluefakeaccel=1 turns it on; it is off otherwise.
++ *
++ * locationd (iOS 16.7.16) opens the IMU through an IOHIDEventSystemClient
++ * and matches services by PrimaryUsagePage/PrimaryUsage:
++ *   accelerometer (0xFF00, 0x03)  kIOHIDEventTypeAccelerometer, in g
++ *   gyro          (0xFF00, 0x09)  kIOHIDEventTypeGyro, in rad/s
++ * It adds LocationID to the match only when its IMULocationID setting is
++ * set (not the case by default). CLAccelerometer::onAccelerometerIohidEvent
++ * drops accelerometer events whose type is not 0 (1 is shake), and reads X/Y/Z
++ * as floats without scaling. CLOrientationNotifier wants both services
++ * ("No gyro; not detecting orientation!").
++ *
++ * Both services send a constant sample every 20 ms (50 Hz) while a client
++ * has them open: gravity for the chosen orientation, and zero rotation.
++ * iOS device axes: +x right, +y toward the top, +z out of the screen;
++ * the axis that points up reads -1 g.
++ *   bluefakeaccel_orient=0  portrait             ( 0, -1, 0)
++ *                        1  portrait upside down ( 0, +1, 0)
++ *                        2  landscape left       (-1,  0, 0)  home side right
++ *                        3  landscape right      (+1,  0, 0)  home side left
++ * Pressing volume up and volume down together steps the orientation
++ * 0 -> 2 -> 1 -> 3 -> 0 (one quarter turn each time). The volume keys still
++ * reach iOS as usual.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSNumber.h>
++#include <pexpert/pexpert.h>
++
++#include "IOHIDEventService.h"
++#include "IOHIDEvent.h"
++#include "IOHIDKeys.h"
++
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" void blueline_fake_accel_key(int key, int down);
++
++#define BLUE_FAKE_PAGE      0xFF00u	/* kHIDPage_AppleVendor */
++#define BLUE_FAKE_ACCEL     0x03u	/* kHIDUsage_AppleVendor_Accelerometer */
++#define BLUE_FAKE_GYRO      0x09u	/* kHIDUsage_AppleVendor_Gyro */
++#define BLUE_FAKE_PERIOD_MS 20u
++
++static const struct {
++	const char *name;
++	IOFixed x, y, z;
++} blue_orient[4] = {
++	{ "portrait", 0, -(1 << 16), 0 },
++	{ "portrait-upside-down", 0, (1 << 16), 0 },
++	{ "landscape-left", -(1 << 16), 0, 0 },
++	{ "landscape-right", (1 << 16), 0, 0 },
++};
++
++static volatile int gBlueOrient;	/* index into blue_orient */
++
++class BlueFakeMotion : public IOHIDEventService {
++	OSDeclareDefaultStructors(BlueFakeMotion);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = NULL,
++	    IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return BLUE_FAKE_PAGE; }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return BLUE_FAKE_PERIOD_MS * 1000; }
++	virtual bool isGyro() { return false; }
++private:
++	IOHIDEvent *sample();
++	void noteInterval(OSDictionary *dict, const char *key, UInt32 *last);
++	static void tick(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fTimer;
++	UInt32 fReportUS, fBatchUS;
++	bool fSent;
++};
++OSDefineMetaClassAndStructors(BlueFakeMotion, IOHIDEventService);
++
++class BlueFakeAccel : public BlueFakeMotion {
++	OSDeclareDefaultStructors(BlueFakeAccel);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return BLUE_FAKE_ACCEL; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x10; }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("accel"); }
++};
++OSDefineMetaClassAndStructors(BlueFakeAccel, BlueFakeMotion);
++
++class BlueFakeGyro : public BlueFakeMotion {
++	OSDeclareDefaultStructors(BlueFakeGyro);
++protected:
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return BLUE_FAKE_GYRO; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x11; }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("gyro"); }
++	virtual bool isGyro() APPLE_KEXT_OVERRIDE { return true; }
++};
++OSDefineMetaClassAndStructors(BlueFakeGyro, BlueFakeMotion);
++
++static bool gBlueFakeOn;
++
++static bool
++blue_fake_enabled(void)
++{
++	static bool parsed;
++	if (!parsed) {
++		int on = 0, orient = 0;
++		(void)PE_parse_boot_argn("bluefakeaccel", &on, sizeof(on));
++		(void)PE_parse_boot_argn("bluefakeaccel_orient", &orient, sizeof(orient));
++		gBlueOrient = (orient >= 0 && orient < 4) ? orient : 0;
++		gBlueFakeOn = on == 1;
++		parsed = true;
++		if (gBlueFakeOn) {
++			IOLog("BLUELINE ACCEL: fake accel (0xFF00,0x03) + gyro (0xFF00,0x09) on, "
++			    "orientation %d %s, %u Hz; volume up+down together rotates\n",
++			    gBlueOrient, blue_orient[gBlueOrient].name, 1000u / BLUE_FAKE_PERIOD_MS);
++		}
++	}
++	return gBlueFakeOn;
++}
++
++bool
++BlueFakeMotion::start(IOService *provider)
++{
++	/* Both personalities always match; without the boot-arg they stay unregistered. */
++	if (!blue_fake_enabled() || !IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty("Transport", "SPU");
++	fTimer = IOTimerEventSource::timerEventSource(this, &BlueFakeMotion::tick);
++	if (!fTimer || _hidWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fTimer);
++		IOLog("BLUELINE ACCEL: %s timer failed\n", getName());
++		return false;
++	}
++	fTimer->setTimeoutMS(BLUE_FAKE_PERIOD_MS);
++	registerService();
++	IOLog("BLUELINE ACCEL: %s registered, usage pair (0x%x, 0x%x)\n", getName(),
++	    (unsigned)getPrimaryUsagePage(), (unsigned)getPrimaryUsage());
++	return true;
++}
++
++void
++BlueFakeMotion::free(void)
++{
++	if (fTimer) {
++		fTimer->cancelTimeout();
++		if (_hidWorkLoop) {
++			_hidWorkLoop->removeEventSource(fTimer);
++		}
++		OSSafeReleaseNULL(fTimer);
++	}
++	IOHIDEventService::free();
++}
++
++IOHIDEvent *
++BlueFakeMotion::sample()
++{
++	uint64_t now = mach_absolute_time();
++
++	if (isGyro()) {
++		return IOHIDEvent::gyroEvent(now, 0, 0, 0);	/* rad/s, type normal */
++	}
++	int o = gBlueOrient & 3;
++	return IOHIDEvent::accelerometerEvent(now, blue_orient[o].x, blue_orient[o].y, blue_orient[o].z);
++}
++
++void
++BlueFakeMotion::tick(OSObject *owner, IOTimerEventSource *sender)
++{
++	BlueFakeMotion *self = (BlueFakeMotion *)owner;
++
++	if (self->handleIsOpen(NULL)) {
++		IOHIDEvent *event = self->sample();
++		if (event) {
++			if (!self->fSent) {
++				self->fSent = true;
++				IOLog("BLUELINE ACCEL: %s first sample to a client\n", self->getName());
++			}
++			self->dispatchEvent(event);
++			event->release();
++		}
++	}
++	sender->setTimeoutMS(BLUE_FAKE_PERIOD_MS);
++}
++
++IOHIDEvent *
++BlueFakeMotion::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	IOHIDEventType mine = isGyro() ? kIOHIDEventTypeGyro : kIOHIDEventTypeAccelerometer;
++	return type == mine ? sample() : NULL;
++}
++
++void
++BlueFakeMotion::noteInterval(OSDictionary *dict, const char *key, UInt32 *last)
++{
++	OSNumber *num = OSDynamicCast(OSNumber, dict->getObject(key));
++
++	if (num && num->unsigned32BitValue() != *last) {
++		*last = num->unsigned32BitValue();
++		setProperty(key, num);
++		IOLog("BLUELINE ACCEL: %s %s %u us (sending every %u ms regardless)\n", getName(), key,
++		    (unsigned)*last, BLUE_FAKE_PERIOD_MS);
++	}
++}
++
++IOReturn
++BlueFakeMotion::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++
++	if (dict) {
++		/* locationd sets these through IOHIDServiceClientSetProperty. */
++		noteInterval(dict, kIOHIDReportIntervalKey, &fReportUS);
++		noteInterval(dict, "BatchInterval", &fBatchUS);
++	}
++	return IOHIDEventService::setProperties(properties);
++}
++
++/* Called by sweet_hid_key() for every key change: 1 volume up, 2 volume down. */
++extern "C" void
++blueline_fake_accel_key(int key, int down)
++{
++	static bool held[3];
++
++	if (!gBlueFakeOn || key < 1 || key > 2) {
++		return;
++	}
++	held[key] = down != 0;
++	if (down && held[1] && held[2]) {
++		static const int next[4] = { 2, 3, 1, 0 };	/* 0 -> 2 -> 1 -> 3 -> 0 */
++		int o = next[gBlueOrient & 3];
++		gBlueOrient = o;
++		IOLog("BLUELINE ACCEL: orientation -> %d %s (%d, %d, %d) g\n", o, blue_orient[o].name,
++		    blue_orient[o].x >> 16, blue_orient[o].y >> 16, blue_orient[o].z >> 16);
++	}
++}
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -30,6 +30,7 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++extern "C" void blueline_fake_accel_key(int key, int down);	/* BlueFakeMotion.cpp */
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -560,6 +561,7 @@
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
+ 	};
+ 
++	blueline_fake_accel_key(key, down);	/* volume up+down: rotate the fake accelerometer */
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+ 		gSweetButtons->key(usages[key], down != 0);
+ 	}
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,16 @@
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = BlueFakeAccel;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = BlueFakeAccel;"
++    "   },"
++    "   {"
++    "     'IOClass'         = BlueFakeGyro;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = BlueFakeGyro;"
++    "   },"
++    "   {"
+     "     'IOClass'         = BlueBattery;"
+     "     'name'            = AppleSmartBattery;"
+     "     'IOProviderClass' = IOResources;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/BlueBattery.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
++iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
