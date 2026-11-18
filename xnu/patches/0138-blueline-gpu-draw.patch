@@ -1,0 +1,904 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0138: blueline GPU: draw stage, 2D engine solid fills into
+ our buffer and the panel (bluegpu=7)
+
+bluegpu=7 runs stage 4 and, once CP_WHERE_AM_I passed, has the A6xx 2D
+engine fill rectangles (CP_BLIT BLIT_OP_SCALE with SOLID_COLOR), as Mesa's
+fd6 clear path does on a630 (mesa-26.3.1 fd6_blitter.cc / fd6_emit.cc,
+freedreno_devices.py; registers from a6xx.xml / adreno_pm4.xml):
+
+ - setup submit: CCU colour/depth invalidate + CACHE_INVALIDATE, (with
+   bluegpu_draw_init=1) SP_UPDATE_CNTL, the a630 magic and static
+   registers, RB_CCU_CNTL 0x10000000 (sysmem) after a WFI, CP_SET_MARKER
+   RM6_BLIT2DSCALE, no UBWC flag buffer;
+ - per rectangle: clear colour, RB/GRAS_A2D_BLT_CNTL 0x00f03080,
+   SP_A2D_OUTPUT_INFO 0xf180, DEST_TL/BR, DEST_BUFFER_INFO 0x430 (linear
+   B8G8R8A8 = the boot framebuffer's 0xAARRGGBB), BASE, PITCH; DEBUG_LABEL;
+   CP_BLIT wrapped in WFI + CP_REG_RMW RB_DBG_ECO_CNTL b24 (a630
+   QCTDD04536579). A stride that is not a multiple of 64 (the panel's
+   4320) is drawn as two surfaces of pitch 2 * stride (even rows, odd rows
+   from base + 4288 with x + 8);
+ - each submit ends with CCU colour/depth flush TS, CACHE_FLUSH_TS, WFI and
+   a CP_MEM_WRITE fence in the target page; RPTR/idle and the fence polled.
+
+Step 1: a 1080x64 buffer of our own (stride 4320, Normal NC, 0x5a5a5a5a)
+at GPU VA 0x01020000 (CP L3 table), 4 rectangles, every pixel checked by
+the CPU. Step 2: the scanout buffer from PE_current_console (pa 0x9d400000)
+mapped as 2M blocks at GPU VA 0x02000000 (ATS1PR-checked), console drawing
+muted (log kept), 4 rectangles (two 400x400 squares, a full-width bar, an
+odd-x 99x100), checked uncached right away and after the hold. Then both
+mappings are cleared and cb0's TLB invalidated before anything else; our
+buffer is freed with the CP memory under the same conditions; the
+framebuffer never.
+
+Boot-args: bluegpu=7, bluegpu_draw_step=1|2 (default 2: own buffer, then
+the panel), bluegpu_draw_hold_ms (default 5000, max 60000),
+bluegpu_draw_init (default 1). Stage 4's bluegpu_cp_* apply.
+---
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c	2026-11-19 10:04:27
++++ b/bsd/dev/blueline_gpu.c	2026-11-19 10:04:55
+@@ -10,6 +10,7 @@
+  * bluegpu=4 runs stage 1, then 2a with stage 2b (SMMU context + HFI) around it;
+  * bluegpu=5 runs 4 with stage 3 (GX: the GPU core powered by the GMU) inside;
+  * bluegpu=6 runs 5 with stage 4 (SQE microcode, ringbuffer, first commands) inside 3;
++ * bluegpu=7 runs 6, then the draw stage (2D engine fills: own buffer, then the panel);
+  * bluegpu_keep=1 leaves CX and the GMU clocks (and, at 3/4, the running GMU,
+  * at 4 also its SMMU bank and memory, at 5 also GX and the votes) on afterwards.
+  *
+@@ -194,6 +195,42 @@
+  *  RB registers (CP not started), 2 SQE_CNTL + ME_INIT, 3 scratch +
+  *  MEM_WRITE, 4 (default) WHERE_AM_I. bluegpu_cp_sidmask (default 0) widens
+  *  the SMR mask if sGFSYNR1 names another GPU stream.
++ *
++ * Draw stage (0138, bluegpu=7): after stage 4's WHERE_AM_I, with the CP
++ * running, the A6xx 2D engine (CP_BLIT BLIT_OP_SCALE, SOLID_COLOR) fills
++ * rectangles, as Mesa's fd6 clear path does on a630.
++ *  Setup submit: CCU colour/depth invalidate, CACHE_INVALIDATE; with
++ *  bluegpu_draw_init=1 (default) SP_UPDATE_CNTL, the a630 magic registers
++ *  and fd6_emit_static_regs; RB_CCU_CNTL 0x10000000 (sysmem: colour at
++ *  0x20000) after a WFI; CP_SET_MARKER RM6_BLIT2DSCALE; no UBWC flags.
++ *  Each rectangle: RB_A2D_CLEAR_COLOR (R, G, B, A), RB/GRAS_A2D_BLT_CNTL
++ *  0x00f03080 (solid, 8_8_8_8_UNORM, mask f, R2D_UNORM8), SP_A2D_OUTPUT_INFO
++ *  0xf180, RB_A2D_PIXEL_CNTL 0, GRAS_A2D_DEST_TL/BR, RB_A2D_DEST_BUFFER
++ *  INFO 0x430 (linear, WXYZ: B8G8R8A8 in memory, as the boot framebuffer)
++ *  / BASE / PITCH, DEBUG_LABEL, then RB_DBG_ECO_CNTL b24 set around
++ *  CP_BLIT by WFI + CP_REG_RMW (a630 QCTDD04536579). The pitch must be a
++ *  multiple of 64 and the panel's stride (4320) is not: such a surface is
++ *  drawn as two of pitch 2 * stride (even rows; odd rows from base + 4288,
++ *  x + 8), so y and h are even. Each submit ends with CCU colour/depth
++ *  flush TS, CACHE_FLUSH_TS, WFI and a CP_MEM_WRITE fence (target page
++ *  +0x100, 16 bytes per submit); RPTR/idle then the fence are polled.
++ *  Step 1: a 1080x64 buffer of our own (stride 4320, Normal NC, 0x5a5a5a5a,
++ *  GPU VA 0x01020000 in the CP's L3 table), 4 rectangles, every pixel
++ *  checked by the CPU (R/B swaps reported). Step 2 (bluegpu_draw_step=2,
++ *  default): the scanout buffer from PE_current_console (pa 0x9d400000
++ *  1080x2160 stride 4320; the MDP refreshes from it on its own) mapped as
++ *  2M blocks at GPU VA 0x02000000 (ATS1PR-checked), console drawing muted
++ *  (sweet_console_muted; the log still gets every line), 4 rectangles
++ *  (two 400x400 squares, a full-width bar, a 99x100 at odd x), checked
++ *  through an uncached mapping: inside every pixel, and the 1-pixel border
++ *  unchanged; again after bluegpu_draw_hold_ms (default 5000) with a
++ *  centre pixel logged each second; console unmuted. Nothing else writes
++ *  the scanout buffer this early (AppleCLCD's sweetfb copy starts with
++ *  IOKit matching, later). The rectangles stay on screen until something
++ *  draws over them.
++ *  Down: both mappings cleared from the page tables and cb0's TLB
++ *  invalidated before anything else, whatever happened; our buffer is
++ *  freed with the CP memory (same conditions), the framebuffer never.
+  *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+@@ -249,6 +286,12 @@
+  *    iommus SID 0); crosshatch sdm845-gpu.dtsi (gfx3d_user SID 0), adreno_
+  *    a6xx.c (SQE minus dword 0); ios-flame gpuprobe.c gpu_run (A640: same
+  *    order, the CP wrote memory).
++ *  - Draw stage: Mesa mesa-26.3.1 (fec8830e) fd6_blitter.cc, fd6_emit.cc/.h,
++ *    tu_clear_blit.cc, freedreno_devices.py, fd6_gmem_cache.h,
++ *    fd6_format_table.c, a6xx.xml, adreno_pm4.xml; Linux a6xx_gpu.c
++ *    (CACHE_FLUSH_TS form); ios-flame 0095 a6_blit_ib (A640 2D copy, same
++ *    registers); SweetFramebuffer.cpp (PE_current_console, WC mappings),
++ *    serial_console.c (sweet_console_muted).
+  *  - Stage 2b: Linux arm-smmu.c/.h (arm_smmu_write_context_bank,
+  *    arm_smmu_init_context_bank), arm-smmu-qcom.c (adreno write_sctlr
+  *    HUPCF, cb0 for the GPU), io-pgtable-arm.c (PTE/TCR/MAIR), a6xx_hfi.c/.h
+@@ -283,6 +326,7 @@
+ #include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);	/* osfmk/arm64/machine_routines.c */
+ extern uint32_t blueline_cmddb_addr(const char *id);	/* blueline_touch.c */
+ extern uint32_t blueline_cmddb_aux(const char *id, uint8_t *buf, uint32_t max);
+ extern bool blueline_cmddb_name(uint32_t addr, char name[9]);
+@@ -2529,6 +2573,727 @@
+ 		v = cp_mem(off)[0];
+ 	}
+ 	return v;
++}
++
++/*
++ * Draw stage (0138, bluegpu=7): after stage 4's WHERE_AM_I, the 2D engine
++ * fills rectangles (CP_BLIT BLIT_OP_SCALE with SOLID_COLOR), first into our
++ * own buffer, then into the scanout buffer the MDP is showing. Mesa
++ * mesa-26.3.1 fd6_blitter.cc (emit_setup, emit_blit_setup, emit_clear_color,
++ * emit_blit_fini, fd6_clear_buffer tail), fd6_emit.cc (fd6_emit_restore,
++ * fd6_emit_static_regs, magic regs), fd6_emit.h (fd6_set_rb_dbg_eco_mode),
++ * freedreno_devices.py (a630: QCTDD04536579, magic values, 2 CCUs),
++ * fd6_gmem_cache.h (sysmem CCU offsets), fd6_format_table.c (B8G8R8A8 =
++ * FMT6_8_8_8_8_UNORM + WXYZ); registers a6xx.xml, packets adreno_pm4.xml.
++ */
++#define CP_REG_RMW		0x21u
++#define CP_BLIT			0x2cu
++#define CP_EVENT_WRITE		0x46u
++#define CP_SET_MARKER		0x65u
++#define BLIT_OP_SCALE		3u
++#define RM6_BLIT2DSCALE		12u
++
++/* vgt_event_type (A6XX) */
++#define EV_CACHE_FLUSH_TS	0x04u
++#define EV_CCU_INV_DEPTH	0x18u
++#define EV_CCU_INV_COLOR	0x19u
++#define EV_CCU_FLUSH_DEPTH_TS	0x1cu
++#define EV_CCU_FLUSH_COLOR_TS	0x1du
++#define EV_CACHE_INVALIDATE	0x31u
++#define EV_DEBUG_LABEL		0x3fu
++
++/* 2D registers (a6xx.xml, A6XX offsets) */
++#define R_GRAS_A2D_BLT_CNTL	0x8400u
++#define R_GRAS_A2D_DEST_TL	0x8405u		/* +1 BR (inclusive); x 0..13, y 16..29 */
++#define R_RB_A2D_BLT_CNTL	0x8c00u		/* +1 RB_A2D_PIXEL_CNTL */
++#define R_RB_A2D_DEST_INFO	0x8c17u		/* +1/+2 BASE (64-byte aligned), +3 PITCH >> 6 */
++#define R_RB_A2D_DEST_FLAG	0x8c20u		/* FLAG_BUFFER_BASE lo/hi, PITCH: 0 (no UBWC) */
++#define R_RB_A2D_CLEAR_COLOR	0x8c2cu		/* DW0..3 = R, G, B, A (R2D_UNORM8: 8-bit unorm) */
++#define R_RB_DBG_ECO_CNTL	0x8e04u
++#define R_RB_CCU_CNTL		0x8e07u
++#define R_SP_A2D_OUTPUT_INFO	0xacc0u
++#define R_SP_UPDATE_CNTL	0xbb08u
++
++#define FMT6_8888_UNORM		0x30u
++#define SWAP_WXYZ		1u
++/* SOLID_COLOR | COLOR_FORMAT | MASK 0xf | IFMT R2D_UNORM8 (0) */
++#define A2D_BLT_CNTL_FILL	((1u << 7) | (FMT6_8888_UNORM << 8) | (0xfu << 20))
++/* IFMT_TYPE FLOAT (0) | COLOR_FORMAT | MASK 0xf */
++#define A2D_OUTPUT_INFO_VAL	((FMT6_8888_UNORM << 3) | (0xfu << 12))
++/* linear, B8G8R8A8 in memory = 0xAARRGGBB words, as the boot framebuffer */
++#define A2D_DEST_INFO_VAL	(FMT6_8888_UNORM | (SWAP_WXYZ << 10))
++/* sysmem CCU (fd6_gmem_cache.h: depth at 0, colour at num_ccu (2) * 64K = 0x20000) */
++#define RB_CCU_CNTL_SYSMEM	((0x20000u >> 12) << 23)
++#define ECO_BLIT_BIT		(1u << 24)	/* QCTDD04536579: RB_DBG_ECO_CNTL b24 around each 2D blit */
++
++/* Our own buffer: the panel's width and stride, so the row-pair split below is exercised before the panel */
++#define DR_OWN_W		1080u
++#define DR_OWN_H		64u
++#define DR_OWN_STRIDE		4320u
++#define DR_OWN_SIZE		0x44000u	/* round_page(4320 * 64) */
++#define DR_OWN_VA		0x01020000u	/* in the CP's L3 table (0x01000000-0x011fffff), entries 32.. */
++#define DR_OWN_FILL		0x5a5a5a5au
++#define DR_FB_VA		0x02000000u	/* L2 entries 16.., 2M blocks */
++#define DR_FB_MAX_BLK		8u
++#define DR_FENCE_OFF		(CP_TARGET_OFF + 0x100u)	/* 16 bytes per submit, in the 0x11111111 target page */
++#define DR_FENCE_VAL		0xd7a00000u
++#define BLK_2M			0x200000ull
++
++struct dr_rect {
++	uint32_t x, y, w, h, argb;
++	const char *name;
++};
++
++/* Step 1: our buffer (1080x64). Odd x and odd width in r2, right edge in r3. */
++static const struct dr_rect dr_own_rects[] = {
++	{ 16, 2, 400, 24, 0xffff0000u, "own0 red" },
++	{ 520, 2, 400, 24, 0xff00ff00u, "own1 green" },
++	{ 17, 30, 401, 24, 0xff0000ffu, "own2 blue" },
++	{ 1040, 30, 40, 32, 0xffffffffu, "own3 white" },
++};
++
++/* Step 2: the panel (1080x2160). y and h even (row pairs). */
++static const struct dr_rect dr_fb_rects[] = {
++	{ 340, 560, 400, 400, 0xffff0000u, "fb0 red 400x400" },
++	{ 340, 1000, 400, 400, 0xff00c000u, "fb1 green 400x400" },
++	{ 0, 1440, 1080, 16, 0xff0040ffu, "fb2 blue full-width bar" },
++	{ 101, 1500, 99, 100, 0xffffffffu, "fb3 white, odd x/w" },
++};
++#define DR_NRECT(a)		(sizeof(a) / sizeof((a)[0]))
++
++static struct {
++	bool on, own_mapped, fb_mapped, unmap_failed;
++	int step, hold_ms, init;
++	vm_offset_t va;		/* own buffer */
++	uint64_t pa;
++	uint64_t fb_pa, fb_blk;	/* scanout buffer (never freed), its first 2M block */
++	uint32_t fb_w, fb_h, fb_stride, fb_nblk;
++	uint32_t slot;		/* next fence slot */
++} dr;
++
++/*
++ * Options and the boot framebuffer (reads only). The console's v_baseAddr
++ * is physical (AppleCLCD::start uses it as fPhys).
++ */
++static bool
++dr_prepare(void)
++{
++	PE_Video v;
++
++	bzero(&dr, sizeof(dr));
++	dr.step = 2;
++	dr.hold_ms = 5000;
++	dr.init = 1;
++	(void)PE_parse_boot_argn("bluegpu_draw_step", &dr.step, sizeof(dr.step));
++	(void)PE_parse_boot_argn("bluegpu_draw_hold_ms", &dr.hold_ms, sizeof(dr.hold_ms));
++	(void)PE_parse_boot_argn("bluegpu_draw_init", &dr.init, sizeof(dr.init));
++	if (dr.step < 1 || dr.step > 2) {
++		dr.step = 2;
++	}
++	if (dr.hold_ms < 0 || dr.hold_ms > 60000) {
++		dr.hold_ms = 5000;
++	}
++	bzero(&v, sizeof(v));
++	(void)PE_current_console(&v);
++	dr.fb_pa = (uint64_t)v.v_baseAddr + v.v_offset;
++	dr.fb_w = (uint32_t)v.v_width;
++	dr.fb_h = (uint32_t)v.v_height;
++	dr.fb_stride = (uint32_t)v.v_rowBytes;
++	dr.fb_blk = dr.fb_pa & ~(BLK_2M - 1);
++	dr.fb_nblk = (uint32_t)((dr.fb_pa + (uint64_t)dr.fb_stride * dr.fb_h - dr.fb_blk + BLK_2M - 1) / BLK_2M);
++	printf("BLUELINE GPU: draw stage (bluegpu=7): step %d (1 own buffer, 2 + the panel), hold %d ms, init regs %d;"
++	    " console fb pa %#llx (offset %#lx) %ux%u depth %lu stride %u = %u 2M block(s) from %#llx\n", dr.step,
++	    dr.hold_ms, dr.init, (unsigned long long)dr.fb_pa, v.v_offset, dr.fb_w, dr.fb_h, v.v_depth, dr.fb_stride,
++	    dr.fb_nblk, (unsigned long long)dr.fb_blk);
++	if (dr.step >= 2 && (dr.fb_pa == 0 || v.v_depth != 32 || dr.fb_w < 1080 || dr.fb_h < 1600 ||
++	    dr.fb_stride < dr.fb_w * 4 || (dr.fb_stride & 3) || ((2 * dr.fb_stride) & 63) || (dr.fb_pa & 63) ||
++	    dr.fb_nblk > DR_FB_MAX_BLK)) {
++		printf("BLUELINE GPU: framebuffer not usable for the 2D engine (want 32 bpp, >= 1080x1600, 64-byte aligned"
++		    " base, 2 * stride a multiple of 64, <= %u blocks): step 1 only\n", DR_FB_MAX_BLK);
++		dr.step = 1;
++	}
++	dr.on = true;
++	return true;
++}
++
++static uint32_t
++dr_xy(uint32_t x, uint32_t y)
++{
++	return (x & 0x3fffu) | ((y & 0x3fffu) << 16);
++}
++
++static void
++dr_event(uint32_t ev)
++{
++	cp_put(pkt7(CP_EVENT_WRITE, 1));
++	cp_put(ev);
++}
++
++/* a6xx_gpu.c a6xx_submit form (4 dwords, the value from the packet; no IRQ: we poll) */
++static void
++dr_event_ts(uint32_t ev, uint32_t off, uint32_t val)
++{
++	cp_put(pkt7(CP_EVENT_WRITE, 4));
++	cp_put(ev);
++	cp_put(CP_VA + off);
++	cp_put(0);
++	cp_put(val);
++}
++
++static void
++dr_reg(uint32_t reg, uint32_t v)
++{
++	cp_put(pkt4(reg, 1));
++	cp_put(v);
++}
++
++/* fd6_set_rb_dbg_eco_mode: WFI, then RB_DBG_ECO_CNTL b24 set (blit) or cleared */
++static void
++dr_eco(bool blit)
++{
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	cp_put(pkt7(CP_REG_RMW, 3));
++	cp_put(R_RB_DBG_ECO_CNTL);
++	cp_put(~ECO_BLIT_BIT);
++	cp_put(blit ? ECO_BLIT_BIT : 0);
++}
++
++static bool
++dr_room(uint32_t n, const char *what)
++{
++	if (cp.wptr + n > CP_RING_DWORDS) {
++		printf("BLUELINE GPU: draw %s needs %u ring dwords, %u left: not submitted\n", what, n,
++		    CP_RING_DWORDS - cp.wptr);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * One rectangle into a linear surface at GPU VA base. RB_A2D_DEST_BUFFER
++ * wants a 64-byte aligned base and pitch; the panel's stride (4320) is
++ * not, so a stride that is not a multiple of 64 is drawn as two surfaces
++ * of pitch 2 * stride: even rows from base, odd rows from base + (stride &
++ * ~63) with x shifted by (stride & 63) / 4 pixels. y and h must be even.
++ * At most 12 + 2 * 22 dwords.
++ */
++static void
++dr_emit_rect(uint32_t base, uint32_t stride, const struct dr_rect *r)
++{
++	uint32_t c = r->argb;
++	bool split = (stride & 63) != 0;
++
++	cp_put(pkt4(R_RB_A2D_CLEAR_COLOR, 4));
++	cp_put((c >> 16) & 0xffu);	/* R */
++	cp_put((c >> 8) & 0xffu);	/* G */
++	cp_put(c & 0xffu);		/* B */
++	cp_put(c >> 24);		/* A */
++	cp_put(pkt4(R_RB_A2D_BLT_CNTL, 2));
++	cp_put(A2D_BLT_CNTL_FILL);
++	cp_put(0);			/* RB_A2D_PIXEL_CNTL */
++	dr_reg(R_GRAS_A2D_BLT_CNTL, A2D_BLT_CNTL_FILL);
++	dr_reg(R_SP_A2D_OUTPUT_INFO, A2D_OUTPUT_INFO_VAL);
++	for (uint32_t k = 0; k < (split ? 2u : 1u); k++) {
++		uint32_t b = base + (k ? (stride & ~63u) : 0), xo = k ? (stride & 63u) / 4 : 0;
++		uint32_t pitch = split ? 2 * stride : stride;
++		uint32_t y0 = split ? r->y / 2 : r->y, y1 = split ? (r->y + r->h) / 2 - 1 : r->y + r->h - 1;
++		cp_put(pkt4(R_GRAS_A2D_DEST_TL, 2));
++		cp_put(dr_xy(r->x + xo, y0));
++		cp_put(dr_xy(r->x + xo + r->w - 1, y1));
++		cp_put(pkt4(R_RB_A2D_DEST_INFO, 4));
++		cp_put(A2D_DEST_INFO_VAL);
++		cp_put(b);
++		cp_put(0);
++		cp_put(pitch >> 6);
++		dr_event(EV_DEBUG_LABEL);
++		dr_eco(true);
++		cp_put(pkt7(CP_BLIT, 1));
++		cp_put(BLIT_OP_SCALE);
++		dr_eco(false);
++	}
++}
++
++/*
++ * fd6_clear_buffer's tail (CCU colour/depth flush TS, CACHE_FLUSH_TS, WFI),
++ * then a CP_MEM_WRITE fence; 17 dwords. Slot: +0 CACHE_FLUSH_TS, +4
++ * MEM_WRITE, +8 CCU colour, +12 CCU depth.
++ */
++static uint32_t
++dr_emit_tail(void)
++{
++	uint32_t off = DR_FENCE_OFF + 16 * dr.slot, v = DR_FENCE_VAL | (dr.slot << 4);
++
++	dr_event_ts(EV_CCU_FLUSH_COLOR_TS, off + 8, v | 8);
++	dr_event_ts(EV_CCU_FLUSH_DEPTH_TS, off + 12, v | 12);
++	dr_event_ts(EV_CACHE_FLUSH_TS, off, v);
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	cp_put(pkt7(CP_MEM_WRITE, 3));
++	cp_put(CP_VA + off + 4);
++	cp_put(0);
++	cp_put(v | 4);
++	dr.slot++;
++	return off;
++}
++
++/* Submit from..wptr and wait for the fence words written by dr_emit_tail at off. */
++static bool
++dr_submit(const char *what, uint32_t from, uint32_t off)
++{
++	uint32_t want = DR_FENCE_VAL | (((off - DR_FENCE_OFF) / 16) << 4);
++	bool sub = cp_submit(what, from);
++	uint32_t mw = cp_mem_wait(off + 4, CP_TARGET_FILL), ts = cp_mem(off)[0];
++	uint32_t ccc = cp_mem(off + 8)[0], ccd = cp_mem(off + 12)[0];
++	bool ok = sub && mw == (want | 4);
++	printf("BLUELINE GPU: draw %s fences: MEM_WRITE %#x (want %#x) CACHE_FLUSH_TS %#x (want %#x) CCU colour %#x"
++	    " depth %#x: %s\n", what, mw, want | 4, ts, want, ccc, ccd, !sub ? "SUBMIT FAILED" : ok ? "done" :
++	    mw == CP_TARGET_FILL ? "NO FENCE" : "WRONG FENCE");
++	if (sub && ts != want) {
++		printf("BLUELINE GPU: CACHE_FLUSH_TS wrote %s\n", ts == CP_TARGET_FILL ? "nothing" : "another value");
++	}
++	if (sub && !ok) {
++		cp_dump(what);
++	}
++	cp_smmu_faults(what);
++	return ok;
++}
++
++/* Setup: cache invalidates, the a630 init state (bluegpu_draw_init), sysmem CCU, 2D marker. */
++static bool
++dr_setup(void)
++{
++	static const struct {
++		uint32_t reg, v;
++	} init[] = {
++		/* freedreno_devices.py a6xx_gen1 / a630 magic regs */
++		{ 0x9804, 0x1f },		/* PC_MODE_CNTL */
++		{ 0x9805, 0x1 },		/* PC_POWER_CNTL */
++		{ 0xa0f8, 0x1 },		/* VFD_POWER_CNTL */
++		{ 0xb600, 0x00108000 },		/* TPL1_DBG_ECO_CNTL */
++		{ 0x8600, 0x880 },		/* GRAS_DBG_ECO_CNTL */
++		{ 0xae03, 0x1430 },		/* SP_CHICKEN_BITS */
++		{ 0xae00, 0x0 },		/* SP_DBG_ECO_CNTL */
++		{ 0xbe04, 0x80000 },		/* HLSQ_DBG_ECO_CNTL */
++		{ 0x9600, 0x0 },		/* VPC_DBG_ECO_CNTL */
++		{ 0x0e12, 0x10000001 },		/* UCHE_UNKNOWN_0E12 */
++		{ 0x8e01, 0x1 },		/* RB_RBP_CNTL */
++		{ 0x8e04, 0x04100000 },		/* RB_DBG_ECO_CNTL */
++		/* fd6_emit.cc fd6_emit_static_regs (non-context, A6XX) */
++		{ 0xae04, 0x0 },		/* SP_NC_MODE_CNTL_2 */
++		{ 0x9602, 0x0 },		/* VPC_LB_MODE_CNTL */
++		{ 0x9e72, 0x0 },		/* PC_CONTEXT_SWITCH_GFX_PREEMPTION_MODE */
++		{ 0xae0f, 0x3f },		/* SP_PERFCTR_SHADER_MASK */
++		{ 0xb605, 0x44 },		/* TPL1_UNKNOWN_B605 */
++		{ 0xbe00, 0x80 },		/* HLSQ_UNKNOWN_BE00 */
++		{ 0xbe01, 0x0 },		/* HLSQ_UNKNOWN_BE01 */
++		{ 0xbb11, 0x0 },		/* HLSQ_SHARED_CONSTS */
++		{ 0x9211, 0x0 },		/* VPC_UNKNOWN_9211 */
++		{ 0x80af, 0x0 },		/* GRAS_SC_SCREEN_SCISSOR_CNTL */
++		{ 0x8811, 0x10 },		/* RB_MODE_CNTL */
++	};
++	uint32_t from = cp.wptr, n = sizeof(init) / sizeof(init[0]);
++
++	if (!dr_room(6 + 3 + 2 * n + 3 + 2 + 4 + 17, "setup")) {
++		return false;
++	}
++	dr_event(EV_CCU_INV_COLOR);
++	dr_event(EV_CCU_INV_DEPTH);
++	dr_event(EV_CACHE_INVALIDATE);
++	if (dr.init) {
++		dr_reg(R_SP_UPDATE_CNTL, 0xfffff);
++		cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++		for (uint32_t i = 0; i < n; i++) {
++			dr_reg(init[i].reg, init[i].v);
++		}
++	}
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	dr_reg(R_RB_CCU_CNTL, RB_CCU_CNTL_SYSMEM);
++	cp_put(pkt7(CP_SET_MARKER, 1));
++	cp_put(RM6_BLIT2DSCALE);
++	cp_put(pkt4(R_RB_A2D_DEST_FLAG, 3));
++	cp_put(0);
++	cp_put(0);
++	cp_put(0);
++	uint32_t off = dr_emit_tail();
++	printf("BLUELINE GPU: draw setup: %u init registers%s, RB_CCU_CNTL %#x, CP_SET_MARKER %u\n", dr.init ? n + 1 : 0,
++	    dr.init ? "" : " skipped (bluegpu_draw_init=0)", RB_CCU_CNTL_SYSMEM, RM6_BLIT2DSCALE);
++	bool ok = dr_submit("2D setup", from, off);
++	printf("BLUELINE GPU: RB_CCU_CNTL reads %#x, RB_DBG_ECO_CNTL %#x, RB_MODE_CNTL %#x\n", cp_rd(R_RB_CCU_CNTL),
++	    cp_rd(R_RB_DBG_ECO_CNTL), cp_rd(0x8811));
++	return ok;
++}
++
++/* Our buffer: contiguous, Normal NC like the CP's, mapped by L3 entries at DR_OWN_VA. */
++static bool
++dr_own_map(void)
++{
++	if (kmem_alloc_contig(kernel_map, &dr.va, DR_OWN_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("BLUELINE GPU: no contiguous %#x bytes for the draw buffer\n", DR_OWN_SIZE);
++		dr.va = 0;
++		return false;
++	}
++	dr.pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)dr.va));
++	bool contig = dr.pa != 0 && ((dr.pa + DR_OWN_SIZE - 1) >> smmu_oas) == 0;
++	for (uint32_t o = 0; o < DR_OWN_SIZE; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(dr.va + o));
++		contig = contig && ptoa_64(pn) == dr.pa + o;
++		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
++	}
++	printf("BLUELINE GPU: draw buffer va %#lx pa %#llx size %#x (%ux%u, stride %u), %s\n", (unsigned long)dr.va,
++	    (unsigned long long)dr.pa, DR_OWN_SIZE, DR_OWN_W, DR_OWN_H, DR_OWN_STRIDE,
++	    contig ? "contiguous" : "NOT CONTIGUOUS OR TOO HIGH");
++	if (!contig) {
++		return false;
++	}
++	volatile uint32_t *p = (volatile uint32_t *)dr.va;
++	for (uint32_t i = 0; i < DR_OWN_SIZE / 4; i++) {
++		p[i] = DR_OWN_FILL;
++	}
++	volatile uint64_t *l3 = (volatile uint64_t *)(cp.va + CP_PT_OFF + 0x2000);
++	for (uint32_t o = 0; o < DR_OWN_SIZE; o += 0x1000u) {
++		l3[((DR_OWN_VA + o) >> 12) & 0x1ff] = LPAE_PAGE(dr.pa + o);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	dr.own_mapped = true;
++	bool ok = smmu_tlbi_cb(0);
++	if (ok && !(rd(smmu + SMMU_IDR0) & (1u << 26))) {
++		ok = smmu_ats_cb(0, DR_OWN_VA, dr.pa) &&
++		    smmu_ats_cb(0, DR_OWN_VA + DR_OWN_SIZE - 0x1000u, dr.pa + DR_OWN_SIZE - 0x1000u);
++	}
++	printf("BLUELINE GPU: draw buffer mapped at GPU VA %#x (L3[%u..%u], first %#llx): %s\n", DR_OWN_VA,
++	    (DR_OWN_VA >> 12) & 0x1ff, ((DR_OWN_VA + DR_OWN_SIZE) >> 12 & 0x1ff) - 1,
++	    (unsigned long long)l3[(DR_OWN_VA >> 12) & 0x1ff], ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/* The scanout buffer: 2M block entries in the CP's L2 at DR_FB_VA. Never freed. */
++static bool
++dr_fb_map(void)
++{
++	volatile uint64_t *l2 = (volatile uint64_t *)(cp.va + CP_PT_OFF + 0x1000);
++	uint32_t i0 = (DR_FB_VA >> 21) & 0x1ff;
++
++	if (((dr.fb_blk + (uint64_t)dr.fb_nblk * BLK_2M - 1) >> smmu_oas) != 0) {
++		printf("BLUELINE GPU: framebuffer above the SMMU's %u-bit output: not mapped\n", smmu_oas);
++		return false;
++	}
++	for (uint32_t i = 0; i < dr.fb_nblk; i++) {
++		if (l2[i0 + i]) {
++			printf("BLUELINE GPU: L2[%u] already %#llx: framebuffer not mapped\n", i0 + i,
++			    (unsigned long long)l2[i0 + i]);
++			return false;
++		}
++	}
++	printf("BLUELINE GPU: about to map the framebuffer (pa %#llx..%#llx, Normal NC, 2M blocks) at GPU VA %#x\n",
++	    (unsigned long long)dr.fb_blk, (unsigned long long)(dr.fb_blk + dr.fb_nblk * BLK_2M), DR_FB_VA);
++	for (uint32_t i = 0; i < dr.fb_nblk; i++) {
++		l2[i0 + i] = LPAE_PAGE(dr.fb_blk + i * BLK_2M) & ~2ull;	/* block: descriptor bits 01 */
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	dr.fb_mapped = true;
++	bool ok = smmu_tlbi_cb(0);
++	for (uint32_t i = 0; ok && i < dr.fb_nblk && !(rd(smmu + SMMU_IDR0) & (1u << 26)); i++) {
++		ok = smmu_ats_cb(0, DR_FB_VA + i * (uint32_t)BLK_2M + 0x1ff000u, dr.fb_blk + i * BLK_2M + 0x1ff000u);
++	}
++	printf("BLUELINE GPU: framebuffer mapped: L2[%u..%u] first %#llx: %s\n", i0, i0 + dr.fb_nblk - 1,
++	    (unsigned long long)l2[i0], ok ? "ok" : "FAILED (ATS)");
++	return ok;
++}
++
++/* Clear both mappings, TLB, then the GPU can no longer reach either buffer through cb0. */
++static void
++dr_unmap(void)
++{
++	if (!dr.own_mapped && !dr.fb_mapped) {
++		return;
++	}
++	volatile uint64_t *l2 = (volatile uint64_t *)(cp.va + CP_PT_OFF + 0x1000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(cp.va + CP_PT_OFF + 0x2000);
++	if (dr.fb_mapped) {
++		for (uint32_t i = 0; i < dr.fb_nblk; i++) {
++			l2[((DR_FB_VA >> 21) & 0x1ff) + i] = 0;
++		}
++	}
++	if (dr.own_mapped) {
++		for (uint32_t o = 0; o < DR_OWN_SIZE; o += 0x1000u) {
++			l3[((DR_OWN_VA + o) >> 12) & 0x1ff] = 0;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool ok = smmu_tlbi_cb(0);
++	dr.unmap_failed = !ok;
++	printf("BLUELINE GPU: draw mappings cleared (framebuffer %d, own buffer %d), cb0 TLB %s\n", dr.fb_mapped,
++	    dr.own_mapped, ok ? "invalidated" : "SYNC TIMEOUT: own buffer will be leaked");
++	dr.fb_mapped = false;
++	dr.own_mapped = false;
++}
++
++/* From cp_smmu_teardown's safe branch: unmapped, TLB clean, cb0 off and GX off. */
++static void
++dr_free(bool safe)
++{
++	if (!dr.va) {
++		return;
++	}
++	if (!safe || dr.own_mapped || dr.unmap_failed) {
++		printf("BLUELINE GPU: draw buffer (pa %#llx) LEAKED on purpose\n", (unsigned long long)dr.pa);
++		return;
++	}
++	for (uint32_t o = 0; o < DR_OWN_SIZE; o += PAGE_SIZE) {
++		pmap_set_cache_attributes(pmap_find_phys(kernel_pmap, (addr64_t)(dr.va + o)), VM_WIMG_DEFAULT);
++	}
++	kmem_free(kernel_map, dr.va, DR_OWN_SIZE);
++	printf("BLUELINE GPU: draw buffer (pa %#llx) freed\n", (unsigned long long)dr.pa);
++	dr.va = 0;
++}
++
++static bool
++dr_in(const struct dr_rect *r, uint32_t x, uint32_t y)
++{
++	return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
++}
++
++static uint32_t
++dr_rb_swap(uint32_t c)
++{
++	return (c & 0xff00ff00u) | ((c >> 16) & 0xffu) | ((c & 0xffu) << 16);
++}
++
++/* Every pixel of our buffer: the rectangles' colour inside, the fill elsewhere. */
++static bool
++dr_own_verify(void)
++{
++	const volatile uint32_t *p = (const volatile uint32_t *)dr.va;
++	uint32_t bad = 0, swapped = 0, shown = 0;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t y = 0; y < DR_OWN_H; y++) {
++		for (uint32_t x = 0; x < DR_OWN_W; x++) {
++			uint32_t want = DR_OWN_FILL, got = p[y * (DR_OWN_STRIDE / 4) + x];
++			for (uint32_t i = 0; i < DR_NRECT(dr_own_rects); i++) {
++				if (dr_in(&dr_own_rects[i], x, y)) {
++					want = dr_own_rects[i].argb;
++				}
++			}
++			if (got != want) {
++				bad++;
++				swapped += want != DR_OWN_FILL && got == dr_rb_swap(want);
++				if (shown++ < 6) {
++					printf("BLUELINE GPU: own buffer (%u,%u) = %#x, want %#x\n", x, y, got, want);
++				}
++			}
++		}
++	}
++	for (uint32_t i = 0; i < DR_NRECT(dr_own_rects); i++) {
++		const struct dr_rect *r = &dr_own_rects[i];
++		printf("BLUELINE GPU: %s (%u,%u %ux%u): corners %#x %#x %#x %#x, outside %#x\n", r->name, r->x, r->y, r->w,
++		    r->h, p[r->y * (DR_OWN_STRIDE / 4) + r->x], p[r->y * (DR_OWN_STRIDE / 4) + r->x + r->w - 1],
++		    p[(r->y + r->h - 1) * (DR_OWN_STRIDE / 4) + r->x],
++		    p[(r->y + r->h - 1) * (DR_OWN_STRIDE / 4) + r->x + r->w - 1],
++		    p[r->y * (DR_OWN_STRIDE / 4) + r->x - (r->x ? 1 : 0)]);
++	}
++	printf("BLUELINE GPU: own buffer check: %u of %u pixels wrong%s: %s\n", bad, DR_OWN_W * DR_OWN_H,
++	    swapped ? " (some R/B SWAPPED)" : "", bad == 0 ? "THE GPU DREW THE RECTANGLES" : "MISMATCH");
++	return bad == 0;
++}
++
++/* Rows y0..y1 of the scanout buffer, uncached (Device), for checks. */
++static volatile uint32_t *
++dr_fb_rows(uint32_t y0, uint32_t y1, vm_offset_t *base, vm_size_t *size)
++{
++	uint64_t a = dr.fb_pa + (uint64_t)y0 * dr.fb_stride, e = dr.fb_pa + (uint64_t)(y1 + 1) * dr.fb_stride;
++	uint64_t a0 = trunc_page_64(a);
++
++	*size = (vm_size_t)(round_page_64(e) - a0);
++	*base = ml_io_map((vm_offset_t)a0, *size);
++	return *base ? (volatile uint32_t *)(*base + (a - a0)) : NULL;
++}
++
++/*
++ * Each panel rectangle: pixels inside equal to its colour; and its 1-pixel
++ * border unchanged since before (sum and count of the border saved in
++ * border[] when pre). Returns the number of rectangles that pass.
++ */
++static uint32_t
++dr_fb_check(const char *when, bool pre, uint64_t *border)
++{
++	uint32_t ymin = dr.fb_h, ymax = 0, pass = 0;
++	vm_offset_t base;
++	vm_size_t size;
++
++	for (uint32_t i = 0; i < DR_NRECT(dr_fb_rects); i++) {
++		const struct dr_rect *r = &dr_fb_rects[i];
++		ymin = MIN(ymin, r->y ? r->y - 1 : 0);
++		ymax = MAX(ymax, MIN(r->y + r->h, dr.fb_h - 1));
++	}
++	volatile uint32_t *fb = dr_fb_rows(ymin, ymax, &base, &size);
++	if (!fb) {
++		printf("BLUELINE GPU: framebuffer rows %u..%u not mappable for the check\n", ymin, ymax);
++		return 0;
++	}
++	uint32_t sw = dr.fb_stride / 4;
++	for (uint32_t i = 0; i < DR_NRECT(dr_fb_rects); i++) {
++		const struct dr_rect *r = &dr_fb_rects[i];
++		uint32_t bad = 0, swapped = 0, first = 0, fx = 0, fy = 0;
++		uint64_t bsum = 0;
++		int32_t x0 = (int32_t)r->x - 1, y0 = (int32_t)r->y - 1, x1 = (int32_t)(r->x + r->w), y1 = (int32_t)(r->y + r->h);
++		for (int32_t y = y0; y <= y1; y++) {
++			for (int32_t x = x0; x <= x1; x++) {
++				if (x < 0 || y < 0 || x >= (int32_t)dr.fb_w || y >= (int32_t)dr.fb_h) {
++					continue;
++				}
++				uint32_t got = fb[(uint32_t)(y - (int32_t)ymin) * sw + (uint32_t)x];
++				if (dr_in(r, (uint32_t)x, (uint32_t)y)) {
++					if (!pre && got != r->argb) {
++						if (!bad++) {
++							first = got;
++							fx = (uint32_t)x;
++							fy = (uint32_t)y;
++						}
++						swapped += got == dr_rb_swap(r->argb);
++					}
++				} else {
++					bsum += (uint64_t)got * (uint32_t)(x * 7 + y * 13 + 1);
++				}
++			}
++		}
++		if (pre) {
++			border[i] = bsum;
++			continue;
++		}
++		bool ok = bad == 0 && bsum == border[i];
++		pass += ok;
++		printf("BLUELINE GPU: %s %s (%u,%u %ux%u, %#x): %u of %u inside wrong%s, border %s: %s\n", when, r->name,
++		    r->x, r->y, r->w, r->h, r->argb, bad, r->w * r->h, swapped ? " (R/B SWAPPED)" : "", bsum == border[i] ? "unchanged" : "CHANGED", ok ? "ok" : "MISMATCH");
++		if (bad) {
++			printf("BLUELINE GPU:  first wrong pixel (%u,%u) = %#x\n", fx, fy, first);
++		}
++	}
++	ml_io_unmap(base, size);
++	return pass;
++}
++
++/* One pixel per panel rectangle, centre, during the hold. */
++static void
++dr_fb_sample(uint32_t t)
++{
++	vm_offset_t base;
++	vm_size_t size;
++
++	printf("BLUELINE GPU: hold %u ms:", t);
++	for (uint32_t i = 0; i < DR_NRECT(dr_fb_rects); i++) {
++		const struct dr_rect *r = &dr_fb_rects[i];
++		uint32_t y = r->y + r->h / 2;
++		volatile uint32_t *row = dr_fb_rows(y, y, &base, &size);
++		if (row) {
++			printf(" %s %#x", r->name, row[r->x + r->w / 2]);
++			ml_io_unmap(base, size);
++		}
++	}
++	printf("\n");
++}
++
++extern int sweet_console_muted;	/* osfmk/console/serial_console.c: log only, no drawing */
++
++/*
++ * The draw stage, CP running and idle after stage 4's WHERE_AM_I. Always
++ * leaves both draw mappings cleared from cb0 (TLB invalidated) on return.
++ */
++static void
++dr_stage(void)
++{
++	const char *res = "stopped early";
++	uint64_t border[DR_NRECT(dr_fb_rects)];
++	int muted_was = sweet_console_muted;
++	bool muted = false;
++
++	bzero(border, sizeof(border));
++	printf("BLUELINE GPU: draw stage: ring at %u of %u dwords\n", cp.wptr, CP_RING_DWORDS);
++	if (!dr_setup()) {
++		res = "2D SETUP FAILED";
++		goto out;
++	}
++
++	/* Step 1: our buffer, every pixel checked. */
++	if (!dr_own_map()) {
++		res = "OWN BUFFER NOT MAPPED";
++		goto out;
++	}
++	uint32_t n = DR_NRECT(dr_own_rects), from = cp.wptr;
++	if (!dr_room(n * 56 + 17, "own buffer")) {
++		res = "RING FULL";
++		goto out;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		dr_emit_rect(DR_OWN_VA, DR_OWN_STRIDE, &dr_own_rects[i]);
++	}
++	uint32_t off = dr_emit_tail();
++	printf("BLUELINE GPU: about to let the 2D engine fill %u rectangles into GPU VA %#x (pa %#llx)\n", n, DR_OWN_VA,
++	    (unsigned long long)dr.pa);
++	bool sub = dr_submit("2D fill own buffer", from, off);
++	bool own_ok = dr_own_verify();
++	if (!sub || !own_ok) {
++		if (sub && !rd(cbn(0, CB_FSR)) && *(volatile uint32_t *)dr.va == DR_OWN_FILL) {
++			printf("BLUELINE GPU: fences written, no pixels, no cb0 fault: suspect the RB's writes going out on"
++			    " another stream (secure mode: sGFSYNR1) or a missing CCU flush\n");
++		}
++		cp_report("after own-buffer fill");
++		res = sub ? "OWN BUFFER WRONG" : "OWN BUFFER FILL FAILED";
++		goto out;
++	}
++	if (dr.step < 2) {
++		res = "THE GPU DREW INTO OUR BUFFER (step 1)";
++		goto out;
++	}
++
++	/* Step 2: the panel. */
++	if (!dr_fb_map()) {
++		res = "FRAMEBUFFER NOT MAPPED";
++		goto out;
++	}
++	n = DR_NRECT(dr_fb_rects);
++	from = cp.wptr;
++	if (!dr_room(n * 56 + 17, "framebuffer")) {
++		res = "RING FULL";
++		goto out;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		dr_emit_rect(DR_FB_VA + (uint32_t)(dr.fb_pa - dr.fb_blk), dr.fb_stride, &dr_fb_rects[i]);
++	}
++	off = dr_emit_tail();
++	printf("BLUELINE GPU: muting console drawing for the fill and %d ms hold (log continues)\n", dr.hold_ms);
++	sweet_console_muted = 1;
++	muted = true;
++	delay(50000);
++	(void)dr_fb_check("before", true, border);
++	printf("BLUELINE GPU: about to let the 2D engine fill %u rectangles into the scanout buffer at pa %#llx\n", n,
++	    (unsigned long long)dr.fb_pa);
++	sub = dr_submit("2D fill framebuffer", from, off);
++	uint32_t pass = dr_fb_check("after fill", false, border);
++	if (sub && pass != n) {
++		cp_report("after framebuffer fill");
++	}
++	if (!sub) {
++		res = "FRAMEBUFFER FILL FAILED";
++		goto out;
++	}
++	for (int t = 0; t < dr.hold_ms; t += 1000) {
++		delay((uint32_t)MIN(1000, dr.hold_ms - t) * 1000);
++		dr_fb_sample((uint32_t)MIN(t + 1000, dr.hold_ms));
++	}
++	uint32_t pass2 = dr_fb_check("after hold", false, border);
++	printf("BLUELINE GPU: panel rectangles: %u of %u right after the fill, %u after %d ms\n", pass, n, pass2,
++	    dr.hold_ms);
++	res = pass == n && pass2 == n ? "THE GPU DREW ON THE PANEL" : pass == n ? "DRAWN, THEN OVERWRITTEN DURING THE HOLD" :
++	    pass ? "PARTLY DRAWN ON THE PANEL" : "NOTHING RIGHT ON THE PANEL";
++
++out:
++	dr_unmap();	/* before anything is freed; the framebuffer itself never is */
++	if (muted) {
++		sweet_console_muted = muted_was;
++	}
++	cp_smmu_faults("after draw");
++	printf("BLUELINE GPU: draw stage %s (step %d, ring %u of %u dwords)\n", res, dr.step, cp.wptr, CP_RING_DWORDS);
+ }
+ 
+ /*
+@@ -2669,6 +3434,10 @@
+ 	if (!sh_ok && sub) {
+ 		cp_dump("CP_WHERE_AM_I");
+ 	}
++	if (sub && sh_ok && dr.on) {
++		printf("BLUELINE GPU: stage 4 %s (step %d); draw stage next\n", res, cp.step);
++		dr_stage();
++	}
+ 
+ out:
+ 	cp_report("stage 4 end");
+@@ -2707,6 +3476,7 @@
+ cp_smmu_teardown(void)
+ {
+ 	if (!cp.routed && !cp.va) {
++		dr.on = false;
+ 		return;
+ 	}
+ 	cp_smmu_faults("before cb0 teardown");
+@@ -2717,7 +3487,9 @@
+ 		cp.routed = false;
+ 	}
+ 	uint32_t smr = cp.smr >= 0 ? rd(smmu + SMMU_SMR(cp.smr)) : 0, gd = rd(gpucc + GPUCC_GX_GDSCR);
+-	if (!(smr & SMMU_SMR_VALID) && !(rd(cbn(0, CB_SCTLR)) & 1) && !(gd & GDSC_PWR_ON)) {
++	bool safe = !(smr & SMMU_SMR_VALID) && !(rd(cbn(0, CB_SCTLR)) & 1) && !(gd & GDSC_PWR_ON);
++	dr_free(safe);
++	if (safe) {
+ 		cp_mem_free();
+ 	} else {
+ 		printf("BLUELINE GPU: smr%d %#x cb0 sctlr %#x gx_gdscr %#x: the GPU may still reach pa %#llx;"
+@@ -2725,6 +3497,7 @@
+ 	}
+ 	cp_smmu_faults("after cb0 teardown");
+ 	cp.on = false;
++	dr.on = false;
+ }
+ 
+ /*
+@@ -2955,7 +3728,8 @@
+ 		return;
+ 	}
+ 	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads%s\n",
+-	    level, keep ? ", keep" : "", level >= 6 ? ", then GMU firmware boot, GX and the CP" :
++	    level, keep ? ", keep" : "", level >= 7 ? ", then GMU firmware boot, GX, the CP and a 2D fill" :
++	    level >= 6 ? ", then GMU firmware boot, GX and the CP" :
+ 	    level >= 5 ? ", then GMU firmware boot and GX" :
+ 	    level >= 3 ? ", then GMU firmware boot, no GX" : ", no firmware, no GX");
+ 
+@@ -3075,8 +3849,8 @@
+ 		}
+ 		if (level >= 5 && mem) {
+ 			/* reads only; gx.on and the PDC addresses, then cp.on and the SQE image */
+-			if (gx_prepare() && level >= 6) {
+-				(void)cp_prepare();
++			if (gx_prepare() && level >= 6 && cp_prepare() && level >= 7) {
++				(void)dr_prepare();
+ 			}
+ 		} else if (level >= 5) {
+ 			printf("BLUELINE GPU: stage 3 needs stage 2b's SMMU memory: skipped\n");
+-- 
+2.39.0
+
