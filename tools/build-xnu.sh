@@ -3,6 +3,11 @@
 #
 #   tools/build-xnu.sh [WORKDIR]          (default work/kbuild)
 #     -> WORKDIR/out/kernel.development.sweet, patch-list.txt, SHA256SUMS
+#   tools/build-xnu.sh --quick [WORKDIR]
+#     after one full build: only our xnu/patches that changed (or are new or
+#     gone) are taken back out of the tree and put in again, then make
+#     recompiles what they touch and relinks (minutes, not a full build).
+#     Same pins only; anything else changed needs a full build.
 #
 # For when CI is not an option: GitHub retired the macos-14 runner image and
 # the newer images only have Xcode 16+, whose iig emits IORPC.kernelContent,
@@ -21,9 +26,16 @@
 # Kit is unpacked into WORKDIR and passed to build.sh as KDKROOT instead of
 # being installed into /Library/Developer/KDKs.
 set -euo pipefail
+# bash 4+ (mapfile; build.sh needs it too); macOS's /bin/bash is 3.2
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+	for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do [ -x "$b" ] && exec "$b" "$0" "$@"; done
+	echo "brew install bash" >&2; exit 1
+fi
 cd "$(dirname "$0")/.."
 repo=$(pwd)
 wf=.github/workflows/xnu.yml
+quick=0
+[ "${1:-}" = --quick ] && { quick=1; shift; }
 work=${1:-work/kbuild}
 mkdir -p "$work"
 work=$(cd "$work" && pwd)
@@ -51,6 +63,63 @@ export DEVELOPER_DIR
 ver=$(DEVELOPER_DIR=$DEVELOPER_DIR xcodebuild -version 2>/dev/null | sed -n 's/^Xcode //p')
 case $ver in 15.*) echo "Xcode $ver at $DEVELOPER_DIR" ;; *) echo "need Xcode 15.x, $DEVELOPER_DIR is '$ver'" >&2; exit 1 ;; esac
 
+BASH4=$(command -v /opt/homebrew/bin/bash /usr/local/bin/bash | head -1)
+[ -n "$BASH4" ] || { echo "brew install bash" >&2; exit 1; }
+
+copy_out() {
+	rm -rf "$work/out" && mkdir "$work/out"
+	cp -R "$work/dxb/fakeroot/System/Library/Kernels/." "$work/out/"
+	cp "$work/patch-list.txt" "$work/out/"
+	(cd "$work/out" && shasum -a 256 kernel.*.sweet > SHA256SUMS && cat SHA256SUMS)
+	echo "kernel: $work/out/kernel.$(echo "${KERNEL_CONFIG:-DEVELOPMENT}" | tr '[:upper:]' '[:lower:]').sweet"
+}
+
+if [ "$quick" = 1 ]; then
+	x=$work/dxb/xnu
+	[ -f "$work/patch-list.txt" ] && [ -d "$x/.git" ] && [ -d "$work/dxb/build/xnu.obj" ] ||
+		{ echo "no earlier full build in $work; run without --quick first" >&2; exit 1; }
+	# The applied stack (patch-list order) and, for our own patches, what the repo has now
+	mapfile -t old < "$work/patch-list.txt"
+	new=()
+	for n in "${old[@]}"; do
+		case $n in 01[0-9][0-9]-*) [ -e "$repo/xnu/patches/$n" ] && new+=("$n") ;; *) new+=("$n") ;; esac
+	done
+	for f in "$repo"/xnu/patches/*.patch; do
+		n=$(basename "$f"); printf '%s\n' "${old[@]}" | grep -qx "$n" || new+=("$n")
+	done
+	mapfile -t new < <(printf '%s\n' "${new[@]}" | LC_ALL=C sort)
+	first=-1	# first position where the stack differs
+	for ((i = 0; i < ${#old[@]} || i < ${#new[@]}; i++)); do
+		o=${old[i]:-} n=${new[i]:-}
+		if [ "$o" != "$n" ] || { case $n in 01[0-9][0-9]-*) ! cmp -s "$repo/xnu/patches/$n" "$work/dxb/patches/$n" ;; *) false ;; esac; }; then
+			first=$i; break
+		fi
+	done
+	[ "$first" -ge 0 ] || echo "no patch changed; relinking only"
+	if [ "$first" -ge 0 ]; then
+		for ((i = ${#old[@]} - 1; i >= first; i--)); do
+			echo "take out ${old[i]}"
+			git -C "$x" apply -R "$work/dxb/patches/${old[i]}"
+		done
+		for ((i = first; i < ${#new[@]}; i++)); do
+			n=${new[i]}
+			case $n in 01[0-9][0-9]-*) cp "$repo/xnu/patches/$n" "$work/dxb/patches/" ;; esac
+			echo "put in  $n"
+			git -C "$x" apply "$work/dxb/patches/$n"
+		done
+		for n in "${old[@]}"; do printf '%s\n' "${new[@]}" | grep -qx "$n" || rm -f "$work/dxb/patches/$n"; done
+		printf '%s\n' "${new[@]}" > "$work/patch-list.txt"
+	fi
+	kdk=$(ls -d "$work"/KDK_*.kdk | head -1)
+	rm -f "$work/dxb/build/xnu.obj/kernel.$(echo "${KERNEL_CONFIG:-DEVELOPMENT}" | tr "[:upper:]" "[:lower:]").sweet"	# build.sh skips make while this exists
+	status=0
+	(cd "$work/dxb" && KDKROOT=$kdk MACOS_VERSION=$MACOS_VERSION KERNEL_CONFIG=${KERNEL_CONFIG:-DEVELOPMENT} MACHINE_CONFIG=SWEET \
+		"$BASH4" -c 'source <(sed "\$d" build.sh); setup_xcode_toolchain; choose_xnu; venv; build_xnu') > "$work/build-quick.log" 2>&1 || status=$?
+	[ "$status" = 0 ] || { tail -20 "$work/build-quick.log"; echo "quick build failed ($status); see $work/build-quick.log" >&2; exit "$status"; }
+	copy_out
+	exit 0
+fi
+
 fetch() {	# DIR REPO SHA
 	if [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" != "$3" ]; then
 		rm -rf "$1"
@@ -58,7 +127,7 @@ fetch() {	# DIR REPO SHA
 		git -C "$1" fetch -q --depth 1 "$2" "$3"
 		git -C "$1" checkout -q FETCH_HEAD
 	fi
-	git -C "$1" reset -q --hard && git -C "$1" clean -fdq	# undo the previous run's patch copies
+	git -C "$1" reset -q --hard && git -C "$1" clean -ffdxq	# a clean tree each run (also the ignored, already patched xnu/ source)
 }
 cd "$work"
 fetch dxb "$DXB_REPO" "$DXB_SHA"
@@ -114,8 +183,6 @@ export KDKROOT=$work/$kdk_dir MACOS_VERSION
 export KERNEL_CONFIG=${KERNEL_CONFIG:-DEVELOPMENT} MACHINE_CONFIG=SWEET
 
 # Build (build.sh wants bash 4+; macOS's /bin/bash is 3.2)
-BASH4=$(command -v /opt/homebrew/bin/bash /usr/local/bin/bash | head -1)
-[ -n "$BASH4" ] || { echo "brew install bash" >&2; exit 1; }
 status=0
 (cd dxb && "$BASH4" build.sh) 2>&1 | tee build.log || status=$?
 [ "$status" = 0 ] || { echo "build.sh failed ($status); see $work/build.log" >&2; exit "$status"; }
@@ -127,8 +194,4 @@ while read -r p; do
 done < patch-list.txt
 [ "$missing" = 0 ] || exit 1
 
-rm -rf out && mkdir out
-cp -R dxb/fakeroot/System/Library/Kernels/. out/
-cp patch-list.txt out/
-(cd out && shasum -a 256 kernel.*.sweet > SHA256SUMS && cat SHA256SUMS)
-echo "kernel: $work/out/kernel.$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]').sweet"
+copy_out
