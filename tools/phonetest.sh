@@ -32,6 +32,8 @@ while [ $# -gt 0 ]; do
 done
 extra="$*"
 base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
+# real time of day: work/rtc-offset = Mac time minus the raw PM8998 RTC count (see rtc*-rtc.txt)
+[ -s work/rtc-offset ] && base="$base bluertc=2 bluertc_offset=$(cat work/rtc-offset)"
 case " $extra " in *" bluereboot="*) : "${wait:=5}" ;; *) : "${wait:=30}" ;; esac
 out=work/test; mkdir -p "$out"
 t0=$(date +%s)

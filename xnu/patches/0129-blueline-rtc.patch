@@ -1,0 +1,325 @@
+diff --git a/bsd/dev/blueline_keys.c b/bsd/dev/blueline_keys.c
+index e87a12c54..009579951 100644
+--- a/bsd/dev/blueline_keys.c
++++ b/bsd/dev/blueline_keys.c
+@@ -10,6 +10,8 @@
+  * That pull-up is the only PMIC register this driver writes for the keys.
+  * blueline_pon_set_reboot_reason() (patch 0127, boot-arg bluereboot) also
+  * writes PON SOFT_RB_SPARE, the reboot reason ABL reads, right before reset.
++ * blueline_spmi_read() (patch 0129) lends the observer channel to other
++ * read-only users (the PM8998 RTC, iokit/Kernel/arm/SweetPlatformExpert.cpp).
+  * read through the SDM845 PMIC arbiter (v5) observer channel, and passed
+  * to the HID services (iokit/Kernel/arm/hid/SweetHID.cpp) as keys
+  * 0 power, 1 volume up, 2 volume down. Boot-arg bluekeys=0: off.
+@@ -32,6 +34,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void blueline_keys_init(void);
+ int blueline_pon_set_reboot_reason(uint8_t reason, uint8_t *before, uint8_t *after);
++int blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len);
+ 
+ #define ARB_CORE_PA	0x0c440000u	/* version, features, APID -> PPID map */
+ #define ARB_OBS_PA	0x0e600000u	/* read-only observer channels */
+@@ -79,16 +82,20 @@ arb_apid(uint16_t ppid, uint32_t count)
+ 	return found;
+ }
+ 
+-/* One-byte EXT_READL on observer channel apid (EE 0). */
++/*
++ * EXT_READL of len (1..4) consecutive registers on observer channel apid
++ * (EE 0): byte count len - 1 in bits 2:0, the bytes come back little-endian
++ * in RDATA0 (Linux pmic_arb_fmt_read_cmd/pmic_arb_read_cmd_unlocked, v2+).
++ */
+ static bool
+-arb_read(uint16_t apid, uint16_t addr, uint8_t *out)
++arb_read_n(uint16_t apid, uint16_t addr, uint8_t *out, unsigned len)
+ {
+-	if (apid == NO_APID) {
++	if (apid == NO_APID || len < 1 || len > 4) {
+ 		return false;
+ 	}
+ 	vm_offset_t ch = arb_obs + 0x80u * apid;
+ 	__asm__ volatile ("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)ch = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	*(volatile uint32_t *)ch = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4) | (len - 1u);
+ 	__asm__ volatile ("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; i++) {
+ 		arb_status = arb_rd(ch, 0x08u);
+@@ -96,7 +103,10 @@ arb_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 			if (arb_status & 0x0eu) {
+ 				return false;
+ 			}
+-			*out = (uint8_t)arb_rd(ch, 0x18u);
++			uint32_t data = arb_rd(ch, 0x18u);
++			for (unsigned b = 0; b < len; b++) {
++				out[b] = (uint8_t)(data >> (8u * b));
++			}
+ 			return true;
+ 		}
+ 		delay(1);
+@@ -104,6 +114,13 @@ arb_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++/* One-byte EXT_READL on observer channel apid (EE 0). */
++static bool
++arb_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	return arb_read_n(apid, addr, out, 1);
++}
++
+ /*
+  * One-byte EXT_WRITEL on read/write channel ch (mapped for apid), only if
+  * the apps EE (0) owns apid.
+@@ -198,6 +215,39 @@ blueline_pon_set_reboot_reason(uint8_t reason, uint8_t *before, uint8_t *after)
+ 	return error;
+ }
+ 
++/*
++ * Read len (1..4) registers of PMIC SID 0 starting at addr (peripheral =
++ * addr >> 8, PPID = addr >> 8 for SID 0), through the observer channel and
++ * under the arbiter lock. Read-only: no ownership needed. Thread context
++ * only (takes a mutex). 0, or EINVAL / ENXIO (no arbiter, peripheral not in
++ * the APID table) / EIO (no answer, or an error status).
++ */
++int
++blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	static uint16_t last_ppid = NO_APID, last_apid = NO_APID;
++
++	if (!buf || len < 1 || len > 4 || ((addr & 0xffu) + len) > 0x100u) {
++		return EINVAL;
++	}
++	if (!arb_setup()) {
++		return ENXIO;
++	}
++	uint16_t ppid = addr >> 8;
++	lck_mtx_lock(&blueline_arb_lock);
++	if (ppid != last_ppid) {
++		last_apid = arb_apid(ppid, arb_count);
++		last_ppid = ppid;
++	}
++	uint16_t apid = last_apid;
++	bool ok = arb_read_n(apid, addr, buf, len);
++	lck_mtx_unlock(&blueline_arb_lock);
++	if (apid == NO_APID) {
++		return ENXIO;
++	}
++	return ok ? 0 : EIO;
++}
++
+ static bool volup_on;
+ 
+ static void
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index bd9bbd923..f7cad5e0a 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -86,6 +86,21 @@ IOKitInitializeTime( void )
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+ #endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * blueline 0129: with bluertc=2 SweetPlatformExpert reads the PM8998 RTC
++	 * and publishes IORTC; wait for it (the platform expert may not have
++	 * started yet), so clock_initialize_calendar() asks it for the time.
++	 */
++	int bluertc = 0;
++	if (PE_parse_boot_argn("bluertc", &bluertc, sizeof(bluertc)) && bluertc >= 2) {
++		t.tv_sec = 10;
++		t.tv_nsec = 0;
++		if (!IOService::waitForService(IOService::resourceMatching("IORTC"), &t)) {
++			IOLog("BLUELINE RTC: no IORTC after 10 s; time of day 0\n");
++		}
++	}
++#endif
+ 
+ 	clock_initialize_calendar();
+ }
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685e9..60224683e 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,9 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,10 +21,153 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
++#endif
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Time of day from the PM8998 RTC (blueline, patch 0129). Boot-args:
++ *   bluertc=0  (default) off: no RTC access, the calendar starts at 0 (1970)
++ *   bluertc=1  probe: read and log the RTC once from start(); time unchanged
++ *   bluertc=2  time of day = raw RTC + bluertc_offset, IORTC published so
++ *              IOKitInitializeTime (patch 0129) waits for it, up to 10 s
++ *   bluertc_offset=SECONDS  added to the raw count (default 0)
++ *
++ * RTC_RW is SPMI SID 0 peripheral 0x60 (pm8998.dtsi rtc@6000, "rtc";
++ * the alarm at 0x61 is not touched). Registers, as Linux rtc-pm8xxx.c
++ * pm8941_regs: RTC_CTRL 0x6046 (bit 7 enable), RDATA0..3 0x6048..0x604b,
++ * a little-endian 32-bit count of seconds. The read is Linux's
++ * pm8xxx_rtc_read_raw(): read the 4 bytes, read byte 0 again, and if it went
++ * down (a carry between the bytes) read the 4 bytes once more.
++ *
++ * The count is not the Unix time. On this phone the RTC is read-only to the
++ * HLOS: the stock device tree has qcom,qpnp-rtc-write = <0>, so Android never
++ * sets it; it keeps the difference to the real time in userland (Qualcomm's
++ * time-services offset on /data, gone with our userdata). The count runs from
++ * whenever the PMIC last lost power or the RTC was last set, so the offset is
++ * calibrated from the Mac (see the 0129 notes) and given as bluertc_offset.
++ * It stays valid until the battery is fully drained or disconnected.
++ * Nothing here writes a PMIC register.
++ */
++extern "C" int blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len);
++
++#define PM8998_RTC_TYPE         0x6004  /* PERPH_TYPE / SUBTYPE */
++#define PM8998_RTC_CTRL         0x6046
++#define PM8998_RTC_RDATA0       0x6048
++
++static int bluertc_mode;
++static bool bluertc_ok;         /* the probe read the RTC and RTC_CTRL has it enabled */
++static uint64_t bluertc_offset;
++
++static int
++bluertc_read_raw(uint32_t *secs, bool *carried)
++{
++	uint8_t b[4], again;
++	int rc;
++
++	*carried = false;
++	if ((rc = blueline_spmi_read(PM8998_RTC_RDATA0, b, 4)) != 0 ||
++	    (rc = blueline_spmi_read(PM8998_RTC_RDATA0, &again, 1)) != 0) {
++		return rc;
++	}
++	if (again < b[0]) {
++		*carried = true;
++		if ((rc = blueline_spmi_read(PM8998_RTC_RDATA0, b, 4)) != 0) {
++			return rc;
++		}
++	}
++	*secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
++	    ((uint32_t)b[3] << 24);
++	return 0;
++}
++
++static uint64_t
++bluertc_uptime_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* Survey + first read, from start(). True if the RTC answered and runs. */
++static bool
++bluertc_probe(void)
++{
++	uint8_t type[2] = { 0, 0 }, ctrl = 0;
++	uint32_t raw = 0;
++	bool carried;
++	int rc;
++
++	IOLog("BLUELINE RTC: mode %d, offset %llu; about to read PM8998 RTC_RW type at %#x (SPMI SID 0)\n",
++	    bluertc_mode, bluertc_offset, PM8998_RTC_TYPE);
++	if ((rc = blueline_spmi_read(PM8998_RTC_TYPE, type, 2)) != 0) {
++		IOLog("BLUELINE RTC: type read failed (%d); no RTC\n", rc);
++		return false;
++	}
++	if ((rc = blueline_spmi_read(PM8998_RTC_CTRL, &ctrl, 1)) != 0) {
++		IOLog("BLUELINE RTC: type %#04x subtype %#04x, RTC_CTRL read failed (%d); no RTC\n",
++		    type[0], type[1], rc);
++		return false;
++	}
++	if ((rc = bluertc_read_raw(&raw, &carried)) != 0) {
++		IOLog("BLUELINE RTC: type %#04x subtype %#04x ctrl %#04x, RDATA read failed (%d); no RTC\n",
++		    type[0], type[1], ctrl, rc);
++		return false;
++	}
++	IOLog("BLUELINE RTC: type %#04x subtype %#04x ctrl %#04x (%s), raw %u s (%#010x)%s at uptime %llu ms;"
++	    " raw + offset = %llu\n", type[0], type[1], ctrl, (ctrl & 0x80) ? "enabled" : "NOT enabled",
++	    raw, raw, carried ? " (re-read after a carry)" : "", bluertc_uptime_ms(),
++	    (unsigned long long)raw + bluertc_offset);
++	return (ctrl & 0x80) != 0;
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t raw = 0;
++	bool carried;
++	int rc;
++
++	if (bluertc_mode < 2 || !bluertc_ok) {
++		return 0;
++	}
++	if ((rc = bluertc_read_raw(&raw, &carried)) != 0) {
++		IOLog("BLUELINE RTC: read failed (%d); time of day 0\n", rc);
++		return 0;
++	}
++	long secs = (long)((uint64_t)raw + bluertc_offset);
++	IOLog("BLUELINE RTC: time of day %ld (raw %u + offset %llu)%s at uptime %llu ms\n", secs, raw,
++	    bluertc_offset, carried ? ", re-read after a carry" : "", bluertc_uptime_ms());
++	return secs;
++}
++
++/*
++ * settimeofday() (timed, date) ends here: the RTC is read-only to us, so only
++ * log the offset that would make the RTC agree. The first 8 calls only.
++ */
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	static unsigned calls;
++	uint32_t raw = 0;
++	bool carried;
++
++	if (bluertc_mode < 1 || calls >= 8) {
++		return;
++	}
++	calls++;
++	if (bluertc_read_raw(&raw, &carried) == 0) {
++		IOLog("BLUELINE RTC: time set to %ld; raw %u, so bluertc_offset=%ld would match (not stored)\n",
++		    secs, raw, secs - (long)raw);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -29,6 +175,18 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	(void)PE_parse_boot_argn("bluertc", &bluertc_mode, sizeof(bluertc_mode));
++	(void)PE_parse_boot_argn("bluertc_offset", &bluertc_offset, sizeof(bluertc_offset));
++	if (bluertc_mode >= 1) {
++		bluertc_ok = bluertc_probe();
++		if (bluertc_mode >= 2) {
++			/* Published even if the RTC failed: the calendar then starts at 0, as without it. */
++			publishResource("IORTC", this);
++			IOLog("BLUELINE RTC: IORTC published (%s)\n", bluertc_ok ? "RTC running" : "RTC unusable, time 0");
++		}
++	}
++#endif
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
