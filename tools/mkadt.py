@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate the Apple Device Tree for XNU on the Pixel 3 (blueline).
 
-  mkadt.py OUT.adt [--qemu] [--cpus N] [--ufs] [--iphone DT.im4p] [--dump]
+  mkadt.py OUT.adt [--qemu] [--cpus N] [--ufs] [--iphone DT.im4p]
+                   [--gpu-fw a630_gmu.bin] [--dump]
 
 The kernel is ios-sweet's SWEET machine config, so this provides what
 that boot path reads: /chosen (RAM range, entropy), /cpus, /arm-io/gic,
@@ -23,6 +24,13 @@ copied from the real D22AP device tree (DeviceTree.d22ap.im4p from the
 IPSW; Apple's file, never stored here). Which properties matter and why is
 from ios-sweet's bring-up notes.
 
+--gpu-fw adds /blueline-gpu with "gmu-firmware": the Adreno 630 GMU's
+firmware (qcom/a630_gmu.bin from linux-firmware, 32768 bytes, a raw
+Cortex-M3 TCM image), which xnu patch 0126 loads at boot-arg bluegpu=3.
+It is not redistributable here: tools/fetch-gpu-fw.sh downloads the pinned
+copy into work/fw/ (ignored by git) and checks its SHA-256; this checks it
+again. The kernel logs the image's 32-bit word sum, printed here too.
+
 --qemu swaps in QEMU virt's GIC, timer frequency and timer interrupt
 (-M virt,gic-version=3) for emulator tests.
 """
@@ -34,6 +42,26 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from adt import Node, dump, load, parse, serialize, strs, u32, u64  # noqa: E402
+
+# qcom/a630_gmu.bin, linux-firmware 88ea23e7 (unchanged since; see
+# tools/fetch-gpu-fw.sh). Legacy image: 16K ITCM then 16K DTCM.
+GMU_FW_SIZE = 0x8000
+GMU_FW_SHA256 = 'da8d9b1b1f5c1a0b311f32567093b4828f3c80031dd8435f91ac13c664e173a6'
+
+
+def gmu_firmware(path):
+    """The GMU image, checked: size, hash, vector table (SP in DTCM, Thumb reset in ITCM)."""
+    fw = open(path, 'rb').read()
+    digest = hashlib.sha256(fw).hexdigest()
+    sp, reset = struct.unpack_from('<II', fw) if len(fw) >= 8 else (0, 0)
+    if len(fw) != GMU_FW_SIZE or not 0x40000 <= sp <= 0x44000 or not reset & 1 or reset >= 0x4000:
+        sys.exit('--gpu-fw %s: not a legacy a630_gmu.bin (%d bytes, sp %#x, reset %#x)'
+                 % (path, len(fw), sp, reset))
+    if digest != GMU_FW_SHA256:
+        sys.exit('--gpu-fw %s: sha256 %s, expected %s (linux-firmware 88ea23e7)'
+                 % (path, digest, GMU_FW_SHA256))
+    return fw
+
 
 # Kernel-managed RAM: above every fixed carve-out in both the mainline and
 # the LineageOS device tree (README, "Second run"), 32 MiB aligned at both
@@ -77,7 +105,7 @@ def d22ap_product(im4p):
     sys.exit('%s: no /product node' % im4p)
 
 
-def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None):
+def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -207,6 +235,12 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None):
             'reg': u64(UFS, UFS_SIZE),		# absolute physical address
         }))
 
+    if gpu_fw is not None:
+        # Read by bsd/dev/blueline_gpu.c (0126) at bluegpu=3 only.
+        extra.append(node('blueline-gpu', {
+            'gmu-firmware': gpu_fw,
+        }))
+
     root_props.update({'#address-cells': u32(2), '#size-cells': u32(2)})
     return node('device-tree', root_props, [chosen, defaults, cpus_node, arm_io, fbcon] + extra + storage)
 
@@ -218,15 +252,24 @@ if __name__ == '__main__':
     ap.add_argument('--cpus', type=int, default=1, help='CPU nodes (default 1)')
     ap.add_argument('--ufs', action='store_true', help='add the UFS host (root on userdata)')
     ap.add_argument('--iphone', metavar='DT.im4p', help='iPhone X identity, /product from this tree')
+    ap.add_argument('--gpu-fw', metavar='a630_gmu.bin',
+                    help='add /blueline-gpu "gmu-firmware" (tools/fetch-gpu-fw.sh)')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if not 1 <= a.cpus <= 8 or (a.qemu and a.cpus != 1):
         sys.exit('--cpus: 1..8 on the phone, 1 in QEMU')
     if a.qemu and a.ufs:
         sys.exit('--ufs: QEMU virt has no UFS host')
-    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone)
+    if a.qemu and a.gpu_fw:
+        sys.exit('--gpu-fw: QEMU virt has no Adreno')
+    gpu_fw = gmu_firmware(a.gpu_fw) if a.gpu_fw else None
+    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
         dump(root)
     print('%s: %d bytes' % (a.out, len(blob)), file=sys.stderr)
+    if gpu_fw is not None:
+        print('  /blueline-gpu gmu-firmware: %d bytes, word sum %#x'
+              % (len(gpu_fw), sum(struct.unpack('<%dI' % (len(gpu_fw) // 4), gpu_fw)) & 0xffffffff),
+              file=sys.stderr)

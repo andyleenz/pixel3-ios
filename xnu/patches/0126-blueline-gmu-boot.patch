@@ -1,0 +1,522 @@
+From 9c8fda041abf87b42db18486a030d3b851c208cc Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 07:50:22 +1100
+Subject: [PATCH] 0126: blueline GPU: Adreno 630 stage 2a, GMU firmware boot
+ (bluegpu=3)
+
+Boot the GMU Cortex-M3 on qcom/a630_gmu.bin until CM3_FW_INIT_RESULT
+reads 0xbabeface. No SMMU, no HFI, no GX: the firmware only reads system
+memory after HFI_CTRL_INIT/HFI_QTBL_INFO, which stay 0 (see the header).
+The firmware comes from the ADT (/blueline-gpu "gmu-firmware", added by
+tools/mkadt.py --gpu-fw, pixel3-ios-gpu/mkadt-gpu-fw.diff); without it
+stage 2 logs and is skipped. bluegpu=1/2 are unchanged except that the
+SMMU read is now level 2 only.
+
+Boot-args: bluegpu=3; bluegpu_keep=1 (leave the GMU running);
+bluegpu_pdc=0 (skip the GPU PDC programming); bluegpu_ms=N (init poll,
+default 200, 1..2000); bluegpu_chipid=0xNNNNNNNN (GMU-format chip id,
+default 0x06030100).
+---
+ bsd/dev/blueline_gpu.c | 443 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 438 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+index 7993c2d..bd7ea2f 100644
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -6,7 +6,40 @@
+  *
+  * Boot-args: bluegpu=1 runs the probe; bluegpu=2 also reads the Adreno
+  * SMMU's global ID registers (the hypervisor may emulate or refuse those);
+- * bluegpu_keep=1 leaves CX and the GMU clocks on afterwards.
++ * bluegpu=3 runs stage 1, then stage 2a below (no SMMU reads);
++ * bluegpu_keep=1 leaves CX and the GMU clocks (and, at 3, the running GMU)
++ * on afterwards.
++ *
++ * Stage 2a (0126, bluegpu=3): boot the GMU's Cortex-M3 on its firmware
++ * until it reports FW_INIT_RESULT 0xbabeface, as Linux a6xx_gmu_fw_start /
++ * a6xx_gmu_start (and KGSL a6xx_gmu_fw_start) do on a cold boot, with no
++ * system memory at all: no Adreno SMMU context, HFI queue table address
++ * and info 0, no log buffer. Why that is enough is from the firmware
++ * itself (qcom/a630_gmu.bin, linux-firmware 88ea23e7, sha256 da8d9b1b..,
++ * 32768 bytes, legacy raw image: 16K ITCM at CM3 0x0, 16K DTCM at CM3
++ * 0x40000; disassembled as Thumb-2): its init (0x1a24) runs seven setup
++ * routines that touch only TCM, its own registers (CM3 0x80000 = GMU dword
++ * 0x1f400), the RSCC (it programs its own TCS with gfx.lvl 0x30050), one
++ * GPU CC register and the NVIC, then writes 0xbabeface (0xbaddface if a
++ * routine failed). Only afterwards (0x229c) does it wait for HFI_CTRL_INIT
++ * bit 0, then for HFI_QTBL_INFO != 0, and only then read the queue table at
++ * HFI_QTBL_ADDR through its SMMU stream. This stage writes neither, so the
++ * GMU never reaches the bus; the SMMU and HFI are stage 2b.
++ *  Steps: firmware from the ADT (/blueline-gpu "gmu-firmware", added by
++ *  tools/mkadt.py --gpu-fw), checked; CM3 must still be held in reset;
++ *  GENERAL_7 = 1; RSCC sequencer setup and (bluegpu_pdc=1, default) the GPU
++ *  PDC at 0xb280000 / sequencer 0xb480000 (a6xx_gmu_rpmh_init, A630:
++ *  pdc_address_offset 0x30080); the 8192 words into ITCM/DTCM by register
++ *  writes (legacy path, read back); the fw_start registers; CM3 out of
++ *  reset; INIT_RESULT polled for bluegpu_ms (default 200). Then the GMU's
++ *  trace ring and fault counters are dumped from DTCM, the CM3 is put back
++ *  into reset, the RSCC TCS are checked idle and every register written
++ *  here is restored in reverse order (unless bluegpu_keep=1).
++ *  The GMU runs from XO (19.2 MHz, stage 1's RCG setting), not Linux's
++ *  200 MHz from GPLL0: ios-flame's A640 GMU booted that way, and the
++ *  firmware's timers count the always-on XO counter.
++ *  bluegpu_chipid overrides the GMU-format chip id (HFI_SFR_ADDR; default
++ *  0x06030100 = KGSL's packing of the Pixel 3's 0x06030001).
+  *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+@@ -26,6 +59,15 @@
+  *  - ios-flame 745c4341 shim/gpuprobe.c (A640 stage 1, same order) and
+  *    HackiOS 63fc2b46 drivers/gpu/hakios.adreno.c (A642L steps 1-9:
+  *    announce before touching, reads before writes, stop on surprise).
++ *  - Stage 2a: Linux a6xx_gmu.c (a6xx_gmu_rpmh_init, a6xx_gmu_power_config,
++ *    a6xx_gmu_fw_load legacy path, a6xx_gmu_fw_start, a6xx_gmu_start,
++ *    a6xx_gmu_rpmh_off, a6xx_gmu_force_off), a6xx_gmu.xml (GMU/RSCC
++ *    offsets), sdm845.dtsi gmu "gmu_pdc" 0xb280000 / "gmu_pdc_seq"
++ *    0xb480000; crosshatch adreno_a6xx.c (_load_gmu_rpmh_ucode,
++ *    a6xx_gmu_fw_start: TCM_BOOT = 2, a6xx_gmu_start: WFI_CONFIG 0,
++ *    0xbabeface within 100 ms), a6xx_reg.h (PDC offsets from 0xb200000),
++ *    kgsl_gmu.c (A630: HFI at GMU VA 0x60000000, only through the SMMU);
++ *    ios-flame gpuprobe.c gmu_boot() (A640, same order, booted at XO).
+  *
+  * There is no chip-id register on A6xx: the id is a device-tree constant
+  * (Linux and KGSL both). The 3D core's registers (RBBM, CP, VBIF) are in
+@@ -45,6 +87,7 @@
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint32_t blueline_cmddb_addr(const char *id);	/* blueline_touch.c */
+@@ -242,6 +285,384 @@ smmu_report(void)
+ 	    rd(smmu + 0x20), rd(smmu + 0x24), rd(smmu + 0x28), rd(smmu + 0x3c));
+ }
+ 
++/* ---- Stage 2a: GMU firmware boot (bluegpu=3) ---- */
++
++/* More GMU registers (a6xx_gmu.xml, dwords from the GPU base) */
++#define GMU_CM3_ITCM_START	0x1b400u	/* 16K, CM3 address 0x0 */
++#define GMU_CM3_DTCM_START	0x1c400u	/* 16K, CM3 address 0x40000 */
++#define GMU_CM3_DTCM_WORDS	0x1000u
++#define GMU_ICACHE_CONFIG	0x1f400u
++#define GMU_DCACHE_CONFIG	0x1f401u
++#define GMU_SYS_BUS_CONFIG	0x1f40fu
++#define GMU_CX_GMU_WFI_CONFIG	0x1f802u	/* KGSL a6xx_gmu_start writes 0 */
++#define GMU_PWR_COL_INTER_FRAME_CTRL 0x1f8c0u
++#define GMU_RPMH_CTRL		0x1f8e8u
++#define GMU_PWR_COL_CP_MSG	0x1f900u	/* log buffer iova | pages-1: left 0 here */
++#define GMU_PWR_COL_CP_RESP	0x1f901u
++#define GMU_HFI_SFR_ADDR	0x1f982u	/* the GMU-format chip id before boot */
++#define GMU_HFI_QTBL_INFO	0x1f984u
++#define GMU_HFI_QTBL_ADDR	0x1f985u
++#define GMU_HFI_CTRL_INIT	0x1f986u	/* never written in 2a */
++#define GMU_GENERAL_0		0x1f9c5u
++#define GMU_GMU2HOST_INTR_INFO	0x1f992u	/* bit 23 CM3_FAULT */
++#define GMU_AO_AHB_FENCE_CTRL	0x23b10u
++#define GMU_AHB_FENCE_RANGE_0	0x23b11u
++#define GMU_AHB_FENCE_STATUS_CLR 0x23b14u
++
++#define GMU_BOOT_TCM		2u		/* KGSL TCM_BOOT; Linux writes 0x02 */
++#define GMU_CM3_CFG_VAL		0x4052u		/* skip the NMI handler (a6xx_gmu_fw_start) */
++#define GMU_FENCE_RANGE		((1u << 31) | (0xau << 18) | 0xa0u)	/* Linux A6xx */
++#define GMU_PWR_COL_VAL		0x9c40400u	/* a6xx_gmu_power_config */
++#define GMU_RPMH_CTRL_ON	0x0f11u		/* interface, LLC, DDR, MX, CX, GFX vote enables */
++#define GMU_CHIPID_DEFAULT	0x06030100u	/* 0x06030001 packed as KGSL/Linux do */
++#define GMU_INIT_DONE		0xbabefaceu
++#define GMU_INIT_FAILED		0xbaddfaceu	/* the firmware's own "a setup routine failed" */
++
++/* The firmware's trace ring (fn 0x1808) and fault counters, in DTCM */
++#define GMU_DTCM_REG(cm3)	(GMU_CM3_DTCM_START + (((cm3) - 0x40000u) >> 2))
++#define GMU_TRACE		GMU_DTCM_REG(0x42000u)	/* [0] write index, [1+i] event word, [0x81+i] AO time (128 slots) */
++#define GMU_FAULTS		GMU_DTCM_REG(0x41200u)	/* bumped by the exception stubs at 0x30-0xd0 */
++
++/* RSCC (dwords from GMU + 0x23000) */
++#define RSCC_PDC_SEQ_START_ADDR	0x008u
++#define RSCC_PDC_MATCH_VALUE_LO	0x009u
++#define RSCC_PDC_MATCH_VALUE_HI	0x00au
++#define RSCC_HIDDEN_TCS_CMD0_ADDR 0x00du
++#define RSCC_HIDDEN_TCS_CMD0_DATA 0x00eu
++#define RSCC_OVERRIDE_START_ADDR 0x100u
++#define RSCC_SEQ_MEM_0_DRV0	0x180u
++
++/* GPU PDC (sdm845.dtsi gmu_pdc / gmu_pdc_seq; dwords, = KGSL a6xx_reg.h - 0x20000) */
++#define PDC_PA			0x0b280000u
++#define PDC_SIZE		0x10000u
++#define PDC_SEQ_PA		0x0b480000u
++#define PDC_SEQ_SIZE		0x1000u
++#define PDC_GPU_ENABLE_PDC	0x1140u
++#define PDC_GPU_SEQ_START_ADDR	0x1148u
++#define PDC_GPU_TCS1_CONTROL	0x1572u
++#define PDC_GPU_TCS3_CONTROL	0x15d6u
++#define PDC_TCS_ENABLE_BANK	1u		/* from TCSn_CONTROL */
++#define PDC_TCS_WAIT_BANK	2u
++#define PDC_TCS_CMD0_MSGID	3u
++#define PDC_TCS_CMD0_ADDR	4u
++#define PDC_TCS_CMD0_DATA	5u
++#define PDC_A630_GFX_ADDR	0x30080u	/* pdc_address_offset (Linux and KGSL); cmd-db says gfx.lvl 0x30050 */
++
++#define GMU_FW_SIZE		0x8000u		/* a6xx_gmu_fw_load: legacy image must be <= 0x8000 */
++
++static const uint32_t rscc_seq[5] = { 0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u, 0x0020e8a8u };
++static const uint32_t pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
++
++/* Every register stage 2 writes (except ITCM/DTCM), with its old value, undone in reverse. */
++#define UNDO_MAX		96
++static struct {
++	vm_offset_t a;
++	uint32_t v;
++} undo[UNDO_MAX];
++static int nundo;
++
++static void
++wr_undo(vm_offset_t a, uint32_t v)
++{
++	if (nundo < UNDO_MAX) {
++		undo[nundo].a = a;
++		undo[nundo].v = rd(a);
++		nundo++;
++	} else {
++		printf("BLUELINE GPU: undo log full at %#lx (not restored)\n", (unsigned long)a);
++	}
++	wr(a, v);
++}
++
++static void
++undo_all(void)
++{
++	int n = nundo;
++	while (nundo > 0) {
++		nundo--;
++		wr(undo[nundo].a, undo[nundo].v);
++	}
++	printf("BLUELINE GPU: %d stage 2 registers restored\n", n);
++}
++
++static void
++gmu_wr(uint32_t o, uint32_t v)
++{
++	wr_undo(gmu + GMU_REG(o), v);
++}
++
++static void
++rscc_wr(uint32_t o, uint32_t v)
++{
++	wr_undo(gmu + RSCC_REG(o), v);
++}
++
++/* The firmware from the ADT; NULL (and why) if it is missing or does not look like a630_gmu.bin. */
++static const uint32_t *
++gmu_fw_from_adt(void)
++{
++	DTEntry node;
++	void const *fw;
++	unsigned size;
++
++	if (SecureDTLookupEntry(NULL, "/blueline-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "gmu-firmware", &fw, &size) != kSuccess) {
++		printf("BLUELINE GPU: no /blueline-gpu gmu-firmware in the device tree"
++		    " (tools/mkadt.py --gpu-fw): stage 2 skipped\n");
++		return NULL;
++	}
++	const uint32_t *w = fw;
++	uint32_t sum = 0;
++	for (unsigned i = 0; i < size / 4; i++) {
++		sum += w[i];
++	}
++	printf("BLUELINE GPU: ADT gmu-firmware %u bytes, word sum %#x, sp %#x reset %#x\n", size, sum,
++	    size >= 8 ? w[0] : 0, size >= 8 ? w[1] : 0);
++	if (size != GMU_FW_SIZE || ((uintptr_t)fw & 3) ||
++	    w[0] < 0x40000u || w[0] > 0x44000u || !(w[1] & 1) || w[1] >= 0x4000u) {
++		printf("BLUELINE GPU: not a legacy a630_gmu.bin image (want 32768 bytes, SP in DTCM,"
++		    " Thumb reset vector in ITCM): stage 2 skipped\n");
++		return NULL;
++	}
++	return w;
++}
++
++/* a6xx_gmu_rpmh_init, RSCC half (A630: not A650/A7xx, so the a6xx sequencer) */
++static void
++rscc_init(void)
++{
++	rscc_wr(RSCC_RSC_STATUS0_DRV0, 1u << 24);		/* disable SDE clock gating */
++	rscc_wr(RSCC_PDC_SLAVE_ID_DRV0, 1);
++	rscc_wr(RSCC_HIDDEN_TCS_CMD0_DATA, 0);
++	rscc_wr(RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
++	rscc_wr(RSCC_HIDDEN_TCS_CMD0_DATA + 2, 0);
++	rscc_wr(RSCC_HIDDEN_TCS_CMD0_ADDR + 2, 0);
++	rscc_wr(RSCC_HIDDEN_TCS_CMD0_DATA + 4, 0x80000000u);
++	rscc_wr(RSCC_HIDDEN_TCS_CMD0_ADDR + 4, 0);
++	rscc_wr(RSCC_OVERRIDE_START_ADDR, 0);
++	rscc_wr(RSCC_PDC_SEQ_START_ADDR, 0x4520);
++	rscc_wr(RSCC_PDC_MATCH_VALUE_LO, 0x4510);
++	rscc_wr(RSCC_PDC_MATCH_VALUE_HI, 0x4514);
++	for (uint32_t i = 0; i < 5; i++) {
++		rscc_wr(RSCC_SEQ_MEM_0_DRV0 + i, rscc_seq[i]);
++	}
++	printf("BLUELINE GPU: RSCC sequencer loaded (status0 %#x seq_busy %#x)\n",
++	    rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)), rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)));
++}
++
++static void
++pdc_tcs(vm_offset_t pdc, uint32_t ctl, const uint32_t data[3])
++{
++	static const uint32_t addr[3] = { 0x30010u, 0x30000u, PDC_A630_GFX_ADDR };	/* mx, cx, gfx */
++	wr_undo(pdc + 4 * (ctl + PDC_TCS_ENABLE_BANK), 7);
++	wr_undo(pdc + 4 * (ctl + PDC_TCS_WAIT_BANK), 0);
++	wr_undo(pdc + 4 * ctl, 0);
++	for (uint32_t c = 0; c < 3; c++) {
++		wr_undo(pdc + 4 * (ctl + PDC_TCS_CMD0_MSGID + 4 * c), 0x10108);
++		wr_undo(pdc + 4 * (ctl + PDC_TCS_CMD0_ADDR + 4 * c), addr[c]);
++		wr_undo(pdc + 4 * (ctl + PDC_TCS_CMD0_DATA + 4 * c), data[c]);
++	}
++}
++
++/* a6xx_gmu_rpmh_init, PDC half. Returns false if the PDC could not be mapped. */
++static bool
++pdc_init(void)
++{
++	static const uint32_t sleep[3] = { 1, 0, 0 }, wake[3] = { 2, 3, 3 };
++	vm_offset_t pdc = ml_io_map(PDC_PA, PDC_SIZE), seq = ml_io_map(PDC_SEQ_PA, PDC_SEQ_SIZE);
++
++	if (!pdc || !seq) {
++		printf("BLUELINE GPU: PDC mapping failed\n");
++		return false;
++	}
++	printf("BLUELINE GPU: about to read the GPU PDC at %#x (AOSS, outside the GPU block)\n", PDC_PA);
++	printf("BLUELINE GPU: PDC enable %#x seq_start %#x tcs1 ctl %#x cmd2 addr %#x, tcs3 cmd2 addr %#x, seq[0] %#x\n",
++	    rd(pdc + 4 * PDC_GPU_ENABLE_PDC), rd(pdc + 4 * PDC_GPU_SEQ_START_ADDR),
++	    rd(pdc + 4 * PDC_GPU_TCS1_CONTROL), rd(pdc + 4 * (PDC_GPU_TCS1_CONTROL + PDC_TCS_CMD0_ADDR + 8)),
++	    rd(pdc + 4 * (PDC_GPU_TCS3_CONTROL + PDC_TCS_CMD0_ADDR + 8)), rd(seq));
++	for (uint32_t i = 0; i < 5; i++) {
++		wr_undo(seq + 4 * i, pdc_seq[i]);
++	}
++	pdc_tcs(pdc, PDC_GPU_TCS1_CONTROL, sleep);
++	pdc_tcs(pdc, PDC_GPU_TCS3_CONTROL, wake);
++	wr_undo(pdc + 4 * PDC_GPU_SEQ_START_ADDR, 0);
++	wr_undo(pdc + 4 * PDC_GPU_ENABLE_PDC, 0x80000001u);
++	printf("BLUELINE GPU: PDC programmed, enable %#x\n", rd(pdc + 4 * PDC_GPU_ENABLE_PDC));
++	return true;
++}
++
++/* a6xx_gmu_fw_load, legacy: the whole image through the ITCM/DTCM register window, then read back. */
++static bool
++gmu_fw_load(const uint32_t *fw)
++{
++	uint64_t t0 = mach_absolute_time(), ns;
++	uint32_t bad = 0, first_bad = 0;
++
++	for (uint32_t i = 0; i < GMU_FW_SIZE / 4; i++) {
++		*(volatile uint32_t *)(gmu + GMU_REG(GMU_CM3_ITCM_START) + 4 * i) = fw[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < GMU_FW_SIZE / 4; i++) {
++		if (rd(gmu + GMU_REG(GMU_CM3_ITCM_START) + 4 * i) != fw[i] && bad++ == 0) {
++			first_bad = i;
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUELINE GPU: firmware written to ITCM/DTCM in %llu us, read back: %u bad words%s",
++	    ns / 1000, bad, bad ? "" : "\n");
++	if (bad) {
++		printf(" (first at word %#x: %#x, want %#x)\n", first_bad,
++		    rd(gmu + GMU_REG(GMU_CM3_ITCM_START) + 4 * first_bad), fw[first_bad]);
++	}
++	return bad == 0;
++}
++
++static void
++gmu_trace_dump(void)
++{
++	uint32_t n = gmu_rd(GMU_TRACE);
++	printf("BLUELINE GPU: GMU trace index %#x; last event words (raw):", n);
++	for (uint32_t k = n > 16 ? n - 16 : 0; k < n && k < 0x10000u; k++) {
++		printf(" %#x", gmu_rd(GMU_TRACE + 1 + (k & 0x7f)));
++	}
++	printf("\nBLUELINE GPU: GMU fault counters:");
++	for (uint32_t i = 0; i < 12; i++) {
++		printf(" %x", gmu_rd(GMU_FAULTS + i));
++	}
++	printf("\n");
++}
++
++/* Linux a6xx_gmu_rpmh_off: no outstanding RPMh votes from the GPU RSC. */
++static void
++rscc_idle_check(void)
++{
++	bool idle[4];
++	for (int i = 0; i < 4; i++) {
++		idle[i] = poll(gmu + RSCC_REG(rscc_tcs_status[i]), 1, 1, i == 3 ? 1000 : 10000);
++	}
++	printf("BLUELINE GPU: RSCC TCS0-3 %#x %#x %#x %#x (%s)\n", rd(gmu + RSCC_REG(rscc_tcs_status[0])),
++	    rd(gmu + RSCC_REG(rscc_tcs_status[1])), rd(gmu + RSCC_REG(rscc_tcs_status[2])),
++	    rd(gmu + RSCC_REG(rscc_tcs_status[3])),
++	    (idle[0] && idle[1] && idle[2] && idle[3]) ? "idle" : "NOT IDLE: a vote may be outstanding");
++}
++
++/*
++ * Stage 2a. Called with CX on, the GMU clocks running and GX off; returns
++ * whether the GMU reported init done. Unless keep, the CM3 is back in reset
++ * and every register this wrote is restored when it returns.
++ */
++static bool
++gmu_boot(bool keep)
++{
++	int use_pdc = 1, ms = 200;
++	uint32_t chipid = GMU_CHIPID_DEFAULT;
++	bool booted = false, started = false;
++
++	(void)PE_parse_boot_argn("bluegpu_pdc", &use_pdc, sizeof(use_pdc));
++	(void)PE_parse_boot_argn("bluegpu_ms", &ms, sizeof(ms));
++	(void)PE_parse_boot_argn("bluegpu_chipid", &chipid, sizeof(chipid));
++	if (ms < 1 || ms > 2000) {
++		ms = 200;
++	}
++	printf("BLUELINE GPU: stage 2a: GMU firmware boot (pdc %d, timeout %d ms, chipid %#x),"
++	    " no SMMU, no HFI, no GX\n", use_pdc, ms, chipid);
++
++	/* 1. Firmware and preconditions: nothing written yet. */
++	const uint32_t *fw = gmu_fw_from_adt();
++	if (!fw) {
++		return false;
++	}
++	uint32_t sysreset = gmu_rd(GMU_CM3_SYSRESET);
++	if (!(sysreset & 1) || !cx_on() || (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
++		printf("BLUELINE GPU: CM3 sysreset %#x, CX %s, GX gdscr %#x: not the state stage 2 expects; stop\n",
++		    sysreset, cx_on() ? "on" : "OFF", rd(gpucc + GPUCC_GX_GDSCR));
++		return false;
++	}
++	nundo = 0;
++
++	/* 2. TCM retention, then the RSC/PDC sequencers (Linux: once, before the first boot). */
++	gmu_wr(GMU_GENERAL_7, 1);
++	rscc_init();
++	if (use_pdc && !pdc_init()) {
++		goto out;
++	}
++
++	/* 3. Firmware into ITCM/DTCM. Its version word (DTCM 0xff8 = CORE_FW_VERSION) picks the done value. */
++	if (!gmu_fw_load(fw)) {
++		goto out;
++	}
++	uint32_t ver = gmu_rd(GMU_CORE_FW_VERSION);
++	uint32_t mask = ver <= 0x20010004u ? 0xffffffffu : 0x1ffu;
++	uint32_t want = ver <= 0x20010004u ? GMU_INIT_DONE : 0x100u;
++	printf("BLUELINE GPU: fw version word %#x: waiting for init result %#x (mask %#x)\n", ver, want, mask);
++
++	/* 4. a6xx_gmu_fw_start registers, HFI and log left at 0, then a6xx_gmu_power_config. */
++	gmu_wr(GMU_CM3_FW_INIT_RESULT, 0);
++	gmu_wr(GMU_CM3_BOOT_CONFIG, GMU_BOOT_TCM);
++	gmu_wr(GMU_HFI_QTBL_ADDR, 0);
++	gmu_wr(GMU_HFI_QTBL_INFO, 0);
++	gmu_wr(GMU_AHB_FENCE_RANGE_0, GMU_FENCE_RANGE);
++	gmu_wr(GMU_CM3_CFG, GMU_CM3_CFG_VAL);
++	gmu_wr(GMU_HFI_SFR_ADDR, chipid);
++	gmu_wr(GMU_PWR_COL_CP_MSG, 0);
++	gmu_wr(GMU_SYS_BUS_CONFIG, 1);
++	gmu_wr(GMU_ICACHE_CONFIG, 1);
++	gmu_wr(GMU_DCACHE_CONFIG, 1);
++	gmu_wr(GMU_PWR_COL_INTER_FRAME_CTRL, GMU_PWR_COL_VAL);
++	gmu_wr(GMU_RPMH_CTRL, gmu_rd(GMU_RPMH_CTRL) | GMU_RPMH_CTRL_ON);
++	gmu_wr(GMU_CX_GMU_WFI_CONFIG, 0);
++
++	/* 5. a6xx_gmu_start: reset, clear the log index, release, poll. */
++	printf("BLUELINE GPU: releasing the GMU CM3 from reset\n");
++	gmu_wr(GMU_CM3_SYSRESET, 1);
++	gmu_wr(GMU_PWR_COL_CP_RESP, 0);
++	uint64_t t0 = mach_absolute_time(), ns;
++	gmu_wr(GMU_CM3_SYSRESET, 0);
++	started = true;
++	uint32_t r = 0;
++	for (int i = 0; i < ms * 100; i++) {
++		r = gmu_rd(GMU_CM3_FW_INIT_RESULT);
++		if ((r & mask) == want || r == GMU_INIT_FAILED) {
++			break;
++		}
++		delay(10);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	booted = (r & mask) == want;
++	printf("BLUELINE GPU: GMU init result %#x after %llu us: %s\n", r, ns / 1000,
++	    booted ? "GMU FIRMWARE RUNNING" : r == GMU_INIT_FAILED ? "FIRMWARE REPORTS INIT FAILED" : "TIMEOUT");
++
++	/* 6. What the GMU says about itself. */
++	printf("BLUELINE GPU: GMU fw_version %#x hfi_ctrl %#x hfi_version %#x general_0 %#x general_7 %#x"
++	    " gmu2host %#x ao_host_int %#x\n", gmu_rd(GMU_CORE_FW_VERSION), gmu_rd(GMU_HFI_CTRL_STATUS),
++	    gmu_rd(GMU_HFI_VERSION_INFO), gmu_rd(GMU_GENERAL_0), gmu_rd(GMU_GENERAL_7),
++	    gmu_rd(GMU_GMU2HOST_INTR_INFO), gmu_rd(GMU_AO_HOST_INT_STATUS));
++	printf("BLUELINE GPU: GMU rpmh_power_state %#x sptprac %#x cx_busy %#x ahb_fence %#x cm3 sysreset %#x\n",
++	    gmu_rd(GMU_RPMH_POWER_STATE), gmu_rd(GMU_SPTPRAC_STATUS), gmu_rd(GMU_AO_CX_BUSY_STATUS),
++	    gmu_rd(GMU_AHB_FENCE_STATUS), gmu_rd(GMU_CM3_SYSRESET));
++	printf("BLUELINE GPU: RSCC status0 %#x seq_busy %#x, GX gdscr %#x (must stay off)\n",
++	    rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)), rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)),
++	    rd(gpucc + GPUCC_GX_GDSCR));
++	gmu_trace_dump();
++	if (keep && booted) {
++		printf("BLUELINE GPU: stage 2a done; GMU left running, waiting for HFI_CTRL_INIT (bluegpu_keep=1)\n");
++		return true;
++	}
++
++out:
++	/* 7. a6xx_gmu_force_off without HFI/GX: no votes left, fence open, CM3 halted; then undo. */
++	if (started) {
++		rscc_idle_check();
++		wr(gmu + GMU_REG(GMU_AHB_FENCE_STATUS_CLR), 0x7);
++		wr(gmu + GMU_REG(GMU_AO_AHB_FENCE_CTRL), 0);
++		wr(gmu + GMU_REG(GMU_CM3_SYSRESET), 1);
++		printf("BLUELINE GPU: GMU CM3 back in reset (sysreset %#x)\n", gmu_rd(GMU_CM3_SYSRESET));
++	}
++	undo_all();
++	printf("BLUELINE GPU: stage 2a %s\n", booted ? "done" : "FAILED; state restored");
++	return booted;
++}
++
+ void
+ blueline_gpu_probe(void)
+ {
+@@ -255,8 +676,8 @@ blueline_gpu_probe(void)
+ 	if (level <= 0) {
+ 		return;
+ 	}
+-	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads, no firmware, no GX\n",
+-	    level, keep ? ", keep" : "");
++	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads%s, no GX\n",
++	    level, keep ? ", keep" : "", level >= 3 ? ", then GMU firmware boot" : ", no firmware");
+ 
+ 	/* 1. GCC: always clocked, read only first. */
+ 	gcc = ml_io_map(GCC_PA, GCC_SIZE);
+@@ -344,9 +765,9 @@ blueline_gpu_probe(void)
+ 		goto restore;
+ 	}
+ 
+-	/* 8-9. GMU, RSCC; SMMU only on request. */
++	/* 8-9. GMU, RSCC; SMMU only on request (level 2; stage 2a never touches it). */
+ 	gmu_report();
+-	if (level >= 2) {
++	if (level == 2) {
+ 		smmu_report();
+ 	}
+ 
+@@ -362,6 +783,18 @@ blueline_gpu_probe(void)
+ 		    A630_CHIPID_DOWNSTREAM, A630_CHIPID_MAINLINE);
+ 	}
+ 	ok = true;
++
++	/* 11. Stage 2a: GMU firmware boot. Never with GX on (checked again inside). */
++	if (level >= 3 && !(rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
++		if (gmu_boot(keep != 0) && keep) {
++			return;
++		}
++		if (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++			printf("BLUELINE GPU: GX GDSC reads ON after stage 2 (%#x): leaving power alone\n",
++			    rd(gpucc + GPUCC_GX_GDSCR));
++			return;
++		}
++	}
+ 	if (keep) {
+ 		printf("BLUELINE GPU: stage 1 done; CX and GMU clocks left on (bluegpu_keep=1)\n");
+ 		return;
+-- 
+2.54.0 (Apple Git-157)
+
