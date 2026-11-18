@@ -53,6 +53,10 @@ if adb devices | grep -q 'recovery$'; then
 	say "phone in recovery: rebooting it to fastboot"
 	adb reboot bootloader
 fi
+# ABL counts each RAM boot as a failed slot-B boot and eventually falls back to
+# slot A (no tap-free adb there); re-marking B active resets its retry count.
+for _ in $(seq 1 60); do fastboot devices | grep -q fastboot && break; sleep 1; done
+fastboot --set-active=b > "$out/$name-slot.txt" 2>&1 || say "warning: set-active=b failed (see $out/$name-slot.txt)"
 say "RAM boot"
 tools/fbboot.sh "$out/$name-shim.img" 3 > "$out/$name-fastboot.txt" 2>&1 || { cat "$out/$name-fastboot.txt"; exit 1; }
 
@@ -62,6 +66,8 @@ until adb devices | grep -q 'recovery$'; do
 	[ "$(date +%s)" -lt "$end" ] || { say "no recovery after $wait min (hung, or still in iOS)"; exit 1; }
 	sleep 3
 done
+# raw PM8998 RTC count as recovery's kernel sees it, with the Mac's clock, for bluertc_offset
+{ echo "mac $(date +%s)"; adb shell 'cat /sys/class/rtc/rtc0/name /sys/class/rtc/rtc0/since_epoch' 2>&1; } > "$out/$name-rtc.txt" || true
 say "pulling the log"
 tools/phone.sh log "$out/$name.txt" > /dev/null
 grep -a -E "$grep" "$out/$name.txt" || say "no lines match '$grep'"
