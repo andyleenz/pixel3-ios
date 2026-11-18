@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 18 Nov 2026 23:30:00 +0100
+Subject: [PATCH] 0123: blueline display power: the power button blanks the
+ panel (ios-sweet 0079 fade), optional DCS display off / sleep in
+
+backboardd calls IOMobileFramebuffer selector 12 (RequestPowerChange,
+seen in our logs: "backboardd sel 12 in 1/0") with 0 when the power button
+or auto-lock turns the display off, and 1 on wake. AppleCLCD ignored it,
+so the panel kept showing the last frame.
+
+As ios-sweet 0079 (and ios-sailfish 0167): while off, the vsync timer
+dims the panel memory, blacks it on the next vsync, stops copying frames;
+on wake the latest frame is copied again. The Pixel 3 panel (LG SW43408)
+is an AMOLED, so black is pixels off. bluefb_power=0 ignores the call.
+
+Experimental, off unless asked for: bluefb_dcs=1 logs the DSI0 and
+PINGPONG_0..3 registers ABL left (read-only); bluefb_dcs=2 also puts the
+panel into display off + sleep in once black (DCS 0x28, 0x10, as Linux
+panel-lg-sw43408 unprepare) and back with 0x11, 135 ms, 0x29 (its
+prepare), from the DSI0 command FIFO (downstream
+dsi_ctrl_hw_cmn_kickoff_fifo_command, ios-sailfish 0168), with the MDP
+autorefresh stopped around the commands (upstream
+dpu_hw_pp_disable_autorefresh). A command that does not complete turns
+the DCS path off for the rest of the boot.
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 268 +++++++++++++++++++++++++-
+ 1 file changed, 267 insertions(+), 1 deletion(-)
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -15,7 +15,10 @@
+  *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+  *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+  *      +0x104 enabled layer mask
+- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h], 18 IsMainDisplay,
++ *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
++ *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
++ *      button / auto-lock), else on. See "Display power" below.
++ *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+@@ -45,6 +48,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <machine/atomic.h>     /* DSB_SY (blueline display power) */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -53,6 +57,7 @@
+ 	kSweetFBSwapWait                = 6,
+ 	kSweetFBGetID                   = 7,
+ 	kSweetFBGetDisplaySize          = 8,
++	kSweetFBRequestPowerChange      = 12,
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
+@@ -112,8 +117,23 @@
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	/* blueline display power (RequestPowerChange) */
++	int           fPowerMode;     /* bluefb_power: 0 ignore, 1 fade to black */
++	int           fDcsMode;       /* bluefb_dcs: 0 off, 1 log registers, 2 DCS off/sleep */
++	bool          fPowerOff;      /* RequestPowerChange(0) */
++	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fPanelAsleep;   /* DCS display off + sleep in sent */
++	volatile uint32_t *fDsi;      /* DSI0 controller */
++	volatile uint32_t *fPPPage;   /* 16K page holding PINGPONG_0..3 */
++	volatile uint32_t *fPP;       /* the pingpong ABL left on autorefresh */
++	uint32_t      fAutoRefresh;   /* its PP_AUTOREFRESH_CONFIG, restored on wake */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void powerStart(void);
++	bool dcsWrite(uint8_t cmd);
++	bool ppIdle(void);
++	void panelSleep(void);
++	void panelWake(void);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -225,6 +245,7 @@
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	powerStart();
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -260,6 +281,32 @@
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (fb->fPowerOff) {
++		/* Off: one dimmed frame, then black (each pass rewrites ~9 MB). */
++		uint32_t step = fb->fFadeStep;
++		if (step <= 7) {
++			fb->fFadeStep = step + 1;
++		}
++		IOLockUnlock(fb->fLock);
++		if (step <= 1) {
++			for (uint32_t y = 0; y < fb->fHeight; y++) {
++				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				for (uint32_t x = 0; x < fb->fWidth; x++) {
++					row[x] = step < 1 ? (row[x] >> 2) & 0x3f3f3f3f : 0xff000000u;
++				}
++			}
++		} else if (step == 7 && fb->fDcsMode >= 2 && !fb->fPanelAsleep) {
++			/* One more vsync for autorefresh to send the black frame. */
++			fb->panelSleep();
++		}
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	if (fb->fPanelAsleep) {
++		IOLockUnlock(fb->fLock);
++		fb->panelWake();
++		IOLockLock(fb->fLock);
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -275,8 +322,211 @@
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++}
++
++/*
++ * Display power (blueline). backboardd calls RequestPowerChange(0) when the
++ * power button locks the phone or auto-lock fires, and (1) on wake. As
++ * ios-sweet 0079: while off, the vsync timer fades the panel memory to
++ * black in two vsyncs (0079 halves over 7) and stops copying; on wake the latest frame
++ * is copied again. The panel is the LG SW43408 AMOLED, so black pixels
++ * emit no light: the screen is dark although the panel, the DSI link and
++ * the MDP (ABL's autorefresh) keep running. bluefb_power=0 ignores the
++ * call (the old behaviour: the last frame stays on).
++ *
++ * Experimental, off by default: the panel itself to display off + sleep
++ * in, with the DCS short writes Linux's panel-lg-sw43408 sends on
++ * unprepare (0x28, 0x10) and on prepare (0x11, 135 ms, 0x29). They go out
++ * through the DSI0 controller ABL left set up, from its command FIFO
++ * (test pattern generator in DMA FIFO mode: no DMA buffer, no SMMU), as
++ * downstream dsi_ctrl_hw_cmn_kickoff_fifo_command() and ios-sailfish 0168.
++ * Before, the MDP's autorefresh on the pingpong feeding DSI0 is stopped
++ * and the frame in flight drained, as upstream
++ * dpu_hw_pp_disable_autorefresh(); it is restored after wake.
++ *   bluefb_dcs=1  only log the DSI0 / pingpong registers (read-only)
++ *   bluefb_dcs=2  also send the DCS commands
++ * Any command that does not complete turns the DCS path off for the boot
++ * (the fade still works) after putting autorefresh back.
++ *
++ * Registers (SDM845): DSI0 at 0xae94000 (sdm845.dtsi mdss_dsi0); DSI 6G
++ * offsets from downstream dsi_ctrl_reg.h (= upstream dsi.xml + 4).
++ * PINGPONG_0..3 at MDP 0xae01000 + 0x70000/0x70800/0x71000/0x71800
++ * (dpu_4_0_sdm845.h), PP_SYNC_CONFIG_VSYNC 0x4 (bit 20 external TE),
++ * PP_LINE_COUNT 0x2c, PP_AUTOREFRESH_CONFIG 0x30 (bit 31 on, 15:0 frame
++ * count) from dpu_hw_pingpong.c.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define BLUE_DSI0_PA            0x0ae94000ULL
++#define BLUE_PP_PAGE_PA         0x0ae70000ULL   /* 16K page: PINGPONG_0..3 */
++#define BLUE_PANEL_LINES        2160
++
++#define DSI_CTRL_REG            0x004   /* bit 0 enable, bit 2 command mode */
++#define DSI_STATUS_REG          0x008   /* bit 2 command mode MDP busy */
++#define DSI_CMD_DMA_CTRL        0x03c   /* 31 broadcast, 30 master, 28 embedded, 26 LP */
++#define DSI_DMA_CMD_LENGTH      0x04c
++#define DSI_TRIG_CTRL           0x084   /* 2:0 DMA trigger, 4 = software */
++#define DSI_DMA_SW_TRIGGER      0x090
++#define DSI_INT_CTRL            0x110   /* bit 0 CMD_MODE_DMA_DONE, bit 24 error */
++#define DSI_TPG_CTRL            0x15c
++#define DSI_TPG_CMD_DMA_INIT    0x17c   /* the command FIFO */
++#define DSI_TPG_DMA_FIFO_RESET  0x1ec
++
++#define PP_SYNC_CONFIG_VSYNC    0x004
++#define PP_LINE_COUNT           0x02c
++#define PP_AUTOREFRESH_CONFIG   0x030
++
++#define DSI_R(off)      (fDsi[(off) / 4])
++#define DSI_W(off, v)   (fDsi[(off) / 4] = (v))
++#define PP_R(off)       (fPP[(off) / 4])
++#define PP_W(off, v)    (fPP[(off) / 4] = (v))
++
++void
++AppleCLCD::powerStart(void)
++{
++	fPowerMode = 1;
++	PE_parse_boot_argn("bluefb_power", &fPowerMode, sizeof(fPowerMode));
++	fDcsMode = 0;
++	PE_parse_boot_argn("bluefb_dcs", &fDcsMode, sizeof(fDcsMode));
++	if (fPowerMode == 0 || fDcsMode == 0) {
++		fDcsMode = 0;
++		return;
++	}
++	fDsi = (volatile uint32_t *)ml_io_map(BLUE_DSI0_PA, 0x4000);
++	fPPPage = (volatile uint32_t *)ml_io_map(BLUE_PP_PAGE_PA, 0x4000);
++	if (fDsi == NULL || fPPPage == NULL) {
++		IOLog("BLUE FB: DSI/MDP mapping failed, no DCS\n");
++		fDcsMode = 0;
++		return;
++	}
++	IOLog("BLUE FB: DSI0 ctrl 0x%x status 0x%x dma_ctrl 0x%x trig 0x%x int 0x%x tpg 0x%x\n",
++	    DSI_R(DSI_CTRL_REG), DSI_R(DSI_STATUS_REG), DSI_R(DSI_CMD_DMA_CTRL),
++	    DSI_R(DSI_TRIG_CTRL), DSI_R(DSI_INT_CTRL), DSI_R(DSI_TPG_CTRL));
++	for (uint32_t i = 0; i < 4; i++) {
++		volatile uint32_t *pp = fPPPage + (0x1000 + 0x800 * i) / 4;
++		uint32_t ar = pp[PP_AUTOREFRESH_CONFIG / 4];
++		IOLog("BLUE FB: PINGPONG_%u sync_vsync 0x%x line %u autorefresh 0x%x\n", i,
++		    pp[PP_SYNC_CONFIG_VSYNC / 4], pp[PP_LINE_COUNT / 4] & 0xffff, ar);
++		if (fPP == NULL && (ar & (1u << 31))) {
++			fPP = pp;
++		}
++	}
++	uint32_t ctrl = DSI_R(DSI_CTRL_REG);
++	if (fDcsMode < 2) {
++		fDcsMode = 0;
++	} else if (fPP == NULL || (ctrl & 0x5) != 0x5 || (DSI_R(DSI_TRIG_CTRL) & 0x7) != 4) {
++		IOLog("BLUE FB: DSI0 not as expected (autorefresh %s, ctrl 0x%x), no DCS\n",
++		    fPP != NULL ? "on" : "off", ctrl);
++		fDcsMode = 0;
++	}
+ }
+ 
++/*
++ * One DCS short write without parameter (data type 0x05) from the DSI
++ * command FIFO, low-power mode. Header word as downstream
++ * dsi_msm_create_packet(): byte 0 command, byte 1 parameter, byte 2
++ * VC << 6 | data type, byte 3 bit 7 last command. False on timeout (20 ms).
++ */
++bool
++AppleCLCD::dcsWrite(uint8_t cmd)
++{
++	uint32_t dmactrl = DSI_R(DSI_CMD_DMA_CTRL);
++
++	DSI_W(DSI_INT_CTRL, (DSI_R(DSI_INT_CTRL) & ~(1u << 24)) | 1u);  /* clear a stale DMA done */
++	DSI_W(DSI_TPG_CTRL, 3u << 16 | 1u << 2 | 1u << 1);     /* FIFO pattern, FIFO mode, CMD DMA TPG on */
++	DSI_W(DSI_TPG_CMD_DMA_INIT, 1u << 31 | 0x05u << 16 | cmd);
++	DSI_W(DSI_TPG_CMD_DMA_INIT, 0);                         /* an even number of words */
++	DSI_W(DSI_CMD_DMA_CTRL, (dmactrl & ~(3u << 30)) | 1u << 28 | 1u << 26);
++	DSI_W(DSI_DMA_CMD_LENGTH, 4);
++	__builtin_arm_dsb(DSB_SY);
++	DSI_W(DSI_DMA_SW_TRIGGER, 1);
++	__builtin_arm_dsb(DSB_SY);
++	bool done = false;
++	for (int i = 0; i < 400 && !done; i++) {
++		done = (DSI_R(DSI_INT_CTRL) & 1u) != 0;
++		if (!done) {
++			IODelay(50);
++		}
++	}
++	DSI_W(DSI_INT_CTRL, (DSI_R(DSI_INT_CTRL) & ~(1u << 24)) | 1u);
++	DSI_W(DSI_TPG_CTRL, 0);                                 /* dsi_ctrl_hw_cmn_reset_cmd_fifo */
++	DSI_W(DSI_TPG_DMA_FIFO_RESET, 1);
++	__builtin_arm_dsb(DSB_SY);
++	IODelay(1);
++	DSI_W(DSI_TPG_DMA_FIFO_RESET, 0);
++	DSI_W(DSI_CMD_DMA_CTRL, dmactrl);
++	__builtin_arm_dsb(DSB_SY);
++	if (!done) {
++		IOLog("BLUE FB: DCS 0x%02x not done (int 0x%x status 0x%x)\n", cmd,
++		    DSI_R(DSI_INT_CTRL), DSI_R(DSI_STATUS_REG));
++	}
++	return done;
++}
++
++/* Stop autorefresh and wait until no frame is in flight (100 ms at most). */
++bool
++AppleCLCD::ppIdle(void)
++{
++	uint32_t sync = PP_R(PP_SYNC_CONFIG_VSYNC);
++	PP_W(PP_SYNC_CONFIG_VSYNC, sync & ~(1u << 20));         /* external TE off */
++	PP_W(PP_AUTOREFRESH_CONFIG, 0);
++	__builtin_arm_dsb(DSB_SY);
++	bool idle = false;
++	for (int i = 0; i < 1000 && !idle; i++) {
++		uint32_t line = PP_R(PP_LINE_COUNT) & 0xffff;
++		idle = (line == 0 || line >= BLUE_PANEL_LINES) && !(DSI_R(DSI_STATUS_REG) & (1u << 2));
++		if (!idle) {
++			IODelay(100);
++		}
++	}
++	PP_W(PP_SYNC_CONFIG_VSYNC, sync);
++	__builtin_arm_dsb(DSB_SY);
++	return idle;
++}
++
++/* Workloop thread (vsync), lock not held. */
++void
++AppleCLCD::panelSleep(void)
++{
++	fAutoRefresh = PP_R(PP_AUTOREFRESH_CONFIG);
++	if (!(fAutoRefresh & (1u << 31))) {
++		IOLog("BLUE FB: autorefresh off (0x%x), no DCS\n", fAutoRefresh);
++		fDcsMode = 0;
++		return;
++	}
++	bool ok = ppIdle();
++	bool off = ok && dcsWrite(0x28);                        /* set_display_off */
++	ok = off && dcsWrite(0x10);                             /* enter_sleep_mode */
++	if (!ok) {
++		if (off) {
++			dcsWrite(0x29);
++		}
++		PP_W(PP_AUTOREFRESH_CONFIG, fAutoRefresh);
++		__builtin_arm_dsb(DSB_SY);
++		IOLog("BLUE FB: panel sleep failed, DCS off for this boot\n");
++		fDcsMode = 0;
++		return;
++	}
++	fPanelAsleep = true;
++	IOLog("BLUE FB: panel display off, sleep in\n");
++}
++
++/* Workloop thread (vsync), lock not held. */
++void
++AppleCLCD::panelWake(void)
++{
++	bool ok = dcsWrite(0x11);                               /* exit_sleep_mode */
++	IOSleep(135);                                           /* as sw43408_program() */
++	ok = dcsWrite(0x29) && ok;                              /* set_display_on */
++	PP_W(PP_AUTOREFRESH_CONFIG, fAutoRefresh);
++	__builtin_arm_dsb(DSB_SY);
++	fPanelAsleep = false;
++	IOLog("BLUE FB: panel sleep out, display on%s\n", ok ? "" : " FAILED, DCS off for this boot");
++	if (!ok) {
++		fDcsMode = 0;
++	}
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -604,6 +854,22 @@
+ 			    args->scalarInput[0] ? "on" : "off");
+ 		}
+ 		break;
++	case kSweetFBRequestPowerChange:
++		if (args->scalarInputCount >= 1 && fFB->fPowerMode != 0) {
++			bool off = args->scalarInput[0] == 0;
++			IOLockLock(fFB->fLock);
++			bool changed = off != fFB->fPowerOff;
++			if (changed) {
++				fFB->fPowerOff = off;
++				fFB->fFadeStep = 0;
++				fFB->fDirty = true;     /* on: redraw the latest frame */
++			}
++			IOLockUnlock(fFB->fLock);
++			if (changed) {
++				IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			}
++		}
++		break;
+ 	case kSweetFBSwapWait:
+ 	default:
+ 		break;
+-- 
+2.54.0 (Apple Git-157)
+
