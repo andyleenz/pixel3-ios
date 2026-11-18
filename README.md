@@ -86,8 +86,10 @@ Rough outline; [docs/LOG.md](docs/LOG.md) has the details and the reasons.
 
 1. **Phone:** Pixel 3 with an unlocked bootloader and LineageOS recovery in slot B. Back up first
    (`tools/backup-phone.sh`).
-2. **Kernel:** push to your fork, and the `xnu` workflow builds `kernel.development.sweet` (Xcode 15 on GitHub's
-   macOS runners).
+2. **Kernel:** `tools/build-xnu.sh` builds `kernel.development.sweet` locally on a Mac with Xcode 15.x installed
+   next to your normal Xcode (`xcodes install 15.4`; no sudo, same pins as the workflow). The `xnu` workflow
+   did the same on GitHub's `macos-14` runners, which have been retired; the newer images only have Xcode 16+,
+   whose `iig` does not fit xnu-8796.
 3. **Payload and shim:** `tools/mkadt.py` (the iPhone X device tree from the IPSW, plus the Pixel 3's
    CPUs, memory and display), `tools/mkpayload.py KERNEL ADT OUT --cmdline '...'`, then
    `p2-shim/build.sh PAYLOAD stock/boot.img`. Toolchain: `brew install llvm lld`.
