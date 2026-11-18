@@ -2,7 +2,8 @@
 """Generate the Apple Device Tree for XNU on the Pixel 3 (blueline).
 
   mkadt.py OUT.adt [--qemu] [--cpus N] [--ufs] [--iphone DT.im4p]
-                   [--gpu-fw a630_gmu.bin] [--dump]
+                   [--gpu-fw a630_gmu.bin [--gpu-sqe auto|vendor|linux|none|PATH]]
+                   [--dump]
 
 The kernel is ios-sweet's SWEET machine config, so this provides what
 that boot path reads: /chosen (RAM range, entropy), /cpus, /arm-io/gic,
@@ -30,6 +31,13 @@ Cortex-M3 TCM image), which xnu patch 0126 loads at boot-arg bluegpu=3.
 It is not redistributable here: tools/fetch-gpu-fw.sh downloads the pinned
 copy into work/fw/ (ignored by git) and checks its SHA-256; this checks it
 again. The kernel logs the image's 32-bit word sum, printed here too.
+It also adds "sqe-firmware", the CP's SQE microcode (a630_sqe.fw, the
+whole file; the kernel drops dword 0 as Linux does), for xnu 0137 at
+bluegpu=6. --gpu-sqe picks it: auto (default) takes the phone's own
+vendor copy at DIR/vendor/a630_sqe.fw if present, else linux-firmware's
+DIR/a630_sqe.fw (DIR = --gpu-fw's directory), else none; vendor/linux
+insist on that one; none leaves it out; or a path. Only the two pinned
+SHA-256s are accepted, and Linux's a630 version check must pass.
 
 --qemu swaps in QEMU virt's GIC, timer frequency and timer interrupt
 (-M virt,gic-version=3) for emulator tests.
@@ -61,6 +69,49 @@ def gmu_firmware(path):
         sys.exit('--gpu-fw %s: sha256 %s, expected %s (linux-firmware 88ea23e7)'
                  % (path, digest, GMU_FW_SHA256))
     return fw
+
+
+# a630_sqe.fw candidates. dword[1] is the version word (Linux's buf[0]):
+# a6xx_ucode_check_version accepts a630 if (word & 0xfff) >= 0x190, or the
+# word ends in 0xa (patched build) with dword[3] & 0xf >= 1.
+SQE_FW_KNOWN = {
+    # linux-firmware 75f16899 (v2.07), tools/fetch-gpu-fw.sh
+    '1c21b527d9183487cc550dabbb3f43e555df5a977a461934fc61f0635a9aa90c': 'linux-firmware 75f16899',
+    # the phone's /vendor/firmware (LineageOS 22.2 blueline vendor image, Google's blob)
+    '36298bd53ea3666413d288a3a3f5266f67fcb6db038a0a481af5869d1c17859c': 'blueline vendor',
+}
+SQE_FW_MAX = 0x9000 + 4		# xnu 0137: SQE window at GPU VA 0x01000000, + dword 0
+
+
+def sqe_version_ok(fw):
+    """(version word, accepted) as Linux's a630 check sees the file."""
+    if len(fw) < 16:
+        return 0, False
+    _, ver, _, pl = struct.unpack_from('<4I', fw)
+    return ver, ((ver & 0xf) == 0xa and (pl & 0xf) >= 1) or (ver & 0xfff) >= 0x190
+
+
+def sqe_firmware(choice, gmu_path):
+    """The SQE image to embed (bytes, description) or (None, why)."""
+    d = os.path.dirname(os.path.abspath(gmu_path))
+    vendor, linux = os.path.join(d, 'vendor', 'a630_sqe.fw'), os.path.join(d, 'a630_sqe.fw')
+    if choice == 'none':
+        return None, 'left out (--gpu-sqe none)'
+    if choice == 'auto':
+        path = vendor if os.path.isfile(vendor) else linux if os.path.isfile(linux) else None
+        if path is None:
+            return None, 'none found (%s, %s; tools/fetch-gpu-fw.sh)' % (vendor, linux)
+    else:
+        path = {'vendor': vendor, 'linux': linux}.get(choice, choice)
+    fw = open(path, 'rb').read()
+    digest = hashlib.sha256(fw).hexdigest()
+    ver, ok = sqe_version_ok(fw)
+    if digest not in SQE_FW_KNOWN:
+        sys.exit('--gpu-sqe %s: sha256 %s is not a known a630_sqe.fw' % (path, digest))
+    if not ok or len(fw) > SQE_FW_MAX or len(fw) % 4:
+        sys.exit('--gpu-sqe %s: %d bytes, version word %#x: not usable (Linux needs >= 0x190 or a patched'
+                 ' ..a build; at most %d bytes)' % (path, len(fw), ver, SQE_FW_MAX))
+    return fw, '%s (%s), version word %#x' % (path, SQE_FW_KNOWN[digest], ver)
 
 
 # Kernel-managed RAM: above every fixed carve-out in both the mainline and
@@ -105,7 +156,7 @@ def d22ap_product(im4p):
     sys.exit('%s: no /product node' % im4p)
 
 
-def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None):
+def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -236,10 +287,12 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None):
         }))
 
     if gpu_fw is not None:
-        # Read by bsd/dev/blueline_gpu.c (0126) at bluegpu=3 only.
-        extra.append(node('blueline-gpu', {
-            'gmu-firmware': gpu_fw,
-        }))
+        # Read by bsd/dev/blueline_gpu.c: the GMU image (0126) at bluegpu=3+,
+        # the SQE microcode (0137) at bluegpu=6.
+        gpu = {'gmu-firmware': gpu_fw}
+        if sqe_fw is not None:
+            gpu['sqe-firmware'] = sqe_fw
+        extra.append(node('blueline-gpu', gpu))
 
     root_props.update({'#address-cells': u32(2), '#size-cells': u32(2)})
     return node('device-tree', root_props, [chosen, defaults, cpus_node, arm_io, fbcon] + extra + storage)
@@ -254,6 +307,8 @@ if __name__ == '__main__':
     ap.add_argument('--iphone', metavar='DT.im4p', help='iPhone X identity, /product from this tree')
     ap.add_argument('--gpu-fw', metavar='a630_gmu.bin',
                     help='add /blueline-gpu "gmu-firmware" (tools/fetch-gpu-fw.sh)')
+    ap.add_argument('--gpu-sqe', default='auto', metavar='auto|vendor|linux|none|PATH',
+                    help='with --gpu-fw: the "sqe-firmware" to add (default auto: vendor/ copy, else linux-firmware)')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if not 1 <= a.cpus <= 8 or (a.qemu and a.cpus != 1):
@@ -263,7 +318,8 @@ if __name__ == '__main__':
     if a.qemu and a.gpu_fw:
         sys.exit('--gpu-fw: QEMU virt has no Adreno')
     gpu_fw = gmu_firmware(a.gpu_fw) if a.gpu_fw else None
-    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw)
+    sqe_fw, sqe_why = sqe_firmware(a.gpu_sqe, a.gpu_fw) if a.gpu_fw else (None, None)
+    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
@@ -273,3 +329,9 @@ if __name__ == '__main__':
         print('  /blueline-gpu gmu-firmware: %d bytes, word sum %#x'
               % (len(gpu_fw), sum(struct.unpack('<%dI' % (len(gpu_fw) // 4), gpu_fw)) & 0xffffffff),
               file=sys.stderr)
+        if sqe_fw is not None:
+            print('  /blueline-gpu sqe-firmware: %d bytes, word sum %#x: %s'
+                  % (len(sqe_fw), sum(struct.unpack('<%dI' % (len(sqe_fw) // 4), sqe_fw)) & 0xffffffff, sqe_why),
+                  file=sys.stderr)
+        else:
+            print('  /blueline-gpu sqe-firmware: %s' % sqe_why, file=sys.stderr)
