@@ -1,0 +1,833 @@
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0143: blueline LMh enable through SCM (bluelmh=1), TSENS guard
+ for Gold (bluecpu_guard=1), shared SCM helper
+
+LMh: the same SCM calls, order, payload and arginfo as Linux 20eef29b
+drivers/thermal/qcom/lmh.c + qcom_scm.c qcom_scm_lmh_dcvsh /
+qcom_scm_lmh_profile_change, logged with every return code. Off by default.
+The SMC64 SIP call from 0134 (blueline_wifi.c) moves to blueline_scm.c and
+gains >4-argument support (x5 -> u64 array) and the payload page.
+
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f252b39..cda7d19 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/blueline_keys.c			standard
+ bsd/dev/blueline_touch.c		standard
+ bsd/dev/blueline_cpufreq.c		standard
++bsd/dev/blueline_scm.c			standard
+ bsd/dev/blueline_wifi.c			standard
+ bsd/dev/blueline_gpu.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
+index 56545f1..00c00eb 100644
+--- a/bsd/dev/blueline_cpufreq.c
++++ b/bsd/dev/blueline_cpufreq.c
+@@ -34,6 +34,27 @@
+  *                   rail to TURBO for those; we do not).
+  *   bluecpu_lmh=1   also dump the first words of the LMh blocks (read only).
+  *   bluecpu_tsens=0 skip the TSENS reads.
++ *
++ * LMh (0143), after the levels above:
++ *   bluelmh=1       enable SDM845 LMh hardware limiting through TrustZone exactly
++ *                   as Linux drivers/thermal/qcom/lmh.c does (see lmh_enable());
++ *                   log every SCM call and its result, LMh/OSM registers and
++ *                   TSENS before and after. Default 0 (off) until tested.
++ *   bluelmh_dry=1   availability query and register reads only, no LMh calls.
++ *   bluelmh_mask=N  clusters: bit 0 Silver (LMh 0x17d78800), bit 1 Gold
++ *                   (0x17d70800); default 3.
++ *   bluelmh_algos=N bit 0 current, 1 reliability, 2 BCL, 3 thermal + profile
++ *                   change; default 0xf (all, as Linux on sdm845).
++ *   bluelmh_trips=0 skip the ARM/HI/LOW thermal threshold calls.
++ *   bluelmh_dump=1  also dump the whole 1 KiB LMh blocks (not +0x8, write only).
++ * Software guard (0143), independent of LMh:
++ *   bluecpu_guard=1 every second read the CPU TSENS sensors (tsens0 s1-s4,
++ *                   s7-s10); at or above bluecpu_guard_hi (80 C) put Gold on
++ *                   level bluecpu_guard_gold (default: highest non-turbo level
++ *                   at or below 1766.4 MHz), below bluecpu_guard_lo (70 C) put
++ *                   back the level it had. Transitions are logged;
++ *                   bluecpu_guard=2 logs every reading. bluecpu_guard_ms=N
++ *                   changes the period.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -43,7 +64,9 @@
+ #include <kern/sched_prim.h>
+ #include <kern/cpu_number.h>
+ #include <machine/machine_routines.h>
++#include <kern/thread_call.h>
+ #include <pexpert/pexpert.h>
++#include "blueline_scm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern processor_t thread_bind(processor_t);
+@@ -576,8 +599,395 @@ cpufreq_legacy(unsigned c, uint32_t di)
+ 	    c, d->rows, old, best, d->lut[best].khz / 1000u, d->per_core ? " (per core)" : "");
+ }
+ 
+-void
+-blueline_cpufreq_init(void)
++/* ---- LMh: hardware limits management through TrustZone (bluelmh=1) ---- */
++
++/*
++ * Linux 20eef29b drivers/thermal/qcom/lmh.c (compatible "qcom,sdm845-lmh",
++ * data LMH_ENABLE_ALGOS) and drivers/firmware/qcom/qcom_scm.c
++ * qcom_scm_lmh_dcvsh / qcom_scm_lmh_profile_change; the Pixel 3 kernel
++ * (crosshatch-4.9 862f51ba drivers/thermal/qcom/msm_lmh_dcvs.c) makes the
++ * same calls with the same payload. Node ids are ASCII: "DCVS", "cp0-", "cp1-".
++ */
++#define SVC_LMH			0x13u
++#define LMH_PROFILE_CHANGE	0x01u
++#define LMH_DCVSH		0x10u
++#define LMH_NODE_DCVS		0x44435653u	/* "DCVS" */
++#define LMH_CLUSTER0_NODE_ID	0x6370302du	/* "cp0-": cpu0-3, LMh 0x17d78800 */
++#define LMH_CLUSTER1_NODE_ID	0x6370312du	/* "cp1-": cpu4-7, LMh 0x17d70800 */
++#define LMH_SUB_FN_THERMAL	0x54484d4cu	/* "THML" */
++#define LMH_SUB_FN_CRNT		0x43524e54u	/* "CRNT" */
++#define LMH_SUB_FN_REL		0x52454c00u	/* "REL" */
++#define LMH_SUB_FN_BCL		0x42434c00u	/* "BCL" */
++#define LMH_ALGO_MODE_ENABLE	0x454e424cu	/* "ENBL" */
++#define LMH_TH_HI_THRESHOLD	0x48494748u	/* "HIGH" */
++#define LMH_TH_LOW_THRESHOLD	0x4c4f5700u	/* "LOW" */
++#define LMH_TH_ARM_THRESHOLD	0x41524d00u	/* "ARM" */
++#define LMH_PAYLOAD_SIZE	(5u * 4u)
++/* sdm845.dtsi lmh_cluster0/1: qcom,lmh-temp-{arm,low,high}-millicelsius */
++#define LMH_TEMP_ARM		65000u
++#define LMH_TEMP_LOW		94500u
++#define LMH_TEMP_HIGH		95000u
++#define LMH_SIZE		0x400u
++
++struct lmh_cluster {
++	const char *name;
++	uint32_t pa, node_id, osm;
++	vm_offset_t base;
++};
++/* Device-tree order (lmh@17d70800 comes first in sdm845.dtsi), so Linux probes Gold first. */
++static struct lmh_cluster lmh_cl[2] = {
++	{ .name = "gold (cp1-)",   .pa = LMH1_PA, .node_id = LMH_CLUSTER1_NODE_ID, .osm = D_GOLD },
++	{ .name = "silver (cp0-)", .pa = LMH0_PA, .node_id = LMH_CLUSTER0_NODE_ID, .osm = D_SILVER },
++};
++
++static const char *
++lmh_name(uint32_t v)
++{
++	switch (v) {
++	case LMH_SUB_FN_THERMAL: return "THERMAL";
++	case LMH_SUB_FN_CRNT: return "CRNT";
++	case LMH_SUB_FN_REL: return "REL";
++	case LMH_SUB_FN_BCL: return "BCL";
++	case LMH_ALGO_MODE_ENABLE: return "ALGO_MODE_ENABLE";
++	case LMH_TH_HI_THRESHOLD: return "HI_THRESHOLD";
++	case LMH_TH_LOW_THRESHOLD: return "LOW_THRESHOLD";
++	case LMH_TH_ARM_THRESHOLD: return "ARM_THRESHOLD";
++	default: return "?";
++	}
++}
++
++/* qcom_scm_lmh_dcvsh(fn, reg, val, LMH_NODE_DCVS, node_id, 0) */
++static int64_t
++lmh_dcvsh(const struct lmh_cluster *c, uint32_t fn, uint32_t reg, uint32_t val)
++{
++	uint64_t pa = 0, res[3];
++	unsigned resumes = 0;
++	uint32_t *p = blueline_scm_payload(LMH_PAYLOAD_SIZE, &pa);
++	if (!p) {
++		printf(TAG "LMh %s: no payload buffer; DCVSH %s/%s not sent\n", c->name, lmh_name(fn),
++		    lmh_name(reg));
++		return SCM_NO_MEM;
++	}
++	p[0] = fn;		/* algorithm */
++	p[1] = 0;		/* sub-algorithm, unused */
++	p[2] = reg;		/* setting */
++	p[3] = 1;		/* number of values */
++	p[4] = val;
++	uint64_t args[5] = { pa, LMH_PAYLOAD_SIZE, LMH_NODE_DCVS, c->node_id, 0 /* version */ };
++	uint32_t arginfo = SCM_ARGS(5, SCM_RO, SCM_VAL, SCM_VAL, SCM_VAL, SCM_VAL);
++	printf(TAG "LMh %s: about to SMC %#x arginfo %#x: DCVSH %s %s = %u (payload PA %#llx "
++	    "[%08x %08x %08x %08x %08x], node %#x/%#x)\n", c->name,
++	    SCM_SMC64 | SCM_OWNER_SIP | SCM_FNID(SVC_LMH, LMH_DCVSH), arginfo, lmh_name(fn),
++	    lmh_name(reg), val, pa, p[0], p[1], p[2], p[3], p[4], LMH_NODE_DCVS, c->node_id);
++	int64_t rc = blueline_scm_call(false, SCM_FNID(SVC_LMH, LMH_DCVSH), arginfo, args, 5, res,
++	    &resumes);
++	printf(TAG "LMh %s: DCVSH %s %s -> %lld %s (x1 %#llx x2 %#llx x3 %#llx, %u resumes)\n",
++	    c->name, lmh_name(fn), lmh_name(reg), (long long)rc, blueline_scm_err(rc), res[0], res[1],
++	    res[2], resumes);
++	return rc;
++}
++
++/* qcom_scm_lmh_profile_change(1) */
++static int64_t
++lmh_profile_change(const struct lmh_cluster *c, uint32_t profile)
++{
++	uint64_t arg = profile, res[3];
++	unsigned resumes = 0;
++	printf(TAG "LMh %s: about to SMC %#x arginfo %#x: PROFILE_CHANGE %u\n", c->name,
++	    SCM_SMC64 | SCM_OWNER_SIP | SCM_FNID(SVC_LMH, LMH_PROFILE_CHANGE),
++	    SCM_ARGS(1, SCM_VAL, 0, 0, 0, 0), profile);
++	int64_t rc = blueline_scm_call(false, SCM_FNID(SVC_LMH, LMH_PROFILE_CHANGE),
++	    SCM_ARGS(1, SCM_VAL, 0, 0, 0, 0), &arg, 1, res, &resumes);
++	printf(TAG "LMh %s: PROFILE_CHANGE %u -> %lld %s (x1 %#llx, %u resumes)\n", c->name, profile,
++	    (long long)rc, blueline_scm_err(rc), res[0], resumes);
++	return rc;
++}
++
++static void
++lmh_regs(const char *when, int dump)
++{
++	for (uint32_t i = 0; i < 2; i++) {
++		struct lmh_cluster *c = &lmh_cl[i];
++		if (!c->base) {
++			printf(TAG "LMh %s: about to map/read LMh block %#x\n", c->name, c->pa);
++			c->base = ml_io_map(c->pa, LMH_SIZE);
++			if (!c->base) {
++				printf(TAG "LMh %s: ml_io_map failed\n", c->name);
++				continue;
++			}
++		}
++		/* +0x8 is LMH_REG_DCVS_INTR_CLR (write only): never read. */
++		printf(TAG "LMh %s %s: +0x0 %#x +0x4 %#x +0xc %#x +0x10 %#x +0x14 %#x +0x18 %#x "
++		    "+0x1c %#x\n", c->name, when, rd(c->base, 0x0), rd(c->base, 0x4), rd(c->base, 0xc),
++		    rd(c->base, 0x10), rd(c->base, 0x14), rd(c->base, 0x18), rd(c->base, 0x1c));
++		if (dump) {
++			for (uint32_t o = 0x20; o < LMH_SIZE; o += 16) {
++				printf(TAG "LMh %s %s raw +%#05x: %08x %08x %08x %08x\n", c->name, when, o,
++				    rd(c->base, o), rd(c->base, o + 4), rd(c->base, o + 8),
++				    rd(c->base, o + 12));
++			}
++		}
++		const struct osm_dom *d = &doms[c->osm];
++		if (d->base) {
++			uint32_t ps = rd(d->base, REG_PSTATE_STATUS), cv = rd(d->base, REG_CURRENT_VOTE);
++			printf(TAG "LMh %s %s: OSM running L_VAL %u (%u MHz), CURRENT_VOTE %#x (limit %u "
++			    "MHz), PERF_STATE %u\n", c->name, when, (ps >> 16) & 0xffu,
++			    lval_mhz((ps >> 16) & 0xffu), cv, lval_mhz(cv & 0x3ffu),
++			    rd(d->base, REG_PERF_STATE));
++		}
++	}
++}
++
++/* lmh_probe() for one cluster, same order and the same give-up points. */
++static void
++lmh_enable(const struct lmh_cluster *c, uint32_t algos, int trips)
++{
++	/* errors in the first three are only logged, as in Linux */
++	if (algos & 1u) {
++		(void)lmh_dcvsh(c, LMH_SUB_FN_CRNT, LMH_ALGO_MODE_ENABLE, 1);
++	}
++	if (algos & 2u) {
++		(void)lmh_dcvsh(c, LMH_SUB_FN_REL, LMH_ALGO_MODE_ENABLE, 1);
++	}
++	if (algos & 4u) {
++		(void)lmh_dcvsh(c, LMH_SUB_FN_BCL, LMH_ALGO_MODE_ENABLE, 1);
++	}
++	if (algos & 8u) {
++		if (lmh_dcvsh(c, LMH_SUB_FN_THERMAL, LMH_ALGO_MODE_ENABLE, 1)) {
++			printf(TAG "LMh %s: thermal enable failed: stopping here (as Linux)\n", c->name);
++			return;
++		}
++		if (lmh_profile_change(c, 1)) {
++			printf(TAG "LMh %s: profile change failed: stopping here (as Linux)\n", c->name);
++			return;
++		}
++	} else {
++		printf(TAG "LMh %s: thermal enable and profile change skipped (bluelmh_algos %#x)\n",
++		    c->name, algos);
++	}
++	if (!trips) {
++		printf(TAG "LMh %s: thermal trips skipped (bluelmh_trips=0)\n", c->name);
++		return;
++	}
++	if (lmh_dcvsh(c, LMH_SUB_FN_THERMAL, LMH_TH_ARM_THRESHOLD, LMH_TEMP_ARM) ||
++	    lmh_dcvsh(c, LMH_SUB_FN_THERMAL, LMH_TH_HI_THRESHOLD, LMH_TEMP_HIGH) ||
++	    lmh_dcvsh(c, LMH_SUB_FN_THERMAL, LMH_TH_LOW_THRESHOLD, LMH_TEMP_LOW)) {
++		printf(TAG "LMh %s: a thermal trip failed: stopping here (as Linux)\n", c->name);
++		return;
++	}
++	printf(TAG "LMh %s: enabled (algos %#x), trips arm %u high %u low %u mC\n", c->name, algos,
++	    LMH_TEMP_ARM, LMH_TEMP_HIGH, LMH_TEMP_LOW);
++}
++
++static void
++lmh_init(void)
++{
++	int on = 0, dry = 0, mask = 3, algos = 0xf, trips = 1, dump = 0;
++	(void)PE_parse_boot_argn("bluelmh", &on, sizeof(on));
++	if (on <= 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("bluelmh_dry", &dry, sizeof(dry));
++	(void)PE_parse_boot_argn("bluelmh_mask", &mask, sizeof(mask));
++	(void)PE_parse_boot_argn("bluelmh_algos", &algos, sizeof(algos));
++	(void)PE_parse_boot_argn("bluelmh_trips", &trips, sizeof(trips));
++	(void)PE_parse_boot_argn("bluelmh_dump", &dump, sizeof(dump));
++	printf(TAG "LMh: bluelmh=%d%s, clusters %#x, algos %#x, trips %s\n", on,
++	    dry ? " (dry: no LMh calls)" : "", mask, algos, trips ? "on" : "off");
++	(void)osm_probe(&doms[D_SILVER], false);
++	(void)osm_probe(&doms[D_GOLD], false);
++
++	lmh_regs("before", dump);
++	tsens_dump("before LMh");
++	int avail = blueline_scm_is_call_avail(SVC_LMH, LMH_DCVSH);
++	int pavail = blueline_scm_is_call_avail(SVC_LMH, LMH_PROFILE_CHANGE);
++	printf(TAG "LMh: scm 13/10 LIMIT_DCVSH %s, 13/01 LIMIT_PROFILE_CHANGE %s\n",
++	    avail < 0 ? "query failed" : avail ? "available" : "absent",
++	    pavail < 0 ? "query failed" : pavail ? "available" : "absent");
++	if (avail != 1) {
++		printf(TAG "LMh: no DCVSH call: stopping (Linux lmh_probe returns -EINVAL)\n");
++		return;
++	}
++	if (dry) {
++		printf(TAG "LMh: dry run done\n");
++		return;
++	}
++	for (uint32_t i = 0; i < 2; i++) {
++		if (mask & (lmh_cl[i].osm == D_SILVER ? 1 : 2)) {
++			lmh_enable(&lmh_cl[i], (uint32_t)algos, trips);
++		}
++	}
++	lmh_regs("after", dump);
++	/* Watch the OSM limit for a second: an LMh that throttles at once shows up here. */
++	uint32_t last[2] = { 0, 0 };
++	for (int ms = 0; ms <= 1000; ms += 50) {
++		for (uint32_t i = 0; i < 2; i++) {
++			const struct osm_dom *d = &doms[lmh_cl[i].osm];
++			if (!d->base) {
++				continue;
++			}
++			uint32_t cv = rd(d->base, REG_CURRENT_VOTE) & 0x3ffu;
++			uint32_t lv = osm_cur_lval(d);
++			if (ms == 0 || ms == 1000 || ((cv << 8) | lv) != last[i]) {
++				printf(TAG "LMh %s +%d ms: limit %u MHz, running %u MHz\n", lmh_cl[i].name,
++				    ms, lval_mhz(cv), lval_mhz(lv));
++			}
++			last[i] = (cv << 8) | lv;
++		}
++		delay(50000);
++	}
++	tsens_dump("after LMh");
++}
++
++/* ---- software guard: TSENS -> Gold level (bluecpu_guard=1) ---- */
++
++static const uint32_t guard_sensor[] = { 1, 2, 3, 4, 7, 8, 9, 10 };	/* tsens0: cpu0-3, cpu4-7 */
++
++static struct {
++	thread_call_t tc;
++	vm_offset_t tm;
++	uint64_t period_ns;
++	int hi, lo, verbose;		/* deci-C */
++	uint32_t low_idx, saved, bad;
++	bool dropped;
++} gd;
++
++static void
++guard_set(uint32_t idx)
++{
++	struct osm_dom *d = &doms[D_GOLD];
++	for (uint32_t i = 0; i < (d->per_core ? 4u : 1u); i++) {
++		wr(d->base, REG_PERF_STATE + 4 * i, idx);
++	}
++}
++
++static void
++guard_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	struct osm_dom *d = &doms[D_GOLD];
++	int max = -10000;
++	uint32_t ms = 0, valid = 0;
++	for (uint32_t i = 0; i < sizeof(guard_sensor) / sizeof(guard_sensor[0]); i++) {
++		uint32_t st = rd(gd.tm, TM_STATUS + 4 * guard_sensor[i]);
++		if (!((st >> 21) & 1u)) {
++			continue;		/* not valid */
++		}
++		int dc = (int)(st & 0xfffu);
++		if (dc & 0x800) {
++			dc -= 0x1000;
++		}
++		valid++;
++		if (dc > max) {
++			max = dc;
++			ms = guard_sensor[i];
++		}
++	}
++	uint32_t cur = rd(d->base, REG_PERF_STATE);
++	int a = max < 0 ? -max : max;
++	if (!valid) {
++		gd.bad++;
++		if (gd.bad == 5 && !gd.dropped) {
++			gd.saved = cur;
++			if (cur > gd.low_idx) {
++				guard_set(gd.low_idx);
++			}
++			gd.dropped = true;
++			printf(TAG "guard: no valid CPU temperature for 5 readings: Gold %u -> %u "
++			    "(%u MHz) to be safe\n", cur, gd.low_idx, d->lut[gd.low_idx].khz / 1000u);
++		}
++	} else {
++		gd.bad = 0;
++		if (gd.verbose > 1) {
++			printf(TAG "guard: max %s%d.%d C (s%u), Gold PERF_STATE %u%s\n", max < 0 ? "-" : "",
++			    a / 10, a % 10, ms, cur, gd.dropped ? " (lowered)" : "");
++		}
++		if (!gd.dropped && max >= gd.hi) {
++			gd.saved = cur;
++			gd.dropped = true;
++			if (cur > gd.low_idx) {
++				guard_set(gd.low_idx);
++				printf(TAG "guard: %d.%d C (tsens0 s%u) >= %d C: Gold PERF_STATE %u (%u MHz) -> "
++				    "%u (%u MHz); OSM limit %u MHz\n", a / 10, a % 10, ms, gd.hi / 10, cur,
++				    cur < d->rows ? d->lut[cur].khz / 1000u : 0, gd.low_idx,
++				    d->lut[gd.low_idx].khz / 1000u,
++				    lval_mhz(rd(d->base, REG_CURRENT_VOTE) & 0x3ffu));
++			} else {
++				printf(TAG "guard: %d.%d C (tsens0 s%u) >= %d C: Gold already at level %u, "
++				    "left\n", a / 10, a % 10, ms, gd.hi / 10, cur);
++			}
++		} else if (gd.dropped && max < gd.lo) {
++			gd.dropped = false;
++			if (cur == gd.low_idx && gd.saved > gd.low_idx) {
++				guard_set(gd.saved);
++				printf(TAG "guard: %d.%d C (tsens0 s%u) < %d C: Gold PERF_STATE %u -> %u "
++				    "(%u MHz) restored\n", a / 10, a % 10, ms, gd.lo / 10, cur, gd.saved,
++				    gd.saved < d->rows ? d->lut[gd.saved].khz / 1000u : 0);
++			} else {
++				printf(TAG "guard: %d.%d C (tsens0 s%u) < %d C: Gold PERF_STATE %u (changed "
++				    "by someone else or was low already), left\n", a / 10, a % 10, ms,
++				    gd.lo / 10, cur);
++			}
++		}
++	}
++	uint64_t deadline;
++	nanoseconds_to_deadline(gd.period_ns, &deadline);
++	(void)thread_call_enter_delayed(gd.tc, deadline);
++}
++
++static void
++guard_start(void)
++{
++	int on = 0, hi = 80, lo = 70, period = 1000, idx = -1;
++	(void)PE_parse_boot_argn("bluecpu_guard", &on, sizeof(on));
++	if (on <= 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("bluecpu_guard_hi", &hi, sizeof(hi));
++	(void)PE_parse_boot_argn("bluecpu_guard_lo", &lo, sizeof(lo));
++	(void)PE_parse_boot_argn("bluecpu_guard_ms", &period, sizeof(period));
++	(void)PE_parse_boot_argn("bluecpu_guard_gold", &idx, sizeof(idx));
++	struct osm_dom *d = &doms[D_GOLD];
++	if (!osm_probe(d, false) || !d->enabled || !d->rows) {
++		printf(TAG "guard: Gold OSM not usable; no guard\n");
++		return;
++	}
++	if (lo >= hi || hi > 110 || lo < 20) {
++		printf(TAG "guard: bad thresholds hi %d lo %d; using 80/70\n", hi, lo);
++		hi = 80;
++		lo = 70;
++	}
++	if (period < 100 || period > 10000) {
++		period = 1000;
++	}
++	if (idx < 0 || (uint32_t)idx >= d->rows) {
++		idx = 0;
++		for (uint32_t i = 0; i < d->rows; i++) {
++			if (d->lut[i].cores != 1u && d->lut[i].khz <= 1766400u) {
++				idx = (int)i;
++			}
++		}
++	}
++	gd.tm = ml_io_map(TSENS0_TM, 0x200);
++	gd.tc = thread_call_allocate(guard_tick, NULL);
++	if (!gd.tm || !gd.tc) {
++		printf(TAG "guard: TSENS map or thread call failed; no guard\n");
++		return;
++	}
++	gd.hi = hi * 10;
++	gd.lo = lo * 10;
++	gd.verbose = on;
++	gd.low_idx = (uint32_t)idx;
++	gd.period_ns = (uint64_t)period * NSEC_PER_MSEC;
++	printf(TAG "guard: on, every %d ms, CPU sensors tsens0 s1-s4 s7-s10: >= %d C -> Gold level %u "
++	    "(%u MHz), < %d C -> back; Gold now PERF_STATE %u\n", period, hi, gd.low_idx,
++	    d->lut[gd.low_idx].khz / 1000u, lo, rd(d->base, REG_PERF_STATE));
++	uint64_t deadline;
++	nanoseconds_to_deadline(gd.period_ns, &deadline);
++	(void)thread_call_enter_delayed(gd.tc, deadline);
++}
++
++static void
++cpufreq_levels(void)
+ {
+ 	int mode = 0;
+ 	(void)PE_parse_boot_argn("bluecpu", &mode, sizeof(mode));
+@@ -594,4 +1004,12 @@ blueline_cpufreq_init(void)
+ 	cpufreq_legacy(0, D_SILVER);
+ 	cpufreq_legacy(1, D_GOLD);
+ }
++
++void
++blueline_cpufreq_init(void)
++{
++	cpufreq_levels();
++	lmh_init();
++	guard_start();
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/blueline_scm.c b/bsd/dev/blueline_scm.c
+new file mode 100644
+index 0000000..65e5df0
+--- /dev/null
++++ b/bsd/dev/blueline_scm.c
+@@ -0,0 +1,193 @@
++/*
++ * Pixel 3 (blueline): shared SCM call helper (see blueline_scm.h). Moved
++ * out of blueline_wifi.c (0134, tested: convention probe, is_call_avail,
++ * PAS is_supported) and extended to the 5-argument calls LMh needs.
++ *
++ * Sources: Linux 20eef29b drivers/firmware/qcom/qcom_scm-smc.c
++ * (__scm_smc_call: SCM_SMC_N_REG_ARGS 4, SCM_SMC_FIRST_EXT_IDX 3,
++ * SCM_SMC_N_EXT_ARGS 7 u64s for SMC64, address in x5; __scm_smc_do_quirk:
++ * INTERRUPTED resume; __scm_smc_do: EBUSY retry 20 x 30 ms),
++ * qcom_scm.c (__qcom_scm_is_call_available), qcom_scm.h (error codes).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "blueline_scm.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define SCM_N_REG_ARGS		4u
++#define SCM_FIRST_EXT_IDX	3u
++#define SCM_N_EXT_ARGS		(SCM_MAX_ARGS - SCM_N_REG_ARGS + 1u)	/* 7 */
++#define SCM_EBUSY		(-12)
++#define SCM_EBUSY_RETRIES	20
++#define SCM_EBUSY_WAIT_US	30000
++
++/* One page: payload at +0 (up to 4 KiB), extra arguments at +0x1000. */
++#define SCM_PAGE_SIZE		0x2000u
++#define SCM_PAYLOAD_MAX		0x1000u
++#define SCM_EXT_OFF		0x1000u
++
++static LCK_GRP_DECLARE(blueline_scm_grp, "blueline_scm");
++static LCK_MTX_DECLARE(blueline_scm_lock, &blueline_scm_grp);
++static vm_offset_t scm_va;
++static uint64_t scm_pa;
++
++static bool
++scm_mem(void)
++{
++	if (scm_va) {
++		return true;
++	}
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, SCM_PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("BLUELINE SCM: no contiguous memory for SCM buffers\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		printf("BLUELINE SCM: no physical page for the SCM buffer\n");
++		return false;
++	}
++	scm_pa = ptoa_64(pn);
++	scm_va = va;
++	printf("BLUELINE SCM: payload/argument buffer at PA %#llx\n", scm_pa);
++	return true;
++}
++
++void *
++blueline_scm_payload(size_t len, uint64_t *pa)
++{
++	if (len > SCM_PAYLOAD_MAX || !scm_mem()) {
++		return NULL;
++	}
++	bzero((void *)scm_va, SCM_PAYLOAD_MAX);
++	*pa = scm_pa;
++	return (void *)scm_va;
++}
++
++static int64_t
++scm_smc(bool fast, uint64_t a[8], uint64_t res[3], unsigned *resumes)
++{
++	uint64_t id = a[0], a6 = 0;
++
++	for (unsigned i = 0; i <= SCM_MAX_RESUMES; i++) {
++		register uint64_t x0 __asm__("x0") = id;
++		register uint64_t x1 __asm__("x1") = a[1];
++		register uint64_t x2 __asm__("x2") = a[2];
++		register uint64_t x3 __asm__("x3") = a[3];
++		register uint64_t x4 __asm__("x4") = a[4];
++		register uint64_t x5 __asm__("x5") = a[5];
++		register uint64_t x6 __asm__("x6") = a6;
++		register uint64_t x7 __asm__("x7") = a[7];
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    :
++		    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		/* 0134 behaviour: only standard (yielding) calls are resumed. */
++		if (x0 == SCM_INTERRUPTED && !fast) {
++			id = SCM_INTERRUPTED;
++			a6 = x6;
++			(*resumes)++;
++			continue;
++		}
++		res[0] = x1;
++		res[1] = x2;
++		res[2] = x3;
++		return (int64_t)(int32_t)x0;
++	}
++	return SCM_GAVE_UP;
++}
++
++int64_t
++blueline_scm_call(bool fast, uint32_t fnid, uint32_t arginfo, const uint64_t *args,
++    unsigned nargs, uint64_t res[3], unsigned *resumes)
++{
++	uint64_t a[8] = { 0 };
++	int64_t rc;
++
++	*resumes = 0;
++	res[0] = res[1] = res[2] = 0;
++	if (nargs > SCM_MAX_ARGS) {
++		return -2;	/* EINVAL_ARG */
++	}
++	a[0] = (fast ? SCM_FAST : 0) | SCM_SMC64 | SCM_OWNER_SIP | fnid;
++	a[1] = arginfo;
++	for (unsigned i = 0; i < SCM_N_REG_ARGS && i < nargs; i++) {
++		a[2 + i] = args[i];
++	}
++
++	lck_mtx_lock(&blueline_scm_lock);
++	if (nargs > SCM_N_REG_ARGS || scm_va) {
++		if (!scm_mem()) {
++			lck_mtx_unlock(&blueline_scm_lock);
++			return SCM_NO_MEM;
++		}
++	}
++	if (nargs > SCM_N_REG_ARGS) {
++		/* args[3..9] as little-endian u64s; x5 = their physical address */
++		uint64_t *ext = (uint64_t *)(scm_va + SCM_EXT_OFF);
++		for (unsigned i = 0; i < SCM_N_EXT_ARGS; i++) {
++			ext[i] = (SCM_FIRST_EXT_IDX + i < nargs) ? args[SCM_FIRST_EXT_IDX + i] : 0;
++		}
++		a[5] = scm_pa + SCM_EXT_OFF;
++	}
++	for (int tries = 0;; tries++) {
++		if (scm_va) {
++			/* payload and extra arguments out to memory TZ reads (dmac_flush_range) */
++			flush_dcache64((addr64_t)scm_pa, SCM_EXT_OFF + SCM_N_EXT_ARGS * 8u, TRUE);
++		}
++		rc = scm_smc(fast, a, res, resumes);
++		if (scm_va) {
++			flush_dcache64((addr64_t)scm_pa, SCM_EXT_OFF + SCM_N_EXT_ARGS * 8u, TRUE);
++		}
++		if (fast || rc != SCM_EBUSY || tries >= SCM_EBUSY_RETRIES) {
++			break;
++		}
++		lck_mtx_unlock(&blueline_scm_lock);
++		delay(SCM_EBUSY_WAIT_US);
++		lck_mtx_lock(&blueline_scm_lock);
++	}
++	lck_mtx_unlock(&blueline_scm_lock);
++	return rc;
++}
++
++int
++blueline_scm_is_call_avail(uint32_t svc, uint32_t cmd)
++{
++	uint64_t res[3], arg = SCM_FNID(svc, cmd) | SCM_OWNER_SIP;
++	unsigned resumes;
++	int64_t rc = blueline_scm_call(false, SCM_FNID(0x06, 0x01), SCM_ARGS(1, 0, 0, 0, 0, 0),
++	    &arg, 1, res, &resumes);
++	if (rc) {
++		printf("BLUELINE SCM: is_call_avail(%#x, %#x) -> %lld %s\n", svc, cmd, (long long)rc,
++		    blueline_scm_err(rc));
++		return -1;
++	}
++	return res[0] ? 1 : 0;
++}
++
++const char *
++blueline_scm_err(int64_t rc)
++{
++	switch (rc) {
++	case 0: return "ok";
++	case SCM_WAITQ_SLEEP: return "WAITQ_SLEEP (not handled)";
++	case -1: return "ERROR";
++	case -2: return "EINVAL_ARG";
++	case -3: return "EINVAL_ADDR";
++	case -4: return "EOPNOTSUPP";
++	case -5: return "ENOMEM";
++	case SCM_EBUSY: return "EBUSY";
++	case SCM_GAVE_UP: return "still INTERRUPTED, gave up";
++	case SCM_NO_MEM: return "no SCM buffer memory";
++	default: return "error";
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/blueline_scm.h b/bsd/dev/blueline_scm.h
+new file mode 100644
+index 0000000..1432456
+--- /dev/null
++++ b/bsd/dev/blueline_scm.h
+@@ -0,0 +1,62 @@
++/*
++ * Pixel 3 (blueline): Qualcomm SCM (TrustZone secure monitor) calls, SMC64
++ * SIP convention, shared by blueline_wifi.c and blueline_cpufreq.c (LMh).
++ * Mirrors Linux 20eef29b drivers/firmware/qcom/qcom_scm-smc.c and
++ * qcom_scm.h. Boot-time use only: callers run one after another from
++ * sweet_ufs_init(); the payload page (blueline_scm_payload) is not locked
++ * between filling it and the call.
++ */
++#ifndef _BLUELINE_SCM_H_
++#define _BLUELINE_SCM_H_
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++/* SMCCC function ids (qcom_scm-smc.c SCM_SMC_FNID, ARM_SMCCC_CALL_VAL) */
++#define SCM_FNID(svc, cmd)	((((uint32_t)(svc) & 0xffu) << 8) | ((uint32_t)(cmd) & 0xffu))
++#define SCM_OWNER_SIP		(2u << 24)
++#define SCM_SMC64		(1u << 30)
++#define SCM_FAST		(1u << 31)
++#define SCM_INTERRUPTED		1
++#define SCM_WAITQ_SLEEP		2
++#define SCM_MAX_RESUMES		1000
++#define SCM_GAVE_UP		(-1000)
++#define SCM_NO_MEM		(-1001)	/* ours: no payload / extra-argument page */
++
++/* qcom_scm.h QCOM_SCM_ARGS: arg count in [3:0], 2-bit type per arg from bit 4 */
++#define SCM_VAL			0u
++#define SCM_RO			1u
++#define SCM_RW			2u
++#define SCM_BUFVAL		3u
++#define SCM_ARGS(n, t0, t1, t2, t3, t4) \
++	(((uint32_t)(n) & 0xfu) | (((t0) & 3u) << 4) | (((t1) & 3u) << 6) | \
++	(((t2) & 3u) << 8) | (((t3) & 3u) << 10) | (((t4) & 3u) << 12))
++#define SCM_MAX_ARGS		10	/* MAX_QCOM_SCM_ARGS */
++
++/*
++ * One SCM call: x0 = function id, x1 = arginfo, x2..x5 = args[0..3]. With
++ * more than 4 arguments, args[3..9] go to a physically contiguous u64 array
++ * whose address is x5 (__scm_smc_call). Standard calls that come back
++ * INTERRUPTED are resumed with x0 = 1, x1..x5 and x7 unchanged and x6 = the
++ * value TZ returned (ARM_SMCCC_QUIRK_QCOM_A6); EBUSY (-12) is retried up to
++ * 20 times 30 ms apart (__scm_smc_do). WAITQ_SLEEP is reported, not handled.
++ * Returns x0 as a signed 32-bit value; res[0..2] = x1..x3.
++ */
++int64_t blueline_scm_call(bool fast, uint32_t fnid, uint32_t arginfo, const uint64_t *args,
++    unsigned nargs, uint64_t res[3], unsigned *resumes);
++
++/*
++ * Physically contiguous, cache-maintained payload memory for buffer
++ * arguments (qcom_tzmem_alloc in Linux). Returns a zeroed area of len
++ * bytes (up to 4 KiB) and its physical address in *pa, or NULL. The area is
++ * cleaned to the point of coherency before, and invalidated after, every
++ * blueline_scm_call.
++ */
++void *blueline_scm_payload(size_t len, uint64_t *pa);
++
++/* INFO/IS_CALL_AVAIL (__qcom_scm_is_call_available): 1 yes, 0 no, -1 query failed. */
++int blueline_scm_is_call_avail(uint32_t svc, uint32_t cmd);
++
++const char *blueline_scm_err(int64_t rc);
++
++#endif /* _BLUELINE_SCM_H_ */
+diff --git a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+index 954eb8a..01558be 100644
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -43,20 +43,11 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "blueline_scm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void blueline_wifi_probe(void);
+ 
+-/* SMCCC function ids (qcom_scm-smc.c, ARM_SMCCC_CALL_VAL) */
+-#define SCM_FNID(svc, cmd)	((((uint32_t)(svc) & 0xffu) << 8) | ((uint32_t)(cmd) & 0xffu))
+-#define SCM_OWNER_SIP		(2u << 24)
+-#define SCM_SMC64		(1u << 30)
+-#define SCM_FAST		(1u << 31)
+-#define SCM_INTERRUPTED		1
+-#define SCM_WAITQ_SLEEP		2
+-#define SCM_MAX_RESUMES		1000
+-#define SCM_GAVE_UP		(-1000)
+-
+ #define SVC_BOOT		0x01
+ #define SVC_PIL			0x02
+ #define SVC_INFO		0x06
+@@ -97,59 +88,17 @@ rd(vm_offset_t a)
+ 	return v;
+ }
+ 
+-/*
+- * One SCM call with a single argument, results in res[0..2] (x1..x3).
+- * Standard (yielding) calls may come back INTERRUPTED; they are resumed as
+- * Linux does. WAITQ_SLEEP (newer TZ only) is reported, not handled.
+- */
++/* One SCM call with a single argument: the shared helper (blueline_scm.c). */
+ static int64_t
+ scm_call(bool fast, uint32_t fnid, uint64_t arginfo, uint64_t arg0, uint64_t res[3], unsigned *resumes)
+ {
+-	uint64_t id = (fast ? SCM_FAST : 0) | SCM_SMC64 | SCM_OWNER_SIP | fnid, a6 = 0;
+-
+-	*resumes = 0;
+-	res[0] = res[1] = res[2] = 0;
+-	for (unsigned i = 0; i <= SCM_MAX_RESUMES; i++) {
+-		register uint64_t x0 __asm__("x0") = id;
+-		register uint64_t x1 __asm__("x1") = arginfo;
+-		register uint64_t x2 __asm__("x2") = arg0;
+-		register uint64_t x3 __asm__("x3") = 0;
+-		register uint64_t x4 __asm__("x4") = 0;
+-		register uint64_t x5 __asm__("x5") = 0;
+-		register uint64_t x6 __asm__("x6") = a6;
+-		register uint64_t x7 __asm__("x7") = 0;
+-		__asm__ volatile ("smc #0"
+-		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+-		    :
+-		    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
+-		if (x0 == SCM_INTERRUPTED && !fast) {
+-			id = SCM_INTERRUPTED;
+-			a6 = x6;
+-			*resumes = i + 1;
+-			continue;
+-		}
+-		res[0] = x1;
+-		res[1] = x2;
+-		res[2] = x3;
+-		return (int64_t)(int32_t)x0;
+-	}
+-	return SCM_GAVE_UP;
++	return blueline_scm_call(fast, fnid, (uint32_t)arginfo, &arg0, 1, res, resumes);
+ }
+ 
+ static const char *
+ scm_err(int64_t rc)
+ {
+-	switch (rc) {
+-	case 0: return "ok";
+-	case SCM_WAITQ_SLEEP: return "WAITQ_SLEEP (not handled)";
+-	case -2: return "EINVAL_ARG";
+-	case -3: return "EINVAL_ADDR";
+-	case -4: return "EOPNOTSUPP";
+-	case -5: return "ENOMEM";
+-	case -12: return "EBUSY";
+-	case SCM_GAVE_UP: return "still INTERRUPTED, gave up";
+-	default: return "error";
+-	}
++	return blueline_scm_err(rc);
+ }
+ 
+ /* INFO/IS_CALL_AVAIL for (svc, cmd): 1 = available, 0 = not, -1 = the query failed. */
