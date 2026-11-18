@@ -1,5 +1,19 @@
 # pixel3-ios
 
+> **About this fork.** This is a fork of **[erikkunz/pixel3-ios](https://github.com/erikkunz/pixel3-ios)**. The
+> port, its design and nearly all of the work are by **Erik Kunz** ([@erikkunz](https://github.com/erikkunz)); the README below is his. The fork follows his
+> project on a second Pixel 3 and sends fixes back upstream:
+>
+> - [#3](https://github.com/erikkunz/pixel3-ios/pull/3): build the kernel locally on a Mac (`tools/build-xnu.sh`),
+>   since GitHub retired the `macos-14` runner
+> - [#2](https://github.com/erikkunz/pixel3-ios/issues/2) / [#4](https://github.com/erikkunz/pixel3-ios/pull/4):
+>   a freshly built iOS root stays at the Apple logo; let the first-boot migration run
+>
+> Work in progress (branch [`linux-host`](https://github.com/andyleenz/pixel3-ios/tree/linux-host), see its
+> [docs/LOG.md](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md)): screen off on lock, USB
+> diagnostics, and the first Adreno 630 GPU steps (the GMU boots its firmware). Please report problems with the
+> port itself upstream.
+
 **Apple's iOS 16 running on a Google Pixel 3.**
 
 A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) to the Pixel 3 (`blueline`, Qualcomm
