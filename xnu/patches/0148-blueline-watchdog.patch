@@ -1,0 +1,874 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 13:00:00 +1100
+Subject: [PATCH] 0148: blueline watchdog: a hung kernel resets itself into
+ recovery (bluewdt=N, bluewdt_mode=hw|sw|auto)
+
+bluewdt=N (off by default) arms the SDM845 APSS watchdog (watchdog@17980000,
+kpss layout: RST 0x4, EN 0x8, STS 0xc, BARK 0x10, BITE 0x14, 32768 Hz, 20
+bits so N <= 31 s): logged and the log written to UFS before the first
+read and the first write, registers logged as ABL left them, BITE = N s,
+BARK = max (after the bite, unused), writes read back and the counter must
+advance ~3277 ticks in 100 ms, else put back in reverse and (auto) the
+software watchdog is used instead. A TIMER_CALL_LOCAL callout on the boot
+CPU pets every second, only while a priority-80 thread (bluewdt_pri) ran
+within bluewdt_stall s (default N/3): dead interrupts and a wedged
+scheduler both stop the pets. First pet and every 60 s logged.
+
+sw (bluewdt_mode=sw, or auto fallback): the same callout and thread are
+heartbeats; a callout on the last CPU (bluewdt_cpu) resets when either is
+N s silent: IMEM restart_reason = recovery, lock-free log write
+(sweet_log_flush_emergency: takes the UFS host for that CPU, waits for a
+command in flight), PSCI SYSTEM_RESET.
+
+bluewdt_recovery=1: at arm time PON SOFT_RB_SPARE = 1 << 1 and IMEM
+0x146bf65c = 0x77665502 (as 0127 does at reboot), so every later reset,
+a bite included, goes to recovery.
+
+Panic: SavePanicInfo spins for ever here (no iBoot panic region); before
+that the ring is written to UFS without locks, then hw lets the bite come
+(bluewdt_panic=reset, sw, or half-armed hw: PSCI reset at once). The
+paniclog's unbuffered output (consdebug_putc_unbuffered, and consdebug_putc
+with console output disabled) now goes into the ring too (after ios-flame
+0098). bluereboot (0127): watchdog off right before its PSCI call, back on
+if PSCI returns.
+
+bluewdt_test=hang|sched|panic (bluewdt_test_after=S, default 20): interrupts
+off and spin on the timer CPU / a priority-95 spinner bound to every CPU /
+panic(), each after a synchronous log write.
+---
+diff --git a/bsd/dev/blueline_wdt.c b/bsd/dev/blueline_wdt.c
+new file mode 100644
+index 0000000..76d9e1b
+--- /dev/null
++++ b/bsd/dev/blueline_wdt.c
+@@ -0,0 +1,589 @@
++/*
++ * Pixel 3 (blueline) watchdog for the test loop (patch 0148): a hung
++ * kernel resets the phone by itself, and with slot B active that lands in
++ * LineageOS recovery, where tools/phonetest.sh pulls the log.
++ *
++ *   bluewdt=N              N seconds (off by default). hw: 2..31 (BITE_TIME
++ *                          is 20 bits of a 32768 Hz count), sw: 2..600
++ *   bluewdt_mode=auto      hw if the APSS watchdog takes our writes and
++ *                          counts, else sw (default); hw or sw to force one
++ *   bluewdt_recovery=1     at arm time, set the reboot reason to recovery the
++ *                          way 0127 does at reboot (PON SOFT_RB_SPARE 1 << 1
++ *                          and IMEM restart_reason 0x77665502), so a bite or
++ *                          any other reset goes to recovery (default 0)
++ *   bluewdt_stall=S        hw: the timer stops petting once the pet thread
++ *                          has not run for S s (default N / 3, at least 2)
++ *   bluewdt_pri=P          pet thread priority (default 80, the lowest
++ *                          kernel priority; 4 also catches user starvation)
++ *   bluewdt_cpu=C          sw: CPU of the checking timer (default the last)
++ *   bluewdt_panic=bite     on panic: write the log, then let the watchdog
++ *                          bite (default in hw); =reset: PSCI reset at once
++ *                          (always so in sw: the checker is halted then)
++ *   bluewdt_test=hang|sched|panic, bluewdt_test_after=S (default 20):
++ *                          hang = interrupts off and spin on the timer CPU,
++ *                          sched = a priority-95 spinner bound to every CPU
++ *                          (interrupts on, no thread below 95 runs),
++ *                          panic = panic(); each writes the log first
++ *
++ * hw: the SDM845 APSS watchdog (qcom,apss-wdt-sdm845 / qcom,kpss-wdt,
++ * watchdog@17980000; Linux qcom-wdt.c kpss layout, msm watchdog_v2.c WDT0_*):
++ * RST 0x04 (write 1 = pet), EN 0x08 (bit 0 enable, bit 1 unmasked bark
++ * interrupt), STS 0x0c (bit 0 expired, bits 20:1 count since the pet),
++ * BARK_TIME 0x10, BITE_TIME 0x14, in 32768 Hz ticks, 20 bits. The bite is
++ * handled by TZ, which resets the SoC. The bark (SPI 0) is not used:
++ * BARK_TIME is the maximum, after the bite. The block is read and logged
++ * before any write (each first access is logged and the log written to
++ * UFS first, so a faulting or hanging access names itself); writes are read
++ * back and the counter must advance, else auto falls back to sw.
++ *
++ * Petting: a timer callout (TIMER_CALL_LOCAL, interrupt context) on the boot
++ * CPU every second writes RST, but only while the pet thread (priority
++ * bluewdt_pri, also once a second) has run within bluewdt_stall s. Dead
++ * interrupts on that CPU stop the callout; a wedged scheduler stops the
++ * thread; either stops the pets. Nothing else pets.
++ *
++ * sw: the same callout and thread only record heartbeats; a second callout
++ * on bluewdt_cpu checks them every second and when either is N s old writes
++ * the console ring to UFS without locks (sweet_log_flush_emergency) and
++ * does 0127's reset: IMEM restart_reason = recovery, PSCI SYSTEM_RESET. It
++ * cannot take the PON (arbiter mutex) there; bluewdt_recovery=1 sets PON at
++ * arm time. sw cannot catch a hang that takes every CPU's interrupts.
++ *
++ * Panic (SavePanicInfo, osfmk/arm/model_dep.c): there is no iBoot panic
++ * region, so SavePanicInfo spins for ever. Before that, blueline_wdt_panic
++ * pets once, writes the ring to UFS, and in hw lets the bite come (<= N s);
++ * in sw, or with bluewdt_panic=reset, or when hw arming failed half-way,
++ * resets with PSCI itself.
++ *
++ * bluereboot (0127): the watchdog is switched off right before its PSCI
++ * call, and on again if PSCI returns.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/cpu_number.h>
++#include <kern/timer_call.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <machine/atomic.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <stdarg.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++extern void thread_deallocate(thread_t);
++extern processor_t thread_bind(processor_t);
++extern processor_t cpu_to_processor(int);
++extern int hz;
++/* bsd/dev/sweet_ufs.c */
++extern void sweet_log_append(const char *c, int size);
++extern int sweet_log_flush_now(void);
++extern int sweet_log_flush_emergency(void);
++/* bsd/dev/blueline_keys.c (0127) */
++extern int blueline_pon_set_reboot_reason(uint8_t reason, uint8_t *before, uint8_t *after);
++
++void blueline_wdt_start(void);
++void blueline_wdt_panic(void);
++void blueline_wdt_prepare_reset(const char *why);
++void blueline_wdt_suspend(void);
++void blueline_wdt_resume(void);
++
++#define WDT_PA                  0x17980000u     /* watchdog@17980000 */
++#define WDT_RST                 0x04u
++#define WDT_EN                  0x08u
++#define WDT_STS                 0x0cu
++#define WDT_BARK_TIME           0x10u
++#define WDT_BITE_TIME           0x14u
++#define WDT_HZ                  32768u
++#define WDT_MAX_TICKS           0xfffffu        /* 20 bits: 31.99 s */
++#define WDT_STS_COUNT(s)        (((s) >> 1) & 0xfffffu)
++
++#define BLUE_IMEM_PA            0x146bf000u     /* qcom,msm-imem@146bf000 */
++#define BLUE_IMEM_RESTART       0x65cu          /* restart_reason@65c */
++#define BLUE_IMEM_RECOVERY      0x77665502u
++#define PSCI_SYSTEM_RESET       0x84000009ull
++
++enum { BW_OFF, BW_HW, BW_SW };
++enum { BT_NONE, BT_HANG, BT_SCHED, BT_PANIC };
++
++static struct {
++	int mode;                               /* what runs */
++	bool wanted;                            /* bluewdt=N was given */
++	bool hw_touched;                        /* hw arming started (EN may be on) */
++	bool panic_reset;                       /* bluewdt_panic=reset */
++	uint32_t secs, stall, pri;
++	int pet_cpu, check_cpu;
++	int test;
++	uint32_t test_after;
++	vm_offset_t regs, imem;
++	uint64_t period_abs, secs_abs, stall_abs, t0;
++	timer_call_data_t pet_call, check_call;
++} bw;
++
++static uint64_t _Atomic bw_cb_beat, bw_thread_beat, bw_pets, bw_checks;
++static uint64_t _Atomic bw_first_pet;
++static bool _Atomic bw_suspended, bw_starved, bw_fired;
++static int bw_chan;
++
++static inline uint32_t
++wdt_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(bw.regs + off);
++}
++
++static inline void
++wdt_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(bw.regs + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint64_t
++bw_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static uint64_t
++bw_abs(uint64_t secs)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime(secs * NSEC_PER_SEC, &abs);
++	return abs;
++}
++
++/*
++ * Straight into the console ring (sweet_ufs.c), for interrupt and panic
++ * context: printf there only reaches the console's own buffer, which is
++ * drained later by threads that may never run again.
++ */
++static void __printflike(1, 2)
++bw_log_direct(const char *fmt, ...)
++{
++	char line[200];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		sweet_log_append(line, MIN(n, (int)sizeof(line) - 1));
++	}
++}
++
++static void
++bw_bind(int cpu)
++{
++	processor_t p = cpu_to_processor(cpu);
++	if (p != PROCESSOR_NULL) {
++		(void)thread_bind(p);
++		thread_block(THREAD_CONTINUE_NULL);     /* migrate to the bound core */
++	}
++}
++
++static void
++bw_sleep(uint32_t secs)
++{
++	(void)tsleep(&bw_chan, PZERO, "bluewdt", (int)secs * hz);
++}
++
++/* 0127's reset, without locks: IMEM cookie, log, PSCI. Returns only on failure. */
++static void
++bw_reset_now(const char *why)
++{
++	if (bw.imem) {
++		*(volatile uint32_t *)(bw.imem + BLUE_IMEM_RESTART) = BLUE_IMEM_RECOVERY;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	bw_log_direct("BLUELINE WDT: %s: IMEM restart_reason %s 0x%08x, log to UFS, PSCI SYSTEM_RESET (cpu %d)\n",
++	    why, bw.imem ? "=" : "unmapped", BLUE_IMEM_RECOVERY, cpu_number());
++	int error = sweet_log_flush_emergency();
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	__asm__ volatile ("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	bw_log_direct("BLUELINE WDT: did not reset (log write %d, PSCI %d)\n", error, (int)(int32_t)x0);
++}
++
++/* Interrupt context, on bw.pet_cpu, every second. */
++static void
++bw_pet_call(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
++{
++	uint64_t now = mach_absolute_time();
++
++	os_atomic_store(&bw_cb_beat, now, relaxed);
++	if (bw.mode == BW_HW && !os_atomic_load(&bw_suspended, relaxed)) {
++		uint64_t tb = os_atomic_load(&bw_thread_beat, relaxed);
++		if (now - tb <= bw.stall_abs) {
++			wdt_wr(WDT_RST, 1);
++			if (os_atomic_inc_orig(&bw_pets, relaxed) == 0) {
++				os_atomic_store(&bw_first_pet, now, relaxed);
++			}
++			os_atomic_store(&bw_starved, false, relaxed);
++		} else if (!os_atomic_xchg(&bw_starved, true, relaxed)) {
++			bw_log_direct("BLUELINE WDT: pet thread silent for %llu ms: no more pets, bite in <= %u s\n",
++			    bw_ms(now - tb), bw.secs);
++		}
++	}
++	timer_call_enter(&bw.pet_call, now + bw.period_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++}
++
++/* sw: interrupt context, on bw.check_cpu, every second. */
++static void
++bw_check_call(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
++{
++	uint64_t now = mach_absolute_time();
++
++	os_atomic_inc(&bw_checks, relaxed);
++	if (!os_atomic_load(&bw_suspended, relaxed)) {
++		uint64_t cb = now - os_atomic_load(&bw_cb_beat, relaxed);
++		uint64_t tb = now - os_atomic_load(&bw_thread_beat, relaxed);
++		if ((cb > bw.secs_abs || tb > bw.secs_abs) && !os_atomic_xchg(&bw_fired, true, relaxed)) {
++			bw_log_direct("BLUELINE WDT: software watchdog: timer on cpu%d silent %llu ms, pet thread %llu ms\n",
++			    bw.pet_cpu, bw_ms(cb), bw_ms(tb));
++			bw_reset_now("software watchdog");
++			return;
++		}
++	}
++	timer_call_enter(&bw.check_call, now + bw.period_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++}
++
++__dead2 static void
++bw_spin_thread(void *arg, __unused wait_result_t wr)
++{
++	bw_bind((int)(uintptr_t)arg);
++	for (;;) {
++		__asm__ volatile ("" ::: "memory");
++	}
++}
++
++static void
++bw_test_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bw_sleep(bw.test_after);
++	switch (bw.test) {
++	case BT_HANG:
++		bw_bind(bw.pet_cpu);
++		printf("BLUELINE WDT TEST: hang: interrupts off on cpu%d (the timer's), spinning; "
++		    "expect a reset within %u s\n", cpu_number(), bw.secs + 2);
++		(void)sweet_log_flush_now();
++		(void)ml_set_interrupts_enabled(FALSE);
++		for (;;) {
++			__asm__ volatile ("" ::: "memory");
++		}
++	case BT_SCHED: {
++		unsigned n = ml_get_cpu_count();
++		printf("BLUELINE WDT TEST: sched: a priority-95 spinner on each of %u CPUs; "
++		    "expect a reset within %u s\n", n, bw.mode == BW_HW ? bw.stall + bw.secs + 2 : bw.secs + 2);
++		(void)sweet_log_flush_now();
++		for (unsigned c = 0; c < n; c++) {
++			thread_t t;
++			if (kernel_thread_start_priority(bw_spin_thread, (void *)(uintptr_t)c, 95, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++			}
++		}
++		return;
++	}
++	case BT_PANIC:
++		printf("BLUELINE WDT TEST: panic on purpose\n");
++		(void)sweet_log_flush_now();
++		panic("BLUELINE WDT TEST: bluewdt_test=panic");
++	default:
++		return;
++	}
++}
++
++__dead2 static void
++bw_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	/* Arm the timer callouts on their CPUs: TIMER_CALL_LOCAL keeps them there. */
++	os_atomic_store(&bw_thread_beat, mach_absolute_time(), relaxed);
++	os_atomic_store(&bw_cb_beat, mach_absolute_time(), relaxed);
++	processor_t prev = PROCESSOR_NULL;
++	if (cpu_to_processor(bw.pet_cpu) != PROCESSOR_NULL) {
++		prev = thread_bind(cpu_to_processor(bw.pet_cpu));
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	int pet_on = cpu_number();
++	timer_call_enter(&bw.pet_call, mach_absolute_time() + bw.period_abs / 4,
++	    TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++	int check_on = -1;
++	if (bw.mode == BW_SW) {
++		bw_bind(bw.check_cpu);
++		check_on = cpu_number();
++		timer_call_enter(&bw.check_call, mach_absolute_time() + bw.period_abs,
++		    TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++	}
++	(void)thread_bind(prev);
++	thread_block(THREAD_CONTINUE_NULL);
++	if (check_on >= 0) {
++		printf("BLUELINE WDT: sw: timer on cpu%d, checker on cpu%d%s, pet thread priority %u\n",
++		    pet_on, check_on, check_on == pet_on ? " (same CPU: an interrupts-off hang there is missed)" : "",
++		    bw.pri);
++	} else {
++		printf("BLUELINE WDT: hw: timer on cpu%d, pet thread priority %u\n", pet_on, bw.pri);
++	}
++
++	bool first = false;
++	uint64_t next_report = mach_absolute_time() + bw_abs(60);
++	for (;;) {
++		uint64_t now = mach_absolute_time();
++		os_atomic_store(&bw_thread_beat, now, relaxed);
++		if (bw.mode == BW_HW && !first && os_atomic_load(&bw_pets, relaxed) != 0) {
++			first = true;
++			printf("BLUELINE WDT: first pet at %llu ms after arming (STS 0x%x)\n",
++			    bw_ms(os_atomic_load(&bw_first_pet, relaxed) - bw.t0), wdt_rd(WDT_STS));
++		}
++		if (now >= next_report) {
++			next_report += bw_abs(60);
++			uint64_t cb = now - os_atomic_load(&bw_cb_beat, relaxed);
++			if (bw.mode == BW_HW) {
++				uint32_t sts = wdt_rd(WDT_STS);
++				printf("BLUELINE WDT: hw alive %llu s: %llu pets, timer %llu ms ago, count %u ticks "
++				    "(%u ms) since the pet, EN 0x%x%s\n", bw_ms(now - bw.t0) / 1000,
++				    os_atomic_load(&bw_pets, relaxed), bw_ms(cb), WDT_STS_COUNT(sts),
++				    WDT_STS_COUNT(sts) * 1000u / WDT_HZ, wdt_rd(WDT_EN),
++				    os_atomic_load(&bw_suspended, relaxed) ? " (suspended)" : "");
++			} else {
++				printf("BLUELINE WDT: sw alive %llu s: %llu checks, timer %llu ms ago\n",
++				    bw_ms(now - bw.t0) / 1000, os_atomic_load(&bw_checks, relaxed), bw_ms(cb));
++			}
++		}
++		bw_sleep(1);
++	}
++}
++
++/*
++ * Try the APSS watchdog. Every first access is logged and the log written
++ * to UFS before it. On failure the registers are put back in reverse.
++ */
++static bool
++bw_hw_arm(void)
++{
++	printf("BLUELINE WDT: about to map and read the APSS watchdog at 0x%x (EN, STS, BARK, BITE)\n", WDT_PA);
++	(void)sweet_log_flush_now();
++	bw.regs = ml_io_map(WDT_PA, 0x1000);
++	if (!bw.regs) {
++		printf("BLUELINE WDT: mapping failed\n");
++		return false;
++	}
++	uint32_t en0 = wdt_rd(WDT_EN), sts0 = wdt_rd(WDT_STS);
++	uint32_t bark0 = wdt_rd(WDT_BARK_TIME), bite0 = wdt_rd(WDT_BITE_TIME);
++	printf("BLUELINE WDT: as ABL left it: EN 0x%x (%s), STS 0x%x (expired bit %u, count %u = %u ms), "
++	    "BARK 0x%x (%u ms), BITE 0x%x (%u ms)\n", en0, (en0 & 1) ? "running" : "off", sts0, sts0 & 1u,
++	    WDT_STS_COUNT(sts0), WDT_STS_COUNT(sts0) * 1000u / WDT_HZ, bark0, bark0 * 1000u / WDT_HZ,
++	    bite0, bite0 * 1000u / WDT_HZ);
++
++	uint32_t ticks = bw.secs * WDT_HZ;
++	printf("BLUELINE WDT: about to write it: EN 0, pet, BARK 0x%x, BITE 0x%x, EN 1\n", WDT_MAX_TICKS, ticks);
++	(void)sweet_log_flush_now();
++	bw.hw_touched = true;
++	wdt_wr(WDT_EN, 0);
++	wdt_wr(WDT_RST, 1);
++	wdt_wr(WDT_BARK_TIME, WDT_MAX_TICKS);   /* after the bite: never seen */
++	wdt_wr(WDT_BITE_TIME, ticks);
++	uint32_t bark = wdt_rd(WDT_BARK_TIME), bite = wdt_rd(WDT_BITE_TIME);
++	const char *why = NULL;
++	uint32_t en = 0, c0 = 0, c1 = 0;
++	if (bark != WDT_MAX_TICKS || bite != ticks) {
++		why = "BARK/BITE writes ignored (secure-only?)";
++	} else {
++		wdt_wr(WDT_EN, 1);
++		en = wdt_rd(WDT_EN);
++		c0 = WDT_STS_COUNT(wdt_rd(WDT_STS));
++		delay(100 * 1000);
++		c1 = WDT_STS_COUNT(wdt_rd(WDT_STS));
++		wdt_wr(WDT_RST, 1);
++		if (!(en & 1)) {
++			why = "EN write ignored";
++		} else if (c1 <= c0 || c1 - c0 < 1000 || c1 - c0 > 10000) {
++			why = "counter does not advance ~3277 ticks in 100 ms";
++		}
++	}
++	if (why) {
++		/* undo, in reverse */
++		wdt_wr(WDT_EN, 0);
++		wdt_wr(WDT_BITE_TIME, bite0);
++		wdt_wr(WDT_BARK_TIME, bark0);
++		wdt_wr(WDT_RST, 1);
++		wdt_wr(WDT_EN, en0);
++		bw.hw_touched = (wdt_rd(WDT_EN) & 1) != 0;
++		printf("BLUELINE WDT: hw unusable: %s (BARK 0x%x BITE 0x%x EN 0x%x, count %u -> %u); "
++		    "registers put back, EN now 0x%x\n", why, bark, bite, en, c0, c1, wdt_rd(WDT_EN));
++		return false;
++	}
++	printf("BLUELINE WDT: hw armed: bite after %u s without a pet (BITE 0x%x, BARK 0x%x unused), "
++	    "count %u -> %u in 100 ms; pets only while the pet thread ran within %u s\n",
++	    bw.secs, bite, bark, c0, c1, bw.stall);
++	return true;
++}
++
++void
++blueline_wdt_start(void)
++{
++	char mode[8] = "auto", test[8] = "", panicm[8] = "bite";
++	uint32_t recovery = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("bluewdt", &bw.secs, sizeof(bw.secs)) || bw.secs == 0) {
++		return;
++	}
++	bw.wanted = true;
++	(void)PE_parse_boot_arg_str("bluewdt_mode", mode, sizeof(mode));
++	(void)PE_parse_boot_arg_str("bluewdt_test", test, sizeof(test));
++	(void)PE_parse_boot_arg_str("bluewdt_panic", panicm, sizeof(panicm));
++	(void)PE_parse_boot_argn("bluewdt_recovery", &recovery, sizeof(recovery));
++	bw.test_after = 20;
++	(void)PE_parse_boot_argn("bluewdt_test_after", &bw.test_after, sizeof(bw.test_after));
++	bw.pri = 80;
++	(void)PE_parse_boot_argn("bluewdt_pri", &bw.pri, sizeof(bw.pri));
++	bw.pri = MAX(1u, MIN(bw.pri, 95u));
++	unsigned ncpu = ml_get_cpu_count();
++	bw.pet_cpu = ml_get_boot_cpu_number();
++	bw.check_cpu = (int)ncpu - 1;
++	(void)PE_parse_boot_argn("bluewdt_cpu", &bw.check_cpu, sizeof(bw.check_cpu));
++	if (bw.check_cpu < 0 || (unsigned)bw.check_cpu >= ncpu) {
++		bw.check_cpu = (int)ncpu - 1;
++	}
++	bw.panic_reset = !strcmp(panicm, "reset");
++	bw.test = !strcmp(test, "hang") ? BT_HANG : !strcmp(test, "sched") ? BT_SCHED :
++	    !strcmp(test, "panic") ? BT_PANIC : BT_NONE;
++
++	bool try_hw = strcmp(mode, "sw") != 0, allow_sw = strcmp(mode, "hw") != 0;
++	if (strcmp(mode, "hw") && strcmp(mode, "sw") && strcmp(mode, "auto")) {
++		printf("BLUELINE WDT: bluewdt_mode=%s is not hw|sw|auto; using auto\n", mode);
++	}
++	printf("BLUELINE WDT: bluewdt=%u mode %s%s%s%s\n", bw.secs, mode,
++	    recovery ? ", reason recovery from now" : "", bw.test ? ", test " : "", bw.test ? test : "");
++
++	bw.imem = ml_io_map(BLUE_IMEM_PA, 0x1000);
++	if (recovery) {
++		uint8_t before = 0, after = 0;
++		int pon = blueline_pon_set_reboot_reason(1, &before, &after);
++		if (bw.imem) {
++			*(volatile uint32_t *)(bw.imem + BLUE_IMEM_RESTART) = BLUE_IMEM_RECOVERY;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		printf("BLUELINE WDT: reboot reason recovery now: PON SOFT_RB_SPARE 0x%02x -> 0x%02x (%d), "
++		    "IMEM restart_reason %s 0x%08x; every reset from here goes to recovery\n",
++		    before, after, pon, bw.imem ? "=" : "unmapped", BLUE_IMEM_RECOVERY);
++	}
++
++	bw.stall = MAX(2u, bw.secs / 3);
++	(void)PE_parse_boot_argn("bluewdt_stall", &bw.stall, sizeof(bw.stall));
++	bw.period_abs = bw_abs(1);
++	timer_call_setup(&bw.pet_call, bw_pet_call, NULL);
++	timer_call_setup(&bw.check_call, bw_check_call, NULL);
++
++	uint32_t asked = bw.secs;
++	if (try_hw) {
++		bw.secs = MAX(2u, MIN(bw.secs, WDT_MAX_TICKS / WDT_HZ));
++		if (bw.secs != asked) {
++			printf("BLUELINE WDT: hw bite time %u s -> %u s (2..31)\n", asked, bw.secs);
++		}
++		bw.stall = MAX(1u, MIN(bw.stall, bw.secs - 1));
++		/* The thread's beat must be fresh before EN goes on. */
++		os_atomic_store(&bw_thread_beat, mach_absolute_time(), relaxed);
++		if (bw_hw_arm()) {
++			bw.mode = BW_HW;
++		}
++	}
++	if (bw.mode == BW_OFF && allow_sw) {
++		bw.secs = MAX(2u, MIN(asked, 600u));
++		bw.mode = BW_SW;
++		printf("BLUELINE WDT: sw: reset when the timer on cpu%d or the pet thread is silent %u s\n",
++		    bw.pet_cpu, bw.secs);
++	}
++	if (bw.mode == BW_OFF) {
++		printf("BLUELINE WDT: off (hw unusable, bluewdt_mode=hw)\n");
++		return;
++	}
++	bw.secs_abs = bw_abs(bw.secs);
++	bw.stall_abs = bw_abs(bw.stall);
++	bw.t0 = mach_absolute_time();
++	if (kernel_thread_start_priority(bw_thread, NULL, (integer_t)bw.pri, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("BLUELINE WDT: no pet thread: %s\n", bw.mode == BW_HW ? "the watchdog will bite" : "off");
++	}
++	if (bw.test && kernel_thread_start(bw_test_thread, NULL, &thread) == KERN_SUCCESS) {
++		printf("BLUELINE WDT TEST: %s in %u s\n", test, bw.test_after);
++		thread_deallocate(thread);
++	}
++}
++
++/*
++ * From SavePanicInfo, interrupts off, the other CPUs halted. Writes the
++ * console ring to UFS, then lets the hw watchdog bite or resets now.
++ */
++void
++blueline_wdt_panic(void)
++{
++	static bool once;
++
++	if (!bw.wanted || once) {
++		return;
++	}
++	once = true;
++	bool bite = bw.mode == BW_HW && !bw.panic_reset && !os_atomic_load(&bw_suspended, relaxed);
++	if (bw.mode == BW_HW) {
++		wdt_wr(WDT_RST, 1);                     /* a whole period for the log write */
++	}
++	bw_log_direct("BLUELINE WDT: panic on cpu%d: writing the log to UFS, then %s\n", cpu_number(),
++	    bite ? "the watchdog bites" : "PSCI reset");
++	int error = sweet_log_flush_emergency();
++	if (bite) {
++		bw_log_direct("BLUELINE WDT: panic log written (%d); bite in <= %u s\n", error, bw.secs);
++		(void)sweet_log_flush_emergency();
++		return;
++	}
++	if (bw.hw_touched && bw.mode != BW_HW && bw.regs) {
++		wdt_wr(WDT_RST, 1);                     /* half-armed hw: keep it out of the reset path */
++	}
++	bw_reset_now("panic");
++}
++
++/* bluereboot (0127): one line before its log write, then off right before PSCI. */
++void
++blueline_wdt_prepare_reset(const char *why)
++{
++	if (bw.mode != BW_OFF) {
++		printf("BLUELINE WDT: %s: watchdog off right before the PSCI reset\n", why);
++	}
++}
++
++void
++blueline_wdt_suspend(void)
++{
++	if (bw.mode == BW_OFF) {
++		return;
++	}
++	os_atomic_store(&bw_suspended, true, relaxed);
++	if (bw.mode == BW_HW) {
++		wdt_wr(WDT_EN, 0);
++	}
++}
++
++void
++blueline_wdt_resume(void)
++{
++	if (bw.mode == BW_OFF) {
++		return;
++	}
++	os_atomic_store(&bw_thread_beat, mach_absolute_time(), relaxed);
++	os_atomic_store(&bw_cb_beat, mach_absolute_time(), relaxed);
++	if (bw.mode == BW_HW) {
++		wdt_wr(WDT_RST, 1);
++		wdt_wr(WDT_EN, 1);
++	}
++	os_atomic_store(&bw_suspended, false, relaxed);
++	printf("BLUELINE WDT: back on (EN 0x%x)\n", bw.mode == BW_HW ? wdt_rd(WDT_EN) : 0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cda7d19..dfc34cb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/blueline_keys.c			standard
+ bsd/dev/blueline_touch.c		standard
+ bsd/dev/blueline_cpufreq.c		standard
+ bsd/dev/blueline_scm.c			standard
++bsd/dev/blueline_wdt.c			standard
+ bsd/dev/blueline_wifi.c			standard
+ bsd/dev/blueline_gpu.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5ae1d81..e7cebb4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -32,6 +32,7 @@
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
++#include <kern/cpu_number.h>
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+@@ -61,6 +62,11 @@ static void bluereboot_after_gpu(void);
+ static void blue_when_init(void);
+ static void bluesnap_arm(void);
+ extern void blueline_touchscript_start(void);
++/* bsd/dev/blueline_wdt.c (patch 0148) */
++extern void blueline_wdt_start(void);
++extern void blueline_wdt_prepare_reset(const char *why);
++extern void blueline_wdt_suspend(void);
++extern void blueline_wdt_resume(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -139,12 +145,33 @@ dma_sync(uint32_t off, uint32_t len)
+ 	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++/*
++ * Emergency owner (patch 0148): once sweet_log_flush_emergency() has taken
++ * the host for a last log write (panic, software watchdog), only that CPU
++ * may issue commands; everyone else gets EIO. ufs_busy counts commands in
++ * flight, so it can wait for one to finish (seq_cst on both sides).
++ */
++static int _Atomic ufs_emergency_cpu = -1;
++static uint32_t _Atomic ufs_busy;
++
++static int ufs_scsi_cmd(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write);
++
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	os_atomic_inc(&ufs_busy, seq_cst);
++	int owner = os_atomic_load(&ufs_emergency_cpu, seq_cst);
++	int error = (owner >= 0 && owner != cpu_number()) ? EIO : ufs_scsi_cmd(cdb, cdb_len, len, write);
++	os_atomic_dec(&ufs_busy, seq_cst);
++	return error;
++}
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_cmd(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -612,6 +639,8 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	/* bluewdt= (patch 0148): hardware or software watchdog, off by default. */
++	blueline_wdt_start();
+ 	blue_when_init();
+ 	bluesnap_arm();
+ 	bluereboot_arm();
+@@ -778,6 +807,59 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/* Write the ring to UFS now, from a thread (patch 0148: before risky accesses). */
++int sweet_log_flush_now(void);
++
++int
++sweet_log_flush_now(void)
++{
++	if (!sweet_log_running) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = sweet_log_running ? sweet_log_write_locked() : ENXIO;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++/*
++ * Last log write before a reset (patch 0148), from panic or interrupt
++ * context: no mutex. Takes the host for this CPU for good (other CPUs'
++ * commands fail from now on), waits up to 2 s for a command in flight,
++ * then up to 5 s for slot 0's doorbell (its issuer halted mid-command),
++ * clears it if still set, and writes. Nothing else may use the UFS after
++ * this: the caller resets, or waits for the watchdog to.
++ */
++int sweet_log_flush_emergency(void);
++
++int
++sweet_log_flush_emergency(void)
++{
++	int me = cpu_number(), owner = -1;
++
++	if (!sweet_log_running || !su.ready) {
++		return ENXIO;
++	}
++	if (!os_atomic_cmpxchgv(&ufs_emergency_cpu, -1, me, &owner, seq_cst) && owner != me) {
++		return EBUSY;
++	}
++	uint64_t t, deadline;
++	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &t);
++	deadline = mach_absolute_time() + t;
++	while (os_atomic_load(&ufs_busy, seq_cst) != 0 && mach_absolute_time() < deadline) {
++	}
++	if (os_atomic_load(&ufs_busy, seq_cst) != 0) {
++		nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &t);
++		deadline = mach_absolute_time() + t;
++		while ((ufs_rd(REG_UTRLDBR) & 1) && mach_absolute_time() < deadline) {
++		}
++		if (ufs_rd(REG_UTRLDBR) & 1) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++		}
++	}
++	return sweet_log_write_locked();
++}
++
+ static void
+ sweet_log_start(void)
+ {
+@@ -1349,14 +1431,18 @@ bluereboot_fire(const char *why)
+ 	    why, bluereboot_target(), before, after, pon, imem ? "=" : "unmapped", cookie,
+ 	    sweet_log_running ? "flushing" : "not on UFS");
+ 
++	blueline_wdt_prepare_reset("bluereboot");
++
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	int error = sweet_log_running ? sweet_log_write_locked() : 0;
+ 	if (!error) {
++		blueline_wdt_suspend();         /* patch 0148: off right before the reset */
+ 		register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
+ 		__asm__ volatile ("smc #0" : "+r"(x0) : :
+ 		    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+ 		    "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
+ 		error = (int)(int32_t)x0;
++		blueline_wdt_resume();
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	/* Only on failure: carry on booting rather than poke PS_HOLD. */
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 39daaf8..7118e40 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -800,10 +800,21 @@ panic_print_symbol_name(vm_address_t search)
+ 	return;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* bsd/dev/blueline_wdt.c (patch 0148, bluewdt=): log to UFS, then reset or bite */
++extern void blueline_wdt_panic(void);
++#endif
++
+ void
+ SavePanicInfo(
+ 	const char *message, __unused void *panic_data, uint64_t panic_options)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* No iBoot panic region here (gPanicBase is 0): the loop below never ends. */
++	if (!panic_info || panic_info->eph_panic_log_offset == 0) {
++		blueline_wdt_panic();
++	}
++#endif
+ 	/*
+ 	 * This should be initialized by the time we get here, but
+ 	 * if it is not, asserting about it will be of no use (it will
+@@ -856,6 +867,9 @@ SavePanicInfo(
+ 	panic_info->eph_other_log_len = PE_get_offset_into_panic_region(debug_buf_ptr) - panic_info->eph_other_log_offset;
+ 
+ 	PEHaltRestart(kPEPanicSync);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	blueline_wdt_panic();
++#endif
+ 
+ 	/*
+ 	 * Notifies registered IOPlatformPanicAction callbacks
+diff --git a/osfmk/kern/printf.c b/osfmk/kern/printf.c
+index e44008f..9ebcbb3 100644
+--- a/osfmk/kern/printf.c
++++ b/osfmk/kern/printf.c
+@@ -908,12 +908,28 @@ vprintf(const char *fmt, va_list ap)
+ 	return vprintf_internal(fmt, ap, __builtin_return_address(0));
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * The paniclog ("panic(cpu N caller ...)", backtraces) goes out unbuffered
++ * (_cnputc), or not at all while console output is disabled, past the
++ * persistent log ring in _cnputs: put it in the ring too (bsd/dev/
++ * sweet_ufs.c, lock-free), so bluewdt's panic write keeps it (patch 0148,
++ * after ios-flame 0098).
++ */
++extern void sweet_log_append(const char *c, int size);
++#endif
++
+ void
+ consdebug_putc(char c)
+ {
+ 	if (!disableConsoleOutput) {
+ 		console_write_char(c);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	else {
++		sweet_log_append(&c, 1);
++	}
++#endif
+ 
+ 	debug_putc(c);
+ 
+@@ -928,6 +944,9 @@ consdebug_putc_unbuffered(char c)
+ 	if (!disableConsoleOutput) {
+ 		console_write_unbuffered(c);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_log_append(&c, 1);
++#endif
+ 
+ 	debug_putc(c);
+ 
+-- 
+2.54.0 (Apple Git-157)

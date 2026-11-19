@@ -1,0 +1,1117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 20:00:00 +1100
+Subject: [PATCH] 0147: blueline GPU: resident GPU, presents by the 2D engine
+ (bluegpu=8)
+
+Stage 6a of pixel3-ios-gpu/gpu-stage6-plan.md. bluegpu=7 proved the chain
+(stages 1-4, zap, CP_SET_SECURE_MODE 0) and CP_BLIT fills on the panel
+with 0 wrong pixels (zap1). bluegpu=8 runs that chain on a kernel thread
+after the UFS probe, stops after the 2D setup (no test rectangles) and
+undoes nothing: CX, GMU, cb0/cb1, GX with OOB GPU_SET, the DCVS level
+(bluegpu_perf, default 1 = 257 MHz), the DDR vote (bluegpu_bw now
+defaults to 1 at 8) and the CP stay up. Any failure before that: the
+normal full undo, CPU presents for the boot.
+
+AppleCLCD's fit path asks blue_gpu_present() first (one hunk in
+SweetFramebuffer.cpp; BlueGPUPresent.cpp turns the SweetSurface into
+numbers and retains surfaces the GPU has mapped). Per full-screen BGRA
+layer: wait for the previous blit's fence (only when it is not done yet;
+500 ms guard from its submit, then: state dump, panel unmapped from cb0,
+GPU presents off for the boot, logged once), the surface's 4K pages into
+one of 4 slots (L1[1], 0x40000000 + n * 16M, read-only, LRU, cached by
+surface), D-cache clean to PoC over the rows read, then in the ring (now
+a circle): CCU/UCHE invalidate, border colour bases on zeroed memory,
+CP_ALWAYS_ON, two black bars (0138 fills), a scaled copy
+1125x2436 -> 997x2160 at x 41 (bilinear, TPL1 FILTER) in two passes (even
+/ odd panel rows, 0138's split for the 4320 stride; the odd pass's source
+window 0x120 (24.8) lower), CCU flush TS, CACHE_FLUSH_TS, WFI,
+CP_ALWAYS_ON, CP_MEM_WRITE seq. WPTR written, no wait. Not full-screen,
+other format, another panel buffer: CPU copy as before (after any blit in
+flight completes).
+
+First GPU present: waited for, then 512 pixels against CPU bilinear and
+nearest models (16.16 fixed point) plus 64 bar pixels; grossly wrong (both
+models > 50 % off) turns GPU presents off. Every 5 s (on presents):
+"BLUELINE GPU: present 5s: ..." with blits, CPU copies by reason, waits,
+slot maps, clean / CPU / GPU blit time, submit-to-done.
+
+Boot-args: bluegpu=8, bluegpu_present=1 (0: resident, CPU presents),
+bluegpu_present_filter=1 (0 nearest), bluegpu_present_yofs=-1 (auto =
+h * 256 / panel h; or 0..0x400), bluegpu_present_check=1,
+bluegpu_present_hang_ms=500. Everything of bluegpu=7 (bluegpu_zap,
+bluegpu_secvid, bluegpu_perf, bluegpu_bw, bluegpu_cp_ms ...) still applies.
+
+---
+  bsd/dev/blueline_gpu.c                |  836 +++++++++++++++++++++++++++++++++-
+  iokit/Kernel/arm/BlueGPUPresent.cpp   |   95 +++
+  iokit/Kernel/arm/SweetFramebuffer.cpp |    8 
+  iokit/conf/files.arm64                |    1 
+  4 files changed, 927 insertions(+), 13 deletions(-)
+
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -288,6 +288,45 @@
+  *  be XPU-protected (Linux: "a permissions violation will soon follow"),
+  *  so it is not read before or after. Nothing here can be undone: the zap
+  *  stays authenticated until the next reset; PAS shutdown is never called.
++ *
++ * Resident GPU and the present blit (0147, bluegpu=8): bluegpu=7's path
++ * (stages 1-4, zap) in a kernel thread, so boot does not wait, with the
++ * draw stage's 2D setup but no test rectangles; on success nothing is
++ * undone (CX, GMU, cb0/cb1, GX, OOB GPU_SET, the DCVS level, the CP and its
++ * memory stay up; bluegpu_bw defaults to 1 here) and the display's present
++ * (SweetFramebuffer.cpp -> BlueGPUPresent.cpp -> blue_gpu_present_c) uses
++ * the 2D engine instead of the CPU fit copy. Any failure before that: the
++ * full undo as at 7, CPU presents for the boot.
++ *  GPU VA: the CP's 64K at 0x01000000 and the panel (dr_fb_map, 2M blocks
++ *  at 0x02000000) as at 7; L1[1] gets an L2 table and 32 L3 tables (one
++ *  contiguous Normal NC arena, like the CP memory) for 4 surface slots at
++ *  0x40000000 + n * 16M. A slot holds a retained SweetSurface (so its pages
++ *  cannot be freed while mapped) and maps its kernel pages (pmap_find_phys,
++ *  4K read-only PTEs, Normal NC); least recently used slot replaced, only
++ *  with no blit in flight, then cb0's TLB invalidated.
++ *  Per present (one full-screen BGRA layer, element 1x1, bytesPerRow a
++ *  multiple of 64): the previous blit's fence (bounded by
++ *  bluegpu_present_hang_ms, default 500; else "present hang": state dumped,
++ *  the panel unmapped from cb0, GPU presents off for the boot); a D-cache
++ *  clean to PoC over the rows read (CleanPoC_DcacheRegion_Force); then into
++ *  the ring (now used as a circle): CCU colour invalidate, CACHE_INVALIDATE,
++ *  CP_REG_TO_MEM of CP_ALWAYS_ON, the two black bars (0138 fills), the
++ *  scaled blit as Mesa fd6 emit_blit_texture / ios-flame a6_blit_ib (RB/
++ *  GRAS_A2D_BLT_CNTL not solid, GRAS_A2D_SRC_XMIN..YMAX 24.8 inclusive,
++ *  TPL1_A2D_SRC_TEXTURE_INFO 0x500430 | FILTER with bluegpu_present_filter=1
++ *  (default; 0 nearest), SIZE, BASE, PITCH, FLAG 0), in 0138's two passes
++ *  for the panel's 4320 stride (even rows at base, odd rows at base + 4288
++ *  with x + 8, pitch 8640): the odd pass's source window moved down by one
++ *  panel row of source (bluegpu_present_yofs, default h * 256 / panel_h =
++ *  0x121); then CCU colour flush TS, CACHE_FLUSH_TS (seq), WFI, ALWAYS_ON
++ *  again and a CP_MEM_WRITE of seq: the fence. WPTR written, no wait.
++ *  Self-check (bluegpu_present_check=N, default 1 = the first GPU present):
++ *  wait for that fence, then 512 pseudo-random pixels of the fit against a
++ *  CPU bilinear (and a nearest) model of the source, tolerance 4 per
++ *  channel, and 64 bar pixels black; grossly wrong turns GPU presents off.
++ *  Stats every 5 s: GPU/CPU presents (why), waits, slot maps, clean, CPU
++ *  time per present, GPU blit time and submit-to-done (CP_ALWAYS_ON).
++ *  bluegpu_present=0: resident, CPU presents (bring-up test only).
+  *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+@@ -381,6 +420,8 @@
+ #include <pexpert/device_tree.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <arm/caches_internal.h>	/* CleanPoC_DcacheRegion_Force (0147) */
++#include <kern/thread.h>		/* kernel_thread_start (0147) */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);	/* osfmk/arm64/machine_routines.c */
+@@ -1664,6 +1705,7 @@
+ 	uint32_t gdscr_was, misc_was, spt_ctl_was;
+ 	vm_offset_t core;
+ } gx;
++static bool gx_resident;	/* 0147, bluegpu=8: bluegpu_bw defaults to 1 */
+ 
+ /* cmd-db aux levels of an ARC resource (u16 each, trailing zeros dropped, as a6xx_gmu_rpmh_read_arc). */
+ static int
+@@ -1742,6 +1784,7 @@
+ 	gx.ms = 100;
+ 	gx.hfi_ms = 200;
+ 	gx.rpmh_stop = 1;
++	gx.bw = gx_resident ? 1 : 0;
+ 	(void)PE_parse_boot_argn("bluegpu_gx_dry", &dry, sizeof(dry));
+ 	(void)PE_parse_boot_argn("bluegpu_gx_step", &gx.step, sizeof(gx.step));
+ 	(void)PE_parse_boot_argn("bluegpu_perf", &gx.perf, sizeof(gx.perf));
+@@ -2220,6 +2263,7 @@
+ 	uint64_t pa;
+ 	int smr, su_mark;
+ 	bool routed, hw_init, started, wedged;
++	bool wrap;		/* 0147 resident: the ring is used as a circle (wptr counts up, index mod size) */
+ 	uint32_t wptr;
+ } cp;
+ 
+@@ -2263,7 +2307,9 @@
+ static void
+ cp_put(uint32_t v)
+ {
+-	if (cp.wptr < CP_RING_DWORDS) {
++	if (cp.wrap) {
++		cp_mem(CP_RING_OFF)[cp.wptr++ & (CP_RING_DWORDS - 1)] = v;
++	} else if (cp.wptr < CP_RING_DWORDS) {
+ 		cp_mem(CP_RING_OFF)[cp.wptr++] = v;
+ 	}
+ }
+@@ -3889,8 +3935,728 @@
+ 	}
+ 	cp_smmu_faults("after draw");
+ 	printf("BLUELINE GPU: draw stage %s (step %d, ring %u of %u dwords)\n", res, dr.step, cp.wptr, CP_RING_DWORDS);
++}
++
++/*
++ * Resident GPU and the present blit (0147, bluegpu=8): see the top of the
++ * file. Everything below runs on the bring-up thread until rs.ready is
++ * published, then only on the display's vsync thread (one caller).
++ */
++#define CP_REG_TO_MEM		0x3eu
++#define REG_TO_MEM_CNT(n)	((uint32_t)(n) << 18)
++#define REG_TO_MEM_64B		(1u << 30)
++#define R_TPL1_CS_BORDER_COLOR_BASE 0xb180u
++#define R_TPL1_GFX_BORDER_COLOR_BASE 0xb302u
++#define R_GRAS_A2D_SRC_XMIN	0x8401u		/* XMIN, XMAX, YMIN, YMAX: 24.8, inclusive */
++#define R_TPL1_A2D_SRC_TEXTURE	0xb4c0u		/* INFO, SIZE, BASE lo/hi, PITCH */
++#define R_TPL1_A2D_SRC_FLAG	0xb4cau		/* FLAG_BASE lo/hi, FLAG_PITCH */
++/* RB/GRAS_A2D_BLT_CNTL not solid: COLOR_FORMAT 8888 | MASK 0xf (flame a6_blit_ib 0x00f03000) */
++#define A2D_BLT_CNTL_COPY	((FMT6_8888_UNORM << 8) | (0xfu << 20))
++/* TPL1_A2D_SRC_TEXTURE_INFO: 8888, linear tiles, WXYZ, UNK20 | UNK22 (fd6 / turnip r2d_src); FILTER b16 */
++#define A2D_SRC_INFO_VAL	(FMT6_8888_UNORM | (SWAP_WXYZ << 10) | (1u << 20) | (1u << 22))
++#define A2D_SRC_FILTER		(1u << 16)
++
++#define RS_SLOTS		4u
++#define RS_SLOT_VA(n)		(0x40000000u + (uint32_t)(n) * 0x1000000u)	/* L1[1]: 0x40000000.. */
++#define RS_SLOT_MAX		0x1000000u	/* 16M: 8 L3 tables */
++#define RS_L3_PER_SLOT		(RS_SLOT_MAX >> 21)
++#define RS_ARENA_SIZE		0x24000u	/* L2 + 32 L3 tables, rounded to 16K pages */
++#define RS_SEQ_OFF		(CP_TARGET_OFF + 0x800u)	/* +0 CACHE_FLUSH_TS, +4 MEM_WRITE, +8 CCU colour */
++#define RS_AO_OFF		(CP_TARGET_OFF + 0x810u)	/* +0 ALWAYS_ON at start, +8 at end (64-bit each) */
++#define RS_BORDER_OFF		(CP_TARGET_OFF + 0xc00u)	/* 512 zero bytes, 128-aligned */
++#define RS_RING_MAX		900u
++#define RS_STAT_NS		(5ull * NSEC_PER_SEC)
++#define RS_SAMPLES		512u
++#define RS_BAR_SAMPLES		64u
++#define RS_TOL			4
++
++/* Shared with iokit/Kernel/arm/BlueGPUPresent.cpp (same layout there). */
++struct blue_gpu_src {
++	void *key;			/* the SweetSurface; the caller retains it while a slot holds it */
++	uintptr_t kva;			/* kernel address of pixel (0, 0) (offset included) */
++	uint64_t len;			/* bytes the GPU may read from kva */
++	uint32_t w, h, bpr, fmt, bpe, ew, eh;
++	int32_t sx, sy, dx, dy, lw, lh;	/* the layer: source point, logical rect */
++};
++struct blue_gpu_dst {
++	uint64_t pa;			/* panel memory */
++	uint32_t w, h, stride, logical_w, logical_h;
++	int32_t fit_x, fit_w;
++};
++
++enum { RSF_NOTUP, RSF_OFF, RSF_LAYER, RSF_DST, RSF_MAP, RSF_N };
++
++static struct {
++	bool req, up, dead, checked, first_map;
++	int present, filter, yofs, check, hang_ms;
++	int ready;			/* published (release) by the bring-up thread */
++	vm_offset_t arena;
++	uint64_t arena_pa;
++	struct {
++		void *key;
++		uintptr_t kva;
++		uint64_t len, use;
++	} slot[RS_SLOTS];
++	uint64_t use;
++	/* the blit in flight */
++	bool busy;
++	uint32_t seq;
++	uint64_t t_submit;
++	/* stats, per 5 s */
++	uint64_t t_stat;
++	uint32_t n_gpu, n_cpu[RSF_N], n_wait, n_map, n_done, n_kick_retry;
++	uint64_t wait_ns, clean_ns, clean_max, cpu_ns, cpu_max, blit_ticks, blit_max, lag_ns, lag_max;
++	uint64_t total_gpu;
++} rs;
++
++/* Options (reads only), at bluegpu=8 before stage 3's options. */
++static void
++rs_prepare(void)
++{
++	bzero(&rs, sizeof(rs));
++	rs.req = true;
++	rs.present = 1;
++	rs.filter = 1;
++	rs.yofs = -1;
++	rs.check = 1;
++	rs.hang_ms = 500;
++	(void)PE_parse_boot_argn("bluegpu_present", &rs.present, sizeof(rs.present));
++	(void)PE_parse_boot_argn("bluegpu_present_filter", &rs.filter, sizeof(rs.filter));
++	(void)PE_parse_boot_argn("bluegpu_present_yofs", &rs.yofs, sizeof(rs.yofs));
++	(void)PE_parse_boot_argn("bluegpu_present_check", &rs.check, sizeof(rs.check));
++	(void)PE_parse_boot_argn("bluegpu_present_hang_ms", &rs.hang_ms, sizeof(rs.hang_ms));
++	if (rs.hang_ms < 20 || rs.hang_ms > 5000) {
++		rs.hang_ms = 500;
++	}
++	if (rs.yofs > 0x400) {
++		rs.yofs = -1;
++	}
++	printf("BLUELINE GPU: resident (bluegpu=8): bring-up on a thread, kept up; GPU presents %s (bluegpu_present=%d),"
++	    " filter %s, odd-row source offset %s%#x (24.8), self-check %d, hang guard %d ms\n",
++	    rs.present ? "ON" : "off", rs.present, rs.filter ? "bilinear" : "nearest", rs.yofs < 0 ? "auto " : "",
++	    rs.yofs < 0 ? 0 : rs.yofs, rs.check, rs.hang_ms);
++}
++
++static volatile uint64_t *
++rs_l3(uint32_t i)
++{
++	return (volatile uint64_t *)(rs.arena + 0x1000u * (1 + i));
++}
++
++static void
++rs_put_ao(uint32_t off)
++{
++	cp_put(pkt7(CP_REG_TO_MEM, 3));
++	cp_put(GXR_CP_ALWAYS_ON | REG_TO_MEM_CNT(2) | REG_TO_MEM_64B);
++	cp_put(CP_VA + off);
++	cp_put(0);
++}
++
++static uint64_t
++rs_ao(uint32_t off)
++{
++	return ((uint64_t)cp_mem(off)[1] << 32) | cp_mem(off)[0];
++}
++
++/* The fence tail: CCU colour/depth flush TS, CACHE_FLUSH_TS, WFI, ALWAYS_ON, MEM_WRITE seq (28 dwords). */
++static void
++rs_put_tail(uint32_t seq)
++{
++	dr_event_ts(EV_CCU_FLUSH_COLOR_TS, RS_SEQ_OFF + 8, seq);
++	dr_event_ts(EV_CCU_FLUSH_DEPTH_TS, RS_SEQ_OFF + 12, seq);
++	dr_event_ts(EV_CACHE_FLUSH_TS, RS_SEQ_OFF, seq);
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	rs_put_ao(RS_AO_OFF + 8);
++	cp_put(pkt7(CP_MEM_WRITE, 3));
++	cp_put(CP_VA + RS_SEQ_OFF + 4);
++	cp_put(0);
++	cp_put(seq);
++}
++
++/* WPTR (index into the circle) as a fenced write; no wait for the GPU. */
++static void
++rs_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	rs.t_submit = mach_absolute_time();
++	cp_wr(GXR_CP_RB_WPTR, cp.wptr & (CP_RING_DWORDS - 1));
++	for (int i = 0; i < 3 && (gmu_rd(GMU_AHB_FENCE_STATUS) & AHB_FENCE_DROPPED); i++) {
++		delay(10);
++		cp_wr(GXR_CP_RB_WPTR, cp.wptr & (CP_RING_DWORDS - 1));
++		rs.n_kick_retry++;
++	}
++	rs.busy = true;
++}
++
++static bool
++rs_done(void)
++{
++	return cp_mem(RS_SEQ_OFF + 4)[0] == rs.seq;
++}
++
++static uint64_t
++rs_ns_since(uint64_t t)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns;
++}
++
++/* Once: the GPU did not finish within the guard. Panel unmapped from cb0, GPU presents off for the boot. */
++static void
++rs_hang(const char *when)
++{
++	printf("BLUELINE GPU: present hang: blit seq %u not done %llu ms after submit (%s); MEM_WRITE word %#x"
++	    " CACHE_FLUSH_TS %#x CCU colour %#x, rptr %u wptr %u (ring index %u)\n", rs.seq,
++	    rs_ns_since(rs.t_submit) / 1000000, when, cp_mem(RS_SEQ_OFF + 4)[0], cp_mem(RS_SEQ_OFF)[0],
++	    cp_mem(RS_SEQ_OFF + 8)[0], cp_rd(GXR_CP_RB_RPTR), cp_rd(GXR_CP_RB_WPTR), cp.wptr & (CP_RING_DWORDS - 1));
++	cp_dump("present blit");
++	gx_report("present hang");
++	volatile uint64_t *l2 = (volatile uint64_t *)(cp.va + CP_PT_OFF + 0x1000);
++	for (uint32_t i = 0; i < dr.fb_nblk; i++) {
++		l2[((DR_FB_VA >> 21) & 0x1ff) + i] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool ok = smmu_tlbi_cb(0);
++	rs.dead = true;
++	rs.busy = false;
++	printf("BLUELINE GPU: present hang: panel unmapped from cb0 (TLB %s); GPU presents OFF for this boot, CPU copies"
++	    " from now; the %u surface slot(s) stay retained and mapped (leaked on purpose)\n",
++	    ok ? "invalidated" : "SYNC TIMEOUT", RS_SLOTS);
++}
++
++/*
++ * The blit in flight, if any, to its fence, bounded by the guard from its
++ * submit. Returns false (and turns GPU presents off) on a hang.
++ */
++static bool
++rs_wait(void)
++{
++	if (!rs.busy) {
++		return true;
++	}
++	uint64_t t0 = mach_absolute_time(), limit = (uint64_t)rs.hang_ms * 1000000ull;
++	bool waited = false;
++	while (!rs_done()) {
++		if (rs_ns_since(rs.t_submit) > limit) {
++			rs_hang("waiting for the previous blit");
++			return false;
++		}
++		waited = true;
++		delay(50);
++	}
++	uint64_t lag = rs_ns_since(rs.t_submit);
++	if (waited) {
++		rs.n_wait++;
++		rs.wait_ns += rs_ns_since(t0);
++	}
++	uint64_t a = rs_ao(RS_AO_OFF), b = rs_ao(RS_AO_OFF + 8), d = b > a ? b - a : 0;
++	rs.n_done++;
++	rs.blit_ticks += d;
++	rs.blit_max = MAX(rs.blit_max, d);
++	rs.lag_ns += lag;
++	rs.lag_max = MAX(rs.lag_max, lag);
++	rs.busy = false;
++	return true;
++}
++
++/*
++ * Resident bring-up tail, from cp_stage after the zap with WHERE_AM_I
++ * working: 2D setup, the panel at DR_FB_VA, the surface tables in L1[1],
++ * the ring as a circle, one fenced no-op. On failure everything of it is
++ * undone and the normal teardown follows.
++ */
++static bool
++rs_up(void)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(cp.va + CP_PT_OFF);
++	const char *why = NULL;
++
++	printf("BLUELINE GPU: resident: zap %s, ring at %u of %u dwords: 2D setup, panel and surface tables\n",
++	    zap.loaded ? "loaded (secure mode off)" : zap.secvid ? "not loaded, SECVID_TRUST_CNTL 0" : "NOT LOADED",
++	    cp.wptr, CP_RING_DWORDS);
++	if (!zap.loaded && !zap.secvid) {
++		why = "the GPU is still in secure mode (no zap)";
++		goto fail;
++	}
++	if (dr.step < 2) {
++		why = "the boot framebuffer is not usable by the 2D engine";
++		goto fail;
++	}
++	if (!dr_setup()) {
++		why = "2D setup failed";
++		goto fail;
++	}
++	if (!dr_fb_map()) {
++		why = "panel not mapped";
++		goto fail;
++	}
++	if (kmem_alloc_contig(kernel_map, &rs.arena, RS_ARENA_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		rs.arena = 0;
++		why = "no contiguous memory for the surface tables";
++		goto fail;
++	}
++	rs.arena_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)rs.arena));
++	bool contig = rs.arena_pa != 0 && ((rs.arena_pa + RS_ARENA_SIZE - 1) >> smmu_oas) == 0;
++	for (uint32_t o = 0; o < RS_ARENA_SIZE; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(rs.arena + o));
++		contig = contig && ptoa_64(pn) == rs.arena_pa + o;
++		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);	/* Normal NC: the SMMU walks without snooping */
++	}
++	if (!contig || l1[1]) {
++		why = contig ? "L1[1] already in use" : "surface tables not contiguous or above the SMMU's output size";
++		goto fail;
++	}
++	volatile uint64_t *l2 = (volatile uint64_t *)rs.arena;
++	for (uint32_t i = 0; i < RS_SLOTS * RS_L3_PER_SLOT; i++) {
++		l2[i] = (rs.arena_pa + 0x1000u * (1 + i)) | LPAE_TABLE;
++	}
++	for (uint32_t i = 0; i < 512 / 4; i++) {
++		cp_mem(RS_BORDER_OFF)[i] = 0;
++	}
++	for (uint32_t i = 0; i < 8; i++) {
++		cp_mem(RS_SEQ_OFF)[i] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	l1[1] = rs.arena_pa | LPAE_TABLE;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!smmu_tlbi_cb(0)) {
++		why = "cb0 TLB sync timeout";
++		goto fail;
++	}
++	printf("BLUELINE GPU: resident: surface tables at pa %#llx (L1[1] -> L2, %u L3), slots at GPU VA %#x + n * 16M;"
++	    " border colours at %#x\n", (unsigned long long)rs.arena_pa, RS_SLOTS * RS_L3_PER_SLOT, RS_SLOT_VA(0),
++	    CP_VA + RS_BORDER_OFF);
++
++	/* The ring as a circle from here on: a fenced no-op through rs_kick. */
++	cp.wrap = true;
++	rs.seq = 1;
++	rs_put_ao(RS_AO_OFF);
++	rs_put_tail(rs.seq);
++	rs_kick();
++	while (!rs_done() && rs_ns_since(rs.t_submit) < (uint64_t)cp.ms * 1000000ull) {
++		delay(10);
++	}
++	uint64_t lat = rs_ns_since(rs.t_submit), a = rs_ao(RS_AO_OFF), b = rs_ao(RS_AO_OFF + 8);
++	printf("BLUELINE GPU: resident: ring check seq 1: MEM_WRITE %#x CACHE_FLUSH_TS %#x after %llu us, rptr %u wptr %u,"
++	    " CP_ALWAYS_ON %#llx -> %#llx: %s\n", cp_mem(RS_SEQ_OFF + 4)[0], cp_mem(RS_SEQ_OFF)[0], lat / 1000,
++	    cp_rd(GXR_CP_RB_RPTR), cp_rd(GXR_CP_RB_WPTR), (unsigned long long)a, (unsigned long long)b,
++	    rs_done() ? "ok" : "NOT DONE");
++	cp_smmu_faults("resident ring check");
++	if (!rs_done()) {
++		why = "ring check not done";
++		cp_dump("resident ring check");
++		goto fail;
++	}
++	rs.busy = false;
++	rs.up = true;
++	rs.first_map = true;
++	rs.t_stat = mach_absolute_time();
++	printf("BLUELINE GPU: resident: GPU UP AND KEPT; %s\n", rs.present ? "presents go through the 2D engine from now"
++	    : "bluegpu_present=0: CPU presents");
++	__atomic_store_n(&rs.ready, 1, __ATOMIC_RELEASE);
++	return true;
++
++fail:
++	printf("BLUELINE GPU: resident: %s: not resident, the normal teardown follows\n", why);
++	cp.wrap = false;
++	rs.busy = false;
++	if (l1[1] && rs.arena && l1[1] == (rs.arena_pa | LPAE_TABLE)) {
++		l1[1] = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (!smmu_tlbi_cb(0)) {
++			rs.arena = 0;	/* the GPU may still walk it: leaked */
++			printf("BLUELINE GPU: resident: surface tables LEAKED on purpose\n");
++		}
++	}
++	if (rs.arena) {
++		for (uint32_t o = 0; o < RS_ARENA_SIZE; o += PAGE_SIZE) {
++			pmap_set_cache_attributes(pmap_find_phys(kernel_pmap, (addr64_t)(rs.arena + o)), VM_WIMG_DEFAULT);
++		}
++		kmem_free(kernel_map, rs.arena, RS_ARENA_SIZE);
++		rs.arena = 0;
++	}
++	dr_unmap();
++	return false;
++}
++
++/* Slot for the surface (mapped if new). Only with no blit in flight. Returns the GPU VA of kva or 0. */
++static uint32_t
++rs_slot(const struct blue_gpu_src *s, void **retain, void **release)
++{
++	uint32_t n = RS_SLOTS, lru = 0;
++
++	for (uint32_t i = 0; i < RS_SLOTS; i++) {
++		if (rs.slot[i].key == s->key && rs.slot[i].kva == s->kva && rs.slot[i].len >= s->len) {
++			n = i;
++			break;
++		}
++		if (rs.slot[i].use < rs.slot[lru].use) {
++			lru = i;
++		}
++	}
++	if (n < RS_SLOTS) {
++		rs.slot[n].use = ++rs.use;
++		return RS_SLOT_VA(n) + (uint32_t)(s->kva & 0xfffu);
++	}
++	n = lru;
++	uintptr_t a0 = s->kva & ~(uintptr_t)0xfffu;
++	uint64_t span = (s->kva + s->len + 0xfffu - a0) & ~0xfffull;
++	if (span > RS_SLOT_MAX) {
++		return 0;
++	}
++	/* Translate every 4K first: nothing changes on failure. */
++	for (uint64_t o = 0; o < span; o += 0x1000u) {
++		uintptr_t va = a0 + (uintptr_t)o;
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++		uint64_t pa = ptoa_64(pn) + (va & PAGE_MASK & ~0xfffull);
++		if (pn == 0 || (pa >> smmu_oas) != 0) {
++			printf("BLUELINE GPU: present: surface kva %#lx +%#llx has no usable pa (%#llx): CPU copy\n",
++			    (unsigned long)s->kva, (unsigned long long)o, (unsigned long long)pa);
++			return 0;
++		}
++	}
++	uint32_t e = 0;
++	for (uint64_t o = 0; o < span; o += 0x1000u, e++) {
++		uintptr_t va = a0 + (uintptr_t)o;
++		uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) + (va & PAGE_MASK & ~0xfffull);
++		rs_l3(n * RS_L3_PER_SLOT + e / 512)[e % 512] = LPAE_PAGE_RO(pa);
++	}
++	for (; e < RS_SLOT_MAX / 0x1000u; e++) {
++		rs_l3(n * RS_L3_PER_SLOT + e / 512)[e % 512] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!smmu_tlbi_cb(0)) {
++		return 0;
++	}
++	*release = rs.slot[n].key;
++	*retain = s->key;
++	rs.slot[n].key = s->key;
++	rs.slot[n].kva = s->kva;
++	rs.slot[n].len = span - (s->kva - a0);
++	rs.slot[n].use = ++rs.use;
++	rs.n_map++;
++	uint32_t gva = RS_SLOT_VA(n) + (uint32_t)(s->kva & 0xfffu);
++	if (rs.first_map) {
++		rs.first_map = false;
++		uint64_t pa0 = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)a0)) + (a0 & PAGE_MASK);
++		printf("BLUELINE GPU: present: first surface %ux%u bpr %u: kva %#lx (%llu KiB, %u 4K pages) -> slot %u GPU VA"
++		    " %#x, first pa %#llx\n", s->w, s->h, s->bpr, (unsigned long)s->kva, span >> 10, (uint32_t)(span >> 12),
++		    n, gva, (unsigned long long)pa0);
++		if (!(rd(smmu + SMMU_IDR0) & (1u << 26))) {
++			(void)smmu_ats_cb(0, RS_SLOT_VA(n), pa0);
++		}
++	}
++	return gva;
+ }
+ 
++/* Source window offset of the odd-row pass, 24.8: one panel row of source (auto) or bluegpu_present_yofs. */
++static uint32_t
++rs_yofs(const struct blue_gpu_src *s, const struct blue_gpu_dst *d)
++{
++	return rs.yofs >= 0 ? (uint32_t)rs.yofs : (uint32_t)(((uint64_t)s->h << 8) / d->h);
++}
++
++/* Bars (fills) and the scaled copy in 0138's two passes. */
++static void
++rs_put_present(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, uint32_t src_va)
++{
++	uint32_t fb_va = DR_FB_VA + (uint32_t)(dr.fb_pa - dr.fb_blk), stride = d->stride;
++	uint32_t yofs = rs_yofs(s, d);
++	const struct dr_rect bar_l = { 0, 0, (uint32_t)d->fit_x, d->h, 0xff000000u, "bar left" };
++	const struct dr_rect bar_r = { (uint32_t)(d->fit_x + d->fit_w), 0, d->w - (uint32_t)(d->fit_x + d->fit_w), d->h,
++		                       0xff000000u, "bar right" };
++
++	dr_event(EV_CCU_INV_COLOR);
++	dr_event(EV_CCU_INV_DEPTH);
++	dr_event(EV_CACHE_INVALIDATE);
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	cp_put(pkt4(R_TPL1_GFX_BORDER_COLOR_BASE, 2));
++	cp_put(CP_VA + RS_BORDER_OFF);
++	cp_put(0);
++	cp_put(pkt4(R_TPL1_CS_BORDER_COLOR_BASE, 2));
++	cp_put(CP_VA + RS_BORDER_OFF);
++	cp_put(0);
++	rs_put_ao(RS_AO_OFF);
++	if (bar_l.w) {
++		dr_emit_rect(fb_va, stride, &bar_l);
++	}
++	if (bar_r.w) {
++		dr_emit_rect(fb_va, stride, &bar_r);
++	}
++	cp_put(pkt4(R_RB_A2D_BLT_CNTL, 2));
++	cp_put(A2D_BLT_CNTL_COPY);
++	cp_put(0);			/* RB_A2D_PIXEL_CNTL */
++	dr_reg(R_GRAS_A2D_BLT_CNTL, A2D_BLT_CNTL_COPY);
++	dr_reg(R_SP_A2D_OUTPUT_INFO, A2D_OUTPUT_INFO_VAL);
++	bool split = (stride & 63) != 0;
++	for (uint32_t k = 0; k < (split ? 2u : 1u); k++) {
++		uint32_t b = fb_va + (k ? (stride & ~63u) : 0), xo = k ? (stride & 63u) / 4 : 0;
++		uint32_t pitch = split ? 2 * stride : stride, rows = split ? d->h / 2 : d->h;
++		uint32_t yo = k ? yofs : 0;
++		cp_put(pkt4(R_GRAS_A2D_SRC_XMIN, 4));
++		cp_put(0);
++		cp_put((s->w - 1) << 8);
++		cp_put(yo);
++		cp_put(((s->h - 1) << 8) + yo);
++		cp_put(pkt4(R_TPL1_A2D_SRC_TEXTURE, 5));
++		cp_put(A2D_SRC_INFO_VAL | (rs.filter ? A2D_SRC_FILTER : 0));
++		cp_put(s->w | (s->h << 15));
++		cp_put(src_va);
++		cp_put(0);
++		cp_put(s->bpr << 3);	/* PITCH field b9.. in 64-byte units */
++		cp_put(pkt4(R_TPL1_A2D_SRC_FLAG, 3));
++		cp_put(0);
++		cp_put(0);
++		cp_put(0);
++		cp_put(pkt4(R_GRAS_A2D_DEST_TL, 2));
++		cp_put(dr_xy((uint32_t)d->fit_x + xo, 0));
++		cp_put(dr_xy((uint32_t)(d->fit_x + d->fit_w) - 1 + xo, rows - 1));
++		cp_put(pkt4(R_RB_A2D_DEST_INFO, 4));
++		cp_put(A2D_DEST_INFO_VAL);
++		cp_put(b);
++		cp_put(0);
++		cp_put(pitch >> 6);
++		dr_event(EV_DEBUG_LABEL);
++		dr_eco(true);
++		cp_put(pkt7(CP_BLIT, 1));
++		cp_put(BLIT_OP_SCALE);
++		dr_eco(false);
++	}
++}
++
++/* ---- self-check: 16.16 fixed point (no FP in the kernel) ---- */
++
++static uint32_t
++rs_texel(const struct blue_gpu_src *s, int32_t x, int32_t y)
++{
++	x = x < 0 ? 0 : (x >= (int32_t)s->w ? (int32_t)s->w - 1 : x);
++	y = y < 0 ? 0 : (y >= (int32_t)s->h ? (int32_t)s->h - 1 : y);
++	return *(const uint32_t *)(s->kva + (uint64_t)y * s->bpr + (uint64_t)x * 4);
++}
++
++/* Source position (16.16, texel centres at .5 - 0.5 = integers) of panel pixel (px, py). */
++static void
++rs_model_uv(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, uint32_t px, uint32_t py, int64_t *u, int64_t *v)
++{
++	bool split = (d->stride & 63) != 0;
++	uint32_t c = px - (uint32_t)d->fit_x, k = split ? py / 2 : py, rows = split ? d->h / 2 : d->h;
++	*u = (int64_t)(((uint64_t)(2 * c + 1) * s->w << 16) / (2 * (uint64_t)d->fit_w)) - 32768;
++	*v = (int64_t)(((uint64_t)(2 * k + 1) * s->h << 16) / (2 * (uint64_t)rows)) - 32768 +
++	    (split && (py & 1) ? (int64_t)rs_yofs(s, d) << 8 : 0);
++}
++
++static uint32_t
++rs_bilinear(const struct blue_gpu_src *s, int64_t u, int64_t v)
++{
++	int32_t x0 = (int32_t)(u >> 16), y0 = (int32_t)(v >> 16);
++	uint32_t fx = (uint32_t)(u & 0xffff), fy = (uint32_t)(v & 0xffff), out = 0;
++	uint32_t p00 = rs_texel(s, x0, y0), p10 = rs_texel(s, x0 + 1, y0);
++	uint32_t p01 = rs_texel(s, x0, y0 + 1), p11 = rs_texel(s, x0 + 1, y0 + 1);
++	for (uint32_t sh = 0; sh < 32; sh += 8) {
++		uint64_t t = (uint64_t)((p00 >> sh) & 0xff) * (65536 - fx) + (uint64_t)((p10 >> sh) & 0xff) * fx;
++		uint64_t b = (uint64_t)((p01 >> sh) & 0xff) * (65536 - fx) + (uint64_t)((p11 >> sh) & 0xff) * fx;
++		uint64_t c = (t * (65536 - fy) + b * fy + (1ull << 31)) >> 32;
++		out |= (uint32_t)MIN(c, 255u) << sh;
++	}
++	return out;
++}
++
++static uint32_t
++rs_nearest(const struct blue_gpu_src *s, int64_t u, int64_t v)
++{
++	return rs_texel(s, (int32_t)((u + 32768) >> 16), (int32_t)((v + 32768) >> 16));
++}
++
++static int
++rs_diff(uint32_t a, uint32_t b)
++{
++	int m = 0;
++	for (uint32_t sh = 0; sh < 24; sh += 8) {	/* B, G, R; alpha not compared */
++		int dd = (int)((a >> sh) & 0xff) - (int)((b >> sh) & 0xff);
++		m = MAX(m, dd < 0 ? -dd : dd);
++	}
++	return m;
++}
++
++/* After the first GPU present's fence: 512 pixels of the fit and 64 bar pixels. False = grossly wrong. */
++static bool
++rs_selfcheck(const struct blue_gpu_src *s, const struct blue_gpu_dst *d)
++{
++	vm_offset_t base;
++	vm_size_t size;
++	volatile uint32_t *fb = dr_fb_rows(0, d->h - 1, &base, &size);
++	uint32_t lcg = 0x2545f491u, bad[2] = { 0, 0 }, bars_bad = 0, shown = 0;
++	int maxd[2] = { 0, 0 };
++	const int sel = rs.filter ? 0 : 1;
++
++	if (!fb) {
++		printf("BLUELINE GPU: present self-check: panel not mapped for reading: skipped\n");
++		return true;
++	}
++	for (uint32_t i = 0; i < RS_SAMPLES; i++) {
++		lcg = lcg * 1664525u + 1013904223u;
++		uint32_t px = (uint32_t)d->fit_x + (lcg >> 8) % (uint32_t)d->fit_w;
++		lcg = lcg * 1664525u + 1013904223u;
++		uint32_t py = (lcg >> 8) % d->h;
++		int64_t u, v;
++		rs_model_uv(s, d, px, py, &u, &v);
++		uint32_t got = fb[(uint64_t)py * (d->stride / 4) + px];
++		uint32_t want[2] = { rs_bilinear(s, u, v), rs_nearest(s, u, v) };
++		for (int m = 0; m < 2; m++) {
++			int dd = rs_diff(got, want[m]);
++			maxd[m] = MAX(maxd[m], dd);
++			bad[m] += dd > RS_TOL;
++		}
++		if (rs_diff(got, want[sel]) > RS_TOL && shown < 6) {
++			shown++;
++			printf("BLUELINE GPU: present self-check: panel (%u,%u) %#x, %s model %#x (other %#x) at source"
++			    " (%lld.%03lld, %lld.%03lld)\n", px, py, got, sel ? "nearest" : "bilinear", want[sel], want[!sel],
++			    u >> 16, ((u & 0xffff) * 1000) >> 16, v >> 16, ((v & 0xffff) * 1000) >> 16);
++		}
++	}
++	uint32_t right = (uint32_t)(d->fit_x + d->fit_w), wr_ = d->w - right;
++	for (uint32_t i = 0; i < RS_BAR_SAMPLES && (d->fit_x > 0 || wr_ > 0); i++) {
++		lcg = lcg * 1664525u + 1013904223u;
++		uint32_t py = (lcg >> 8) % d->h, px;
++		bool left = (i & 1) ? d->fit_x > 0 : wr_ == 0;
++		px = left ? (lcg >> 20) % (uint32_t)d->fit_x : right + (lcg >> 20) % wr_;
++		bars_bad += fb[(uint64_t)py * (d->stride / 4) + px] != 0xff000000u;
++	}
++	ml_io_unmap(base, size);
++	bool ok = bad[sel] * 100 <= RS_SAMPLES && bars_bad == 0;
++	bool gross = bad[0] * 2 > RS_SAMPLES && bad[1] * 2 > RS_SAMPLES;
++	printf("BLUELINE GPU: present self-check: %u samples, tolerance %d: bilinear model %u over (max diff %d), nearest"
++	    " model %u over (max diff %d); bars %u of %u not black: %s\n", RS_SAMPLES, RS_TOL, bad[0], maxd[0], bad[1],
++	    maxd[1], bars_bad, RS_BAR_SAMPLES, ok ? "PASS" : gross ? "FAIL (GROSSLY WRONG: GPU presents off)" :
++	    "MISMATCH (kept on)");
++	return !gross;
++}
++
++static void
++rs_stats(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - rs.t_stat, &ns);
++	if (ns < RS_STAT_NS) {
++		return;
++	}
++	uint32_t cpu = 0;
++	for (int i = 0; i < RSF_N; i++) {
++		cpu += rs.n_cpu[i];
++	}
++	uint32_t g = rs.n_gpu ? rs.n_gpu : 1, dn = rs.n_done ? rs.n_done : 1;
++	printf("BLUELINE GPU: present 5s: %u GPU blits (%llu total), %u CPU copies (not up %u, off %u, layer %u, dst %u,"
++	    " map %u), %u waited (%llu us), %u slot maps, clean avg %llu max %llu us, CPU per GPU present avg %llu max %llu"
++	    " us, blit avg %llu max %llu us, submit->done avg %llu max %llu us, WPTR retries %u%s\n", rs.n_gpu,
++	    rs.total_gpu, cpu, rs.n_cpu[RSF_NOTUP], rs.n_cpu[RSF_OFF], rs.n_cpu[RSF_LAYER], rs.n_cpu[RSF_DST],
++	    rs.n_cpu[RSF_MAP], rs.n_wait, rs.wait_ns / 1000, rs.n_map, rs.clean_ns / g / 1000, rs.clean_max / 1000,
++	    rs.cpu_ns / g / 1000, rs.cpu_max / 1000, rs.blit_ticks * 10 / 192 / dn, rs.blit_max * 10 / 192,
++	    rs.lag_ns / dn / 1000, rs.lag_max / 1000, rs.n_kick_retry, rs.dead ? "; DEAD (hang)" : "");
++	rs.t_stat = mach_absolute_time();
++	rs.n_gpu = rs.n_wait = rs.n_map = rs.n_done = rs.n_kick_retry = 0;
++	bzero(rs.n_cpu, sizeof(rs.n_cpu));
++	rs.wait_ns = rs.clean_ns = rs.clean_max = rs.cpu_ns = rs.cpu_max = 0;
++	rs.blit_ticks = rs.blit_max = rs.lag_ns = rs.lag_max = 0;
++}
++
++/* CPU copy: the blit in flight first (bounded), so the CPU's pixels land after the GPU's. */
++static int
++rs_cpu(int why)
++{
++	if (rs.busy && !rs.dead) {
++		(void)rs_wait();
++	}
++	rs.n_cpu[why]++;
++	if (rs.up) {
++		rs_stats();
++	}
++	return 0;
++}
++
++/*
++ * The display's present for one layer (BlueGPUPresent.cpp, vsync thread).
++ * Returns 1 when the GPU took it (blit submitted, not waited for), 0 for
++ * the CPU copy. *retain / *release: surfaces the caller must retain (now
++ * in a slot) / release (evicted).
++ */
++int blue_gpu_present_c(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, void **retain, void **release);
++
++int
++blue_gpu_present_c(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, void **retain, void **release)
++{
++	*retain = NULL;
++	*release = NULL;
++	if (!__atomic_load_n(&rs.ready, __ATOMIC_ACQUIRE)) {
++		if (rs.req) {
++			rs.n_cpu[RSF_NOTUP]++;
++		}
++		return 0;
++	}
++	if (rs.dead || !rs.present) {
++		return rs_cpu(RSF_OFF);
++	}
++	uint64_t t0 = mach_absolute_time();
++	if (s->sx || s->sy || s->dx || s->dy || s->lw != (int32_t)s->w || s->lh != (int32_t)s->h || s->w != d->logical_w ||
++	    s->h != d->logical_h || s->fmt != 0x42475241u || s->bpe != 4 || s->ew != 1 || s->eh != 1 || (s->bpr & 63) ||
++	    (s->kva & 63) || s->bpr < s->w * 4 || s->w > 0x3fff || s->h > 0x3fff || s->w < 2 || s->h < 2 ||
++	    s->len < (uint64_t)s->bpr * (s->h - 1) + (uint64_t)s->w * 4) {
++		return rs_cpu(RSF_LAYER);
++	}
++	if (d->pa != dr.fb_pa || d->stride != dr.fb_stride || d->w != dr.fb_w || d->h != dr.fb_h || (d->h & 1) ||
++	    d->fit_x < 0 || d->fit_w <= 0 || d->fit_x + d->fit_w > (int32_t)d->w) {
++		return rs_cpu(RSF_DST);
++	}
++	if (!rs_wait()) {
++		return rs_cpu(RSF_OFF);
++	}
++	uint32_t src_va = rs_slot(s, retain, release);
++	if (!src_va) {
++		return rs_cpu(RSF_MAP);
++	}
++	uint64_t len = (uint64_t)s->bpr * (s->h - 1) + (uint64_t)s->w * 4, tc = mach_absolute_time(), ns;
++	CleanPoC_DcacheRegion_Force((vm_offset_t)s->kva, (size_t)len);
++	absolutetime_to_nanoseconds(mach_absolute_time() - tc, &ns);
++	rs.clean_ns += ns;
++	rs.clean_max = MAX(rs.clean_max, ns);
++
++	uint32_t from = cp.wptr;
++	rs.seq++;
++	rs_put_present(s, d, src_va);
++	rs_put_tail(rs.seq);
++	if (cp.wptr - from > RS_RING_MAX) {
++		printf("BLUELINE GPU: present: %u ring dwords (max %u): BUG, GPU presents off\n", cp.wptr - from,
++		    RS_RING_MAX);
++		rs.dead = true;
++		return rs_cpu(RSF_OFF);
++	}
++	rs_kick();
++	rs.n_gpu++;
++	rs.total_gpu++;
++	if (rs.check && !rs.checked) {
++		rs.checked = true;
++		printf("BLUELINE GPU: present: first GPU present (seq %u, %u ring dwords, source %ux%u bpr %u at GPU VA %#x,"
++		    " panel %ux%u at %#x, fit x %d w %d, odd-row offset %#x): waiting for it, then the self-check\n", rs.seq,
++		    cp.wptr - from, s->w, s->h, s->bpr, src_va, d->w, d->h, DR_FB_VA + (uint32_t)(dr.fb_pa - dr.fb_blk),
++		    d->fit_x, d->fit_w, rs_yofs(s, d));
++		if (!rs_wait()) {
++			return 0;	/* hang: logged; GPU presents off, this frame too is a CPU copy */
++		}
++		cp_smmu_faults("first GPU present");
++		printf("BLUELINE GPU: present: first blit done: %llu us on the GPU (CP_ALWAYS_ON), %llu us submit to done\n",
++		    rs.blit_max * 10 / 192, rs.lag_max / 1000);
++		if (!rs_selfcheck(s, d)) {
++			rs.present = 0;
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	rs.cpu_ns += ns;
++	rs.cpu_max = MAX(rs.cpu_max, ns);
++	rs_stats();
++	return 1;
++}
++
+ /*
+  * Stage 4 with GX up and OOB GPU_SET held (stage 3's gx_probe passed):
+  * reads, cb0 and memory, hw_init, SQE/RB, SQE_CNTL, the commands. Leaves
+@@ -4032,7 +4798,11 @@
+ 	if (sub && sh_ok && dr.on) {
+ 		printf("BLUELINE GPU: stage 4 %s (step %d); zap, then the draw stage\n", res, cp.step);
+ 		if (zap_stage()) {
+-			dr_stage();
++			if (rs.req) {
++				res = rs_up() ? "CP UP, RESIDENT: PRESENTS BY THE 2D ENGINE" : "CP UP, RESIDENT SETUP FAILED";
++			} else {
++				dr_stage();
++			}
+ 		} else {
+ 			res = "CP UP, RING STOPPED AFTER THE ZAP";
+ 		}
+@@ -4143,9 +4913,10 @@
+ 	hfi_dump(m);
+ 	printf("BLUELINE GPU: stage 3 %s (step %d)\n", gx.up ? "GX UP: THE GPU CORE ANSWERS" :
+ 	    gx.step < 4 ? "stopped early" : "GX NOT UP", gx.step);
+-	if (keep) {
+-		printf("BLUELINE GPU: GX, its votes%s and the OOB requests left as they are (bluegpu_keep=1)%s\n",
+-		    gx.bw_voted ? ", the DDR vote" : "", cp.started ? "; the CP keeps running" : "");
++	if (keep || rs.up) {
++		printf("BLUELINE GPU: GX, its votes%s and the OOB requests left as they are (%s)%s\n",
++		    gx.bw_voted ? ", the DDR vote" : "", rs.up ? "resident, bluegpu=8" : "bluegpu_keep=1",
++		    cp.started ? "; the CP keeps running" : "");
+ 		return hfi;
+ 	}
+ 	cp_halt();
+@@ -4274,9 +5045,10 @@
+ 		gmu_trace_dump();
+ 		printf("BLUELINE GPU: stage 2b HFI %s\n", mem->hfi_ok ? "OK" : "FAILED");
+ 	}
+-	if (keep && booted) {
+-		printf("BLUELINE GPU: stage 2a done; GMU left running%s (bluegpu_keep=1)\n",
+-		    mem ? " with its SMMU bank, memory and HFI" : ", waiting for HFI_CTRL_INIT");
++	if ((keep || rs.up) && booted) {
++		printf("BLUELINE GPU: stage 2a done; GMU left running%s (%s)\n",
++		    mem ? " with its SMMU bank, memory and HFI" : ", waiting for HFI_CTRL_INIT",
++		    rs.up ? "resident, bluegpu=8" : "bluegpu_keep=1");
+ 		return true;
+ 	}
+ 
+@@ -4313,8 +5085,8 @@
+ 	return booted;
+ }
+ 
+-void
+-blueline_gpu_probe(void)
++static void
++gpu_bringup(void)
+ {
+ 	int level = 0, keep = 0;
+ 	bool run, cx_turned = false, ok = false;
+@@ -4327,7 +5099,8 @@
+ 		return;
+ 	}
+ 	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads%s\n",
+-	    level, keep ? ", keep" : "", level >= 7 ? ", then GMU firmware boot, GX, the CP and a 2D fill" :
++	    level, keep ? ", keep" : "", level >= 8 ? ", then GMU firmware boot, GX, the CP, zap, resident (presents)" :
++	    level >= 7 ? ", then GMU firmware boot, GX, the CP and a 2D fill" :
+ 	    level >= 6 ? ", then GMU firmware boot, GX and the CP" :
+ 	    level >= 5 ? ", then GMU firmware boot and GX" :
+ 	    level >= 3 ? ", then GMU firmware boot, no GX" : ", no firmware, no GX");
+@@ -4455,7 +5228,10 @@
+ 		} else if (level >= 5) {
+ 			printf("BLUELINE GPU: stage 3 needs stage 2b's SMMU memory: skipped\n");
+ 		}
+-		if (gmu_boot(keep != 0, mem) && keep) {
++		if (gmu_boot(keep != 0, mem) && (keep || rs.up)) {
++			if (rs.up) {
++				printf("BLUELINE GPU: stage 1 done; CX, GMU clocks, GMU, GX and the CP left up (resident)\n");
++			}
+ 			return;
+ 		}
+ 		if (mem) {
+@@ -4501,4 +5277,40 @@
+ 	}
+ 	printf("BLUELINE GPU: stage 1 %s; state restored\n", ok ? "done" : "BACKED OFF");
+ }
++
++/* 0147: bluegpu=8 brings the GPU up on its own thread (boot goes on; presents use the CPU until it is up). */
++static void
++gpu_bringup_thread(void *arg, wait_result_t wr_)
++{
++	uint64_t t0 = mach_absolute_time(), ns;
++
++	(void)arg;
++	(void)wr_;
++	printf("BLUELINE GPU: resident bring-up thread started\n");
++	gpu_bringup();
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUELINE GPU: resident bring-up thread done after %llu ms: %s\n", ns / 1000000,
++	    rs.up ? "GPU RESIDENT" : "not resident (everything undone as at bluegpu=7)");
++}
++
++void
++blueline_gpu_probe(void)
++{
++	int level = 0;
++	thread_t th;
++
++	(void)PE_parse_boot_argn("bluegpu", &level, sizeof(level));
++	if (level < 8) {
++		gpu_bringup();
++		return;
++	}
++	rs_prepare();
++	gx_resident = true;
++	if (kernel_thread_start(gpu_bringup_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("BLUELINE GPU: no bring-up thread: resident bring-up skipped, CPU presents\n");
++		rs.req = false;
++		return;
++	}
++	thread_deallocate(th);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/BlueGPUPresent.cpp b/iokit/Kernel/arm/BlueGPUPresent.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/BlueGPUPresent.cpp
+@@ -0,0 +1,95 @@
++/*
++ * blueline (Pixel 3, SDM845): AppleCLCD's present through the Adreno 630's
++ * 2D engine, patch 0147 (bsd/dev/blueline_gpu.c, bluegpu=8).
++ *
++ * SweetFramebuffer.cpp's fit path calls blue_gpu_present() for each layer
++ * before its CPU copy; false means "copy with the CPU as before". This
++ * file only turns the SweetSurface into plain numbers for the C side and
++ * keeps the surfaces the GPU has mapped alive: blue_gpu_present_c names a
++ * surface to retain when it maps one into a slot and the one it evicted,
++ * which is released here (its pages are unmapped from the GPU by then).
++ * Surfaces of a hung GPU stay retained for the boot.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include "SweetSurface.h"
++
++/* Same layout as bsd/dev/blueline_gpu.c. */
++struct blue_gpu_src {
++	void *key;
++	uintptr_t kva;
++	uint64_t len;
++	uint32_t w, h, bpr, fmt, bpe, ew, eh;
++	int32_t sx, sy, dx, dy, lw, lh;
++};
++struct blue_gpu_dst {
++	uint64_t pa;
++	uint32_t w, h, stride, logical_w, logical_h;
++	int32_t fit_x, fit_w;
++};
++
++extern "C" int blue_gpu_present_c(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, void **retain,
++    void **release);
++
++bool blue_gpu_present(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h,
++    uint64_t panel_pa, uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride, int32_t fit_x, int32_t fit_w,
++    uint32_t logical_w, uint32_t logical_h);
++
++bool
++blue_gpu_present(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h,
++    uint64_t panel_pa, uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride, int32_t fit_x, int32_t fit_w,
++    uint32_t logical_w, uint32_t logical_h)
++{
++	struct blue_gpu_src src;
++	struct blue_gpu_dst dst;
++	void *retain = NULL, *release = NULL;
++
++	/* Only kernel buffers (wired, cacheable): not physical surfaces such as the panel's own. */
++	if (s == NULL || OSDynamicCast(IOBufferMemoryDescriptor, s->memory) == NULL) {
++		return false;
++	}
++	uintptr_t base = s->kernelAddress();
++	uint64_t mlen = s->memory->getLength();
++	if (base == 0 || s->offset >= mlen) {
++		return false;
++	}
++	bzero(&src, sizeof(src));
++	src.key = s;
++	src.kva = base + s->offset;
++	src.len = mlen - s->offset;
++	src.w = s->width;
++	src.h = s->height;
++	src.bpr = s->bytesPerRow;
++	src.fmt = s->pixelFormat;
++	src.bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++	src.ew = s->elementWidth;
++	src.eh = s->elementHeight;
++	src.sx = sx;
++	src.sy = sy;
++	src.dx = dx;
++	src.dy = dy;
++	src.lw = w;
++	src.lh = h;
++	bzero(&dst, sizeof(dst));
++	dst.pa = panel_pa;
++	dst.w = panel_w;
++	dst.h = panel_h;
++	dst.stride = panel_stride;
++	dst.logical_w = logical_w;
++	dst.logical_h = logical_h;
++	dst.fit_x = fit_x;
++	dst.fit_w = fit_w;
++	int done = blue_gpu_present_c(&src, &dst, &retain, &release);
++	if (retain != NULL) {
++		((SweetSurface *)retain)->retain();
++	}
++	if (release != NULL) {
++		((SweetSurface *)release)->release();
++	}
++	return done != 0;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -664,7 +664,13 @@
+ 			dx = dy = 0;
+ 		}
+ 		if (fFit) {
+-			presentFit(s, src, bpe, sx, sy, dx, dy, w, h);
++			/* 0147: the GPU's 2D engine (bluegpu=8, BlueGPUPresent.cpp); false = the CPU copy */
++			extern bool blue_gpu_present(SweetSurface *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
++			    uint64_t, uint32_t, uint32_t, uint32_t, int32_t, int32_t, uint32_t, uint32_t);
++			if (!blue_gpu_present(s, sx, sy, dx, dy, w, h, fPhys, fWidth, fHeight, fRowBytes, fFitX, fFitW,
++			    fLogicalW, fLogicalH)) {
++				presentFit(s, src, bpe, sx, sy, dx, dy, w, h);
++			}
+ 			s->release();
+ 			continue;
+ 		}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/BlueBattery.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/BlueDPU.cpp                                     optional iokitcpp
++iokit/Kernel/arm/BlueGPUPresent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

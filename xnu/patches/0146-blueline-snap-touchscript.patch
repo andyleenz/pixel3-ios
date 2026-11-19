@@ -1,0 +1,950 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0146: blueline screenshots (bluesnap=) and scripted touches
+ (bluetouchscript=)
+
+Lets the test loop see and drive iOS with nobody at the phone.
+
+bluesnap=T,sb+T,... takes box-filtered copies of the panel memory
+(1080x2160 BGRA; default 2x, RGB565 = 540x1080, 1139 KiB) at the given
+times, bluesnap_on_reboot=1 one more right before bluereboot resets. They
+go to the 128 MiB of userdata right below the console log area, through
+the log's own UFS path, after checking that the HFS+ root volume ends
+before it; an area header (count, used blocks, boot nonce) is reset when
+armed. tools/phonetest.sh pulls them in recovery and tools/snap2png.py
+makes PNGs.
+
+bluetouchscript=TIME:ACTION,...;... injects taps, long presses and swipes
+in panel pixels through sweet_hid_touch's mapping (edge flag included),
+presses keys, starts a fake-accelerometer turn (volchord) or takes a
+snap. Real touches are dropped while a touch step runs.
+
+TIME is seconds after the UFS driver started (as bluereboot_after=N), or
+sb+N: N seconds after SpringBoard first exists.
+
+---
+ bsd/dev/blueline_touch.c                |  226 +++++++++++++++
+ bsd/dev/sweet_ufs.c                     |  471 ++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp   |   27 +
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp |   16 +
+ iokit/Kernel/arm/hid/SweetHID.cpp       |   58 +++
+ 5 files changed, 798 insertions(+)
+
+diff -ru a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+--- a/bsd/dev/blueline_touch.c	2026-11-19 10:58:55
++++ b/bsd/dev/blueline_touch.c	2026-11-19 11:02:43
+@@ -664,4 +664,230 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * Scripted touches (patch 0146): the agent drives iOS without a hand.
++ *
++ *   bluetouchscript=STEP;STEP;...      ('/' works between steps too)
++ *   STEP = TIME:ACTION,ARG,...         (fields by ',': boot-args end at a space)
++ *   TIME = T | sb+T                    (sweet_ufs.c: s after the UFS driver
++ *                                       started, or after SpringBoard appeared)
++ *   tap,X,Y                down, 80 ms, up
++ *   hold,X,Y,MS            down, MS, up (long press)
++ *   swipe,X1,Y1,X2,Y2,MS   down at 1, a move every 16 ms along the line, at 2
++ *                          after MS, up
++ *   key,NAME               home|power|volup|voldown pressed for 100 ms
++ *                          (sweet_hid_key, as the hardware keys)
++ *   volchord               a fake-accelerometer quarter turn, as volume up +
++ *                          down (needs bluefakeaccel=1; BlueFakeMotion.cpp)
++ *   snap                   a screenshot now (bluesnap, sweet_ufs.c)
++ * Steps run in order, each at its time (at once if that has passed).
++ * X, Y are panel pixels (0..1079, 0..2159) and go through sweet_hid_touch's
++ * mapping, as finger 0. While a touch step runs, the touch screen's own
++ * contacts are dropped (SweetHID.cpp). The home and app-switcher gestures
++ * need an edge touch: the swipe must start within 48 px of the bottom
++ * (Y >= 2112, patch 0118), e.g. swipe,540,2150,540,900,300.
++ */
++extern void sweet_hid_touch_inject(int finger, int down, int x, int y);
++extern int sweet_hid_touch_script(int on);
++extern void sweet_hid_key(int key, int down);
++extern int blueline_fake_accel_turn(const char *why);
++extern int bluesnap_take(const char *why);
++extern bool blue_when_parse(const char **s, bool *sb, uint32_t *ms);
++extern bool blue_when_wait(bool sb, uint32_t ms);
++extern void blue_when_now(uint32_t *ms, int32_t *sb_ms);
++extern void blue_sleep_until(uint64_t deadline);
++void blueline_touchscript_start(void);
++
++#define SCRIPT_MOVE_MS  16
++static char touch_script[512];
++
++static uint64_t
++script_ms(uint32_t ms)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static bool
++script_int(const char **p, int *v)
++{
++	const char *s = *p;
++	int sign = 1, n = 0;
++
++	if (*s == ',') {
++		s++;
++	}
++	if (*s == '-') {
++		sign = -1;
++		s++;
++	}
++	if (*s < '0' || *s > '9') {
++		return false;
++	}
++	for (; *s >= '0' && *s <= '9'; s++) {
++		if (n > 1000000) {
++			return false;
++		}
++		n = n * 10 + (*s - '0');
++	}
++	*v = sign * n;
++	*p = s;
++	return true;
++}
++
++static bool
++script_word(const char **p, const char *w)
++{
++	size_t n = strlen(w);
++	if (strncmp(*p, w, n) != 0) {
++		return false;
++	}
++	char c = (*p)[n];
++	if (c != 0 && c != ',' && c != ';' && c != '/') {
++		return false;
++	}
++	*p += n;
++	return true;
++}
++
++/* One touch contact: down at 1, moves to 2 over ms (0: stays), up. */
++static void
++script_contact(int x1, int y1, int x2, int y2, uint32_t ms)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint32_t steps = ms / SCRIPT_MOVE_MS;
++
++	sweet_hid_touch_inject(0, 1, x1, y1);
++	for (uint32_t i = 1; i <= steps; i++) {
++		blue_sleep_until(t0 + script_ms(i * SCRIPT_MOVE_MS));
++		int x = x1 + (int)((int64_t)(x2 - x1) * i / steps);
++		int y = y1 + (int)((int64_t)(y2 - y1) * i / steps);
++		sweet_hid_touch_inject(0, 1, x, y);
++	}
++	blue_sleep_until(t0 + script_ms(ms));
++	sweet_hid_touch_inject(0, 1, x2, y2);
++	sweet_hid_touch_inject(0, 0, x2, y2);
++}
++
++static void
++touchscript_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static const char *const keys[] = { "power", "volup", "voldown", "home" };
++	const char *p = touch_script;
++	unsigned n = 0;
++
++	while (*p) {
++		const char *step = p;
++		bool sb;
++		uint32_t when, ms;
++		int32_t sb_ms;
++		int a[5];
++		int k = -1;
++
++		if (!blue_when_parse(&p, &sb, &when) || *p++ != ':') {
++			printf("BLUELINE SCRIPT: bad time at \"%s\"; script stopped\n", step);
++			return;
++		}
++		const char *act = p;
++		bool ok = true;
++		enum { S_TAP, S_HOLD, S_SWIPE, S_KEY, S_CHORD, S_SNAP } kind;
++		if (script_word(&p, "tap")) {
++			kind = S_TAP;
++			ok = script_int(&p, &a[0]) && script_int(&p, &a[1]);
++		} else if (script_word(&p, "hold")) {
++			kind = S_HOLD;
++			ok = script_int(&p, &a[0]) && script_int(&p, &a[1]) && script_int(&p, &a[2]) &&
++			    a[2] >= 0 && a[2] <= 60000;
++		} else if (script_word(&p, "swipe")) {
++			kind = S_SWIPE;
++			ok = script_int(&p, &a[0]) && script_int(&p, &a[1]) && script_int(&p, &a[2]) &&
++			    script_int(&p, &a[3]) && script_int(&p, &a[4]) && a[4] >= 0 && a[4] <= 60000;
++		} else if (script_word(&p, "key")) {
++			kind = S_KEY;
++			ok = *p++ == ',';
++			for (int i = 0; ok && i < 4; i++) {
++				if (script_word(&p, keys[i])) {
++					k = i;
++				}
++			}
++			ok = ok && k >= 0;
++		} else if (script_word(&p, "volchord")) {
++			kind = S_CHORD;
++		} else if (script_word(&p, "snap")) {
++			kind = S_SNAP;
++		} else {
++			ok = false;
++			kind = S_SNAP;
++		}
++		if (!ok || (*p && *p != ';' && *p != '/')) {
++			printf("BLUELINE SCRIPT: bad step \"%s\"; script stopped\n", step);
++			return;
++		}
++		int act_len = (int)(p - act);
++		if (*p) {
++			p++;
++		}
++		if (!blue_when_wait(sb, when)) {
++			printf("BLUELINE SCRIPT: no SpringBoard in time; script stopped before \"%.*s\"\n",
++			    act_len, act);
++			return;
++		}
++		blue_when_now(&ms, &sb_ms);
++		printf("BLUELINE SCRIPT: step %u at %u.%03u s (SpringBoard %d ms): %.*s\n",
++		    n++, ms / 1000, ms % 1000, sb_ms, act_len, act);
++		if (kind == S_SWIPE && a[1] < 2112 && a[1] >= 2160 - 150) {
++			printf("BLUELINE SCRIPT: note: the swipe starts at y %d, above the 48 px bottom "
++			    "edge band (y >= 2112): no home gesture\n", a[1]);
++		}
++		switch (kind) {
++		case S_TAP:
++		case S_HOLD:
++		case S_SWIPE:
++			if (!sweet_hid_touch_script(1)) {
++				printf("BLUELINE SCRIPT: no touch service yet; step skipped\n");
++				break;
++			}
++			if (kind == S_TAP) {
++				script_contact(a[0], a[1], a[0], a[1], 80);
++			} else if (kind == S_HOLD) {
++				script_contact(a[0], a[1], a[0], a[1], (uint32_t)a[2]);
++			} else {
++				script_contact(a[0], a[1], a[2], a[3], (uint32_t)a[4]);
++			}
++			(void)sweet_hid_touch_script(0);
++			break;
++		case S_KEY:
++			sweet_hid_key(k, 1);
++			blue_sleep_until(mach_absolute_time() + script_ms(100));
++			sweet_hid_key(k, 0);
++			break;
++		case S_CHORD:
++			if (!blueline_fake_accel_turn("bluetouchscript volchord")) {
++				printf("BLUELINE SCRIPT: volchord: fake accelerometer off (needs bluefakeaccel=1)\n");
++			}
++			break;
++		case S_SNAP:
++			(void)bluesnap_take("bluetouchscript");
++			break;
++		}
++	}
++	printf("BLUELINE SCRIPT: done (%u steps)\n", n);
++}
++
++void
++blueline_touchscript_start(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_arg_str("bluetouchscript", touch_script, sizeof(touch_script)) ||
++	    !touch_script[0]) {
++		return;
++	}
++	printf("BLUELINE SCRIPT: %s\n", touch_script);
++	if (kernel_thread_start(touchscript_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ru a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-19 10:58:55
++++ b/bsd/dev/sweet_ufs.c	2026-11-19 11:01:49
+@@ -31,6 +31,8 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -56,6 +58,9 @@
+ extern void sweet_usb_probe(void);
+ static void bluereboot_arm(void);
+ static void bluereboot_after_gpu(void);
++static void blue_when_init(void);
++static void bluesnap_arm(void);
++extern void blueline_touchscript_start(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -607,12 +612,16 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	blue_when_init();
++	bluesnap_arm();
+ 	bluereboot_arm();
+ 	sweet_sample_start();
+ 	/* Pixel 3 hardware keys (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	blueline_cpufreq_init();
+ 	blueline_keys_init();
+ 	blueline_touch_init();
++	/* bluetouchscript= (patch 0146, blueline_touch.c) */
++	blueline_touchscript_start();
+ 	/* Wi-Fi stage 1: SCM queries and read-only state, off unless bluewifi=1 (blueline_wifi.c). */
+ 	blueline_wifi_probe();
+ 	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
+@@ -788,6 +797,465 @@
+ }
+ 
+ /*
++ * Timed test actions (patch 0146): screenshots here (bluesnap=) and
++ * scripted touches in blueline_touch.c (bluetouchscript=) share one clock.
++ * A time is
++ *   T        seconds (decimals allowed: 25.5) after this driver started,
++ *            the same clock as bluereboot_after=N
++ *   sb+T     T seconds after a process named SpringBoard first exists
++ *            (looked for every second, for up to bluereboot_timeout s, 300)
++ */
++static uint64_t blue_when_t0;                   /* mach time of sweet_ufs_init */
++static uint64_t _Atomic blue_when_sb;           /* mach time SpringBoard was first seen */
++static uint32_t blue_when_timeout = 300;
++static int blue_when_chan;
++
++bool blue_when_parse(const char **s, bool *sb, uint32_t *ms);
++bool blue_when_wait(bool sb, uint32_t ms);
++void blue_when_now(uint32_t *ms, int32_t *sb_ms);
++void blue_sleep_until(uint64_t deadline);
++
++static void
++blue_when_init(void)
++{
++	blue_when_t0 = mach_absolute_time();
++	(void)PE_parse_boot_argn("bluereboot_timeout", &blue_when_timeout, sizeof(blue_when_timeout));
++}
++
++void
++blue_sleep_until(uint64_t deadline)
++{
++	if (mach_absolute_time() < deadline) {
++		(void)assert_wait_deadline(&blue_when_chan, THREAD_UNINT, deadline);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static uint64_t
++blue_ms_to_abs(uint32_t ms)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static uint32_t
++blue_abs_to_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++/* "T" or "sb+T" at *s, T = digits [. up to 3 digits]; *s moves past it. */
++bool
++blue_when_parse(const char **s, bool *sb, uint32_t *ms)
++{
++	const char *p = *s;
++	uint32_t v = 0, frac = 0, scale = 1000;
++
++	*sb = false;
++	if ((p[0] == 's' || p[0] == 'S') && (p[1] == 'b' || p[1] == 'B')) {
++		*sb = true;
++		p += 2;
++		if (*p == '+') {
++			p++;
++		}
++	}
++	if (*p < '0' || *p > '9') {
++		return false;
++	}
++	for (; *p >= '0' && *p <= '9'; p++) {
++		if (v > 100000) {
++			return false;
++		}
++		v = v * 10 + (uint32_t)(*p - '0');
++	}
++	if (*p == '.') {
++		for (p++; *p >= '0' && *p <= '9'; p++) {
++			if (scale > 1) {
++				scale /= 10;
++				frac += (uint32_t)(*p - '0') * scale;
++			}
++		}
++	}
++	*ms = v * 1000 + frac;
++	*s = p;
++	return true;
++}
++
++static int
++blue_when_find_springboard(proc_t p, void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, "SpringBoard") == 0) {
++		*(bool *)arg = true;
++	}
++	return PROC_RETURNED;
++}
++
++/* Milliseconds since the driver started, and since SpringBoard (-1: not seen). */
++void
++blue_when_now(uint32_t *ms, int32_t *sb_ms)
++{
++	uint64_t now = mach_absolute_time(), sb = os_atomic_load(&blue_when_sb, relaxed);
++	*ms = blue_abs_to_ms(now - blue_when_t0);
++	*sb_ms = sb ? (int32_t)blue_abs_to_ms(now - sb) : -1;
++}
++
++/* Sleep until the time; false when SpringBoard did not come in time. */
++bool
++blue_when_wait(bool sb, uint32_t ms)
++{
++	uint64_t base = blue_when_t0;
++
++	if (sb) {
++		uint64_t limit = mach_absolute_time() + blue_ms_to_abs(blue_when_timeout * 1000u);
++		while ((base = os_atomic_load(&blue_when_sb, relaxed)) == 0) {
++			bool found = false;
++			proc_iterate(PROC_ALLPROCLIST, blue_when_find_springboard, &found, NULL, NULL);
++			if (found) {
++				(void)os_atomic_cmpxchg(&blue_when_sb, 0ull, mach_absolute_time(), relaxed);
++				continue;
++			}
++			if (mach_absolute_time() > limit) {
++				return false;
++			}
++			blue_sleep_until(mach_absolute_time() + blue_ms_to_abs(1000));
++		}
++	}
++	blue_sleep_until(base + blue_ms_to_abs(ms));
++	return true;
++}
++
++/*
++ * Screenshots (patch 0146): the agent sees the screen without a camera.
++ *
++ *   bluesnap=TIME,TIME,...     a snap at each time (see above), in list order
++ *   bluesnap_on_reboot=1       one more right before bluereboot resets
++ *   bluesnap_scale=2           1, 2 (default) or 4: box-filtered downscale
++ *   bluesnap_bpp=16            16 (RGB565, default) or 32 (B, G, R, A)
++ * bluetouchscript= can take one too (its "snap" action).
++ *
++ * A snap reads the panel memory (blue_fb_snapinfo(), SweetFramebuffer.cpp:
++ * 1080x2160 BGRA, stride 4320) through the kernel mapping AppleCLCD uses,
++ * averages scale x scale pixels and writes the picture to UFS through the
++ * same path as the console log ring: 2x, 16 bpp = 540x1080, 1139 KiB.
++ *
++ * Where: the 128 MiB of userdata right below the log area (the last
++ * 4100 KiB), so tools/phonetest.sh reads it from recovery with dd as it does
++ * the log. userdata holds only the 16 GiB HFS+ root image at its start; the
++ * rest (~35 GiB) is unused. Before the first write the HFS+ volume header
++ * is read and the snaps stay off unless the volume ends before the area.
++ * ufs_write_blocks() still refuses anything outside userdata.
++ *
++ * Area layout, 4 KiB blocks; block 0 (rewritten after each snap, and with
++ * count 0 when the snaps are armed, so a later pull never sees an older
++ * boot's pictures):
++ *   "BLUESNPS" | u64 boot nonce | u32 version 1 | u32 count
++ *   | u32 used blocks (with block 0) | u32 area blocks
++ * then each snap: one header block
++ *   "BLUESNAP" | u64 boot nonce | u32 version 1 | u32 index | u32 width
++ *   | u32 height | u32 bpp | u32 scale | u32 bytes | u32 ms since start
++ *   | i32 ms since SpringBoard (-1) | u32 panel width | u32 panel height
++ *   | u32 0 | char why[32]
++ * and the pixels (rows top to bottom, little endian), padded to a block.
++ */
++#define BLUESNAP_BLOCKS         ((128u << 20) / UFS_BLOCK)
++#define BLUESNAP_MAX            64u
++
++struct bluesnap_area {
++	char magic[8];
++	uint64_t nonce;
++	uint32_t version, count, used, blocks;
++};
++
++struct bluesnap_header {
++	char magic[8];
++	uint64_t nonce;
++	uint32_t version, index, width, height, bpp, scale, bytes, ms;
++	int32_t sb_ms;
++	uint32_t src_w, src_h, rsvd;
++	char why[32];
++};
++
++extern int blue_fb_snapinfo(uintptr_t *pixels, uint32_t *w, uint32_t *h, uint32_t *stride);
++int bluesnap_take(const char *why);
++
++static LCK_MTX_DECLARE(bluesnap_lock, &sweet_ufs_grp);
++static struct {
++	bool on, on_reboot;
++	uint32_t scale, bpp;
++	uint64_t area;                          /* first device block of the area */
++	uint64_t nonce;
++	uint32_t count, used;                   /* under bluesnap_lock */
++	vm_offset_t buf;
++	vm_size_t bufsize;
++	char times[256];
++} bs;
++
++/* Area block 0 into the bounce buffer and out. Caller holds sweet_ufs_lock. */
++static int
++bluesnap_write_area_locked(uint32_t count, uint32_t used)
++{
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	struct bluesnap_area a = {
++		.magic = { 'B', 'L', 'U', 'E', 'S', 'N', 'P', 'S' },
++		.nonce = bs.nonce, .version = 1, .count = count, .used = used,
++		.blocks = BLUESNAP_BLOCKS,
++	};
++	bzero(bounce, UFS_BLOCK);
++	memcpy(bounce, &a, sizeof(a));
++	return ufs_write_blocks(bs.area, 1);
++}
++
++static inline uint32_t
++be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++/* Make the box-filtered copy of the panel in bs.buf. Returns the byte count. */
++static uint32_t
++bluesnap_convert(uintptr_t px, uint32_t w, uint32_t h, uint32_t stride, uint32_t *ow, uint32_t *oh)
++{
++	uint32_t sc = bs.scale, n = sc * sc;
++	*ow = w / sc;
++	*oh = h / sc;
++	uint32_t bytes = *ow * *oh * (bs.bpp / 8);
++	uint8_t *out = (uint8_t *)bs.buf;
++	/* scale rows of the panel, copied out of the write-combined mapping in one go each */
++	const uint8_t *rows = (const uint8_t *)(bs.buf + ((bytes + 63u) & ~63u));
++
++	for (uint32_t oy = 0; oy < *oh; oy++) {
++		for (uint32_t r = 0; r < sc; r++) {
++			memcpy((void *)(uintptr_t)(rows + (uint64_t)r * w * 4),
++			    (const void *)(px + (uint64_t)(oy * sc + r) * stride), (size_t)w * 4);
++		}
++		for (uint32_t ox = 0; ox < *ow; ox++) {
++			uint32_t b = 0, g = 0, rd = 0;
++			for (uint32_t r = 0; r < sc; r++) {
++				const uint8_t *p = rows + ((uint64_t)r * w + (uint64_t)ox * sc) * 4;
++				for (uint32_t c = 0; c < sc; c++, p += 4) {
++					b += p[0];
++					g += p[1];
++					rd += p[2];
++				}
++			}
++			b /= n;
++			g /= n;
++			rd /= n;
++			if (bs.bpp == 16) {
++				uint16_t v = (uint16_t)((rd >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
++				out[0] = (uint8_t)v;
++				out[1] = (uint8_t)(v >> 8);
++				out += 2;
++			} else {
++				out[0] = (uint8_t)b;
++				out[1] = (uint8_t)g;
++				out[2] = (uint8_t)rd;
++				out[3] = 0xff;
++				out += 4;
++			}
++		}
++	}
++	return bytes;
++}
++
++/* One snap now. Thread context only (it sleeps on locks and UFS commands). */
++int
++bluesnap_take(const char *why)
++{
++	uintptr_t px;
++	uint32_t w, h, stride, ow, oh, ms;
++	int32_t sb_ms;
++	int error = 0;
++
++	if (!bs.on) {
++		return ENXIO;
++	}
++	if (!blue_fb_snapinfo(&px, &w, &h, &stride) || w < bs.scale || h < bs.scale) {
++		printf("BLUELINE SNAP: %s: no framebuffer yet, no snap\n", why);
++		return ENXIO;
++	}
++	lck_mtx_lock(&bluesnap_lock);
++	uint32_t need_bytes = (w / bs.scale) * (h / bs.scale) * (bs.bpp / 8);
++	uint32_t blocks = 1 + (need_bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++	if (bs.count >= BLUESNAP_MAX || bs.used + blocks > BLUESNAP_BLOCKS) {
++		printf("BLUELINE SNAP: %s: area full (%u snaps), no snap\n", why, bs.count);
++		lck_mtx_unlock(&bluesnap_lock);
++		return ENOSPC;
++	}
++	vm_size_t want = round_page((vm_size_t)((need_bytes + 63u) & ~63u) + (vm_size_t)bs.scale * w * 4);
++	if (bs.bufsize < want) {
++		if (bs.buf) {
++			kmem_free(kernel_map, bs.buf, bs.bufsize);
++			bs.buf = 0;
++			bs.bufsize = 0;
++		}
++		if (kmem_alloc(kernel_map, &bs.buf, want, KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			bs.buf = 0;
++			printf("BLUELINE SNAP: %s: no memory for %lu KiB, no snap\n", why, (unsigned long)(want >> 10));
++			lck_mtx_unlock(&bluesnap_lock);
++			return ENOMEM;
++		}
++		bs.bufsize = want;
++	}
++
++	blue_when_now(&ms, &sb_ms);
++	uint64_t t = mach_absolute_time();
++	uint32_t bytes = bluesnap_convert(px, w, h, stride, &ow, &oh);
++	uint32_t conv_ms = blue_abs_to_ms(mach_absolute_time() - t);
++
++	uint64_t at = bs.area + bs.used;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	struct bluesnap_header hd = {
++		.magic = { 'B', 'L', 'U', 'E', 'S', 'N', 'A', 'P' },
++		.nonce = bs.nonce, .version = 1, .index = bs.count, .width = ow, .height = oh,
++		.bpp = bs.bpp, .scale = bs.scale, .bytes = bytes, .ms = ms, .sb_ms = sb_ms,
++		.src_w = w, .src_h = h,
++	};
++	strlcpy(hd.why, why, sizeof(hd.why));
++
++	t = mach_absolute_time();
++	lck_mtx_lock(&sweet_ufs_lock);
++	bzero(bounce, UFS_BLOCK);
++	memcpy(bounce, &hd, sizeof(hd));
++	error = ufs_write_blocks(at, 1);
++	for (uint32_t off = 0; !error && off < bytes; off += BOUNCE_SIZE) {
++		uint32_t n = MIN(BOUNCE_SIZE, bytes - off);
++		uint32_t nb = (n + UFS_BLOCK - 1) / UFS_BLOCK;
++		memcpy(bounce, (const void *)(bs.buf + off), n);
++		bzero((char *)bounce + n, nb * UFS_BLOCK - n);
++		error = ufs_write_blocks(at + 1 + off / UFS_BLOCK, nb);
++	}
++	if (!error) {
++		error = bluesnap_write_area_locked(bs.count + 1, bs.used + blocks);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	uint32_t write_ms = blue_abs_to_ms(mach_absolute_time() - t);
++
++	if (error) {
++		printf("BLUELINE SNAP: %s: UFS write failed (%d); snaps off\n", why, error);
++		bs.on = false;
++	} else {
++		printf("BLUELINE SNAP: #%u %s at %u.%03u s (SpringBoard %d ms): %ux%u, %u bpp, %u KiB "
++		    "at block 0x%llx; %u ms to read, %u ms to write\n",
++		    bs.count, why, ms / 1000, ms % 1000, sb_ms, ow, oh, bs.bpp, bytes >> 10, at,
++		    conv_ms, write_ms);
++		bs.count++;
++		bs.used += blocks;
++	}
++	lck_mtx_unlock(&bluesnap_lock);
++	return error;
++}
++
++static void
++bluesnap_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	const char *p = bs.times;
++	char why[32];
++
++	while (*p) {
++		const char *item = p;
++		bool sb;
++		uint32_t ms;
++		if (!blue_when_parse(&p, &sb, &ms) || (*p && *p != ',')) {
++			printf("BLUELINE SNAP: bad time at \"%s\" in bluesnap=; stopping\n", item);
++			return;
++		}
++		snprintf(why, sizeof(why), "bluesnap %.*s", (int)(p - item), item);
++		if (*p == ',') {
++			p++;
++		}
++		if (!blue_when_wait(sb, ms)) {
++			printf("BLUELINE SNAP: no SpringBoard after %u s; snaps at sb+ times dropped\n",
++			    blue_when_timeout);
++			(void)bluesnap_take("SpringBoard timeout");
++			return;
++		}
++		(void)bluesnap_take(why);
++	}
++}
++
++static void
++bluesnap_arm(void)
++{
++	char script[8];
++	thread_t thread;
++
++	bool have_times = PE_parse_boot_arg_str("bluesnap", bs.times, sizeof(bs.times)) && bs.times[0];
++	uint32_t on_reboot = 0;
++	(void)PE_parse_boot_argn("bluesnap_on_reboot", &on_reboot, sizeof(on_reboot));
++	bool have_script = PE_parse_boot_arg_str("bluetouchscript", script, sizeof(script)) && script[0];
++	if (!have_times && !on_reboot && !have_script) {
++		return;
++	}
++	bs.scale = 2;
++	bs.bpp = 16;
++	(void)PE_parse_boot_argn("bluesnap_scale", &bs.scale, sizeof(bs.scale));
++	(void)PE_parse_boot_argn("bluesnap_bpp", &bs.bpp, sizeof(bs.bpp));
++	if (bs.scale != 1 && bs.scale != 2 && bs.scale != 4) {
++		bs.scale = 2;
++	}
++	if (bs.bpp != 16 && bs.bpp != 32) {
++		bs.bpp = 16;
++	}
++	if (!su.writable) {
++		printf("BLUELINE SNAP: off: needs ufsrw=1\n");
++		return;
++	}
++	if (su.nblocks < 2 * (SWEET_LOG_BLOCKS + BLUESNAP_BLOCKS)) {
++		printf("BLUELINE SNAP: off: partition too small\n");
++		return;
++	}
++	uint64_t rel = su.nblocks - SWEET_LOG_BLOCKS - BLUESNAP_BLOCKS;
++	bs.area = su.first_block + rel;
++	bs.nonce = mach_absolute_time();
++
++	/* The HFS+ volume header (partition byte 1024) must end before the area. */
++	lck_mtx_lock(&sweet_ufs_lock);
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(su.first_block, 1);
++	uint64_t hfs_end = 0;
++	uint32_t sig = 0;
++	if (!error) {
++		sig = (uint32_t)b[1024] << 8 | b[1025];
++		hfs_end = ((uint64_t)be32(b + 1024 + 40) * be32(b + 1024 + 44) + UFS_BLOCK - 1) / UFS_BLOCK;
++	}
++	if (error || (sig != 0x482b && sig != 0x4858) || hfs_end == 0 || hfs_end > rel) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("BLUELINE SNAP: off: HFS+ volume header %s (signature 0x%04x, ends at block 0x%llx, "
++		    "area at 0x%llx); not writing\n", error ? "unreadable" : "does not clear the area",
++		    sig, hfs_end, rel);
++		return;
++	}
++	error = bluesnap_write_area_locked(0, 1);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("BLUELINE SNAP: off: area header write failed (%d)\n", error);
++		return;
++	}
++	bs.used = 1;
++	bs.on_reboot = on_reboot != 0;
++	bs.on = true;
++	printf("BLUELINE SNAP: %u MiB at block 0x%llx (userdata +%llu MiB; HFS+ ends at %llu MiB), "
++	    "scale %u, %u bpp; at %s%s\n",
++	    BLUESNAP_BLOCKS * UFS_BLOCK >> 20, bs.area, rel * UFS_BLOCK >> 20, hfs_end * UFS_BLOCK >> 20,
++	    bs.scale, bs.bpp, have_times ? bs.times : "-", bs.on_reboot ? ", and before reboot" : "");
++	if (have_times && kernel_thread_start(bluesnap_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/*
+  * Test-loop reboot (patch 0127): end a hardware test boot on its own, with
+  * the console log on UFS, in fastboot or in recovery.
+  *
+@@ -865,6 +1333,9 @@
+ 	if (br.when != BR_GPU) {
+ 		(void)sync_internal();          /* waits for the sync, at most 5 s */
+ 		bluereboot_sleep(1);            /* as sweet_usb.c "reboot": journal */
++	}
++	if (bs.on_reboot) {
++		(void)bluesnap_take("before reboot");
+ 	}
+ 	int pon = blueline_pon_set_reboot_reason(br.reason, &before, &after);
+ 	uint32_t cookie = br.reason == 2 ? 0x77665500u : 0x77665502u;
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-19 10:58:55
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-19 11:03:41
+@@ -40,6 +40,29 @@
+     uintptr_t panel_va, uint32_t lw, uint32_t lh);
+ extern "C" void blue_dpu_stat(int kind, uint64_t dt);
+ 
++/*
++ * Screenshots (bluesnap=, sweet_ufs.c, patch 0146): the kernel mapping of
++ * the panel memory, set once AppleCLCD has started. 32 bits per pixel,
++ * byte order B, G, R, A (SWEET_FB_FORMAT_BGRA).
++ */
++static uintptr_t gBlueSnapPixels;
++static uint32_t gBlueSnapW, gBlueSnapH, gBlueSnapStride;
++extern "C" int blue_fb_snapinfo(uintptr_t *pixels, uint32_t *w, uint32_t *h, uint32_t *stride);
++
++extern "C" int
++blue_fb_snapinfo(uintptr_t *pixels, uint32_t *w, uint32_t *h, uint32_t *stride)
++{
++	uintptr_t p = __atomic_load_n(&gBlueSnapPixels, __ATOMIC_ACQUIRE);
++	if (p == 0) {
++		return 0;
++	}
++	*pixels = p;
++	*w = gBlueSnapW;
++	*h = gBlueSnapH;
++	*stride = gBlueSnapStride;
++	return 1;
++}
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -251,6 +274,10 @@
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	powerStart();
+ 	blue_dpu_start(fPhys, fWidth, fHeight, fRowBytes, fPixels, fLogicalW, fLogicalH);
++	gBlueSnapW = fWidth;
++	gBlueSnapH = fHeight;
++	gBlueSnapStride = fRowBytes;
++	__atomic_store_n(&gBlueSnapPixels, fPixels, __ATOMIC_RELEASE);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+diff -ru a/iokit/Kernel/arm/hid/BlueFakeMotion.cpp b/iokit/Kernel/arm/hid/BlueFakeMotion.cpp
+--- a/iokit/Kernel/arm/hid/BlueFakeMotion.cpp	2026-11-19 10:58:55
++++ b/iokit/Kernel/arm/hid/BlueFakeMotion.cpp	2026-11-19 11:03:41
+@@ -68,6 +68,7 @@
+ extern "C" uint64_t mach_absolute_time(void);
+ extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+ extern "C" void blueline_fake_accel_key(int key, int down);
++extern "C" int blueline_fake_accel_turn(const char *why);
+ 
+ #define BLUE_FAKE_PAGE      0xFF00u	/* kHIDPage_AppleVendor */
+ #define BLUE_FAKE_ACCEL     0x03u	/* kHIDUsage_AppleVendor_Accelerometer */
+@@ -410,6 +411,21 @@
+ 		noteInterval(dict, "BatchInterval", &fBatchUS);
+ 	}
+ 	return IOHIDEventService::setProperties(properties);
++}
++
++/*
++ * A quarter turn as volume up + volume down would start, for scripts
++ * (bluetouchscript= "volchord", blueline_touch.c, patch 0146); works with
++ * bluefakeaccel_keys=0 too. Returns 0 when the fake accelerometer is off.
++ */
++extern "C" int
++blueline_fake_accel_turn(const char *why)
++{
++	if (!blue_fake_enabled()) {
++		return 0;
++	}
++	blue_request_turn(why);
++	return 1;
+ }
+ 
+ /*
+diff -ru a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-19 10:58:55
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-19 11:03:41
+@@ -362,6 +362,7 @@
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void touch(int finger, bool down, int x, int y);
++	void liftAll(void);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+@@ -374,6 +375,8 @@
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+ 	IOFixed fY[SWEET_TOUCH_FINGERS];
++	int fPX[SWEET_TOUCH_FINGERS];	/* last panel position, for liftAll() */
++	int fPY[SWEET_TOUCH_FINGERS];
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+@@ -536,6 +539,8 @@
+ 	if (down) {
+ 		fX[finger] = nx;
+ 		fY[finger] = ny;
++		fPX[finger] = x;
++		fPY[finger] = y;
+ 	}
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerX, nx);
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerY, ny);
+@@ -567,8 +572,61 @@
+ 	}
+ }
+ 
++/* Lift every finger that is down (at its last position). */
++void
++SweetHIDTouch::liftAll(void)
++{
++	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
++		IOLockLock(fLock);
++		bool d = fDown[i];
++		int x = fPX[i], y = fPY[i];
++		IOLockUnlock(fLock);
++		if (d) {
++			touch(i, false, x, y);
++		}
++	}
++}
++
++/*
++ * Scripted touches (bluetouchscript=, blueline_touch.c, patch 0146). While
++ * a script step runs, contacts from the touch screen are dropped; at its
++ * start the fingers that are down are lifted, so the step's contact is the
++ * only one. A finger still on the glass afterwards comes back as a new
++ * contact with its next move.
++ */
++static volatile bool gSweetTouchScript;
++extern "C" int sweet_hid_touch_script(int on);
++extern "C" void sweet_hid_touch_inject(int finger, int down, int x, int y);
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
++{
++	if (gSweetTouch && !gSweetTouchScript) {
++		gSweetTouch->touch(finger, down != 0, x, y);
++	}
++}
++
++/* 1: a script step begins (returns 0 if there is no touch service yet); 0: it ended. */
++extern "C" int
++sweet_hid_touch_script(int on)
++{
++	if (!gSweetTouch) {
++		return 0;
++	}
++	if (on) {
++		gSweetTouchScript = true;
++		__atomic_thread_fence(__ATOMIC_SEQ_CST);
++		gSweetTouch->liftAll();
++	} else {
++		gSweetTouch->liftAll();
++		gSweetTouchScript = false;
++	}
++	return 1;
++}
++
++/* A contact from the script, in panel pixels: the same path as the touch screen's. */
++extern "C" void
++sweet_hid_touch_inject(int finger, int down, int x, int y)
+ {
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);

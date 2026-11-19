@@ -1,0 +1,494 @@
+From 49f32cd5bf5ed7d3b80e2f90f72cdf1598c4ce6c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 08:40:36 +1100
+Subject: [PATCH] 0130: battery state from the PMI8998 fuel gauge (bluebatt=1)
+
+---
+ bsd/dev/blueline_keys.c          |  37 +++-
+ iokit/Kernel/arm/BlueBattery.cpp | 360 +++++++++++++++++++++++++++++--
+ 2 files changed, 372 insertions(+), 25 deletions(-)
+
+diff --git a/bsd/dev/blueline_keys.c b/bsd/dev/blueline_keys.c
+index 0095799..30d50fc 100644
+--- a/bsd/dev/blueline_keys.c
++++ b/bsd/dev/blueline_keys.c
+@@ -35,6 +35,8 @@ extern void sweet_hid_key(int key, int down);
+ void blueline_keys_init(void);
+ int blueline_pon_set_reboot_reason(uint8_t reason, uint8_t *before, uint8_t *after);
+ int blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len);
++int blueline_spmi_read_sid(uint8_t sid, uint16_t addr, uint8_t *buf, unsigned len);
++int blueline_spmi_apid(uint8_t sid, uint8_t periph, uint16_t *apid, uint8_t *owner);
+ 
+ #define ARB_CORE_PA	0x0c440000u	/* version, features, APID -> PPID map */
+ #define ARB_OBS_PA	0x0e600000u	/* read-only observer channels */
+@@ -216,24 +218,25 @@ blueline_pon_set_reboot_reason(uint8_t reason, uint8_t *before, uint8_t *after)
+ }
+ 
+ /*
+- * Read len (1..4) registers of PMIC SID 0 starting at addr (peripheral =
+- * addr >> 8, PPID = addr >> 8 for SID 0), through the observer channel and
++ * Read len (1..4) registers of PMIC slave sid starting at addr (peripheral =
++ * addr >> 8, PPID = (sid << 8) | peripheral), through the observer channel and
+  * under the arbiter lock. Read-only: no ownership needed. Thread context
+  * only (takes a mutex). 0, or EINVAL / ENXIO (no arbiter, peripheral not in
+  * the APID table) / EIO (no answer, or an error status).
++ * blueline_spmi_read() is SID 0 (PM8998); 0130 adds SID 2 (PMI8998).
+  */
+ int
+-blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++blueline_spmi_read_sid(uint8_t sid, uint16_t addr, uint8_t *buf, unsigned len)
+ {
+ 	static uint16_t last_ppid = NO_APID, last_apid = NO_APID;
+ 
+-	if (!buf || len < 1 || len > 4 || ((addr & 0xffu) + len) > 0x100u) {
++	if (!buf || sid > 0xfu || len < 1 || len > 4 || ((addr & 0xffu) + len) > 0x100u) {
+ 		return EINVAL;
+ 	}
+ 	if (!arb_setup()) {
+ 		return ENXIO;
+ 	}
+-	uint16_t ppid = addr >> 8;
++	uint16_t ppid = (uint16_t)(((unsigned)sid << 8) | (addr >> 8));
+ 	lck_mtx_lock(&blueline_arb_lock);
+ 	if (ppid != last_ppid) {
+ 		last_apid = arb_apid(ppid, arb_count);
+@@ -248,6 +251,30 @@ blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len)
+ 	return ok ? 0 : EIO;
+ }
+ 
++int
++blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	return blueline_spmi_read_sid(0, addr, buf, len);
++}
++
++/* APID of PPID (sid << 8) | periph and its owner EE (0 = apps), for logs. 0 or ENXIO. */
++int
++blueline_spmi_apid(uint8_t sid, uint8_t periph, uint16_t *apid, uint8_t *owner)
++{
++	*apid = NO_APID;
++	*owner = 0xff;
++	if (sid > 0xfu || !arb_setup()) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&blueline_arb_lock);
++	*apid = arb_apid((uint16_t)(((unsigned)sid << 8) | periph), arb_count);
++	if (*apid != NO_APID) {
++		*owner = (uint8_t)(arb_rd(arb_cnfg, 0x700u + 4u * *apid) & 7u);
++	}
++	lck_mtx_unlock(&blueline_arb_lock);
++	return *apid == NO_APID ? ENXIO : 0;
++}
++
+ static bool volup_on;
+ 
+ static void
+diff --git a/iokit/Kernel/arm/BlueBattery.cpp b/iokit/Kernel/arm/BlueBattery.cpp
+index a3a873d..fe21cee 100644
+--- a/iokit/Kernel/arm/BlueBattery.cpp
++++ b/iokit/Kernel/arm/BlueBattery.cpp
+@@ -1,18 +1,62 @@
+ /*
+- * Pixel 3 (blueline) battery for iOS, static for now: 100 %, on external
++ * Pixel 3 (blueline) battery for iOS. By default static: 100 %, on external
+  * power, full, not charging (2915 mAh, the Pixel 3's design capacity).
+  * Without any IOPMPowerSource iOS shows an empty battery and no percentage.
+- * Nothing is read from the PMIC yet (PMI8998 fuel gauge: later). Pattern as
+- * ios-sweet's SweetBattery (0062): matched on IOResources, the complete
+- * source published before registerService() wakes powerd.
++ * Pattern as ios-sweet's SweetBattery (0062): matched on IOResources, the
++ * complete source published before registerService() wakes powerd.
++ *
++ * Boot-arg bluebatt=1 (patch 0130): real values from the PMI8998 (SPMI SID 2),
++ * read-only, through blueline_spmi_read_sid() (bsd/dev/blueline_keys.c), at start
++ * and then every bluebatt_secs (default 30) seconds:
++ *   FG_BATT_SOC  0x4000: MONOTONIC_SOC 0x4009 (+ shadow copy 0x400a), the
++ *                        percentage Linux's qpnp-fg-gen3 reports
++ *   FG_BATT_INFO 0x4100: BATT_TEMP 0x4150/51 (0.25 K), VBATT 0x41a0/a1
++ *                        (122.07 uV), IBATT 0x41a2/a3 (488.281 uA, signed,
++ *                        positive = discharging); LSB/MSB swapped on v1.x
++ *   SCHG         0x1000: BATTERY_CHARGER_STATUS_1/2 0x1006/07 (charge state),
++ *                        USBIN/DCIN INT_RT_STS 0x1310/0x1410 bit 4 (plugged)
++ * No FG SRAM (memif) access, nothing written, no interrupts. Boot-args:
++ * bluebatt_secs=N (10..600), bluebatt_log=N (full logs for the first N
++ * reads, default 5; then one line when %, plug or charge state changes),
++ * bluebatt_dry=1 (read and log, but keep publishing the static values).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
+ 
+ #define BLUE_BATTERY_MAH	2915u
+ 
++/* bsd/dev/blueline_keys.c (0129 observer-channel reads; SID argument from 0130) */
++extern "C" int blueline_spmi_read_sid(uint8_t sid, uint16_t addr, uint8_t *buf, unsigned len);
++extern "C" int blueline_spmi_apid(uint8_t sid, uint8_t periph, uint16_t *apid, uint8_t *owner);
++
++/* PMI8998 peripherals, PPID = (SID 2 << 8) | peripheral */
++#define PMI_REVID		0x201u	/* REVISION4 0x03, TYPE 0x04, SUBTYPE 0x05 */
++#define PMI_CHGR		0x210u	/* BATTERY_CHARGER_STATUS_1 0x06, _2 0x07 */
++#define PMI_USBIN		0x213u	/* INT_RT_STS 0x10 */
++#define PMI_DCIN		0x214u	/* INT_RT_STS 0x10 (wireless charger input) */
++#define PMI_MISC		0x216u	/* ICL_STATUS 0x07, POWER_PATH_STATUS 0x0b */
++#define PMI_FG_SOC		0x240u	/* MONOTONIC_SOC 0x09/0x0a, INT_RT_STS 0x10 */
++#define PMI_FG_INFO		0x241u	/* TEMP_STS 0x06, SYS_BATT 0x07, INT_RT_STS 0x10, ... */
++#define PMI8998_SUBTYPE		0x15u	/* qcom-spmi-pmic.c: PM8998 0x14, PMI8998 0x15 */
++#define PMI8998_V2P0_REV4	0x02u
++
++#define PLUGIN_RT_STS_BIT	0x10u	/* USBIN/DCIN INT_RT_STS */
++#define BT_MISS_RT_STS_BIT	0x08u	/* FG_BATT_INFO INT_RT_STS */
++#define BAT_OV_STS_BIT		0x20u	/* BATTERY_CHARGER_STATUS_2 */
++
++struct BlueBattReading {
++	uint8_t soc[2], socRt, infoSts[2], infoRt, temp[2], vi[4], chg[2], usbin, dcin, icl, path;
++	unsigned percent, mV, chgState;
++	int mA;			/* FG sign: positive = out of the battery */
++	int deciC;
++	bool plugged, charging, full;
++};
++
+ class BlueBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(BlueBattery);
+ public:
+@@ -21,6 +65,21 @@ public:
+ private:
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
++	void putLegacy(UInt32 mah, UInt32 mV, SInt32 mA, UInt32 flags);
++	bool pmicSetup(void);
++	bool pmicRead(const char *what, uint16_t ppid, uint8_t off, uint8_t *buf, unsigned len,
++	    bool trace);
++	bool readAll(BlueBattReading *r, bool trace);
++	bool refresh(void);
++	void publish(const BlueBattReading *r);
++	void armRefresh(void);
++	static void refreshCallout(thread_call_param_t p0, thread_call_param_t p1);
++
++	thread_call_t refreshCall;
++	uint32_t refreshSecs, logCount, refreshCount, errorCount;
++	bool dry, swapVI, logged;
++	unsigned lastPercent;
++	bool lastPlugged, lastCharging, lastFull;
+ };
+ OSDefineMetaClassAndStructors(BlueBattery, IOPMPowerSource);
+ 
+@@ -70,6 +129,253 @@ BlueBattery::putBool(const char *key, bool value)
+ 	}
+ }
+ 
++/* IOPMCopyBatteryInfo's per-source compatibility dictionary */
++void
++BlueBattery::putLegacy(UInt32 mah, UInt32 mV, SInt32 mA, UInt32 flags)
++{
++	OSDictionary *legacy = OSDictionary::withCapacity(6);
++	if (!legacy) {
++		return;
++	}
++	const char *keys[] = { kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		               kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		               kIOBatteryFlagsKey };
++	UInt32 values[] = { mah, BLUE_BATTERY_MAH, mV, (UInt32)mA, 0, flags };
++	for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
++		OSNumber *number = OSNumber::withNumber(values[i], 32);
++		if (number) {
++			legacy->setObject(keys[i], number);
++			number->release();
++		}
++	}
++	setLegacyIOBatteryInfo(legacy);
++	legacy->release();
++}
++
++/* One read; logs before the access when tracing, and (rate-limited) failures. */
++bool
++BlueBattery::pmicRead(const char *what, uint16_t ppid, uint8_t off, uint8_t *buf, unsigned len,
++    bool trace)
++{
++	uint16_t addr = (uint16_t)(((ppid & 0xffu) << 8) | off);
++
++	if (trace) {
++		IOLog("BLUELINE BATTERY: about to read %s, SID %u 0x%04x, %u byte(s)\n", what,
++		    ppid >> 8, addr, len);
++	}
++	int error = blueline_spmi_read_sid((uint8_t)(ppid >> 8), addr, buf, len);
++	if (error) {
++		errorCount++;
++		if (errorCount <= 5 || (errorCount % 100) == 0) {
++			IOLog("BLUELINE BATTERY: read %s (SID %u 0x%04x) failed: error %d "
++			    "(%u errors)\n", what, ppid >> 8, addr, error, errorCount);
++		}
++		return false;
++	}
++	return true;
++}
++
++/* PMIC identity and arbiter channels; false keeps the static battery. */
++bool
++BlueBattery::pmicSetup(void)
++{
++	static const struct {
++		const char *name;
++		uint16_t ppid;
++	} periph[] = {
++		{ "REVID", PMI_REVID }, { "SCHG_CHGR", PMI_CHGR }, { "SCHG_USB", PMI_USBIN },
++		{ "SCHG_DC", PMI_DCIN }, { "SCHG_MISC", PMI_MISC }, { "FG_BATT_SOC", PMI_FG_SOC },
++		{ "FG_BATT_INFO", PMI_FG_INFO },
++	};
++	bool fgOk = true;
++
++	for (unsigned i = 0; i < sizeof(periph) / sizeof(periph[0]); i++) {
++		uint16_t apid;
++		uint8_t owner;
++		int error = blueline_spmi_apid((uint8_t)(periph[i].ppid >> 8),
++		    (uint8_t)(periph[i].ppid & 0xffu), &apid, &owner);
++		if (error) {
++			IOLog("BLUELINE BATTERY: %s PPID %#x: no APID\n", periph[i].name, periph[i].ppid);
++		} else {
++			IOLog("BLUELINE BATTERY: %s PPID %#x: APID %u, owner EE %u%s\n", periph[i].name,
++			    periph[i].ppid, apid, owner, owner ? " (not apps; reads still work)" : "");
++		}
++		if (error && (periph[i].ppid == PMI_REVID || periph[i].ppid == PMI_FG_SOC ||
++		    periph[i].ppid == PMI_FG_INFO)) {
++			fgOk = false;
++		}
++	}
++	if (!fgOk) {
++		IOLog("BLUELINE BATTERY: REVID or fuel gauge not reachable; static battery\n");
++		return false;
++	}
++	uint8_t rev[3] = { 0, 0, 0 };	/* REVISION4, TYPE, SUBTYPE */
++	if (!pmicRead("REVID", PMI_REVID, 0x03, rev, 3, true)) {
++		IOLog("BLUELINE BATTERY: REVID read failed; static battery\n");
++		return false;
++	}
++	if (rev[2] != PMI8998_SUBTYPE) {
++		IOLog("BLUELINE BATTERY: SID 2 REVID rev4 %#x type %#x subtype %#x is not a "
++		    "PMI8998 (0x15); static battery\n", rev[0], rev[1], rev[2]);
++		return false;
++	}
++	/* qpnp-fg-gen3 PMI8998_V1_REV_WA: VBATT/IBATT LSB and MSB swapped before v2.0 */
++	swapVI = rev[0] < PMI8998_V2P0_REV4;
++	IOLog("BLUELINE BATTERY: PMI8998 rev4 %#x type %#x%s\n", rev[0], rev[1],
++	    swapVI ? " (v1: VBATT/IBATT bytes swapped)" : "");
++	return true;
++}
++
++static const char *const chgStateName[8] = {
++	"trickle", "pre-charge", "fast", "full-on", "taper", "terminated", "inhibited", "disabled",
++};
++
++bool
++BlueBattery::readAll(BlueBattReading *r, bool trace)
++{
++	bzero(r, sizeof(*r));
++
++	/*
++	 * MONOTONIC_SOC and its shadow copy: retry until both agree (qpnp-fg-gen3
++	 * fg_get_msoc_raw(), 5 tries); else take the lower (mainline qcom_fg).
++	 */
++	unsigned tries = 0;
++	do {
++		if (!pmicRead("FG MONOTONIC_SOC", PMI_FG_SOC, 0x09, r->soc, 2, trace && tries == 0)) {
++			return false;
++		}
++	} while (r->soc[0] != r->soc[1] && ++tries < 5);
++	if (!pmicRead("FG_BATT_SOC INT_RT_STS", PMI_FG_SOC, 0x10, &r->socRt, 1, trace) ||
++	    !pmicRead("FG BATT_TEMP_STS/SYS_BATT", PMI_FG_INFO, 0x06, r->infoSts, 2, trace) ||
++	    !pmicRead("FG_BATT_INFO INT_RT_STS", PMI_FG_INFO, 0x10, &r->infoRt, 1, trace) ||
++	    !pmicRead("FG BATT_TEMP", PMI_FG_INFO, 0x50, r->temp, 2, trace) ||
++	    !pmicRead("FG VBATT/IBATT", PMI_FG_INFO, 0xa0, r->vi, 4, trace) ||
++	    !pmicRead("SCHG BATTERY_CHARGER_STATUS_1/2", PMI_CHGR, 0x06, r->chg, 2, trace) ||
++	    !pmicRead("SCHG USBIN INT_RT_STS", PMI_USBIN, 0x10, &r->usbin, 1, trace) ||
++	    !pmicRead("SCHG DCIN INT_RT_STS", PMI_DCIN, 0x10, &r->dcin, 1, trace) ||
++	    !pmicRead("SCHG ICL_STATUS", PMI_MISC, 0x07, &r->icl, 1, trace) ||
++	    !pmicRead("SCHG POWER_PATH_STATUS", PMI_MISC, 0x0b, &r->path, 1, trace)) {
++		return false;
++	}
++
++	/* 0 and 255 are 0 % and 100 %, 1..254 scale to 1..99 (fg_get_msoc()) */
++	unsigned raw = r->soc[0] < r->soc[1] ? r->soc[0] : r->soc[1];
++	r->percent = raw == 255 ? 100 : raw == 0 ? 0 : ((raw - 1) * 98 + 126) / 253 + 1;
++
++	/* 11 bits, 0.25 K -> deci-degrees C, rounded (fg_get_battery_temp()) */
++	int t = ((r->temp[1] & 0x07) << 8) | r->temp[0];
++	int x = (t - 273 * 4) * 10;
++	r->deciC = x >= 0 ? (x + 2) / 4 : (x - 2) / 4;
++
++	uint8_t vlo = swapVI ? r->vi[1] : r->vi[0], vhi = swapVI ? r->vi[0] : r->vi[1];
++	uint8_t ilo = swapVI ? r->vi[3] : r->vi[2], ihi = swapVI ? r->vi[2] : r->vi[3];
++	uint64_t vraw = (uint64_t)((vhi << 8) | vlo);
++	r->mV = (unsigned)(vraw * 122070u / 1000000u);
++	int64_t iraw = (int16_t)(uint16_t)((ihi << 8) | ilo);
++	r->mA = (int)(iraw * 488281 / 1000000);
++
++	r->chgState = r->chg[0] & 0x07u;
++	r->plugged = ((r->usbin | r->dcin) & PLUGIN_RT_STS_BIT) != 0;
++	/* qcom_smbx smb_get_prop_status(): 0..4 charging, 5/6 full, 7 not charging */
++	r->charging = r->plugged && r->chgState <= 4 && !(r->chg[1] & BAT_OV_STS_BIT);
++	r->full = r->plugged && (r->chgState == 5 || r->chgState == 6);
++	return true;
++}
++
++void
++BlueBattery::publish(const BlueBattReading *r)
++{
++	/* Rounded up, so powerd's CurrentCapacity / MaxCapacity gives r->percent back. */
++	UInt32 mah = (r->percent * BLUE_BATTERY_MAH + 99) / 100;
++	SInt32 amperage = -r->mA;	/* Apple sign: negative = discharging */
++	UInt32 flags = kIOBatteryInstalled;
++
++	if (r->plugged) {
++		flags |= kIOBatteryChargerConnect;
++	}
++	if (r->charging) {
++		flags |= kIOBatteryCharge;
++	}
++	setCurrentCapacity(mah);
++	setMaxCapacity(BLUE_BATTERY_MAH);
++	setExternalConnected(r->plugged);
++	setExternalChargeCapable(r->plugged);
++	setIsCharging(r->charging);
++	setAtWarnLevel(!r->plugged && r->percent <= 10);
++	setAtCriticalLevel(!r->plugged && r->percent <= 5);
++	setVoltage(r->mV);
++	setAmperage(amperage);
++	putBool("FullyCharged", r->full || (r->plugged && r->percent == 100 && !r->charging));
++	putBool("AppleRawExternalConnected", r->plugged);
++	putNumber("AppleRawCurrentCapacity", mah);
++	putNumber("InstantAmperage", (UInt32)amperage);
++	putNumber("Temperature", (UInt32)(r->deciC * 10));	/* centidegrees */
++	putLegacy(mah, r->mV, amperage, flags);
++	updateStatus();
++}
++
++bool
++BlueBattery::refresh(void)
++{
++	BlueBattReading r;
++	bool trace = refreshCount == 0;
++	unsigned n = ++refreshCount;
++
++	if (!readAll(&r, trace)) {
++		return false;
++	}
++	bool missing = (r.infoRt & BT_MISS_RT_STS_BIT) != 0;
++	bool sane = !missing && r.mV >= 2500 && r.mV <= 4800 && r.deciC > -400 && r.deciC < 900;
++	bool changed = !logged || r.percent != lastPercent || r.plugged != lastPlugged ||
++	    r.charging != lastCharging || r.full != lastFull;
++	int absDeci = r.deciC < 0 ? -r.deciC : r.deciC;
++
++	if (n <= logCount) {
++		IOLog("BLUELINE BATTERY: #%u raw soc %02x/%02x rt %02x | info sts %02x sys %02x rt %02x "
++		    "temp %02x %02x v/i %02x %02x %02x %02x | chg %02x %02x usbin %02x dcin %02x "
++		    "icl %02x path %02x\n", n, r.soc[0], r.soc[1], r.socRt, r.infoSts[0], r.infoSts[1],
++		    r.infoRt, r.temp[0], r.temp[1], r.vi[0], r.vi[1], r.vi[2], r.vi[3], r.chg[0],
++		    r.chg[1], r.usbin, r.dcin, r.icl, r.path);
++	}
++	if (n <= logCount || changed || !sane) {
++		IOLog("BLUELINE BATTERY: #%u %u%% %u mV %d mA (FG, + = discharging) %s%d.%d C, "
++		    "%s%s, charger %s%s%s%s\n", n, r.percent, r.mV, r.mA, r.deciC < 0 ? "-" : "",
++		    absDeci / 10, absDeci % 10, (r.usbin & PLUGIN_RT_STS_BIT) ? "USB in" : "USB out",
++		    (r.dcin & PLUGIN_RT_STS_BIT) ? ", wireless in" : "", chgStateName[r.chgState],
++		    r.charging ? ", charging" : "", r.full ? ", full" : "",
++		    !sane ? (missing ? ", BATTERY MISSING: not published" :
++		    ", implausible: not published") : dry ? " (dry run: static values kept)" : "");
++	}
++	if (!sane) {
++		return false;
++	}
++	logged = true;
++	lastPercent = r.percent;
++	lastPlugged = r.plugged;
++	lastCharging = r.charging;
++	lastFull = r.full;
++	if (!dry) {
++		publish(&r);
++	}
++	return true;
++}
++
++void
++BlueBattery::armRefresh(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(refreshSecs, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(refreshCall, deadline);
++}
++
++void
++BlueBattery::refreshCallout(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	BlueBattery *self = (BlueBattery *)p0;
++	self->refresh();
++	self->armRefresh();
++}
++
+ bool
+ BlueBattery::start(IOService *provider)
+ {
+@@ -97,28 +403,42 @@ BlueBattery::start(IOService *provider)
+ 	putNumber("DesignCapacity", BLUE_BATTERY_MAH);
+ 	putNumber("InstantAmperage", 0);
+ 	putNumber("Temperature", 2500);		/* centidegrees, fixed */
++	putLegacy(BLUE_BATTERY_MAH, 4350, 0,
++	    (UInt32)(kIOBatteryInstalled | kIOBatteryChargerConnect));
+ 
+-	/* IOPMCopyBatteryInfo's per-source compatibility dictionary */
+-	OSDictionary *legacy = OSDictionary::withCapacity(6);
+-	if (legacy) {
+-		const char *keys[] = { kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+-			               kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+-			               kIOBatteryFlagsKey };
+-		UInt32 values[] = { BLUE_BATTERY_MAH, BLUE_BATTERY_MAH, 4350, 0, 0,
+-			            (UInt32)(kIOBatteryInstalled | kIOBatteryChargerConnect) };
+-		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+-			OSNumber *number = OSNumber::withNumber(values[i], 32);
+-			if (number) {
+-				legacy->setObject(keys[i], number);
+-				number->release();
++	int mode = 0;
++	(void)PE_parse_boot_argn("bluebatt", &mode, sizeof(mode));
++	bool live = false;
++	if (mode == 1) {
++		int secs = 30, logs = 5, dryArg = 0;
++		(void)PE_parse_boot_argn("bluebatt_secs", &secs, sizeof(secs));
++		(void)PE_parse_boot_argn("bluebatt_log", &logs, sizeof(logs));
++		(void)PE_parse_boot_argn("bluebatt_dry", &dryArg, sizeof(dryArg));
++		refreshSecs = (uint32_t)(secs < 10 ? 10 : secs > 600 ? 600 : secs);
++		logCount = (uint32_t)(logs < 0 ? 0 : logs);
++		dry = dryArg != 0;
++		IOLog("BLUELINE BATTERY: bluebatt=1: PMI8998 fuel gauge every %u s%s\n", refreshSecs,
++		    dry ? ", dry run" : "");
++		if (pmicSetup()) {
++			refreshCall = thread_call_allocate_with_priority(refreshCallout, this,
++			    THREAD_CALL_PRIORITY_LOW);
++			live = refreshCall != NULL;
++			if (!refresh()) {
++				IOLog("BLUELINE BATTERY: first read failed; static values until a read works\n");
+ 			}
+ 		}
+-		setLegacyIOBatteryInfo(legacy);
+-		legacy->release();
+ 	}
+ 	updateStatus();
+-	IOLog("BLUELINE BATTERY: AppleSmartBattery, static, 100%% on external power\n");
++	if (live) {
++		IOLog("BLUELINE BATTERY: AppleSmartBattery, from the PMI8998%s\n",
++		    dry ? " (dry run: static 100% published)" : "");
++	} else {
++		IOLog("BLUELINE BATTERY: AppleSmartBattery, static, 100%% on external power\n");
++	}
+ 	registerService();
++	if (live) {
++		armRefresh();
++	}
+ 	return true;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+

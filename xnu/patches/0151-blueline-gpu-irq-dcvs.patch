@@ -1,0 +1,1502 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 23:00:00 +1100
+Subject: [PATCH] 0151: blueline GPU: interrupts, recovery, DCVS, cache clean
+ option (bluegpu=8)
+
+On top of 0147. Only bsd/dev/blueline_gpu.c.
+
+Interrupts: GIC SPI 300 (INTID 332, level) through 0121's
+sweet_spi_attach. The fence tail gets a second CACHE_FLUSH_TS with the
+IRQ bit after its MEM_WRITE (a6xx_submit), writing seq to CP+0x2820; the
+vsync thread sleeps on it in 2 ms slices instead of delay(50) polling.
+Checked at bring-up with a fenced no-op; no interrupt -> polled as 0147.
+RBBM_INT_0 error bits snapshot CP state in the handler (CP_INTERRUPT_
+STATUS, SQE_STAT opcode, HW_FAULT, PROTECT_STATUS, IB1/IB2, cb0 FSR/FAR)
+and are decoded once on the thread. A storm (> 20000/s) masks the line.
+GMU "gmu" (305) and "hfi" (304) SPIs: watchdog bite, fence error, AHB
+error, CM3 fault, logged; a bite or CM3 fault ends GPU presents.
+
+Hang and recovery: RBBM hang detect (masked in the handler, as
+a6xx_fault_detect_irq) or the bluegpu_present_hang_ms guard -> dump once
+(CP state, 32 ring dwords around rptr, GX), SQE and VBIF halt, RBBM soft
+reset, hw_init, SQE/RB registers, ME_INIT, CP_SET_SECURE_MODE 0 (or
+SECVID_TRUST_CNTL 0), 0138's 2D setup, cb0 TLBI, fenced no-op; the hung
+frame is a CPU copy and presents resume. bluegpu_recover_max (3) in a
+minute, a failed step or a GMU fault: 0147's "present hang" (CPU
+presents for the boot). bluegpu_test_hang=N (kind 1 IB to an unmapped
+VA, 2 WAIT_REG_MEM forever, 3 garbage header; _every=S repeats).
+
+Clock: bluegpu_mhz=N picks the lowest level >= N. bluegpu_dcvs=1: busy
+% per >= 100 ms (GMU power counter 0 XOCLK, blit CP_ALWAYS_ON time as a
+fallback) -> the lowest level running it at bluegpu_dcvs_target % (65),
+up at once, down after 3 windows, legacy GMU DCVS OOB; the DDR vote
+follows the level's peak bandwidth (bluegpu_bw_kbps=N fixes it).
+Measured clock (CP ALWAYS_COUNT vs CP_ALWAYS_ON) logged per change.
+
+Cache clean: bluegpu_present_clean=1 (default) DC CVAC as 0147; 0 none
+(UNSAFE, test only); 2 a coherence probe at up (lines this CPU left
+dirty, read by CP_MEM_TO_MEM through a WB inner-shareable mapping):
+coherent -> surface slots mapped cacheable and no clean; the
+first-present self-check short of PASS turns cleaning back on.
+---
+ bsd/dev/blueline_gpu.c | 1111 +++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 1048 insertions(+), 63 deletions(-)
+
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -328,6 +328,38 @@
+  *  time per present, GPU blit time and submit-to-done (CP_ALWAYS_ON).
+  *  bluegpu_present=0: resident, CPU presents (bring-up test only).
+  *
++ * Interrupts, recovery, DCVS, cache clean option (0151, bluegpu=8):
++ *  - GIC SPI 300 (INTID 332, level; 0121's sweet_spi_attach) for RBBM_INT_0
++ *    (A6XX_INT_MASK). Each fence tail gets a CACHE_FLUSH_TS with the IRQ bit
++ *    after its MEM_WRITE; the vsync thread sleeps on it (2 ms slices) instead
++ *    of polling. Checked with a fenced no-op at bring-up; no interrupt ->
++ *    polling as 0147. Error bits snapshot CP state in the handler and are
++ *    decoded once on the thread (a6xx_cp_hw_err_irq). > 20000 interrupts in
++ *    a second: masked at the GIC. bluegpu_irq=0: polled.
++ *  - GMU SPIs 305 "gmu" (AO_HOST_INT: watchdog bite, fence error, AHB error)
++ *    and 304 "hfi" (CM3_FAULT only): logged; a bite or CM3 fault ends GPU
++ *    presents (no GMU restart here). bluegpu_gmu_irq=0: not attached.
++ *  - Hang = RBBM hang detect interrupt (hw_init's HANG_INT_CNTL) or the
++ *    bluegpu_present_hang_ms guard. Recovery (bluegpu_recover=1): dump once,
++ *    SQE + VBIF halt, RBBM soft reset, hw_init, SQE/RB registers, ME_INIT,
++ *    secure mode off as the zap left it, 0138's 2D setup, cb0 TLBI, fenced
++ *    no-op; the hung frame is a CPU copy. bluegpu_recover_max (3) in a
++ *    minute -> CPU presents for the boot (0147's "present hang").
++ *  - bluegpu_test_hang=N: a bad packet (bluegpu_test_hang_kind 1 IB to an
++ *    unmapped VA, 2 WAIT_REG_MEM forever, 3 garbage header) in front of the
++ *    first present N s after up; bluegpu_test_hang_every=S repeats it.
++ *  - bluegpu_mhz=N: the lowest level >= N (257 342 414 520 596 675 710) at
++ *    start. bluegpu_dcvs=1: every >= 100 ms of presents, busy % (GMU power
++ *    counter 0 XOCLK, else blit time) -> lowest level that runs it at
++ *    bluegpu_dcvs_target % (65) within bluegpu_dcvs_min..max; up at once,
++ *    down after 3 windows; legacy GMU DCVS OOB (a6xx_gmu_set_freq), the DDR
++ *    vote follows the level (bluegpu_bw_kbps=N fixes it). Logged per change.
++ *  - bluegpu_present_clean: 1 (default) DC CVAC to PoC per present; 0 no
++ *    clean (UNSAFE, measures what it costs); 2 a coherence probe at up
++ *    (CPU-dirty lines read by the CP through a cacheable inner-shareable
++ *    mapping): coherent -> surface slots mapped cacheable and no clean, else
++ *    the clean stays; a first-present self-check short of PASS reverts.
++ *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+  *    gpucc@5090000, adreno_smmu@5040000), gpucc-sdm845.c (gmu_clk_src RCG
+@@ -422,6 +454,7 @@
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>	/* CleanPoC_DcacheRegion_Force (0147) */
+ #include <kern/thread.h>		/* kernel_thread_start (0147) */
++#include <kern/sched_prim.h>		/* assert_wait_deadline, clear_wait (0151) */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);	/* osfmk/arm64/machine_routines.c */
+@@ -433,6 +466,8 @@
+ extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);	/* osfmk/vm/pmap.h, kernel-private */
+ extern unsigned int pmap_cache_attributes(ppnum_t);
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);	/* pexpert/arm/pe_fiq.c */
++extern void sweet_spi_mask(uint32_t intid, bool masked);
+ void blueline_gpu_probe(void);
+ 
+ /* GCC (gcc-sdm845.c) */
+@@ -1691,8 +1726,13 @@
+ static const uint32_t bw_cnoc_on[3] = { 0x60000001u, 0x20000001u, 0x60000001u };
+ static const uint32_t bw_ddr_addr[3] = { 0x50000u, 0x5005cu, 0x5000cu };
+ 
+-/* Optional apps-side DDR vote (bluegpu_bw=1): Linux's gfx-mem path at the lowest GPU OPP */
+-#define GX_BW_KBPS		1648000u	/* sdm845.dtsi opp-257000000 opp-peak-kBps */
++/*
++ * Optional apps-side DDR vote (bluegpu_bw=1): Linux's gfx-mem path at the
++ * GPU level's opp-peak-kBps (sdm845.dtsi; 0151: per level, as
++ * dev_pm_opp_set_opp after a6xx_gmu_set_freq), or bluegpu_bw_kbps.
++ */
++static const uint32_t gpu_bw_kbps[GX_LEVELS] = { 0, 1648000, 2724000, 4068000, 6220000, 6220000, 7216000, 7216000 };
++static uint32_t gx_bw_kbps_arg;	/* bluegpu_bw_kbps: fixed vote instead of the level's */
+ #define BCM_CMD(commit, valid, x, y) (((uint32_t)(commit) << 30) | ((uint32_t)(valid) << 29) | \
+ 	(((uint32_t)(x) & 0x3fffu) << 14) | ((uint32_t)(y) & 0x3fffu))
+ 
+@@ -1701,7 +1741,7 @@
+ 	int step, perf, bw, wr, ms, hfi_ms, rpmh_stop;
+ 	uint32_t gx_votes[GX_LEVELS], cx_votes[CX_LEVELS];
+ 	bool started, rail, sptprac, gpu_oob, up, bw_voted;
+-	uint32_t bw_addr[2], bw_data[2];
++	uint32_t bw_addr[2], bw_data[2], bw_kbps;
+ 	uint32_t gdscr_was, misc_was, spt_ctl_was;
+ 	vm_offset_t core;
+ } gx;
+@@ -1800,6 +1840,21 @@
+ 	if (gx.perf < 1 || gx.perf >= GX_LEVELS) {
+ 		gx.perf = 1;
+ 	}
++	/* 0151: bluegpu_mhz=N picks the lowest level at or above N MHz (wins over bluegpu_perf) */
++	int mhz = 0;
++	if (PE_parse_boot_argn("bluegpu_mhz", &mhz, sizeof(mhz)) && mhz > 0) {
++		int l = 1;
++		while (l < GX_LEVELS - 1 && gpu_khz[l] < (uint32_t)mhz * 1000u) {
++			l++;
++		}
++		printf("BLUELINE GPU: bluegpu_mhz=%d: level %d (%u MHz)%s\n", mhz, l, gpu_khz[l] / 1000,
++		    gpu_khz[l] / 1000 != (uint32_t)mhz ? ", the next OPP up (257/342/414/520/596/675/710)" : "");
++		gx.perf = l;
++	}
++	uint32_t kbps = 0;
++	if (PE_parse_boot_argn("bluegpu_bw_kbps", &kbps, sizeof(kbps)) && kbps >= 100000 && kbps <= 7216000) {
++		gx_bw_kbps_arg = kbps;
++	}
+ 	if (gx.ms < 1 || gx.ms > 2000) {
+ 		gx.ms = 100;
+ 	}
+@@ -1863,11 +1918,11 @@
+ 	    rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)), gmu_rd(GMU_GMU2HOST_INTR_INFO));
+ }
+ 
+-/* a6xx_gmu_set_oob, legacy bits, polled; the ack is cleared either way. */
++/* a6xx_gmu_set_oob, legacy bits, polled; the ack is cleared either way. No log (0151: DCVS at run time). */
+ static bool
+-gmu_oob_set(const char *name, uint32_t req, uint32_t ack)
++gmu_oob_quiet(uint32_t req, uint32_t ack, uint32_t *info_out, uint64_t *ns)
+ {
+-	uint64_t t0 = mach_absolute_time(), ns;
++	uint64_t t0 = mach_absolute_time();
+ 	uint32_t info = 0;
+ 	bool ok = false;
+ 
+@@ -1880,8 +1935,19 @@
+ 		}
+ 		delay(10);
+ 	}
+-	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, ns);
+ 	wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1u << ack);
++	*info_out = info;
++	return ok;
++}
++
++static bool
++gmu_oob_set(const char *name, uint32_t req, uint32_t ack)
++{
++	uint64_t ns;
++	uint32_t info;
++	bool ok = gmu_oob_quiet(req, ack, &info, &ns);
++
+ 	printf("BLUELINE GPU: OOB %s (host2gmu bit %u): %s after %llu us (gmu2host %#x)\n", name, req,
+ 	    ok ? "acked" : (info & GMU2HOST_CM3_FAULT) ? "CM3 FAULT" : "NO ACK", ns / 1000, info);
+ 	return ok;
+@@ -1895,13 +1961,14 @@
+ }
+ 
+ /* Optional: the apps-side gfx-mem vote (icc-rpmh bcm_aggregate: peak * width / buswidth * 1000 / unit). */
+-static void
+-gx_bw_vote(void)
++static int
++gx_bw_vote_kbps(uint32_t kbps, bool quiet)
+ {
+ 	static const struct {
+ 		const char *id;
+ 		uint32_t buswidth;	/* icc-sdm845: ebi 4 bytes, qns_llcc 16 */
+ 	} bcm[2] = { { "MC0", 4 }, { "SH0", 16 } };
++	uint32_t data[2];
+ 
+ 	for (int i = 0; i < 2; i++) {
+ 		uint8_t a[8] = { 0 };
+@@ -1910,24 +1977,49 @@
+ 		uint32_t width = a[4] | (uint32_t)a[5] << 8;
+ 		if (!addr || len < 6 || !unit || !width) {
+ 			printf("BLUELINE GPU: BCM %s: addr %#x aux %u bytes: unusable, no DDR vote\n", bcm[i].id, addr, len);
+-			return;
++			return ENOENT;
+ 		}
+-		uint64_t y = ((uint64_t)GX_BW_KBPS * width + bcm[i].buswidth - 1) / bcm[i].buswidth;
++		uint64_t y = ((uint64_t)kbps * width + bcm[i].buswidth - 1) / bcm[i].buswidth;
+ 		y = (y * 1000 + unit - 1) / unit;
+ 		if (y > 0x3fff) {
+ 			y = 0x3fff;
+ 		}
+ 		gx.bw_addr[i] = addr;
+-		gx.bw_data[i] = BCM_CMD(1, 1, 0, y);
+-		printf("BLUELINE GPU: BCM %s at %#x unit %u width %u: %u kBps peak -> y %llu, cmd %#x\n", bcm[i].id, addr,
+-		    unit, width, GX_BW_KBPS, (unsigned long long)y, gx.bw_data[i]);
++		data[i] = BCM_CMD(1, 1, 0, y);
++		if (!quiet) {
++			printf("BLUELINE GPU: BCM %s at %#x unit %u width %u: %u kBps peak -> y %llu, cmd %#x\n", bcm[i].id,
++			    addr, unit, width, kbps, (unsigned long long)y, data[i]);
++		}
+ 	}
+-	printf("BLUELINE GPU: about to vote DDR through the apps RSC (DRV 2 active TCS)\n");
+-	int err = blueline_rpmh_write(gx.bw_addr, gx.bw_data, 2);
+-	gx.bw_voted = err != ENXIO && err != EBUSY;	/* a timeout may still have reached RPMh */
+-	printf("BLUELINE GPU: DDR vote: err %d\n", err);
++	if (!quiet) {
++		printf("BLUELINE GPU: about to vote DDR through the apps RSC (DRV 2 active TCS)\n");
++	}
++	int err = blueline_rpmh_write(gx.bw_addr, data, 2);
++	if (err != ENXIO && err != EBUSY) {	/* a timeout may still have reached RPMh */
++		gx.bw_voted = true;
++		gx.bw_data[0] = data[0];
++		gx.bw_data[1] = data[1];
++		gx.bw_kbps = kbps;
++	}
++	if (!quiet) {
++		printf("BLUELINE GPU: DDR vote %u kBps: err %d\n", kbps, err);
++	}
++	return err;
+ }
+ 
++/* The level's opp-peak-kBps (or bluegpu_bw_kbps). */
++static uint32_t
++gx_level_kbps(int level)
++{
++	return gx_bw_kbps_arg ? gx_bw_kbps_arg : gpu_bw_kbps[level];
++}
++
++static void
++gx_bw_vote(void)
++{
++	(void)gx_bw_vote_kbps(gx_level_kbps(gx.perf), false);
++}
++
+ /* Back to Linux's keepalive vote for MC0/SH0 (x 1, y 1): never 0, which could collapse DDR. */
+ static void
+ gx_bw_drop(void)
+@@ -2225,7 +2317,7 @@
+ 
+ #define RBBM_INT_HANG_DETECT	(1u << 23)
+ #define RBBM_INT_BAD		((1u << 1) | (1u << 9) | (1u << 23) | (1u << 24))	/* AHB err, CP HW err, hang, UCHE OOB */
+-#define A6XX_INT_MASK_VAL	0x3d0e242u	/* a6xx_gpu.c A6XX_INT_MASK; GIC SPI 300 stays disabled: polled */
++#define A6XX_INT_MASK_VAL	0x3d0e242u	/* a6xx_gpu.c A6XX_INT_MASK; GIC SPI 300 attached at bluegpu=8 (0151) */
+ #define CP_RB_CNTL_VAL		0x08000209u	/* BUFSZ log2(4K/8) 9, BLKSZ log2(32/8) 2 << 8, NO_UPDATE bit 27 */
+ #define UCHE_TRAP		0x1fffffffff000ull
+ #define AHB_FENCE_DROPPED	0x3u		/* GMU_AHB_FENCE_STATUS: write dropped (fence_status_check) */
+@@ -2251,6 +2343,8 @@
+ #define CP_MEM_WRITE_VAL	0x600df00du
+ #define CP_SCRATCH_VAL		0xcafe0001u
+ #define LPAE_PAGE_RO(pa)	(LPAE_PAGE(pa) | (1ull << 7))	/* AP[2]: MSM_BO_GPU_READONLY for the SQE */
++/* 0151: SH inner, AttrIndx 1 (MAIR 0xff, WBRWA): io-pgtable-arm for IOMMU_READ | IOMMU_CACHE */
++#define LPAE_PAGE_RO_WB(pa)	(LPAE_PAGE_RO(pa) | (1ull << 8) | (1ull << 2))
+ #define SQE_FW_MAX		(CP_SQE_MAX + 4u)	/* the file, dword 0 included */
+ 
+ static struct {
+@@ -2550,9 +2644,9 @@
+ 	return true;
+ }
+ 
+-/* a6xx_gpu.c hw_init, a630 branches, up to the interrupts; no hwcg, CP_PROTECT or UBWC yet. */
++/* a6xx_gpu.c hw_init, a630 branches, up to the interrupts; no hwcg, CP_PROTECT or UBWC yet. quiet: one line (0151 recovery). */
+ static void
+-cp_hw_init(void)
++cp_hw_init(bool quiet)
+ {
+ 	static const struct {
+ 		uint16_t reg;
+@@ -2603,12 +2697,23 @@
+ 	};
+ 	uint32_t n = sizeof(r) / sizeof(r[0]);
+ 
+-	printf("BLUELINE GPU: about to write %u hw_init registers (each logged once it reads back)\n", n);
++	uint32_t differ = 0;
++	if (!quiet) {
++		printf("BLUELINE GPU: about to write %u hw_init registers (each logged once it reads back)\n", n);
++	}
+ 	cp.hw_init = true;
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		cp_wr(r[i].reg, r[i].v);
+-		printf("BLUELINE GPU: hw_init %s (%#x) = %#x, reads %#x\n", r[i].name, r[i].reg, r[i].v, cp_rd(r[i].reg));
++		uint32_t v = cp_rd(r[i].reg);
++		differ += v != r[i].v;
++		if (!quiet) {
++			printf("BLUELINE GPU: hw_init %s (%#x) = %#x, reads %#x\n", r[i].name, r[i].reg, r[i].v, v);
++		}
+ 	}
++	if (quiet) {
++		printf("BLUELINE GPU: hw_init: %u registers written, %u read back another value (as at bring-up: some"
++		    " are write-only)\n", n, differ);
++	}
+ }
+ 
+ /*
+@@ -3964,6 +4069,13 @@
+ #define RS_SEQ_OFF		(CP_TARGET_OFF + 0x800u)	/* +0 CACHE_FLUSH_TS, +4 MEM_WRITE, +8 CCU colour */
+ #define RS_AO_OFF		(CP_TARGET_OFF + 0x810u)	/* +0 ALWAYS_ON at start, +8 at end (64-bit each) */
+ #define RS_BORDER_OFF		(CP_TARGET_OFF + 0xc00u)	/* 512 zero bytes, 128-aligned */
++#define RS_IRQ_OFF		(CP_TARGET_OFF + 0x820u)	/* 0151: the fence interrupt's CACHE_FLUSH_TS (seq) */
++#define RS_TEST_OFF		(CP_TARGET_OFF + 0x830u)	/* 0151: word the test hang's WAIT_REG_MEM polls (0) */
++#define RS_PROBE_OFF		(CP_TARGET_OFF + 0x900u)	/* 0151: coherence probe results, 8 words */
++#define RS_TEST_BAD_VA		0x7ff00000u	/* L1[1], L2 entry 511: no L3 table there */
++#define CP_WAIT_REG_MEM		0x3cu
++#define CP_INDIRECT_BUFFER	0x3fu
++#define CP_MEM_TO_MEM		0x73u
+ #define RS_RING_MAX		900u
+ #define RS_STAT_NS		(5ull * NSEC_PER_SEC)
+ #define RS_SAMPLES		512u
+@@ -3986,9 +4098,72 @@
+ 
+ enum { RSF_NOTUP, RSF_OFF, RSF_LAYER, RSF_DST, RSF_MAP, RSF_N };
+ 
++/* 0151: interrupts. GPU (gpu@5000000 "kgsl_3d0_irq") SPI 300, GMU "hfi" SPI 304 and "gmu" SPI 305, all level. */
++#define RS_INTID_GPU		(32u + 300u)
++#define RS_INTID_HFI		(32u + 304u)
++#define RS_INTID_GMU		(32u + 305u)
++#define RBBM_INT_CACHE_FLUSH_TS	(1u << 20)
++#define RBBM_INT_ERRORS		((1u << 1) | (1u << 6) | (1u << 9) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25))
++#define RBBM_INT_CP_HW_ERROR	(1u << 9)
++#define CP_EVENT_IRQ		(1u << 31)	/* CP_EVENT_WRITE dword 0 */
++#define RBBM_STATUS3_SMMU_STALLED (1u << 24)
++#define GXR_CP_IB1_BASE		0x0928u		/* lo, hi; +2 IB1_REM_SIZE */
++#define GXR_CP_IB2_BASE		0x092bu		/* lo, hi; +2 IB2_REM_SIZE */
++#define GMU_AO_HOST_INT_CLR	0x23b04u
++#define GMU_AO_HOST_INT_MASK	0x23b06u
++#define GMU_AO_GPU_CX_BUSY_MASK	0x23b0eu
++#define GMU_AO_WDOG_BITE	(1u << 0)
++#define GMU_AO_FENCE_ERR	(1u << 3)
++#define GMU_AO_HOST_AHB_ERR	(1u << 5)
++#define GMU_AO_IRQS		(GMU_AO_WDOG_BITE | GMU_AO_FENCE_ERR | GMU_AO_HOST_AHB_ERR)	/* a6xx_gmu.c GMU_IRQ_MASK */
++#define GMU_POWER_COUNTER_SELECT_0 0x1f841u
++#define GMU_POWER_COUNTER_XOCLK_0 0x1f844u	/* L, H: 19.2 MHz ticks with the GPU busy (a6xx_gpu_busy) */
++#define RS_IRQ_STORM		20000u		/* interrupts in one second: masked at the GIC, polling again */
++#define RS_SLICE_US		2000u		/* sleep slice while waiting for a fence (a lost interrupt costs this) */
++#define RS_EVENT		((event_t)(uintptr_t)&rs.irq_seq)	/* the vsync thread sleeps on it */
++#define RS_REC_MAX		8
++
++static const char *const rs_int_names[32] = {
++	"RBBM_GPU_IDLE", "CP_AHB_ERROR", NULL, NULL, NULL, NULL, "RBBM_ATB_ASYNCFIFO_OVERFLOW", "RBBM_GPC_ERROR",
++	"CP_SW", "CP_HW_ERROR", "CP_CCU_FLUSH_DEPTH_TS", "CP_CCU_FLUSH_COLOR_TS", "CP_CCU_RESOLVE_TS", "CP_IB2",
++	"CP_IB1", "CP_RB", NULL, "CP_RB_DONE_TS", "CP_WT_DONE_TS", NULL, "CP_CACHE_FLUSH_TS", NULL,
++	"RBBM_ATB_BUS_OVERFLOW", "RBBM_HANG_DETECT", "UCHE_OOB_ACCESS", "UCHE_TRAP_INTR", "DEBBUS_INTR_0",
++	"DEBBUS_INTR_1", NULL, NULL, "ISDB_CPU_IRQ", "ISDB_UNDER_DEBUG",
++};
++
++/* What the interrupt handler saw at the first error (read in interrupt context, logged by the vsync thread). */
++struct rs_fault {
++	uint32_t status, cp_int, sqe1, hw_fault, protect, rbbm, rbbm3, rptr, wptr, ib1_rem, ib2_rem, fsr, far_lo;
++	uint64_t ib1, ib2, t;
++};
++
+ static struct {
+ 	bool req, up, dead, checked, first_map;
+ 	int present, filter, yofs, check, hang_ms;
++	/* 0151 options */
++	int irq, gmu_irq, recover, recover_max, test_hang, test_kind, test_every, dcvs, dcvs_min, dcvs_max, dcvs_target,
++	    clean;
++	/* 0151 interrupts: written by the handlers (any CPU), read by the vsync thread */
++	bool irq_on, hfi_on, gmu_on;
++	volatile uint32_t irq_n, irq_fence, irq_spurious, irq_window_n, irq_seq, irq_errors, irq_hang, irq_stormed;
++	volatile uint64_t irq_t, irq_window_t;
++	volatile uint32_t err_bits, err_n, gmu_ao, gmu_ao_n, gmu_cm3, hfi_n, fault_taken;
++	struct rs_fault fault;
++	uint32_t err_logged, gmu_logged;
++	/* 0151 recovery and the test hook */
++	uint32_t n_recover, n_recover_total;
++	uint64_t rec_t[RS_REC_MAX];
++	bool dumped;
++	const char *why;
++	uint64_t t_up, test_next;
++	uint32_t test_seq, n_test;
++	/* 0151 DCVS */
++	bool busy_gmu;
++	uint64_t dcvs_t, dcvs_xo, dcvs_ticks;
++	uint32_t dcvs_low, dcvs_changes, busy_pct;
++	/* 0151 cache */
++	bool coherent;
++	uint32_t n_irq_wake, n_slice, n_clean_skip;
+ 	int ready;			/* published (release) by the bring-up thread */
+ 	vm_offset_t arena;
+ 	uint64_t arena_pa;
+@@ -4006,7 +4181,7 @@
+ 	uint64_t t_stat;
+ 	uint32_t n_gpu, n_cpu[RSF_N], n_wait, n_map, n_done, n_kick_retry;
+ 	uint64_t wait_ns, clean_ns, clean_max, cpu_ns, cpu_max, blit_ticks, blit_max, lag_ns, lag_max;
+-	uint64_t total_gpu;
++	uint64_t total_gpu, blit_total;
+ } rs;
+ 
+ /* Options (reads only), at bluegpu=8 before stage 3's options. */
+@@ -4020,6 +4195,45 @@
+ 	rs.yofs = -1;
+ 	rs.check = 1;
+ 	rs.hang_ms = 500;
++	rs.irq = 1;
++	rs.gmu_irq = 1;
++	rs.recover = 1;
++	rs.recover_max = 3;
++	rs.test_kind = 3;
++	rs.dcvs_min = 257;
++	rs.dcvs_max = 710;
++	rs.dcvs_target = 65;
++	rs.clean = 1;
++	(void)PE_parse_boot_argn("bluegpu_irq", &rs.irq, sizeof(rs.irq));
++	(void)PE_parse_boot_argn("bluegpu_gmu_irq", &rs.gmu_irq, sizeof(rs.gmu_irq));
++	(void)PE_parse_boot_argn("bluegpu_recover", &rs.recover, sizeof(rs.recover));
++	(void)PE_parse_boot_argn("bluegpu_recover_max", &rs.recover_max, sizeof(rs.recover_max));
++	(void)PE_parse_boot_argn("bluegpu_test_hang", &rs.test_hang, sizeof(rs.test_hang));
++	(void)PE_parse_boot_argn("bluegpu_test_hang_kind", &rs.test_kind, sizeof(rs.test_kind));
++	(void)PE_parse_boot_argn("bluegpu_test_hang_every", &rs.test_every, sizeof(rs.test_every));
++	(void)PE_parse_boot_argn("bluegpu_dcvs", &rs.dcvs, sizeof(rs.dcvs));
++	(void)PE_parse_boot_argn("bluegpu_dcvs_min", &rs.dcvs_min, sizeof(rs.dcvs_min));
++	(void)PE_parse_boot_argn("bluegpu_dcvs_max", &rs.dcvs_max, sizeof(rs.dcvs_max));
++	(void)PE_parse_boot_argn("bluegpu_dcvs_target", &rs.dcvs_target, sizeof(rs.dcvs_target));
++	(void)PE_parse_boot_argn("bluegpu_present_clean", &rs.clean, sizeof(rs.clean));
++	if (rs.recover_max < 1 || rs.recover_max > RS_REC_MAX) {
++		rs.recover_max = 3;
++	}
++	if (rs.test_kind < 1 || rs.test_kind > 3) {
++		rs.test_kind = 3;
++	}
++	if (rs.test_hang < 0 || rs.test_hang > 3600) {
++		rs.test_hang = 0;
++	}
++	if (rs.test_every < 0 || rs.test_every > 3600) {
++		rs.test_every = 0;
++	}
++	if (rs.dcvs_target < 20 || rs.dcvs_target > 95) {
++		rs.dcvs_target = 65;
++	}
++	if (rs.clean < 0 || rs.clean > 2) {
++		rs.clean = 1;
++	}
+ 	(void)PE_parse_boot_argn("bluegpu_present", &rs.present, sizeof(rs.present));
+ 	(void)PE_parse_boot_argn("bluegpu_present_filter", &rs.filter, sizeof(rs.filter));
+ 	(void)PE_parse_boot_argn("bluegpu_present_yofs", &rs.yofs, sizeof(rs.yofs));
+@@ -4035,6 +4249,19 @@
+ 	    " filter %s, odd-row source offset %s%#x (24.8), self-check %d, hang guard %d ms\n",
+ 	    rs.present ? "ON" : "off", rs.present, rs.filter ? "bilinear" : "nearest", rs.yofs < 0 ? "auto " : "",
+ 	    rs.yofs < 0 ? 0 : rs.yofs, rs.check, rs.hang_ms);
++	static const char *const kinds[4] = { "", "CP_INDIRECT_BUFFER to an unmapped VA", ("CP_WAIT_REG_MEM that never"
++		                              " matches"), "a garbage packet header" };
++	printf("BLUELINE GPU: resident (0151): interrupts %s (bluegpu_irq=%d, GMU %d), recovery %s (bluegpu_recover=%d,"
++	    " CPU presents after %d in a minute), DCVS %s (bluegpu_dcvs=%d, %d..%d MHz, target busy %d%%), cache clean"
++	    " mode %d (%s)\n", rs.irq ? "on" : "OFF (polled)", rs.irq, rs.gmu_irq, rs.recover ? "on" : "OFF (dead on hang)",
++	    rs.recover, rs.recover_max, rs.dcvs ? "load-based" : "off (fixed level)", rs.dcvs, rs.dcvs_min, rs.dcvs_max,
++	    rs.dcvs_target, rs.clean, rs.clean == 0 ? "NONE: UNSAFE, test only" : rs.clean == 2 ?
++	    "coherent mapping if the probe passes, else clean" : "DC CVAC over the rows read");
++	if (rs.test_hang) {
++		printf("BLUELINE GPU: TEST HOOK: bluegpu_test_hang=%d: %s %d s after the GPU is up%s%s\n", rs.test_hang,
++		    kinds[rs.test_kind], rs.test_hang, rs.test_every ? ", then every bluegpu_test_hang_every s" : "",
++		    rs.test_every ? "" : " (once)");
++	}
+ }
+ 
+ static volatile uint64_t *
+@@ -4058,7 +4285,12 @@
+ 	return ((uint64_t)cp_mem(off)[1] << 32) | cp_mem(off)[0];
+ }
+ 
+-/* The fence tail: CCU colour/depth flush TS, CACHE_FLUSH_TS, WFI, ALWAYS_ON, MEM_WRITE seq (28 dwords). */
++/*
++ * The fence tail: CCU colour/depth flush TS, CACHE_FLUSH_TS, WFI, ALWAYS_ON,
++ * MEM_WRITE seq (28 dwords); with the interrupt on (0151) a second
++ * CACHE_FLUSH_TS with the IRQ bit after the MEM_WRITE (a6xx_submit's form),
++ * so the interrupt comes after the word rs_done reads (33 dwords).
++ */
+ static void
+ rs_put_tail(uint32_t seq)
+ {
+@@ -4071,6 +4303,9 @@
+ 	cp_put(CP_VA + RS_SEQ_OFF + 4);
+ 	cp_put(0);
+ 	cp_put(seq);
++	if (rs.irq_on) {
++		dr_event_ts(EV_CACHE_FLUSH_TS | CP_EVENT_IRQ, RS_IRQ_OFF, seq);
++	}
+ }
+ 
+ /* WPTR (index into the circle) as a fenced write; no wait for the GPU. */
+@@ -4102,16 +4337,30 @@
+ 	return ns;
+ }
+ 
+-/* Once: the GPU did not finish within the guard. Panel unmapped from cb0, GPU presents off for the boot. */
++/* 16 ring dwords either side of the CP's read pointer (the circle). */
+ static void
++rs_ring_dump(void)
++{
++	uint32_t rp = cp_rd(GXR_CP_RB_RPTR) & (CP_RING_DWORDS - 1);
++	printf("BLUELINE GPU: ring around rptr %u (wptr index %u):", rp, cp.wptr & (CP_RING_DWORDS - 1));
++	for (uint32_t i = rp + CP_RING_DWORDS - 16; i < rp + CP_RING_DWORDS + 16; i++) {
++		printf("%s%#x", (i & (CP_RING_DWORDS - 1)) == rp ? " [" : " ", cp_mem(CP_RING_OFF)[i & (CP_RING_DWORDS - 1)]);
++	}
++	printf(" ]\n");
++}
++
++/* Once: GPU presents end for the boot (no recovery, or it failed). Panel unmapped from cb0. */
++static void
+ rs_hang(const char *when)
+ {
+-	printf("BLUELINE GPU: present hang: blit seq %u not done %llu ms after submit (%s); MEM_WRITE word %#x"
+-	    " CACHE_FLUSH_TS %#x CCU colour %#x, rptr %u wptr %u (ring index %u)\n", rs.seq,
+-	    rs_ns_since(rs.t_submit) / 1000000, when, cp_mem(RS_SEQ_OFF + 4)[0], cp_mem(RS_SEQ_OFF)[0],
++	printf("BLUELINE GPU: present hang: %s: blit seq %u, %llu ms after its submit; MEM_WRITE word %#x"
++	    " CACHE_FLUSH_TS %#x CCU colour %#x, rptr %u wptr %u (ring index %u)\n", when, rs.seq,
++	    rs_ns_since(rs.t_submit) / 1000000, cp_mem(RS_SEQ_OFF + 4)[0], cp_mem(RS_SEQ_OFF)[0],
+ 	    cp_mem(RS_SEQ_OFF + 8)[0], cp_rd(GXR_CP_RB_RPTR), cp_rd(GXR_CP_RB_WPTR), cp.wptr & (CP_RING_DWORDS - 1));
+ 	cp_dump("present blit");
++	rs_ring_dump();
+ 	gx_report("present hang");
++	cp_wr(GXR_RBBM_INT_0_MASK, 0);
+ 	volatile uint64_t *l2 = (volatile uint64_t *)(cp.va + CP_PT_OFF + 0x1000);
+ 	for (uint32_t i = 0; i < dr.fb_nblk; i++) {
+ 		l2[((DR_FB_VA >> 21) & 0x1ff) + i] = 0;
+@@ -4126,8 +4375,190 @@
+ }
+ 
+ /*
++ * 0151 interrupts (sweet_spi_attach, interrupt context): read and clear,
++ * note, wake the vsync thread. Nothing is logged here. A hang detect masks
++ * RBBM_INT_0 (a6xx_fault_detect_irq) until the recovery's hw_init.
++ */
++static uint64_t rs_abs_sec;
++
++static void
++rs_storm(uint32_t intid, uint64_t now)
++{
++	if (now - rs.irq_window_t > rs_abs_sec) {
++		rs.irq_window_t = now;
++		rs.irq_window_n = 0;
++	}
++	if (++rs.irq_window_n > RS_IRQ_STORM) {
++		sweet_spi_mask(intid, true);
++		rs.irq_stormed = intid;
++		if (intid == RS_INTID_GPU) {
++			rs.irq_on = false;
++		}
++	}
++}
++
++static void
++rs_irq(__unused void *arg)
++{
++	uint64_t now = mach_absolute_time();
++	uint32_t st = cp_rd(GXR_RBBM_INT_0_STATUS);
++
++	cp_wr(GXR_RBBM_INT_CLEAR_CMD, st);
++	rs.irq_n++;
++	rs_storm(RS_INTID_GPU, now);
++	if (!st) {
++		rs.irq_spurious++;
++		return;
++	}
++	if (st & RBBM_INT_CACHE_FLUSH_TS) {
++		rs.irq_fence++;
++		rs.irq_seq = cp_mem(RS_IRQ_OFF)[0];
++		rs.irq_t = now;
++	}
++	if (st & RBBM_INT_ERRORS) {
++		rs.err_bits |= st & RBBM_INT_ERRORS;
++		rs.err_n++;
++		if (!rs.fault_taken) {
++			struct rs_fault *f = &rs.fault;
++			f->status = st;
++			f->t = now;
++			f->cp_int = cp_rd(GXR_CP_INTERRUPT_STATUS);
++			cp_wr(GXR_CP_SQE_STAT_ADDR, 1);
++			f->sqe1 = cp_rd(GXR_CP_SQE_STAT_DATA);
++			f->hw_fault = cp_rd(GXR_CP_HW_FAULT);
++			f->protect = cp_rd(GXR_CP_PROTECT_STATUS);
++			f->rbbm = cp_rd(GXR_RBBM_STATUS);
++			f->rbbm3 = cp_rd(GXR_RBBM_STATUS + 3);
++			f->rptr = cp_rd(GXR_CP_RB_RPTR);
++			f->wptr = cp_rd(GXR_CP_RB_WPTR);
++			f->ib1 = ((uint64_t)cp_rd(GXR_CP_IB1_BASE + 1) << 32) | cp_rd(GXR_CP_IB1_BASE);
++			f->ib1_rem = cp_rd(GXR_CP_IB1_BASE + 2);
++			f->ib2 = ((uint64_t)cp_rd(GXR_CP_IB2_BASE + 1) << 32) | cp_rd(GXR_CP_IB2_BASE);
++			f->ib2_rem = cp_rd(GXR_CP_IB2_BASE + 2);
++			f->fsr = rd(cbn(0, CB_FSR));
++			f->far_lo = rd(cbn(0, CB_FAR_LO));
++			__atomic_store_n(&rs.fault_taken, 1, __ATOMIC_RELEASE);
++		}
++		/* Linux bails while the SMMU stalls on a fault; cb0 never stalls (CFCFG 0), checked anyway. */
++		if ((st & RBBM_INT_HANG_DETECT) && !(cp_rd(GXR_RBBM_STATUS + 3) & RBBM_STATUS3_SMMU_STALLED)) {
++			cp_wr(GXR_RBBM_INT_0_MASK, 0);
++			rs.irq_hang = 1;
++		}
++	}
++	thread_wakeup(RS_EVENT);
++}
++
++/* GMU "gmu" interrupt (a6xx_gmu_irq): watchdog bite, fence error, host AHB error. */
++static void
++rs_gmu_irq(__unused void *arg)
++{
++	uint32_t st = gmu_rd(GMU_AO_HOST_INT_STATUS);
++
++	wr(gmu + GMU_REG(GMU_AO_HOST_INT_CLR), st);
++	rs.gmu_ao |= st;
++	if (++rs.gmu_ao_n > 1000 || (st & GMU_AO_WDOG_BITE)) {
++		sweet_spi_mask(RS_INTID_GMU, true);	/* enough for the log; a bite ends GPU presents anyway */
++		rs.gmu_on = false;
++	}
++	thread_wakeup(RS_EVENT);
++}
++
++/* GMU "hfi" interrupt, CM3_FAULT only (a6xx_hfi_irq); the OOB ack bits in the same register are left alone. */
++static void
++rs_hfi_irq(__unused void *arg)
++{
++	uint32_t st = gmu_rd(GMU_GMU2HOST_INTR_INFO);
++
++	if (st & GMU2HOST_CM3_FAULT) {
++		wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), GMU2HOST_CM3_FAULT);
++		rs.gmu_cm3++;
++	}
++	if (rs.gmu_cm3 || ++rs.hfi_n > 100) {
++		sweet_spi_mask(RS_INTID_HFI, true);
++		rs.hfi_on = false;
++	}
++	thread_wakeup(RS_EVENT);
++}
++
++/* Decoded, on the vsync thread: the first error snapshot in full, later ones (after a recovery) in one line. */
++static void
++rs_log_errors(void)
++{
++	if (rs.irq_stormed && !(rs.gmu_logged & 1)) {
++		rs.gmu_logged |= 1;
++		printf("BLUELINE GPU: interrupt storm on INTID %u (> %u per second): masked at the GIC%s\n", rs.irq_stormed,
++		    RS_IRQ_STORM, rs.irq_stormed == RS_INTID_GPU ? "; fences polled again" : "");
++	}
++	if ((rs.gmu_ao & ~(rs.gmu_logged >> 8)) & GMU_AO_IRQS) {
++		uint32_t newbits = rs.gmu_ao & ~(rs.gmu_logged >> 8) & GMU_AO_IRQS;
++		rs.gmu_logged |= newbits << 8;
++		printf("BLUELINE GPU: GMU interrupt: AO host status %#x:%s%s%s (AHB fence status %#x, %u interrupts)\n",
++		    rs.gmu_ao, (newbits & GMU_AO_WDOG_BITE) ? " GMU WATCHDOG EXPIRED" : "",
++		    (newbits & GMU_AO_FENCE_ERR) ? " AHB fence error" : "", (newbits & GMU_AO_HOST_AHB_ERR) ?
++		    " GMU AHB bus error" : "", gmu_rd(GMU_AHB_FENCE_STATUS), rs.gmu_ao_n);
++	}
++	if (rs.gmu_cm3 && !(rs.gmu_logged & 2)) {
++		rs.gmu_logged |= 2;
++		printf("BLUELINE GPU: GMU interrupt: GMU2HOST CM3_FAULT: GMU FIRMWARE FAULT (gmu2host %#x)\n",
++		    gmu_rd(GMU_GMU2HOST_INTR_INFO));
++	}
++	if (!__atomic_load_n(&rs.fault_taken, __ATOMIC_ACQUIRE) || rs.err_logged > rs.n_recover_total) {
++		return;
++	}
++	const struct rs_fault *f = &rs.fault;
++	uint64_t ns;
++	absolutetime_to_nanoseconds(f->t - rs.t_submit, &ns);
++	rs.err_logged = rs.n_recover_total + 1;
++	if (rs.err_logged > 1) {
++		printf("BLUELINE GPU: GPU error interrupt again: status %#x cp_int %#x opcode? %#x hw_fault %#x protect %#x,"
++		    " rbbm %#x, rptr %u wptr %u, cb0 fsr %#x far %#x (%u error interrupts so far)\n", f->status, f->cp_int,
++		    f->sqe1, f->hw_fault, f->protect, f->rbbm, f->rptr, f->wptr, f->fsr, f->far_lo, rs.err_n);
++		return;
++	}
++	printf("BLUELINE GPU: GPU ERROR INTERRUPT (a6xx_irq), %lld us after the last submit: RBBM_INT_0_STATUS %#x:",
++	    (int64_t)ns / 1000, f->status);
++	for (int i = 0; i < 32; i++) {
++		if ((f->status >> i) & 1) {
++			printf(" %s", rs_int_names[i] ? rs_int_names[i] : "?");
++		}
++	}
++	printf("\n");
++	if (f->status & RBBM_INT_CP_HW_ERROR) {	/* a6xx_cp_hw_err_irq */
++		printf("BLUELINE GPU: CP_INTERRUPT_STATUS %#x:%s", f->cp_int, f->cp_int ? "" : " (nothing)");
++		if (f->cp_int & (1u << 0)) {
++			printf(" CP opcode error (possible opcode %#x);", f->sqe1);
++		}
++		if (f->cp_int & (1u << 1)) {
++			printf(" CP ucode error;");
++		}
++		if (f->cp_int & (1u << 2)) {
++			printf(" CP HW fault (CP_HW_FAULT %#x);", f->hw_fault);
++		}
++		if (f->cp_int & (1u << 4)) {
++			printf(" CP protected mode error (%s addr %#x, status %#x);", (f->protect & (1u << 20)) ? "READ" :
++			    "WRITE", f->protect & 0x3ffffu, f->protect);
++		}
++		if (f->cp_int & (1u << 5)) {
++			printf(" CP AHB error;");
++		}
++		if (f->cp_int & (1u << 6)) {
++			printf(" CP VSD decoder parity error;");
++		}
++		if (f->cp_int & (1u << 7)) {
++			printf(" CP illegal instruction error;");
++		}
++		printf("\n");
++	}
++	printf("BLUELINE GPU: at the error: rbbm status %#x status3 %#x, rb rptr %u wptr %u, ib1 %#llx/%u ib2 %#llx/%u,"
++	    " cb0 fsr %#x far %#x\n", f->rbbm, f->rbbm3, f->rptr, f->wptr, (unsigned long long)f->ib1, f->ib1_rem,
++	    (unsigned long long)f->ib2, f->ib2_rem, f->fsr, f->far_lo);
++}
++
++/*
+  * The blit in flight, if any, to its fence, bounded by the guard from its
+- * submit. Returns false (and turns GPU presents off) on a hang.
++ * submit. With the interrupt the thread sleeps (RS_SLICE_US slices, so a
++ * lost interrupt costs one slice); else it polls. Returns false on a hang
++ * (rs.why says which), for rs_recover.
+  */
+ static bool
+ rs_wait(void)
+@@ -4138,14 +4569,38 @@
+ 	uint64_t t0 = mach_absolute_time(), limit = (uint64_t)rs.hang_ms * 1000000ull;
+ 	bool waited = false;
+ 	while (!rs_done()) {
++		if (rs.irq_hang) {
++			rs.why = "RBBM hang detect interrupt";
++			return false;
++		}
+ 		if (rs_ns_since(rs.t_submit) > limit) {
+-			rs_hang("waiting for the previous blit");
++			rs.why = "fence not written within bluegpu_present_hang_ms (software guard)";
+ 			return false;
+ 		}
+ 		waited = true;
+-		delay(50);
++		if (rs.irq_on) {
++			uint64_t dl;
++			clock_interval_to_deadline(RS_SLICE_US, NSEC_PER_USEC, &dl);
++			(void)assert_wait_deadline(RS_EVENT, THREAD_UNINT, dl);
++			if (rs_done() || rs.irq_hang) {
++				(void)clear_wait(current_thread(), THREAD_AWAKENED);
++				continue;
++			}
++			if (thread_block(THREAD_CONTINUE_NULL) == THREAD_AWAKENED) {
++				rs.n_irq_wake++;
++			} else {
++				rs.n_slice++;
++			}
++		} else {
++			delay(50);
++		}
+ 	}
+-	uint64_t lag = rs_ns_since(rs.t_submit);
++	uint64_t lag, it = rs.irq_t;
++	if (rs.irq_on && rs.irq_seq == rs.seq && it > rs.t_submit) {
++		absolutetime_to_nanoseconds(it - rs.t_submit, &lag);	/* the interrupt's time */
++	} else {
++		lag = rs_ns_since(rs.t_submit);
++	}
+ 	if (waited) {
+ 		rs.n_wait++;
+ 		rs.wait_ns += rs_ns_since(t0);
+@@ -4153,14 +4608,302 @@
+ 	uint64_t a = rs_ao(RS_AO_OFF), b = rs_ao(RS_AO_OFF + 8), d = b > a ? b - a : 0;
+ 	rs.n_done++;
+ 	rs.blit_ticks += d;
++	rs.blit_total += d;
+ 	rs.blit_max = MAX(rs.blit_max, d);
+ 	rs.lag_ns += lag;
+ 	rs.lag_max = MAX(rs.lag_max, lag);
+ 	rs.busy = false;
++	if (rs.test_seq && rs.test_seq == rs.seq) {
++		printf("BLUELINE GPU: TEST HOOK: seq %u with the bad packet COMPLETED (no hang; error interrupts so far %u):"
++		    " the CP went past it\n", rs.test_seq, rs.err_n);
++		rs.test_seq = 0;
++	}
+ 	return true;
+ }
+ 
++/* A fenced no-op (ALWAYS_ON, the tail) through rs_kick, polled for up to cp.ms. */
++static bool
++rs_sync(const char *what, bool quiet)
++{
++	rs.seq++;
++	rs_put_ao(RS_AO_OFF);
++	rs_put_tail(rs.seq);
++	rs_kick();
++	while (!rs_done() && rs_ns_since(rs.t_submit) < (uint64_t)cp.ms * 1000000ull) {
++		delay(10);
++	}
++	bool ok = rs_done();
++	if (!quiet || !ok) {
++		uint64_t lat = rs_ns_since(rs.t_submit), a = rs_ao(RS_AO_OFF), b = rs_ao(RS_AO_OFF + 8);
++		printf("BLUELINE GPU: resident: %s seq %u: MEM_WRITE %#x CACHE_FLUSH_TS %#x after %llu us, rptr %u wptr %u,"
++		    " CP_ALWAYS_ON %#llx -> %#llx: %s\n", what, rs.seq, cp_mem(RS_SEQ_OFF + 4)[0], cp_mem(RS_SEQ_OFF)[0],
++		    lat / 1000, cp_rd(GXR_CP_RB_RPTR), cp_rd(GXR_CP_RB_WPTR), (unsigned long long)a, (unsigned long long)b,
++		    ok ? "ok" : "NOT DONE");
++	}
++	rs.busy = !ok;
++	return ok;
++}
++
++/* GPU core clock: CP perf counter 0 (ALWAYS_COUNT, hw_init) against CP_ALWAYS_ON (19.2 MHz) over 1 ms. */
++static uint32_t
++rs_clock_mhz(void)
++{
++	uint64_t c0 = dr_ctr(GXR_RBBM_PERFCTR_CP0), a0 = dr_ctr(GXR_CP_ALWAYS_ON);
++	delay(1000);
++	uint64_t c1 = dr_ctr(GXR_RBBM_PERFCTR_CP0), a1 = dr_ctr(GXR_CP_ALWAYS_ON);
++	return a1 > a0 ? (uint32_t)((c1 - c0) * 192 / ((a1 - a0) * 10)) : 0;
++}
++
++/* GMU XOCLK_0: GPU busy in 19.2 MHz ticks (a6xx_gpu_busy). */
++static uint64_t
++rs_xoclk(void)
++{
++	uint32_t h = gmu_rd(GMU_POWER_COUNTER_XOCLK_0 + 1), l = gmu_rd(GMU_POWER_COUNTER_XOCLK_0);
++	uint32_t h2 = gmu_rd(GMU_POWER_COUNTER_XOCLK_0 + 1);
++	if (h2 != h) {
++		l = gmu_rd(GMU_POWER_COUNTER_XOCLK_0);
++	}
++	return ((uint64_t)h2 << 32) | l;
++}
++
++/* a6xx_gpu.c hw_init: the busy counter (GMU power counter 0, countable 5 = GPU busy, CX_BUSY_MASK 0xff000000). */
++static void
++rs_busy_setup(void)
++{
++	wr(gmu + GMU_REG(GMU_AO_GPU_CX_BUSY_MASK), 0xff000000u);
++	uint32_t sel = gmu_rd(GMU_POWER_COUNTER_SELECT_0);
++	wr(gmu + GMU_REG(GMU_POWER_COUNTER_SELECT_0), (sel & ~0xffu) | (1u << 5));
++	wr(gmu + GMU_REG(GMU_POWER_COUNTER_ENABLE), 1);
++	uint64_t x0 = rs_xoclk();
++	delay(1000);
++	uint64_t x1 = rs_xoclk();
++	printf("BLUELINE GPU: busy counter: GMU power counter select_0 %#x -> %#x, enable %#x, XOCLK_0 %#llx -> %#llx"
++	    " over 1 ms idle (busy ticks %llu)\n", sel, gmu_rd(GMU_POWER_COUNTER_SELECT_0),
++	    gmu_rd(GMU_POWER_COUNTER_ENABLE), (unsigned long long)x0, (unsigned long long)x1,
++	    (unsigned long long)(x1 - x0));
++}
++
++/* The lowest level at or above mhz (1 .. GX_LEVELS - 1). */
++static int
++gx_level_at(int mhz)
++{
++	int l = 1;
++	while (l < GX_LEVELS - 1 && gpu_khz[l] < (uint32_t)mhz * 1000u) {
++		l++;
++	}
++	return l;
++}
++
+ /*
++ * a6xx_gmu_set_freq, legacy, then the level's DDR vote (dev_pm_opp_set_opp:
++ * before raising the clock, after lowering it). One line per change.
++ */
++static bool
++gx_set_level(int l, const char *why)
++{
++	int old = gx.perf, err = 0;
++	uint32_t info, ret;
++	uint64_t ns;
++
++	if (l == old || l < 1 || l >= GX_LEVELS) {
++		return false;
++	}
++	if (gx.bw_voted && gx_level_kbps(l) > gx.bw_kbps) {
++		err = gx_bw_vote_kbps(gx_level_kbps(l), true);
++	}
++	wr(gmu + GMU_REG(GMU_DCVS_ACK_OPTION), 0);
++	wr(gmu + GMU_REG(GMU_DCVS_PERF_SETTING), (3u << 28) | (uint32_t)l);
++	wr(gmu + GMU_REG(GMU_DCVS_BW_SETTING), 0xff);
++	bool ok = gmu_oob_quiet(OOB_DCVS_SET, OOB_DCVS_ACK, &info, &ns);
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << OOB_DCVS_ACK);	/* gmu_oob_clear */
++	ret = gmu_rd(GMU_DCVS_RETURN);
++	if (ok && !ret) {
++		gx.perf = l;
++	}
++	if (gx.bw_voted && gx_level_kbps(gx.perf) < gx.bw_kbps) {
++		err = gx_bw_vote_kbps(gx_level_kbps(gx.perf), true);
++	}
++	uint32_t mhz = rs_clock_mhz();
++	rs.dcvs_changes++;
++	printf("BLUELINE GPU: DCVS %u -> %u MHz (%s): OOB %s after %llu us (gmu2host %#x), DCVS_RETURN %#x%s, DDR vote %u kBps"
++	    "%s%d, measured %u MHz\n", gpu_khz[old] / 1000, gpu_khz[l] / 1000, why, ok ? "acked" : "NOT ACKED", ns / 1000,
++	    info, ret, ret ? " (ERROR: level kept)" : "", gx.bw_voted ? gx.bw_kbps : 0,
++	    gx.bw_voted ? " err " : " (no vote, bluegpu_bw=0) ", err, mhz);
++	return gx.perf == l;
++}
++
++/* bluegpu_dcvs=1: every >= 100 ms (on presents), busy % -> the level that would run it at the target busy. */
++static void
++rs_dcvs_tick(void)
++{
++	uint64_t now = mach_absolute_time(), ns;
++
++	if (!rs.dcvs) {
++		return;
++	}
++	if (!rs.dcvs_t) {
++		rs.dcvs_t = now;
++		rs.dcvs_xo = rs_xoclk();
++		rs.dcvs_ticks = rs.blit_total;
++		return;
++	}
++	absolutetime_to_nanoseconds(now - rs.dcvs_t, &ns);
++	if (ns < 100ull * NSEC_PER_MSEC) {
++		return;
++	}
++	uint64_t xo = rs_xoclk(), dxo = xo - rs.dcvs_xo, dbl = rs.blit_total - rs.dcvs_ticks;
++	rs.busy_gmu = dxo != 0 || dbl == 0;	/* a counter that never moves while blits run: blit time instead */
++	uint64_t busy = rs.busy_gmu ? dxo : dbl, pct = busy * 10000 / 192 * 100 / ns;
++	rs.busy_pct = (uint32_t)MIN(pct, 100ull);
++	rs.dcvs_t = now;
++	rs.dcvs_xo = xo;
++	rs.dcvs_ticks = rs.blit_total;
++
++	int lmin = gx_level_at(rs.dcvs_min), lmax = gx_level_at(rs.dcvs_max);
++	if (lmax > lmin && gpu_khz[lmax] > (uint32_t)rs.dcvs_max * 1000u) {
++		lmax--;
++	}
++	uint64_t want = (uint64_t)gpu_khz[gx.perf] / 1000 * rs.busy_pct / (uint32_t)rs.dcvs_target;
++	int l = lmin;
++	while (l < lmax && gpu_khz[l] < want * 1000) {
++		l++;
++	}
++	char why[48];
++	snprintf(why, sizeof(why), "busy %u%% (%s)", rs.busy_pct, rs.busy_gmu ? "GMU counter" : "blit time");
++	if (l > gx.perf) {
++		rs.dcvs_low = 0;
++		(void)gx_set_level(l, why);
++	} else if (l < gx.perf) {
++		if (++rs.dcvs_low >= 3) {	/* down only after 3 windows in a row */
++			rs.dcvs_low = 0;
++			(void)gx_set_level(l, why);
++		}
++	} else {
++		rs.dcvs_low = 0;
++	}
++}
++
++/* 0151 interrupts on (after the ring check): GPU SPI 300 with a fenced check, GMU SPIs 304/305. */
++static void
++rs_irq_attach(void)
++{
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &rs_abs_sec);
++	rs.irq_window_t = mach_absolute_time();
++	if (rs.irq) {
++		cp_wr(GXR_RBBM_INT_CLEAR_CMD, 0xffffffffu);
++		if (sweet_spi_attach(RS_INTID_GPU, false, rs_irq, NULL)) {
++			uint32_t f0 = rs.irq_fence, n0 = rs.irq_n;
++			rs.irq_on = true;
++			bool ok = rs_sync("interrupt check", false);
++			for (int t = 0; ok && rs.irq_fence == f0 && t < cp.ms * 100; t++) {
++				delay(10);
++			}
++			bool got = rs.irq_fence != f0 && rs.irq_seq == rs.seq;
++			printf("BLUELINE GPU: interrupts: GPU INTID %u (SPI 300, level) attached; RBBM_INT_0_MASK %#x; fence"
++			    " interrupt for seq %u: %s (%u interrupts, %u fence, irq seq %u)\n", RS_INTID_GPU,
++			    cp_rd(GXR_RBBM_INT_0_MASK), rs.seq, got ? "RECEIVED: fences interrupt-driven" : ok ?
++			    "NOT RECEIVED: fences polled (error interrupts stay attached)" : "RING CHECK FAILED",
++			    rs.irq_n - n0, rs.irq_fence - f0, rs.irq_seq);
++			rs.irq_on = got;
++			rs.busy = false;
++		} else {
++			printf("BLUELINE GPU: interrupts: INTID %u not attached (no GIC distributor?): polled\n", RS_INTID_GPU);
++		}
++	}
++	if (rs.gmu_irq) {
++		wr(gmu + GMU_REG(GMU_AO_HOST_INT_CLR), 0xffffffffu);
++		wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), GMU2HOST_CM3_FAULT);
++		rs.gmu_on = sweet_spi_attach(RS_INTID_GMU, false, rs_gmu_irq, NULL);
++		rs.hfi_on = sweet_spi_attach(RS_INTID_HFI, false, rs_hfi_irq, NULL);
++		if (rs.gmu_on) {
++			wr(gmu + GMU_REG(GMU_AO_HOST_INT_MASK), ~GMU_AO_IRQS);
++		}
++		if (rs.hfi_on) {
++			wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_MASK), ~GMU2HOST_CM3_FAULT);
++		}
++		printf("BLUELINE GPU: interrupts: GMU INTID %u (gmu, SPI 305) %s, mask %#x; INTID %u (hfi, SPI 304) %s, mask"
++		    " %#x; AO host status %#x gmu2host %#x\n", RS_INTID_GMU, rs.gmu_on ? "attached" : "NOT attached",
++		    gmu_rd(GMU_AO_HOST_INT_MASK), RS_INTID_HFI, rs.hfi_on ? "attached" : "NOT attached",
++		    gmu_rd(GMU_GMU2HOST_INTR_MASK), gmu_rd(GMU_AO_HOST_INT_STATUS), gmu_rd(GMU_GMU2HOST_INTR_INFO));
++	}
++}
++
++/*
++ * bluegpu_present_clean=2: does the GPU see what the CPU left dirty in its
++ * cache through a cacheable mapping (KGSL's IOCOHERENT: IOMMU_CACHE)? A
++ * 16K kernel page in slot 3 (free now) with LPAE_PAGE_RO_WB; per round
++ * the page holds A in DRAM (clean + invalidate) and B in this CPU's cache,
++ * and CP_MEM_TO_MEM copies 8 words into the CP's NC memory: B everywhere
++ * (4 rounds) = coherent, any A = the GPU read DRAM. Unmapped afterwards.
++ */
++static void
++rs_coherence_probe(void)
++{
++	const uint32_t n = RS_SLOTS - 1, words = PAGE_SIZE / 4;
++	uint32_t good = 0, stale = 0, other = 0;
++	vm_offset_t va = 0;
++
++	if (kmem_alloc(kernel_map, &va, PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("BLUELINE GPU: coherence probe: no page: cleaning stays\n");
++		return;
++	}
++	for (uint32_t o = 0; o < PAGE_SIZE; o += 0x1000u) {
++		uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) + o;
++		rs_l3(n * RS_L3_PER_SLOT)[o >> 12] = LPAE_PAGE_RO_WB(pa);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool tlb = smmu_tlbi_cb(0), sub = tlb;
++	volatile uint32_t *w = (volatile uint32_t *)va;
++	for (uint32_t r = 0; sub && r < 4; r++) {
++		uint32_t a = 0xa0000000u | (r << 20), b = 0xb0000000u | (r << 20);
++		for (uint32_t i = 0; i < words; i++) {
++			w[i] = a ^ i;
++		}
++		FlushPoC_DcacheRegion(va, PAGE_SIZE);	/* A in DRAM, nothing of the page cached */
++		for (uint32_t i = 0; i < words; i++) {
++			w[i] = b ^ i;			/* B only in this CPU's cache */
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t k = 0; k < 8; k++) {
++			cp_mem(RS_PROBE_OFF)[k] = CP_TARGET_FILL;
++		}
++		dr_event(EV_CACHE_INVALIDATE);
++		for (uint32_t k = 0; k < 8; k++) {
++			uint32_t idx = k * (words / 8) + r * 17;
++			cp_put(pkt7(CP_MEM_TO_MEM, 5));
++			cp_put(0);
++			cp_put(CP_VA + RS_PROBE_OFF + 4 * k);
++			cp_put(0);
++			cp_put(RS_SLOT_VA(n) + 4 * idx);
++			cp_put(0);
++		}
++		cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++		sub = rs_sync("coherence probe", true);
++		for (uint32_t k = 0; sub && k < 8; k++) {
++			uint32_t idx = k * (words / 8) + r * 17, v = cp_mem(RS_PROBE_OFF)[k];
++			good += v == (b ^ idx);
++			stale += v == (a ^ idx);
++			other += v != (b ^ idx) && v != (a ^ idx);
++		}
++	}
++	for (uint32_t o = 0; o < PAGE_SIZE; o += 0x1000u) {
++		rs_l3(n * RS_L3_PER_SLOT)[o >> 12] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool unmapped = smmu_tlbi_cb(0);
++	rs.coherent = sub && good == 32;
++	printf("BLUELINE GPU: coherence probe: 32 words this CPU left dirty, read by the CP through a cacheable inner-"
++	    "shareable mapping: %u new, %u stale (DRAM), %u other%s: %s\n", good, stale, other, sub ? "" :
++	    " (SUBMIT FAILED)", rs.coherent ? "THE GPU SEES THE CPU CACHES: surface slots cacheable, NO CLEAN per present"
++	    " (the first present's self-check confirms)" : "not coherent: the clean per present stays");
++	if (unmapped) {
++		kmem_free(kernel_map, va, PAGE_SIZE);
++	} else {
++		printf("BLUELINE GPU: coherence probe: TLB sync timeout: the page stays allocated (leaked on purpose)\n");
++	}
++}
++
++/*
+  * Resident bring-up tail, from cp_stage after the zap with WHERE_AM_I
+  * working: 2D setup, the panel at DR_FB_VA, the surface tables in L1[1],
+  * the ring as a circle, one fenced no-op. On failure everything of it is
+@@ -4215,8 +4958,8 @@
+ 	for (uint32_t i = 0; i < 512 / 4; i++) {
+ 		cp_mem(RS_BORDER_OFF)[i] = 0;
+ 	}
+-	for (uint32_t i = 0; i < 8; i++) {
+-		cp_mem(RS_SEQ_OFF)[i] = 0;
++	for (uint32_t i = 0; i < 16; i++) {
++		cp_mem(RS_SEQ_OFF)[i] = 0;	/* seq, ALWAYS_ON, the interrupt's TS, the test word */
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	l1[1] = rs.arena_pa | LPAE_TABLE;
+@@ -4231,28 +4974,33 @@
+ 
+ 	/* The ring as a circle from here on: a fenced no-op through rs_kick. */
+ 	cp.wrap = true;
+-	rs.seq = 1;
+-	rs_put_ao(RS_AO_OFF);
+-	rs_put_tail(rs.seq);
+-	rs_kick();
+-	while (!rs_done() && rs_ns_since(rs.t_submit) < (uint64_t)cp.ms * 1000000ull) {
+-		delay(10);
+-	}
+-	uint64_t lat = rs_ns_since(rs.t_submit), a = rs_ao(RS_AO_OFF), b = rs_ao(RS_AO_OFF + 8);
+-	printf("BLUELINE GPU: resident: ring check seq 1: MEM_WRITE %#x CACHE_FLUSH_TS %#x after %llu us, rptr %u wptr %u,"
+-	    " CP_ALWAYS_ON %#llx -> %#llx: %s\n", cp_mem(RS_SEQ_OFF + 4)[0], cp_mem(RS_SEQ_OFF)[0], lat / 1000,
+-	    cp_rd(GXR_CP_RB_RPTR), cp_rd(GXR_CP_RB_WPTR), (unsigned long long)a, (unsigned long long)b,
+-	    rs_done() ? "ok" : "NOT DONE");
++	rs.seq = 0;
++	bool synced = rs_sync("ring check", false);
+ 	cp_smmu_faults("resident ring check");
+-	if (!rs_done()) {
++	if (!synced) {
+ 		why = "ring check not done";
+ 		cp_dump("resident ring check");
+ 		goto fail;
+ 	}
+ 	rs.busy = false;
++
++	/* 0151: interrupts, the busy counter, the clock, the coherence probe; none of them can fail the bring-up. */
++	rs_irq_attach();
++	rs_busy_setup();
++	printf("BLUELINE GPU: GPU clock: level %d (%u MHz asked via the GMU), measured %u MHz (CP ALWAYS_COUNT vs"
++	    " CP_ALWAYS_ON); DDR vote %u kBps%s\n", gx.perf, gpu_khz[gx.perf] / 1000, rs_clock_mhz(),
++	    gx.bw_voted ? gx.bw_kbps : 0, gx.bw_voted ? "" : " (none: bluegpu_bw=0)");
++	if (rs.clean == 2) {
++		rs_coherence_probe();
++	}
+ 	rs.up = true;
+ 	rs.first_map = true;
+-	rs.t_stat = mach_absolute_time();
++	rs.t_stat = rs.t_up = mach_absolute_time();
++	if (rs.test_hang) {
++		uint64_t d;
++		nanoseconds_to_absolutetime((uint64_t)rs.test_hang * NSEC_PER_SEC, &d);
++		rs.test_next = rs.t_up + d;
++	}
+ 	printf("BLUELINE GPU: resident: GPU UP AND KEPT; %s\n", rs.present ? "presents go through the 2D engine from now"
+ 	    : "bluegpu_present=0: CPU presents");
+ 	__atomic_store_n(&rs.ready, 1, __ATOMIC_RELEASE);
+@@ -4281,6 +5029,203 @@
+ 	return false;
+ }
+ 
++/*
++ * 0151 recovery, on the vsync thread after a hang (RBBM hang detect or the
++ * software guard): dump once, SQE halt, VBIF halt, RBBM soft reset, then
++ * the CP again as cp_stage brought it up (hw_init, SQE/RB registers,
++ * ME_INIT, secure mode off as the zap left it: CP_SET_SECURE_MODE 0 or
++ * SECVID_TRUST_CNTL 0, as Linux's hw_init does after a reset), 0138's 2D
++ * setup, cb0 TLB invalidate (the page tables are memory: unchanged) and a
++ * fenced no-op on the circle. The hung blit is abandoned. More than
++ * bluegpu_recover_max recoveries in a minute, a GMU fault, or a failed
++ * step: rs_hang (CPU presents for the boot). Returns whether the GPU is
++ * presenting again.
++ */
++static bool
++rs_recover(const char *why)
++{
++	uint64_t t0 = mach_absolute_time(), ns, minute = 60ull * NSEC_PER_SEC;
++	const char *bad = NULL;
++	uint32_t recent = 0, hung = rs.seq;
++
++	rs_log_errors();
++	if (!rs.recover) {
++		rs_hang(why);
++		return false;
++	}
++	if (rs.gmu_cm3 || (rs.gmu_ao & GMU_AO_WDOG_BITE)) {
++		rs_hang("GMU fault: no recovery without restarting the GMU");
++		return false;
++	}
++	for (int i = 0; i < RS_REC_MAX; i++) {
++		recent += rs.rec_t[i] && rs_ns_since(rs.rec_t[i]) < minute;
++	}
++	if (recent >= (uint32_t)rs.recover_max) {
++		printf("BLUELINE GPU: recovery: %u recoveries in the last minute (bluegpu_recover_max=%d): giving up\n",
++		    recent, rs.recover_max);
++		rs_hang(why);
++		return false;
++	}
++	rs.rec_t[rs.n_recover_total % RS_REC_MAX] = t0;
++	rs.n_recover_total++;
++	rs.n_recover++;
++	printf("BLUELINE GPU: RECOVERY %u (%s): blit seq %u abandoned (%u recoveries in the last minute before this one)\n",
++	    rs.n_recover_total, why, hung, recent);
++	if (!rs.dumped) {
++		rs.dumped = true;
++		cp_dump("GPU hang (first; later recoveries log one line)");
++		rs_ring_dump();
++		gx_report("before recovery");
++	} else {
++		cp_report("before recovery");
++	}
++
++	/* 1. Stop: interrupts, SQE, VBIF (a6xx_bus_clear_pending_transactions). */
++	cp_wr(GXR_RBBM_INT_0_MASK, 0);
++	cp_wr(GXR_CP_SQE_CNTL, 0);
++	cp.started = false;
++	gx_bus_halt();
++
++	/* 2. a6xx_gpu_sw_reset: asserted for 100 us. */
++	cp_wr(GXR_RBBM_SW_RESET_CMD, 1);
++	(void)cp_rd(GXR_RBBM_SW_RESET_CMD);
++	delay(100);
++	cp_wr(GXR_RBBM_SW_RESET_CMD, 0);
++	(void)cp_rd(GXR_RBBM_SW_RESET_CMD);
++	delay(1);
++	cp_wr(GXR_RBBM_INT_CLEAR_CMD, 0xffffffffu);
++	uint32_t fsr = rd(cbn(0, CB_FSR));
++	if (fsr) {
++		wr(cbn(0, CB_FSR), fsr);
++	}
++	uint32_t rp = cp_rd(GXR_CP_RB_RPTR), wp = cp_rd(GXR_CP_RB_WPTR), sq = cp_rd(GXR_CP_SQE_CNTL);
++	printf("BLUELINE GPU: recovery: after the soft reset: rbbm status %#x, rptr %u wptr %u sqe_cntl %#x, sqe_instr_base"
++	    " %#x; cb0 fsr was %#x%s\n", cp_rd(GXR_RBBM_STATUS), rp, wp, sq, cp_rd(GXR_CP_SQE_INSTR_BASE), fsr,
++	    fsr ? " (cleared)" : "");
++	if (rp || wp || (sq & 1)) {
++		bad = "ring pointers or SQE not reset";
++		goto out;
++	}
++	rs.irq_hang = 0;
++	__atomic_store_n(&rs.fault_taken, 0, __ATOMIC_RELEASE);
++
++	/* 3. The CP as cp_stage: hw_init (RBBM_INT_0_MASK back on), SQE and ring registers, ME_INIT. */
++	cp.wrap = false;
++	cp.wptr = 0;
++	rs.busy = false;
++	cp_hw_init(true);
++	cp_wr(GXR_CP_SQE_INSTR_BASE, CP_VA);
++	cp_wr(GXR_CP_SQE_INSTR_BASE + 1, 0);
++	cp_wr(GXR_CP_RB_BASE, CP_VA + CP_RING_OFF);
++	cp_wr(GXR_CP_RB_BASE + 1, 0);
++	cp_wr(GXR_CP_RB_CNTL, CP_RB_CNTL_VAL);
++	cp_wr(GXR_CP_RB_RPTR_ADDR, CP_VA + CP_SHADOW_OFF);
++	cp_wr(GXR_CP_RB_RPTR_ADDR + 1, 0);
++	if (cp_rd(GXR_CP_SQE_INSTR_BASE) != CP_VA || cp_rd(GXR_CP_RB_BASE) != CP_VA + CP_RING_OFF ||
++	    cp_rd(GXR_CP_RB_CNTL) != CP_RB_CNTL_VAL) {
++		bad = "CP base registers did not take";
++		goto out;
++	}
++	cp_put(pkt7(CP_ME_INIT, 8));
++	cp_put(0x0000002f);
++	cp_put(0x00000003);
++	cp_put(0x20000000);
++	for (int i = 0; i < 5; i++) {
++		cp_put(0);
++	}
++	cp_wr(GXR_CP_SQE_CNTL, 1);
++	cp.started = true;
++	delay(10);
++	if (!cp_submit("CP_ME_INIT (recovery)", 0)) {
++		bad = "ME_INIT failed";
++		goto out;
++	}
++	if (zap.loaded) {
++		uint32_t from = cp.wptr;
++		cp_put(pkt7(CP_SET_SECURE_MODE, 1));
++		cp_put(0);
++		if (!cp_submit("CP_SET_SECURE_MODE 0 (recovery)", from)) {
++			bad = "CP_SET_SECURE_MODE 0 failed";
++			goto out;
++		}
++	} else if (zap.secvid) {
++		cp_wr(GXR_RBBM_SECVID_TRUST_CNTL, 0);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++
++	/* 4. 0138's 2D setup (a fresh fence slot), the TLB, a fenced no-op on the circle. */
++	if (dr.slot >= 64) {
++		dr.slot = 1;	/* below RS_SEQ_OFF: DR_FENCE_OFF + 16 * 112 would reach it */
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		cp_mem(DR_FENCE_OFF + 16 * dr.slot)[i] = CP_TARGET_FILL;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!dr_setup()) {
++		bad = "2D setup failed";
++		goto out;
++	}
++	if (!smmu_tlbi_cb(0)) {
++		bad = "cb0 TLB sync timeout";
++		goto out;
++	}
++	cp.wrap = true;
++	if (!rs_sync("recovery ring check", false)) {
++		bad = "ring check not done";
++		goto out;
++	}
++	rs.busy = false;
++	if (rs.irq_hang) {
++		bad = "hang detect again during the recovery";
++	}
++
++out:
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if (bad) {
++		printf("BLUELINE GPU: RECOVERY %u FAILED after %llu ms: %s\n", rs.n_recover_total, ns / 1000000, bad);
++		rs_hang("recovery failed");
++		return false;
++	}
++	rs.dcvs_t = 0;
++	printf("BLUELINE GPU: RECOVERY %u DONE after %llu us: CP re-initialised (%s), presents resume at seq %u;"
++	    " %u error interrupts so far, rbbm int_0_mask %#x\n", rs.n_recover_total, ns / 1000, zap.loaded ?
++	    "secure mode off by CP_SET_SECURE_MODE 0" : "SECVID_TRUST_CNTL 0", rs.seq + 1, rs.err_n,
++	    cp_rd(GXR_RBBM_INT_0_MASK));
++	return true;
++}
++
++/* 0151 test hook: one bad packet in front of a present (bluegpu_test_hang_kind). */
++
++static void
++rs_put_test(void)
++{
++	uint32_t at = cp.wptr & (CP_RING_DWORDS - 1);
++
++	rs.n_test++;
++	rs.test_seq = rs.seq;
++	if (rs.test_kind == 1) {
++		cp_put(pkt7(CP_INDIRECT_BUFFER, 3));
++		cp_put(RS_TEST_BAD_VA);
++		cp_put(0);
++		cp_put(64);
++	} else if (rs.test_kind == 2) {
++		cp_put(pkt7(CP_WAIT_REG_MEM, 6));
++		cp_put(3u | (1u << 4));		/* WRITE_EQ, POLL_MEMORY */
++		cp_put(CP_VA + RS_TEST_OFF);	/* holds 0 */
++		cp_put(0);
++		cp_put(0xdeadbeefu);
++		cp_put(0xffffffffu);
++		cp_put(16);
++	} else {
++		cp_put(0xdeadbeefu);		/* no packet type 0xd: an opcode error */
++		cp_put(0xdeadbeefu);
++	}
++	printf("BLUELINE GPU: TEST HOOK %u: %s at ring index %u, in front of present seq %u (%llu s after up)\n",
++	    rs.n_test, rs.test_kind == 1 ? "CP_INDIRECT_BUFFER to unmapped GPU VA 0x7ff00000" : rs.test_kind == 2 ?
++	    "CP_WAIT_REG_MEM on a word that never matches" : "garbage header 0xdeadbeef", at, rs.seq,
++	    rs_ns_since(rs.t_up) / NSEC_PER_SEC);
++}
++
+ /* Slot for the surface (mapped if new). Only with no blit in flight. Returns the GPU VA of kva or 0. */
+ static uint32_t
+ rs_slot(const struct blue_gpu_src *s, void **retain, void **release)
+@@ -4321,7 +5266,7 @@
+ 	for (uint64_t o = 0; o < span; o += 0x1000u, e++) {
+ 		uintptr_t va = a0 + (uintptr_t)o;
+ 		uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) + (va & PAGE_MASK & ~0xfffull);
+-		rs_l3(n * RS_L3_PER_SLOT + e / 512)[e % 512] = LPAE_PAGE_RO(pa);
++		rs_l3(n * RS_L3_PER_SLOT + e / 512)[e % 512] = rs.coherent ? LPAE_PAGE_RO_WB(pa) : LPAE_PAGE_RO(pa);
+ 	}
+ 	for (; e < RS_SLOT_MAX / 0x1000u; e++) {
+ 		rs_l3(n * RS_L3_PER_SLOT + e / 512)[e % 512] = 0;
+@@ -4480,8 +5425,8 @@
+ 	return m;
+ }
+ 
+-/* After the first GPU present's fence: 512 pixels of the fit and 64 bar pixels. False = grossly wrong. */
+-static bool
++/* After the first GPU present's fence: 512 pixels of the fit and 64 bar pixels. 2 pass, 1 mismatch/skipped, 0 grossly wrong. */
++static int
+ rs_selfcheck(const struct blue_gpu_src *s, const struct blue_gpu_dst *d)
+ {
+ 	vm_offset_t base;
+@@ -4493,7 +5438,7 @@
+ 
+ 	if (!fb) {
+ 		printf("BLUELINE GPU: present self-check: panel not mapped for reading: skipped\n");
+-		return true;
++		return 1;
+ 	}
+ 	for (uint32_t i = 0; i < RS_SAMPLES; i++) {
+ 		lcg = lcg * 1664525u + 1013904223u;
+@@ -4531,7 +5476,7 @@
+ 	    " model %u over (max diff %d); bars %u of %u not black: %s\n", RS_SAMPLES, RS_TOL, bad[0], maxd[0], bad[1],
+ 	    maxd[1], bars_bad, RS_BAR_SAMPLES, ok ? "PASS" : gross ? "FAIL (GROSSLY WRONG: GPU presents off)" :
+ 	    "MISMATCH (kept on)");
+-	return !gross;
++	return ok ? 2 : gross ? 0 : 1;
+ }
+ 
+ static void
+@@ -4554,7 +5499,15 @@
+ 	    rs.n_cpu[RSF_MAP], rs.n_wait, rs.wait_ns / 1000, rs.n_map, rs.clean_ns / g / 1000, rs.clean_max / 1000,
+ 	    rs.cpu_ns / g / 1000, rs.cpu_max / 1000, rs.blit_ticks * 10 / 192 / dn, rs.blit_max * 10 / 192,
+ 	    rs.lag_ns / dn / 1000, rs.lag_max / 1000, rs.n_kick_retry, rs.dead ? "; DEAD (hang)" : "");
++	printf("BLUELINE GPU: present 5s (0151): interrupts since up %u (fence %u, spurious %u, errors %u), waits woken %u / slice"
++	    " %u%s, recoveries %u (total %u), GPU %u MHz%s busy %u%% (%s), DCVS changes %u, clean %s (%u skipped)\n",
++	    rs.irq_n, rs.irq_fence, rs.irq_spurious, rs.err_n, rs.n_irq_wake, rs.n_slice, rs.irq_on ? "" :
++	    " (fences polled)", rs.n_recover, rs.n_recover_total, gpu_khz[gx.perf] / 1000, rs.dcvs ? " (DCVS)" : "",
++	    rs.busy_pct, rs.dcvs ? (rs.busy_gmu ? "GMU counter" : "blit time") : "not sampled: bluegpu_dcvs=0",
++	    rs.dcvs_changes, rs.clean == 0 ? "OFF (unsafe test)" : rs.coherent ? "skipped (coherent)" : "DC CVAC",
++	    rs.n_clean_skip);
+ 	rs.t_stat = mach_absolute_time();
++	rs.n_irq_wake = rs.n_slice = rs.n_clean_skip = rs.n_recover = 0;
+ 	rs.n_gpu = rs.n_wait = rs.n_map = rs.n_done = rs.n_kick_retry = 0;
+ 	bzero(rs.n_cpu, sizeof(rs.n_cpu));
+ 	rs.wait_ns = rs.clean_ns = rs.clean_max = rs.cpu_ns = rs.cpu_max = 0;
+@@ -4565,8 +5518,8 @@
+ static int
+ rs_cpu(int why)
+ {
+-	if (rs.busy && !rs.dead) {
+-		(void)rs_wait();
++	if (rs.busy && !rs.dead && !rs_wait()) {
++		(void)rs_recover(rs.why);	/* the CPU copies this frame either way */
+ 	}
+ 	rs.n_cpu[why]++;
+ 	if (rs.up) {
+@@ -4598,6 +5551,14 @@
+ 		return rs_cpu(RSF_OFF);
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
++	rs_log_errors();
++	if ((rs.gmu_cm3 || (rs.gmu_ao & GMU_AO_WDOG_BITE)) && !rs.dead) {
++		rs_hang("GMU fault interrupt");
++		return rs_cpu(RSF_OFF);
++	}
++	if (rs.irq_hang && !rs.busy && !rs_recover("RBBM hang detect interrupt with no blit in flight")) {
++		return rs_cpu(RSF_OFF);
++	}
+ 	if (s->sx || s->sy || s->dx || s->dy || s->lw != (int32_t)s->w || s->lh != (int32_t)s->h || s->w != d->logical_w ||
+ 	    s->h != d->logical_h || s->fmt != 0x42475241u || s->bpe != 4 || s->ew != 1 || s->eh != 1 || (s->bpr & 63) ||
+ 	    (s->kva & 63) || s->bpr < s->w * 4 || s->w > 0x3fff || s->h > 0x3fff || s->w < 2 || s->h < 2 ||
+@@ -4608,7 +5569,7 @@
+ 	    d->fit_x < 0 || d->fit_w <= 0 || d->fit_x + d->fit_w > (int32_t)d->w) {
+ 		return rs_cpu(RSF_DST);
+ 	}
+-	if (!rs_wait()) {
++	if (!rs_wait() && !rs_recover(rs.why)) {
+ 		return rs_cpu(RSF_OFF);
+ 	}
+ 	uint32_t src_va = rs_slot(s, retain, release);
+@@ -4616,13 +5577,29 @@
+ 		return rs_cpu(RSF_MAP);
+ 	}
+ 	uint64_t len = (uint64_t)s->bpr * (s->h - 1) + (uint64_t)s->w * 4, tc = mach_absolute_time(), ns;
+-	CleanPoC_DcacheRegion_Force((vm_offset_t)s->kva, (size_t)len);
++	if (rs.clean == 1 || (rs.clean == 2 && !rs.coherent)) {
++		CleanPoC_DcacheRegion_Force((vm_offset_t)s->kva, (size_t)len);
++	} else {
++		__asm__ volatile ("dsb sy" ::: "memory");	/* coherent (or bluegpu_present_clean=0): stores done */
++		rs.n_clean_skip++;
++	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - tc, &ns);
+ 	rs.clean_ns += ns;
+ 	rs.clean_max = MAX(rs.clean_max, ns);
+ 
++	bool test = rs.test_next && mach_absolute_time() >= rs.test_next;
++	if (test) {
++		uint64_t ev = 0;
++		if (rs.test_every) {
++			nanoseconds_to_absolutetime((uint64_t)rs.test_every * NSEC_PER_SEC, &ev);
++		}
++		rs.test_next = ev ? mach_absolute_time() + ev : 0;
++	}
+ 	uint32_t from = cp.wptr;
+ 	rs.seq++;
++	if (test) {
++		rs_put_test();
++	}
+ 	rs_put_present(s, d, src_va);
+ 	rs_put_tail(rs.seq);
+ 	if (cp.wptr - from > RS_RING_MAX) {
+@@ -4641,18 +5618,26 @@
+ 		    cp.wptr - from, s->w, s->h, s->bpr, src_va, d->w, d->h, DR_FB_VA + (uint32_t)(dr.fb_pa - dr.fb_blk),
+ 		    d->fit_x, d->fit_w, rs_yofs(s, d));
+ 		if (!rs_wait()) {
+-			return 0;	/* hang: logged; GPU presents off, this frame too is a CPU copy */
++			(void)rs_recover(rs.why);
++			rs.checked = false;	/* checked again on the next GPU present */
++			return 0;		/* this frame is a CPU copy */
+ 		}
+ 		cp_smmu_faults("first GPU present");
+-		printf("BLUELINE GPU: present: first blit done: %llu us on the GPU (CP_ALWAYS_ON), %llu us submit to done\n",
+-		    rs.blit_max * 10 / 192, rs.lag_max / 1000);
+-		if (!rs_selfcheck(s, d)) {
++		printf("BLUELINE GPU: present: first blit done: %llu us on the GPU (CP_ALWAYS_ON), %llu us submit to done%s\n",
++		    rs.blit_max * 10 / 192, rs.lag_max / 1000, rs.irq_on ? " (fence interrupt)" : "");
++		int chk = rs_selfcheck(s, d);
++		if (chk == 0) {
+ 			rs.present = 0;
++		} else if (chk == 1 && rs.coherent) {
++			rs.coherent = false;
++			printf("BLUELINE GPU: present: self-check not a clean PASS with the clean skipped: cleaning per present"
++			    " from now (the coherence probe was wrong or the mapping is not snooped)\n");
+ 		}
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	rs.cpu_ns += ns;
+ 	rs.cpu_max = MAX(rs.cpu_max, ns);
++	rs_dcvs_tick();
+ 	rs_stats();
+ 	return 1;
+ }
+@@ -4699,7 +5684,7 @@
+ 		res = "NO SMMU BANK OR MEMORY";
+ 		goto out;
+ 	}
+-	cp_hw_init();
++	cp_hw_init(false);
+ 	printf("BLUELINE GPU: about to program CP_SQE_INSTR_BASE (0x830), CP_RB_BASE, CP_RB_CNTL, CP_RB_RPTR_ADDR\n");
+ 	cp_wr(GXR_CP_SQE_INSTR_BASE, CP_VA);
+ 	cp_wr(GXR_CP_SQE_INSTR_BASE + 1, 0);
+-- 
+2.39.0

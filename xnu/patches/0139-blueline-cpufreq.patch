@@ -1,0 +1,644 @@
+diff --git a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
+--- a/bsd/dev/blueline_cpufreq.c
++++ b/bsd/dev/blueline_cpufreq.c
+@@ -1,77 +1,597 @@
+ /*
+- * Pixel 3 (blueline) CPU clocks: ask SDM845's CPU frequency firmware
+- * ("cpufreq-hw", one controller per cluster) for its highest regular
+- * performance level. Without this the cores run at whatever level the
+- * bootloader left. Same register interface as Linux's qcom-cpufreq-hw:
+- * frequency table at +0x110 (40 rows of 32 bytes; 19.2 MHz * L_VAL, a
+- * repeated frequency ends it, core count 1 marks turbo), requested index at
+- * +0x920 (+4 per core with per-core DCVS). The firmware applies it within
+- * its own voltage and thermal limits. Boot-arg bluecpufreq=0: leave as is.
++ * Pixel 3 (blueline) CPU clocks. SDM845's CPU and L3 clocks belong to the OSM
++ * (Operating State Manager) firmware, one register block per domain:
++ *   L3      0x17d41000  (downstream "osm_l3_base")
++ *   Silver  0x17d43000  cpu0-3 (mainline "freq-domain0", downstream "osm_pwrcl_base")
++ *   Gold    0x17d45800  cpu4-7 (mainline "freq-domain1", downstream "osm_perfcl_base")
++ * Register layout (Linux drivers/cpufreq/qcom-cpufreq-hw.c qcom_soc_data, and
++ * Google's crosshatch-4.9 drivers/clk/qcom/clk-cpu-osm.c, "v2" = SDM845 v2 silicon):
++ *   0x000 ENABLE          bit 0: firmware owns the domain
++ *   0x0bc DCVS_CTRL       bit 0: per-core requests (PERF_STATE + 4 * core)
++ *   0x110 FREQ_LUT        40 rows of 32 bytes: [31:30] source (0 = 300 MHz
++ *                         fixed clock), [18:16] max active cores (1 = turbo
++ *                         row), [7:0] L_VAL (x 19.2 MHz)
++ *   0x114 VOLT_LUT        [21:16] virtual corner, [11:0] open-loop mV
++ *   0x700 PSTATE_STATUS   [23:16] L_VAL the domain runs at now (downstream)
++ *   0x704 CURRENT_VOTE    [9:0] L_VAL ceiling after LMh limits (mainline throttle)
++ *   0x780/0x7d0           PERF_STATE / cycle counters on SDM845 v1 silicon
++ *   0x920 PERF_STATE      requested LUT index (+4 per core with per-core DCVS)
++ *   0x9c0 CYCLE_COUNTER   32-bit cycle count (+4 per core), v2
++ *
++ * Boot-args:
++ *   (none)          as 0106: put Silver and Gold at their top non-turbo level
++ *                   (bluecpufreq=0: leave the bootloader's levels).
++ *   bluecpu=1       read only: OSM enable, LUTs, status, limits, TSENS
++ *                   temperatures; time a dependent-add loop against CNTVCT
++ *                   on one Silver and one Gold core. Writes nothing.
++ *   bluecpu=2       bluecpu=1, then request bluecpu_silver=N / bluecpu_gold=N
++ *                   (default: top non-turbo level; bluecpu_turbo=1 allows the
++ *                   1-core turbo rows), wait, re-read, re-measure. Kept unless
++ *                   bluecpu_undo=1. bluecpu_l3=N also requests L3 level N.
++ *   bluecpu_scpu=N / bluecpu_gcpu=N   cores to measure on (default 1 / 4)
++ *   bluecpu_mxok=1  allow Silver above 1689.6 MHz / L3 above 1478.4 MHz when
++ *                   the domain is not already there (downstream votes the MX
++ *                   rail to TURBO for those; we do not).
++ *   bluecpu_lmh=1   also dump the first words of the LMh blocks (read only).
++ *   bluecpu_tsens=0 skip the TSENS reads.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/cpu_number.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern processor_t thread_bind(processor_t);
++extern processor_t cpu_to_processor(int);
+ void blueline_cpufreq_init(void);
+ 
+-#define REG_ENABLE	0x000u
+-#define REG_DCVS_CTRL	0x0bcu
+-#define REG_FREQ_LUT	0x110u
+-#define REG_PERF_STATE	0x920u
+-#define LUT_ROWS	40u
+-#define LUT_ROW		32u
+-#define XO_KHZ		19200u
++#define OSM_SIZE		0x1400u
++#define REG_ENABLE		0x000u
++#define REG_DCVS_CTRL		0x0bcu
++#define REG_FREQ_LUT		0x110u
++#define REG_VOLT_LUT		0x114u
++#define REG_PSTATE_STATUS	0x700u
++#define REG_CURRENT_VOTE	0x704u
++#define REG_PERF_STATE_V1	0x780u
++#define REG_CYCLES_V1		0x7d0u
++#define REG_PERF_STATE		0x920u
++#define REG_CYCLES		0x9c0u
++#define LUT_ROWS		40u
++#define LUT_ROW			32u
++#define XO_KHZ			19200u
++#define FIXED_KHZ		300000u
+ 
+-static void
+-cpufreq_domain(unsigned d, vm_offset_t pa)
++#define TSENS0_TM		0x0c263000u	/* 13 sensors; cpu0-3 = s1-4, cpu4-7 = s7-10 */
++#define TSENS0_SROT		0x0c222000u
++#define TSENS1_TM		0x0c265000u	/* 8 sensors */
++#define TSENS1_SROT		0x0c223000u
++#define TM_INT_EN		0x004u
++#define TM_CRIT_INT_MASK	0x01cu
++#define TM_CRIT_THRESH		0x060u
++#define TM_STATUS		0x0a0u
++#define SROT_CTRL		0x004u
++
++#define LMH0_PA			0x17d78800u	/* cluster 0 (Silver) */
++#define LMH1_PA			0x17d70800u	/* cluster 1 (Gold) */
++
++#define TAG			"BLUELINE CPU: "
++
++struct osm_level {
++	uint32_t khz, cores, mv, vc, lval, rawf, rawv;
++};
++
++struct osm_dom {
++	const char *name;
++	uint32_t pa;
++	uint32_t mx_turbo_khz;	/* downstream qcom,mx-turbo-freq; 0: none */
++	vm_offset_t base;
++	bool enabled, per_core;
++	uint32_t rows;
++	struct osm_level lut[LUT_ROWS];
++};
++
++enum { D_SILVER, D_GOLD, D_L3, D_COUNT };
++static struct osm_dom doms[D_COUNT] = {
++	[D_SILVER] = { .name = "silver", .pa = 0x17d43000u, .mx_turbo_khz = 1689600u },
++	[D_GOLD]   = { .name = "gold",   .pa = 0x17d45800u, .mx_turbo_khz = 0u },
++	[D_L3]     = { .name = "L3",     .pa = 0x17d41000u, .mx_turbo_khz = 1478400u },
++};
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
+ {
+-	vm_offset_t base = ml_io_map(pa, 0x1400);
+-	if (!base) {
+-		return;
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint64_t
++cntvct(void)
++{
++	uint64_t v;
++	__asm__ volatile ("isb\n mrs %0, cntvct_el0" : "=r"(v) :: "memory");
++	return v;
++}
++
++static uint32_t
++lval_mhz(uint32_t lval)
++{
++	return lval * XO_KHZ / 1000u;
++}
++
++/* Map the block and read ENABLE, DCVS_CTRL and the LUT (as qcom-cpufreq-hw). */
++static bool
++osm_probe(struct osm_dom *d, bool verbose)
++{
++	if (!d->base) {
++		if (verbose) {
++			printf(TAG "%s: about to map OSM %#x and read ENABLE/LUT\n", d->name, d->pa);
++		}
++		d->base = ml_io_map(d->pa, OSM_SIZE);
++		if (!d->base) {
++			printf(TAG "%s: ml_io_map failed\n", d->name);
++			return false;
++		}
+ 	}
+-	volatile uint32_t *r = (volatile uint32_t *)base;
+-	if (!(r[REG_ENABLE / 4] & 1u)) {
+-		printf("BLUELINE CPUFREQ: cluster %u controller not enabled; left as is\n", d);
+-		return;
+-	}
+-	uint32_t best = 0, best_khz = 0, prev_khz = 0, rows = 0;
++	uint32_t en = rd(d->base, REG_ENABLE), dcvs = rd(d->base, REG_DCVS_CTRL);
++	d->enabled = en & 1u;
++	d->per_core = dcvs & 1u;
++	uint32_t prev = 0;
++	d->rows = 0;
+ 	for (uint32_t i = 0; i < LUT_ROWS; i++) {
+-		uint32_t row = r[(REG_FREQ_LUT + i * LUT_ROW) / 4];
+-		uint32_t src = row >> 30, lval = row & 0xffu, cores = (row >> 16) & 7u;
+-		uint32_t khz = src ? XO_KHZ * lval : 0;	/* src 0: fixed 300 MHz-class clock */
+-		if (i > 0 && khz == prev_khz) {
+-			break;				/* end of table */
++		struct osm_level *l = &d->lut[i];
++		l->rawf = rd(d->base, REG_FREQ_LUT + i * LUT_ROW);
++		l->rawv = rd(d->base, REG_VOLT_LUT + i * LUT_ROW);
++		l->lval = l->rawf & 0xffu;
++		l->cores = (l->rawf >> 16) & 7u;
++		l->khz = (l->rawf >> 30) ? XO_KHZ * l->lval : FIXED_KHZ;
++		l->mv = l->rawv & 0xfffu;
++		l->vc = (l->rawv >> 16) & 0x3fu;
++		if (i > 0 && l->khz == prev) {
++			break;			/* a repeated frequency ends the table */
+ 		}
+-		prev_khz = khz;
+-		rows = i + 1;
+-		if (cores != 1 && khz > best_khz) {	/* skip turbo rows */
++		prev = l->khz;
++		d->rows = i + 1;
++	}
++	if (verbose) {
++		printf(TAG "%s: ENABLE %#x DCVS_CTRL %#x (%s, %s), %u levels\n", d->name, en, dcvs,
++		    d->enabled ? "enabled" : "NOT enabled", d->per_core ? "per-core" : "per-cluster",
++		    d->rows);
++		uint32_t show = d->rows < LUT_ROWS ? d->rows + 1 : LUT_ROWS;
++		for (uint32_t i = 0; i < show; i++) {
++			struct osm_level *l = &d->lut[i];
++			printf(TAG "%s LUT[%2u] %7u kHz cores %u %4u mV vc %2u (raw %08x %08x)%s\n",
++			    d->name, i, l->khz, l->cores, l->mv, l->vc, l->rawf, l->rawv,
++			    i >= d->rows ? " end" : (l->cores == 1u ? " turbo" : ""));
++		}
++	}
++	return true;
++}
++
++/* Highest frequency in the table, skipping 1-core turbo rows unless asked. */
++static uint32_t
++osm_top(const struct osm_dom *d, bool turbo)
++{
++	uint32_t best = 0, best_khz = 0;
++	for (uint32_t i = 0; i < d->rows; i++) {
++		if ((turbo || d->lut[i].cores != 1u) && d->lut[i].khz > best_khz) {
+ 			best = i;
+-			best_khz = khz;
++			best_khz = d->lut[i].khz;
+ 		}
+ 	}
+-	uint32_t old = r[REG_PERF_STATE / 4];
+-	bool per_core = r[REG_DCVS_CTRL / 4] & 1u;
+-	for (unsigned c = 0; c < (per_core ? 4u : 1u); c++) {
+-		r[REG_PERF_STATE / 4 + c] = best;
++	return best;
++}
++
++static uint32_t
++osm_cur_lval(const struct osm_dom *d)
++{
++	return (rd(d->base, REG_PSTATE_STATUS) >> 16) & 0xffu;
++}
++
++static void
++osm_status(const struct osm_dom *d, const char *when)
++{
++	uint32_t ps = rd(d->base, REG_PSTATE_STATUS), cv = rd(d->base, REG_CURRENT_VOTE);
++	uint32_t p[4], p1[4], c[4], c1[4];
++	for (uint32_t i = 0; i < 4; i++) {
++		p[i] = rd(d->base, REG_PERF_STATE + 4 * i);
++		p1[i] = rd(d->base, REG_PERF_STATE_V1 + 4 * i);
++		c[i] = rd(d->base, REG_CYCLES + 4 * i);
++		c1[i] = rd(d->base, REG_CYCLES_V1 + 4 * i);
+ 	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t want = p[0] < LUT_ROWS ? d->lut[p[0]].khz / 1000u : 0;
++	printf(TAG "%s %s: PSTATE_STATUS %#x (running L_VAL %u = %u MHz), CURRENT_VOTE %#x "
++	    "(limit L_VAL %u = %u MHz), PERF_STATE %u (= %u MHz)\n", d->name, when,
++	    ps, (ps >> 16) & 0xffu, lval_mhz((ps >> 16) & 0xffu), cv, cv & 0x3ffu,
++	    lval_mhz(cv & 0x3ffu), p[0], want);
++	printf(TAG "%s %s: 0x920 %#x %#x %#x %#x | 0x9c0 %#x %#x %#x %#x | v1 0x780 %#x %#x %#x %#x"
++	    " | v1 0x7d0 %#x %#x %#x %#x\n", d->name, when, p[0], p[1], p[2], p[3],
++	    c[0], c[1], c[2], c[3], p1[0], p1[1], p1[2], p1[3], c1[0], c1[1], c1[2], c1[3]);
++}
++
++static void
++osm_raw(const struct osm_dom *d)
++{
++	static const uint32_t win[][2] = { { 0x000, 0x40 }, { 0x0b0, 0x20 }, { 0x700, 0x20 } };
++	for (uint32_t w = 0; w < sizeof(win) / sizeof(win[0]); w++) {
++		for (uint32_t o = win[w][0]; o < win[w][0] + win[w][1]; o += 16) {
++			printf(TAG "%s raw +%#05x: %08x %08x %08x %08x\n", d->name, o, rd(d->base, o),
++			    rd(d->base, o + 4), rd(d->base, o + 8), rd(d->base, o + 12));
++		}
++	}
++}
++
++/* ---- temperatures (TSENS v2, read only) ---- */
++
++static vm_offset_t tm[2], srot[2];
++static const uint32_t tsens_n[2] = { 13, 8 };
++
++static void
++tsens_dump(const char *when)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("bluecpu_tsens", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	bool first = !tm[0];
++	if (first) {
++		printf(TAG "about to map/read TSENS TM %#x %#x SROT %#x %#x\n", TSENS0_TM, TSENS1_TM,
++		    TSENS0_SROT, TSENS1_SROT);
++		tm[0] = ml_io_map(TSENS0_TM, 0x200);
++		tm[1] = ml_io_map(TSENS1_TM, 0x200);
++		srot[0] = ml_io_map(TSENS0_SROT, 0x100);
++		srot[1] = ml_io_map(TSENS1_SROT, 0x100);
++		if (!tm[0] || !tm[1] || !srot[0] || !srot[1]) {
++			printf(TAG "TSENS map failed\n");
++			tm[0] = 0;
++			return;
++		}
++	}
++	for (uint32_t t = 0; t < 2; t++) {
++		char line[256];
++		int n = snprintf(line, sizeof(line), TAG "tsens%u %s (C):", t, when);
++		for (uint32_t s = 0; s < tsens_n[t] && n > 0 && n < (int)sizeof(line); s++) {
++			uint32_t st = rd(tm[t], TM_STATUS + 4 * s);
++			int dc = (int)(st & 0xfffu);
++			if (dc & 0x800) {
++				dc -= 0x1000;		/* 12-bit signed, 0.1 C */
++			}
++			int a = dc < 0 ? -dc : dc;
++			n += snprintf(line + n, sizeof(line) - (size_t)n, (st >> 21) & 1u ?
++			    " s%u %s%d.%d%s" : " s%u ?", s, dc < 0 ? "-" : "", a / 10, a % 10,
++			    (st >> 19) & 1u ? "!" : "");
++		}
++		printf("%s\n", line);
++		if (first) {
++			char th[256];
++			int m = snprintf(th, sizeof(th), TAG "tsens%u SROT_CTRL %#x INT_EN %#x "
++			    "CRIT_INT_MASK %#x crit thresholds:", t, rd(srot[t], SROT_CTRL),
++			    rd(tm[t], TM_INT_EN), rd(tm[t], TM_CRIT_INT_MASK));
++			for (uint32_t s = 0; s < tsens_n[t] && m > 0 && m < (int)sizeof(th); s++) {
++				m += snprintf(th + m, sizeof(th) - (size_t)m, " %#x",
++				    rd(tm[t], TM_CRIT_THRESH + 4 * s) & 0xfffu);
++			}
++			printf("%s\n", th);
++		}
++	}
++	if (first) {
++		printf(TAG "tsens0 sensors: cpu0-3 = s1-s4, cpu4-7 = s7-s10 (mainline thermal "
++		    "zones); '!' = critical status\n");
++	}
++}
++
++static void
++lmh_dump(void)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("bluecpu_lmh", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	static const uint32_t pa[2] = { LMH0_PA, LMH1_PA };
++	for (uint32_t i = 0; i < 2; i++) {
++		printf(TAG "about to map/read LMh %u at %#x\n", i, pa[i]);
++		vm_offset_t b = ml_io_map(pa[i], 0x400);
++		if (!b) {
++			continue;
++		}
++		/* +0x8 is LMH_REG_DCVS_INTR_CLR (write only): not read. */
++		printf(TAG "LMh %u: +0x0 %#x +0x4 %#x +0xc %#x +0x10 %#x +0x14 %#x +0x18 %#x "
++		    "+0x1c %#x\n", i, rd(b, 0x0), rd(b, 0x4), rd(b, 0xc), rd(b, 0x10),
++		    rd(b, 0x14), rd(b, 0x18), rd(b, 0x1c));
++	}
++}
++
++/* ---- loop timing on a bound core ---- */
++
++#define LOOP_ITERS	65536u
++#define ADDS_PER_ITER	64u
++
++struct meas {
++	int cpu;
++	volatile int done;
++	int ran_on;
++	uint64_t mpidr, midr, ticks;
++	uint32_t osm_cycles;
++	bool have_cycles;
++};
++static struct meas meas_slot[8];
++static uint32_t meas_used;
++static volatile uint64_t meas_sink;
++
++/* 64 dependent adds per iteration: one add per cycle on Kryo 385 Gold and Silver. */
++static uint64_t __attribute__((noinline))
++add_chain(uint64_t iters)
++{
++	uint64_t x = 0;
++	__asm__ volatile (
++		"1:\n"
++		".rept 64\n"
++		"add %0, %0, #1\n"
++		".endr\n"
++		"subs %1, %1, #1\n"
++		"b.ne 1b\n"
++		: "+r"(x), "+r"(iters) :: "cc");
++	return x;
++}
++
++static void
++meas_thread(void *arg, wait_result_t wr __unused)
++{
++	struct meas *m = arg;
++	processor_t prev = thread_bind(cpu_to_processor(m->cpu));
++	thread_block(THREAD_CONTINUE_NULL);		/* migrate to the bound core */
++
++	uint64_t best = UINT64_MAX;
++	for (int r = 0; r < 3; r++) {
++		boolean_t s = ml_set_interrupts_enabled(FALSE);
++		int c = cpu_number();
++		const struct osm_dom *d = &doms[c < 4 ? D_SILVER : D_GOLD];
++		vm_offset_t cyc = 0;
++		if (d->base) {
++			cyc = d->base + REG_CYCLES + (d->per_core ? 4u * ((uint32_t)c & 3u) : 0u);
++		}
++		uint32_t c0 = cyc ? *(volatile uint32_t *)cyc : 0;
++		uint64_t t0 = cntvct();
++		meas_sink += add_chain(LOOP_ITERS);
++		uint64_t t1 = cntvct();
++		uint32_t c1 = cyc ? *(volatile uint32_t *)cyc : 0;
++		uint64_t mpidr, midr;
++		__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
++		__asm__ volatile ("mrs %0, midr_el1" : "=r"(midr));
++		ml_set_interrupts_enabled(s);
++		if (t1 - t0 < best) {
++			best = t1 - t0;
++			m->ran_on = c;
++			m->mpidr = mpidr;
++			m->midr = midr;
++			m->osm_cycles = c1 - c0;
++			m->have_cycles = cyc != 0;
++		}
++	}
++	m->ticks = best;
++	thread_bind(prev);
++	__asm__ volatile ("dmb ish" ::: "memory");
++	m->done = 1;
++}
++
++static void
++measure(int cpu, const char *when)
++{
++	if (cpu < 0 || (unsigned)cpu >= ml_get_cpu_count() || cpu_to_processor(cpu) == PROCESSOR_NULL) {
++		printf(TAG "%s: cpu%d not running (%u cpus); not measured\n", when, cpu,
++		    ml_get_cpu_count());
++		return;
++	}
++	if (meas_used >= sizeof(meas_slot) / sizeof(meas_slot[0])) {
++		return;
++	}
++	struct meas *m = &meas_slot[meas_used++];
++	m->cpu = cpu;
++	printf(TAG "%s: timing %u dependent adds on cpu%d (bound thread)\n", when,
++	    LOOP_ITERS * ADDS_PER_ITER, cpu);
++	thread_t th;
++	if (kernel_thread_start(meas_thread, m, &th) != KERN_SUCCESS) {
++		printf(TAG "%s: kernel_thread_start failed\n", when);
++		return;
++	}
++	thread_deallocate(th);
++	for (int ms = 0; ms < 2000 && !m->done; ms++) {
++		delay(1000);
++	}
++	if (!m->done) {
++		printf(TAG "%s: cpu%d measurement timed out after 2 s (thread left bound)\n", when, cpu);
++		return;
++	}
++	uint64_t adds = (uint64_t)LOOP_ITERS * ADDS_PER_ITER;
++	uint64_t mhz10 = m->ticks ? adds * 192u / m->ticks : 0;	/* adds * 19.2 MHz / ticks, x10 */
++	uint64_t osm10 = m->ticks ? (uint64_t)m->osm_cycles * 192u / m->ticks : 0;
++	uint32_t part = (uint32_t)(m->midr >> 4) & 0xfffu;
++	printf(TAG "%s: cpu%d ran on cpu%d MPIDR %#llx MIDR %#llx (%s): %llu ticks of 19.2 MHz "
++	    "= %llu.%llu MHz by the add loop; OSM cycle counter %s%u = %llu.%llu MHz\n", when,
++	    cpu, m->ran_on, m->mpidr, m->midr, part == 0x802 ? "Kryo 385 Gold" :
++	    part == 0x803 ? "Kryo 385 Silver" : "?", m->ticks, mhz10 / 10, mhz10 % 10,
++	    m->have_cycles ? "+" : "(unmapped) ", m->osm_cycles, osm10 / 10, osm10 % 10);
++}
++
++/* ---- requests (bluecpu=2) ---- */
++
++struct undo {
++	bool valid;
++	uint32_t n, old[4];
++};
++static struct undo undo_log[D_COUNT];
++
++static void
++osm_request(uint32_t di, uint32_t idx, bool mxok)
++{
++	struct osm_dom *d = &doms[di];
++	if (!d->base || !d->enabled) {
++		printf(TAG "%s: not enabled; no request\n", d->name);
++		return;
++	}
++	if (idx >= d->rows) {
++		printf(TAG "%s: index %u out of range (%u levels); no request\n", d->name, idx, d->rows);
++		return;
++	}
++	struct osm_level *l = &d->lut[idx];
++	uint32_t cur_khz = osm_cur_lval(d) * XO_KHZ;
++	if (d->mx_turbo_khz && l->khz >= d->mx_turbo_khz && cur_khz < d->mx_turbo_khz && !mxok) {
++		printf(TAG "%s: level %u (%u MHz) needs MX at TURBO (downstream votes it; running "
++		    "%u MHz now); skipped, bluecpu_mxok=1 to force\n", d->name, idx, l->khz / 1000u,
++		    cur_khz / 1000u);
++		return;
++	}
++	struct undo *u = &undo_log[di];
++	u->n = (d->per_core && di != D_L3) ? 4u : 1u;
++	for (uint32_t i = 0; i < u->n; i++) {
++		u->old[i] = rd(d->base, REG_PERF_STATE + 4 * i);
++	}
++	u->valid = true;
++	printf(TAG "%s: about to write PERF_STATE %#x (x%u) = %u (%u MHz, cores %u, %u mV), was %u\n",
++	    d->name, d->pa + REG_PERF_STATE, u->n, idx, l->khz / 1000u, l->cores, l->mv, u->old[0]);
++	for (uint32_t i = 0; i < u->n; i++) {
++		wr(d->base, REG_PERF_STATE + 4 * i, idx);
++	}
++	uint32_t us = 0, lv = osm_cur_lval(d);
++	while (lv != l->lval && us < 5000) {
++		delay(50);
++		us += 50;
++		lv = osm_cur_lval(d);
++	}
++	printf(TAG "%s: running L_VAL %u (%u MHz) after %u us: %s; readback PERF_STATE %u, "
++	    "CURRENT_VOTE limit %u MHz\n", d->name, lv, lval_mhz(lv), us,
++	    lv == l->lval ? "reached" : "NOT reached in 5 ms", rd(d->base, REG_PERF_STATE),
++	    lval_mhz(rd(d->base, REG_CURRENT_VOTE) & 0x3ffu));
++}
++
++static void
++osm_undo(void)
++{
++	for (int di = D_COUNT - 1; di >= 0; di--) {
++		struct undo *u = &undo_log[di];
++		if (!u->valid) {
++			continue;
++		}
++		for (int i = (int)u->n - 1; i >= 0; i--) {
++			wr(doms[di].base, REG_PERF_STATE + 4u * (uint32_t)i, u->old[i]);
++		}
++		delay(1000);
++		printf(TAG "%s: undo: PERF_STATE back to %u, running L_VAL %u (%u MHz)\n",
++		    doms[di].name, u->old[0], osm_cur_lval(&doms[di]),
++		    lval_mhz(osm_cur_lval(&doms[di])));
++	}
++}
++
++static void
++bluecpu_run(int mode)
++{
++	int scpu = 1, gcpu = 4, mxok = 0, turbo = 0, undo = 0;
++	(void)PE_parse_boot_argn("bluecpu_scpu", &scpu, sizeof(scpu));
++	(void)PE_parse_boot_argn("bluecpu_gcpu", &gcpu, sizeof(gcpu));
++	(void)PE_parse_boot_argn("bluecpu_mxok", &mxok, sizeof(mxok));
++	(void)PE_parse_boot_argn("bluecpu_turbo", &turbo, sizeof(turbo));
++	(void)PE_parse_boot_argn("bluecpu_undo", &undo, sizeof(undo));
++	if ((unsigned)scpu >= ml_get_cpu_count()) {
++		scpu = 0;
++	}
++	uint64_t cntfrq;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
++	printf(TAG "bluecpu=%d (%s), %u cpus, CNTFRQ %llu; 0106's automatic request skipped\n", mode,
++	    mode >= 2 ? "request levels" : "read only", ml_get_cpu_count(), cntfrq);
++
++	for (uint32_t di = 0; di < D_COUNT; di++) {
++		if (osm_probe(&doms[di], true)) {
++			osm_status(&doms[di], "boot");
++			osm_raw(&doms[di]);
++		}
++	}
++	lmh_dump();
++	tsens_dump("before");
++	measure(scpu, "silver before");
++	measure(gcpu, "gold before");
++	if (mode < 2) {
++		tsens_dump("after timing");
++		return;
++	}
++
++	int s = (int)osm_top(&doms[D_SILVER], turbo), g = (int)osm_top(&doms[D_GOLD], turbo), l3 = -1;
++	(void)PE_parse_boot_argn("bluecpu_silver", &s, sizeof(s));
++	(void)PE_parse_boot_argn("bluecpu_gold", &g, sizeof(g));
++	(void)PE_parse_boot_argn("bluecpu_l3", &l3, sizeof(l3));
++	if (doms[D_SILVER].base && s >= 0) {
++		osm_request(D_SILVER, (uint32_t)s, mxok);
++	}
++	if (doms[D_GOLD].base && g >= 0) {
++		osm_request(D_GOLD, (uint32_t)g, mxok);
++	}
++	if (doms[D_L3].base && l3 >= 0) {
++		osm_request(D_L3, (uint32_t)l3, mxok);
++	}
++	delay(20000);
++	for (uint32_t di = 0; di < D_COUNT; di++) {
++		if (doms[di].base) {
++			osm_status(&doms[di], "after request");
++		}
++	}
++	measure(scpu, "silver after");
++	measure(gcpu, "gold after");
++	tsens_dump("after");
++	if (undo) {
++		osm_undo();
++	} else {
++		printf(TAG "levels kept (bluecpu_undo=1 restores the old ones)\n");
++	}
++}
++
++/* 0106 behaviour, unchanged: top non-turbo level on both clusters. */
++static void
++cpufreq_legacy(unsigned c, uint32_t di)
++{
++	struct osm_dom *d = &doms[di];
++	if (!osm_probe(d, false)) {
++		return;
++	}
++	if (!d->enabled) {
++		printf("BLUELINE CPUFREQ: cluster %u controller not enabled; left as is\n", c);
++		return;
++	}
++	uint32_t best = osm_top(d, false);
++	uint32_t old = rd(d->base, REG_PERF_STATE);
++	for (uint32_t i = 0; i < (d->per_core ? 4u : 1u); i++) {
++		wr(d->base, REG_PERF_STATE + 4 * i, best);
++	}
+ 	printf("BLUELINE CPUFREQ: cluster %u: %u levels, was %u, now %u = %u MHz%s\n",
+-	    d, rows, old, best, best_khz / 1000, per_core ? " (per core)" : "");
++	    c, d->rows, old, best, d->lut[best].khz / 1000u, d->per_core ? " (per core)" : "");
+ }
+ 
+ void
+ blueline_cpufreq_init(void)
+ {
++	int mode = 0;
++	(void)PE_parse_boot_argn("bluecpu", &mode, sizeof(mode));
++	if (mode > 0) {
++		bluecpu_run(mode);
++		return;
++	}
+ 	int enabled = 1;
+ 	(void)PE_parse_boot_argn("bluecpufreq", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("BLUELINE CPUFREQ: left at the bootloader's levels (bluecpufreq=0)\n");
+ 		return;
+ 	}
+-	cpufreq_domain(0, 0x17d43000u);		/* Silver: cpu0-3 */
+-	cpufreq_domain(1, 0x17d45800u);		/* Gold: cpu4-7 */
++	cpufreq_legacy(0, D_SILVER);
++	cpufreq_legacy(1, D_GOLD);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

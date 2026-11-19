@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Generate the Apple Device Tree for XNU on the Pixel 3 (blueline).
 
-  mkadt.py OUT.adt [--qemu] [--cpus N] [--ufs] [--iphone DT.im4p] [--dump]
+  mkadt.py OUT.adt [--qemu] [--cpus N] [--ufs] [--iphone DT.im4p]
+                   [--gpu-fw a630_gmu.bin [--gpu-sqe auto|vendor|linux|none|PATH]
+                    [--gpu-zap auto|none|PATH.mdt]]
+                   [--haptic-fw DIR]
+                   [--dump]
 
 The kernel is ios-sweet's SWEET machine config, so this provides what
 that boot path reads: /chosen (RAM range, entropy), /cpus, /arm-io/gic,
@@ -23,6 +27,34 @@ copied from the real D22AP device tree (DeviceTree.d22ap.im4p from the
 IPSW; Apple's file, never stored here). Which properties matter and why is
 from ios-sweet's bring-up notes.
 
+--gpu-fw adds /blueline-gpu with "gmu-firmware": the Adreno 630 GMU's
+firmware (qcom/a630_gmu.bin from linux-firmware, 32768 bytes, a raw
+Cortex-M3 TCM image), which xnu patch 0126 loads at boot-arg bluegpu=3.
+It is not redistributable here: tools/fetch-gpu-fw.sh downloads the pinned
+copy into work/fw/ (ignored by git) and checks its SHA-256; this checks it
+again. The kernel logs the image's 32-bit word sum, printed here too.
+
+--haptic-fw DIR adds /blueline-haptic with "wmfw" (DIR/cs40l20.wmfw, the
+CS40L20's DSP program) and "wavetable" (DIR/cs40l20.bin), the vendor
+partition's /firmware copies (work/fw/vendor/, ignored by git: debugfs
+from the OTA's vendor.img), loaded by xnu patch 0150 at bluehaptic=2.
+It also adds "sqe-firmware", the CP's SQE microcode (a630_sqe.fw, the
+whole file; the kernel drops dword 0 as Linux does), for xnu 0137 at
+bluegpu=6. --gpu-sqe picks it: auto (default) takes the phone's own
+vendor copy at DIR/vendor/a630_sqe.fw if present, else linux-firmware's
+DIR/a630_sqe.fw (DIR = --gpu-fw's directory), else none; vendor/linux
+insist on that one; none leaves it out; or a path. Only the two pinned
+SHA-256s are accepted, and Linux's a630 version check must pass.
+And "zap-elf", the GPU's zap shader for xnu 0144 (bluegpu=7, PAS id 13):
+the phone's own /vendor/firmware a630_zap.mdt + .b00..b0N (Google-signed
+for blueline; never committed, work/fw/vendor only), squashed into one
+ELF the way pil-squasher does (segment N at its p_offset), checked as
+Linux's mdt_loader checks it (header, hash segment, metadata == the .mdt
+for a split image, loadable span within the 0x2000 gpu_mem region) and,
+if DIR/vendor/a630_zap.elf exists, byte-compared with it. --gpu-zap: auto
+(default) takes DIR/vendor/a630_zap.mdt if present, else none; none
+leaves it out; or a .mdt path. Only the pinned SHA-256 is accepted.
+
 --qemu swaps in QEMU virt's GIC, timer frequency and timer interrupt
 (-M virt,gic-version=3) for emulator tests.
 """
@@ -34,6 +66,152 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from adt import Node, dump, load, parse, serialize, strs, u32, u64  # noqa: E402
+
+# qcom/a630_gmu.bin, linux-firmware 88ea23e7 (unchanged since; see
+# tools/fetch-gpu-fw.sh). Legacy image: 16K ITCM then 16K DTCM.
+GMU_FW_SIZE = 0x8000
+GMU_FW_SHA256 = 'da8d9b1b1f5c1a0b311f32567093b4828f3c80031dd8435f91ac13c664e173a6'
+
+
+def gmu_firmware(path):
+    """The GMU image, checked: size, hash, vector table (SP in DTCM, Thumb reset in ITCM)."""
+    fw = open(path, 'rb').read()
+    digest = hashlib.sha256(fw).hexdigest()
+    sp, reset = struct.unpack_from('<II', fw) if len(fw) >= 8 else (0, 0)
+    if len(fw) != GMU_FW_SIZE or not 0x40000 <= sp <= 0x44000 or not reset & 1 or reset >= 0x4000:
+        sys.exit('--gpu-fw %s: not a legacy a630_gmu.bin (%d bytes, sp %#x, reset %#x)'
+                 % (path, len(fw), sp, reset))
+    if digest != GMU_FW_SHA256:
+        sys.exit('--gpu-fw %s: sha256 %s, expected %s (linux-firmware 88ea23e7)'
+                 % (path, digest, GMU_FW_SHA256))
+    return fw
+
+
+# a630_sqe.fw candidates. dword[1] is the version word (Linux's buf[0]):
+# a6xx_ucode_check_version accepts a630 if (word & 0xfff) >= 0x190, or the
+# word ends in 0xa (patched build) with dword[3] & 0xf >= 1.
+SQE_FW_KNOWN = {
+    # linux-firmware 75f16899 (v2.07), tools/fetch-gpu-fw.sh
+    '1c21b527d9183487cc550dabbb3f43e555df5a977a461934fc61f0635a9aa90c': 'linux-firmware 75f16899',
+    # the phone's /vendor/firmware (LineageOS 22.2 blueline vendor image, Google's blob)
+    '36298bd53ea3666413d288a3a3f5266f67fcb6db038a0a481af5869d1c17859c': 'blueline vendor',
+}
+SQE_FW_MAX = 0x9000 + 4		# xnu 0137: SQE window at GPU VA 0x01000000, + dword 0
+
+# a630_zap: the squashed ELF (pil-squasher layout) of the phone's split
+# /vendor/firmware a630_zap.mdt + .b00-.b02 (LineageOS 22.2 blueline vendor
+# image, Google's blob), which is also the vendor's own a630_zap.elf.
+ZAP_KNOWN = {
+    'b5e73cff5e70c5cff5abbf41017039855a8aa0fef75ff583f40499a1bca866de': 'blueline vendor',
+}
+ZAP_REGION_SIZE = 0x2000		# sdm845.dtsi gpu_mem 0x8c415000, xnu 0144
+ZAP_FILE_MAX = 0x10000			# xnu 0144's limit
+ZAP_META_MAX = 0x4000
+
+
+def zap_phdrs(elf, what):
+    """mdt_header_valid: the program headers of a 32-bit ELF."""
+    if len(elf) < 52 or elf[:4] != b'\x7fELF' or elf[4] != 1:
+        sys.exit('--gpu-zap %s: not a 32-bit ELF' % what)
+    phoff, = struct.unpack_from('<I', elf, 0x1c)
+    phentsize, phnum, shentsize, shnum = struct.unpack_from('<HHHH', elf, 0x2a)
+    if phentsize != 32 or phnum < 2 or phoff + 32 * phnum > len(elf) or shentsize or shnum:
+        sys.exit('--gpu-zap %s: ELF header not valid for mdt_loader' % what)
+    return [struct.unpack_from('<8I', elf, phoff + 32 * i) for i in range(phnum)]
+
+
+def zap_firmware(choice, gmu_path):
+    """The squashed zap ELF to embed (bytes, description) or (None, why)."""
+    d = os.path.join(os.path.dirname(os.path.abspath(gmu_path)), 'vendor')
+    if choice == 'none':
+        return None, 'left out (--gpu-zap none)'
+    mdt_path = os.path.join(d, 'a630_zap.mdt') if choice == 'auto' else choice
+    if not os.path.isfile(mdt_path):
+        if choice == 'auto':
+            return None, 'none found (%s)' % mdt_path
+        sys.exit('--gpu-zap %s: no such file' % mdt_path)
+    if not mdt_path.endswith('.mdt'):
+        sys.exit('--gpu-zap %s: want the .mdt (its .bNN next to it)' % mdt_path)
+    mdt = open(mdt_path, 'rb').read()
+    log = ['%s sha256 %s' % (os.path.basename(mdt_path), hashlib.sha256(mdt).hexdigest())]
+    ph = zap_phdrs(mdt, mdt_path)
+    if ph[0][0] == 1:
+        sys.exit('--gpu-zap %s: phdr 0 is PT_LOAD' % mdt_path)
+    hashes = [i for i in range(1, len(ph)) if ph[i][6] & (7 << 24) == 2 << 24]
+    if not hashes:
+        sys.exit('--gpu-zap %s: no hash segment' % mdt_path)
+    ehdr_size, hash_size = ph[0][4], ph[hashes[0]][4]
+    if ehdr_size + hash_size != len(mdt):
+        sys.exit('--gpu-zap %s: %d bytes, not header %#x + hash %#x: not a split image\'s .mdt'
+                 % (mdt_path, len(mdt), ehdr_size, hash_size))
+    # pil-squasher: every segment with bytes, from its .bNN, at its p_offset
+    size = max(p[1] + p[4] for p in ph if p[4])
+    elf = bytearray(size)
+    for i, (typ, off, va, pa, filesz, memsz, flags, align) in enumerate(ph):
+        if not filesz:
+            continue
+        seg_path = mdt_path[:-4] + '.b%02d' % i
+        if not os.path.isfile(seg_path):
+            sys.exit('--gpu-zap %s: missing (segment %d, %#x bytes)' % (seg_path, i, filesz))
+        seg = open(seg_path, 'rb').read()
+        log.append('%s sha256 %s' % (os.path.basename(seg_path), hashlib.sha256(seg).hexdigest()))
+        if len(seg) != filesz:
+            sys.exit('--gpu-zap %s: %d bytes, phdr %d says %#x' % (seg_path, len(seg), i, filesz))
+        elf[off:off + filesz] = seg
+    elf = bytes(elf)
+    # qcom_mdt_read_metadata on the squashed file must give the .mdt back
+    if elf[:ehdr_size] + elf[ph[hashes[0]][1]:ph[hashes[0]][1] + hash_size] != mdt:
+        sys.exit('--gpu-zap %s: the .bNN do not match the .mdt\'s header and hash' % mdt_path)
+    load = [p for p in ph if p[0] == 1 and p[6] & (7 << 24) != 2 << 24 and p[5]]
+    if not load or any(p[4] > p[5] for p in load):
+        sys.exit('--gpu-zap %s: no loadable segment, or p_filesz > p_memsz' % mdt_path)
+    span = max((p[3] + p[5] + 0xfff) & ~0xfff for p in load) - min(p[3] for p in load)
+    if span > ZAP_REGION_SIZE or len(elf) > ZAP_FILE_MAX or len(mdt) > ZAP_META_MAX:
+        sys.exit('--gpu-zap %s: image %#x (region %#x), file %d, metadata %d: too big'
+                 % (mdt_path, span, ZAP_REGION_SIZE, len(elf), len(mdt)))
+    vendor_elf = mdt_path[:-4] + '.elf'
+    if os.path.isfile(vendor_elf):
+        same = open(vendor_elf, 'rb').read() == elf
+        log.append('%s %s' % (os.path.basename(vendor_elf), 'identical' if same else 'DIFFERS'))
+        if not same:
+            sys.exit('--gpu-zap %s: the squashed image differs from %s' % (mdt_path, vendor_elf))
+    digest = hashlib.sha256(elf).hexdigest()
+    if digest not in ZAP_KNOWN:
+        sys.exit('--gpu-zap %s: squashed sha256 %s is not a known a630_zap' % (mdt_path, digest))
+    return elf, ('%s (%s), squashed sha256 %s, metadata %d bytes, load span %#x; %s'
+                 % (mdt_path, ZAP_KNOWN[digest], digest, len(mdt), span, ', '.join(log)))
+
+
+def sqe_version_ok(fw):
+    """(version word, accepted) as Linux's a630 check sees the file."""
+    if len(fw) < 16:
+        return 0, False
+    _, ver, _, pl = struct.unpack_from('<4I', fw)
+    return ver, ((ver & 0xf) == 0xa and (pl & 0xf) >= 1) or (ver & 0xfff) >= 0x190
+
+
+def sqe_firmware(choice, gmu_path):
+    """The SQE image to embed (bytes, description) or (None, why)."""
+    d = os.path.dirname(os.path.abspath(gmu_path))
+    vendor, linux = os.path.join(d, 'vendor', 'a630_sqe.fw'), os.path.join(d, 'a630_sqe.fw')
+    if choice == 'none':
+        return None, 'left out (--gpu-sqe none)'
+    if choice == 'auto':
+        path = vendor if os.path.isfile(vendor) else linux if os.path.isfile(linux) else None
+        if path is None:
+            return None, 'none found (%s, %s; tools/fetch-gpu-fw.sh)' % (vendor, linux)
+    else:
+        path = {'vendor': vendor, 'linux': linux}.get(choice, choice)
+    fw = open(path, 'rb').read()
+    digest = hashlib.sha256(fw).hexdigest()
+    ver, ok = sqe_version_ok(fw)
+    if digest not in SQE_FW_KNOWN:
+        sys.exit('--gpu-sqe %s: sha256 %s is not a known a630_sqe.fw' % (path, digest))
+    if not ok or len(fw) > SQE_FW_MAX or len(fw) % 4:
+        sys.exit('--gpu-sqe %s: %d bytes, version word %#x: not usable (Linux needs >= 0x190 or a patched'
+                 ' ..a build; at most %d bytes)' % (path, len(fw), ver, SQE_FW_MAX))
+    return fw, '%s (%s), version word %#x' % (path, SQE_FW_KNOWN[digest], ver)
+
 
 # Kernel-managed RAM: above every fixed carve-out in both the mainline and
 # the LineageOS device tree (README, "Second run"), 32 MiB aligned at both
@@ -77,7 +255,17 @@ def d22ap_product(im4p):
     sys.exit('%s: no /product node' % im4p)
 
 
-def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None):
+def haptic_firmware(d):
+    """cs40l20.wmfw + cs40l20.bin from DIR, checked for their magic."""
+    wmfw = open(os.path.join(d, 'cs40l20.wmfw'), 'rb').read()
+    wt = open(os.path.join(d, 'cs40l20.bin'), 'rb').read()
+    if wmfw[:4] != b'WMFW' or len(wmfw) & 3 or wt[:4] != b'WMDR':
+        sys.exit('--haptic-fw %s: cs40l20.wmfw / cs40l20.bin are not WMFW / WMDR files' % d)
+    return wmfw, wt
+
+
+def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None,
+          haptic_fw=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -207,6 +395,20 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None):
             'reg': u64(UFS, UFS_SIZE),		# absolute physical address
         }))
 
+    if gpu_fw is not None:
+        # Read by bsd/dev/blueline_gpu.c: the GMU image (0126) at bluegpu=3+,
+        # the SQE microcode (0137) at bluegpu=6.
+        gpu = {'gmu-firmware': gpu_fw}
+        if sqe_fw is not None:
+            gpu['sqe-firmware'] = sqe_fw
+        if zap_fw is not None:
+            gpu['zap-elf'] = zap_fw		# 0144, bluegpu=7
+        extra.append(node('blueline-gpu', gpu))
+
+    if haptic_fw is not None:
+        # Read by bsd/dev/blueline_haptic.c (0150) at bluehaptic=2.
+        extra.append(node('blueline-haptic', {'wmfw': haptic_fw[0], 'wavetable': haptic_fw[1]}))
+
     root_props.update({'#address-cells': u32(2), '#size-cells': u32(2)})
     return node('device-tree', root_props, [chosen, defaults, cpus_node, arm_io, fbcon] + extra + storage)
 
@@ -218,15 +420,49 @@ if __name__ == '__main__':
     ap.add_argument('--cpus', type=int, default=1, help='CPU nodes (default 1)')
     ap.add_argument('--ufs', action='store_true', help='add the UFS host (root on userdata)')
     ap.add_argument('--iphone', metavar='DT.im4p', help='iPhone X identity, /product from this tree')
+    ap.add_argument('--gpu-fw', metavar='a630_gmu.bin',
+                    help='add /blueline-gpu "gmu-firmware" (tools/fetch-gpu-fw.sh)')
+    ap.add_argument('--gpu-sqe', default='auto', metavar='auto|vendor|linux|none|PATH',
+                    help='with --gpu-fw: the "sqe-firmware" to add (default auto: vendor/ copy, else linux-firmware)')
+    ap.add_argument('--gpu-zap', default='auto', metavar='auto|none|PATH.mdt',
+                    help='with --gpu-fw: the "zap-elf" to add (default auto: DIR/vendor/a630_zap.mdt + .bNN)')
+    ap.add_argument('--haptic-fw', metavar='DIR',
+                    help='add /blueline-haptic "wmfw" + "wavetable" from DIR/cs40l20.wmfw, cs40l20.bin')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if not 1 <= a.cpus <= 8 or (a.qemu and a.cpus != 1):
         sys.exit('--cpus: 1..8 on the phone, 1 in QEMU')
     if a.qemu and a.ufs:
         sys.exit('--ufs: QEMU virt has no UFS host')
-    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone)
+    if a.qemu and a.gpu_fw:
+        sys.exit('--gpu-fw: QEMU virt has no Adreno')
+    gpu_fw = gmu_firmware(a.gpu_fw) if a.gpu_fw else None
+    sqe_fw, sqe_why = sqe_firmware(a.gpu_sqe, a.gpu_fw) if a.gpu_fw else (None, None)
+    zap_fw, zap_why = zap_firmware(a.gpu_zap, a.gpu_fw) if a.gpu_fw else (None, None)
+    haptic_fw = haptic_firmware(a.haptic_fw) if a.haptic_fw else None
+    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw,
+                 haptic_fw=haptic_fw)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
         dump(root)
     print('%s: %d bytes' % (a.out, len(blob)), file=sys.stderr)
+    if haptic_fw is not None:
+        print('  /blueline-haptic wmfw %d bytes, wavetable %d bytes' % (len(haptic_fw[0]), len(haptic_fw[1])),
+              file=sys.stderr)
+    if gpu_fw is not None:
+        print('  /blueline-gpu gmu-firmware: %d bytes, word sum %#x'
+              % (len(gpu_fw), sum(struct.unpack('<%dI' % (len(gpu_fw) // 4), gpu_fw)) & 0xffffffff),
+              file=sys.stderr)
+        if sqe_fw is not None:
+            print('  /blueline-gpu sqe-firmware: %d bytes, word sum %#x: %s'
+                  % (len(sqe_fw), sum(struct.unpack('<%dI' % (len(sqe_fw) // 4), sqe_fw)) & 0xffffffff, sqe_why),
+                  file=sys.stderr)
+        else:
+            print('  /blueline-gpu sqe-firmware: %s' % sqe_why, file=sys.stderr)
+        if zap_fw is not None:
+            print('  /blueline-gpu zap-elf: %d bytes, word sum %#x: %s'
+                  % (len(zap_fw), sum(struct.unpack('<%dI' % (len(zap_fw) // 4), zap_fw[:len(zap_fw) // 4 * 4]))
+                     & 0xffffffff, zap_why), file=sys.stderr)
+        else:
+            print('  /blueline-gpu zap-elf: %s' % zap_why, file=sys.stderr)

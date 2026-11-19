@@ -1,0 +1,976 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0128: blueline GPU: Adreno 630 stage 2b, GMU SMMU context
+ and HFI (bluegpu=4)
+
+Applies on top of 0126 (stage 2a). Two parts:
+
+1. 0126 review fixes (affect bluegpu=3 too): drop the CX_GMU_WFI_CONFIG
+   write (KGSL's is dropped on Pixel 3, Linux never writes it); record
+   GPU CC 0x1060 and the GMU watchdog (0x1f816, 0x1f817, 0x1f811,
+   0x1f813) in the undo log before releasing the CM3, so the restore
+   clears the watchdog enable first; check the CX GDSC really collapsed
+   (bounded 500 ms, loud log if not); note the PDC gfx address question.
+
+2. Stage 2b (bluegpu=4): read-only survey of the Adreno SMMU (GR0, GR1,
+   banks 0-4 only; 5-7 are the hypervisor's), a no-effect write probe,
+   then our own AArch64 stage-1 bank (default cb1) with page tables for
+   KGSL's GMU addresses (HFI 0x60000000, debug 0x60100000, log
+   0x60200000, 16K each, one 64K contiguous buffer made Normal NC),
+   ATS1PR self-test, then stream 5 routed (S2CR, SMR). The GMU boots
+   with QTBL_ADDR/QTBL_INFO and the log set; after 0xbabeface the host
+   sets HFI_CTRL_INIT, polls HFI_CTRL_STATUS and sends legacy (v1)
+   GMU_INIT and FW_VERSION, logging the replies, debug queue and
+   buffers. Teardown: CM3 reset, 2a registers restored, SMMU restored
+   in reverse, TLB invalidated, memory freed (or leaked, logged, if the
+   GMU could still reach it). If the SMMU setup backs off, plain 2a runs.
+
+Boot-args: bluegpu=4; bluegpu_smmu_dry=1 (survey + write probe only);
+bluegpu_cb=1..4 (default 1); bluegpu_sid (default 5); bluegpu_sidmask
+(default 0); bluegpu_ats=0 (skip the ATS check); bluegpu_hfi_ms (default
+200, 1..2000); plus 0126's bluegpu_keep/pdc/ms/chipid.
+---
+ bsd/dev/blueline_gpu.c | 812 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 793 insertions(+), 19 deletions(-)
+
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+index bd7ea2f..0b7acc7 100644
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -7,8 +7,9 @@
+  * Boot-args: bluegpu=1 runs the probe; bluegpu=2 also reads the Adreno
+  * SMMU's global ID registers (the hypervisor may emulate or refuse those);
+  * bluegpu=3 runs stage 1, then stage 2a below (no SMMU reads);
+- * bluegpu_keep=1 leaves CX and the GMU clocks (and, at 3, the running GMU)
+- * on afterwards.
++ * bluegpu=4 runs stage 1, then 2a with stage 2b (SMMU context + HFI) around it;
++ * bluegpu_keep=1 leaves CX and the GMU clocks (and, at 3/4, the running GMU,
++ * at 4 also its SMMU bank and memory) on afterwards.
+  *
+  * Stage 2a (0126, bluegpu=3): boot the GMU's Cortex-M3 on its firmware
+  * until it reports FW_INIT_RESULT 0xbabeface, as Linux a6xx_gmu_fw_start /
+@@ -40,6 +41,60 @@
+  *  firmware's timers count the always-on XO counter.
+  *  bluegpu_chipid overrides the GMU-format chip id (HFI_SFR_ADDR; default
+  *  0x06030100 = KGSL's packing of the Pixel 3's 0x06030001).
++ *  0126 ran on the phone (log-gpu2a.txt: 0xbabeface after 364 us, fault
++ *  counters 0, RSCC idle, 66 registers restored). Fixes from its review,
++ *  folded in by 0128: no CX_GMU_WFI_CONFIG write (KGSL's regwrite drops it
++ *  on Pixel 3: 0x7e008 is beyond the GMU reg_len 0x40000; Linux never
++ *  writes it); the registers the firmware itself writes outside our list
++ *  (GPU CC 0x1060, its watchdog 0x1f816/0x1f817/0x1f811/0x1f813, armed at
++ *  fw 0x3e58: bark 0x927c00, bite 0x1b77400 XO ticks = 0.5/1.5 s, enable 3;
++ *  the firmware pets it, 0x1f812 = 1, from its own bark interrupt, NVIC
++ *  30, handler 0x10d0) are recorded first, so restore clears the enable
++ *  first; CX collapse is checked afterwards (KGSL waits up to 5 s).
++ *
++ * Stage 2b (0128, bluegpu=4): give the GMU its memory and talk HFI.
++ *  Who owns the Adreno SMMU: EL1. Downstream (crosshatch msm-arm-smmu-
++ *  sdm845.dtsi) kgsl_smmu has no qcom,skip-init (apps_smmu has), so the
++ *  Pixel 3's own kernel resets it from EL1 (all SMRs, banks, sCR0); mainline
++ *  does the same on sdm845. sdm845-gpu.dtsi: "CB5(ATOS) & CB5/6/7 are
++ *  protected by HYP", so banks 5-7 (pages 0xd000-0xffff) are never read or
++ *  written here. Checked at run time anyway: a read-only survey, then a
++ *  write probe on two registers with no effect (our idle bank's
++ *  CONTEXTIDR, a free SMR with VALID clear), restored at once; any write
++ *  that does not read back stops 2b before the GMU runs.
++ *  Our bank (bluegpu_cb, default 1: mainline's allocator gives cb0 to the
++ *  GPU, the GMU the next) is AArch64 LPAE stage 1, 4K granule, T0SZ 32
++ *  (3-level walk from L1), non-cacheable outer-shareable walks (no
++ *  dma-coherent), MAIR0 0xf404ff44 (attr 0 = Normal NC), TCR2 36-bit PA,
++ *  ASID = bank, SCTLR M|TRE|AFE|CFRE|HUPCF|ASIDPNE (no CFIE: no handler;
++ *  CFCFG 0: faults terminate, never stall). Written in arm_smmu_write_
++ *  context_bank order, each read back, TLB invalidated by ASID, checked
++ *  with ATS1PR, and only then is stream 5 (sdm845.dtsi gmu iommus =
++ *  <&adreno_smmu 5>, bluegpu_sid/bluegpu_sidmask) routed: S2CR, then SMR.
++ *  If sCR0.CLIENTPD (SMMU off) is set it is cleared with USFCFG|GFRE|
++ *  GCFGFRE, else sCR0 is left alone.
++ *  Memory: one 64K kmem_alloc_contig buffer, switched to VM_WIMG_WCOMB
++ *  (Normal NC in every kernel mapping, caches cleaned) because the GMU and
++ *  we write the same HFI header lines: HFI 16K at GMU VA 0x60000000 (KGSL
++ *  hfi_mem), debug 16K at 0x60100000 (KGSL dump_mem, GMU_INIT dbg_buffer),
++ *  log 16K at 0x60200000 (PWR_COL_CP_MSG = va | 3, as Linux), page tables
++ *  in the last 16K. Nothing else is mapped: any other GMU access faults.
++ *  HFI: the legacy (v1) protocol (Linux gmu->legacy for the a630 family,
++ *  same a630_gmu.bin): queue table and queues as a6xx_hfi_init (ids 0, 4,
++ *  5; no alignment, no cookies); QTBL_ADDR/QTBL_INFO = 1 and the log before
++ *  the CM3 is released; after 0xbabeface: HFI_CTRL_INIT = 1, poll
++ *  HFI_CTRL_STATUS (the firmware writes 1, or 0xfe if the table is not
++ *  usable); GMU_INIT (cold boot), FW_VERSION (supported 1.10); replies
++ *  logged with the debug queue and buffers. Not sent: PERF/BW tables (they
++ *  make the GMU vote), TEST. Not done: Linux's legacy gfx_rail_on and
++ *  SPTPRAC enable before HFI (they power GX).
++ *  Teardown: CM3 into reset (2a's path), 2a registers restored, then
++ *  sCR0/SMR/S2CR/bank restored in reverse, TLB invalidated, our faults
++ *  cleared, memory back to cacheable and freed, only if the CM3 reads in
++ *  reset and the SMR invalid (else it is leaked, logged).
++ *  bluegpu_smmu_dry=1: survey and write probe only, then plain 2a.
++ *  bluegpu_ats=0 skips the ATS self-test; bluegpu_hfi_ms (default 200)
++ *  bounds each HFI wait.
+  *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+@@ -64,10 +119,20 @@
+  *    a6xx_gmu_rpmh_off, a6xx_gmu_force_off), a6xx_gmu.xml (GMU/RSCC
+  *    offsets), sdm845.dtsi gmu "gmu_pdc" 0xb280000 / "gmu_pdc_seq"
+  *    0xb480000; crosshatch adreno_a6xx.c (_load_gmu_rpmh_ucode,
+- *    a6xx_gmu_fw_start: TCM_BOOT = 2, a6xx_gmu_start: WFI_CONFIG 0,
++ *    a6xx_gmu_fw_start: TCM_BOOT = 2,
+  *    0xbabeface within 100 ms), a6xx_reg.h (PDC offsets from 0xb200000),
+  *    kgsl_gmu.c (A630: HFI at GMU VA 0x60000000, only through the SMMU);
+  *    ios-flame gpuprobe.c gmu_boot() (A640, same order, booted at XO).
++ *  - Stage 2b: Linux arm-smmu.c/.h (arm_smmu_write_context_bank,
++ *    arm_smmu_init_context_bank), arm-smmu-qcom.c (adreno write_sctlr
++ *    HUPCF, cb0 for the GPU), io-pgtable-arm.c (PTE/TCR/MAIR), a6xx_hfi.c/.h
++ *    (queue init/read/write, send_msg, start_v1), a6xx_gmu.c
++ *    (a6xx_gmu_hfi_start, fw_start QTBL/log writes, resume INTR_CLR);
++ *    crosshatch sdm845-gpu.dtsi (kgsl_smmu, "protected by HYP"),
++ *    msm-arm-smmu-sdm845.dtsi, kgsl_gmu.c (GMU VA layout), kgsl_hfi.c/.h
++ *    (GMU_INIT dbg buffer, FW_VERSION); a630_gmu.bin disassembly (0x229c
++ *    HFI start, 0x1988 queue lookup by id, 0x3e58 watchdog); ios-flame
++ *    gpuprobe.c smmu_setup/hfi (A640); bsd/dev/sweet_usb.c ud_smmu_setup.
+  *
+  * There is no chip-id register on A6xx: the id is a device-tree constant
+  * (Linux and KGSL both). The 3D core's registers (RBBM, CP, VBIF) are in
+@@ -88,9 +153,14 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint32_t blueline_cmddb_addr(const char *id);	/* blueline_touch.c */
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);	/* osfmk/vm/pmap.h, kernel-private */
++extern unsigned int pmap_cache_attributes(ppnum_t);
+ void blueline_gpu_probe(void);
+ 
+ /* GCC (gcc-sdm845.c) */
+@@ -294,15 +364,20 @@ smmu_report(void)
+ #define GMU_ICACHE_CONFIG	0x1f400u
+ #define GMU_DCACHE_CONFIG	0x1f401u
+ #define GMU_SYS_BUS_CONFIG	0x1f40fu
+-#define GMU_CX_GMU_WFI_CONFIG	0x1f802u	/* KGSL a6xx_gmu_start writes 0 */
++/* GMU_CX_GMU_WFI_CONFIG 0x1f802 is not written: KGSL's write is dropped on Pixel 3 (beyond reg_len) */
++#define GMU_WDOG_BARK		0x1f816u	/* firmware 0x3e58 arms the GMU watchdog: */
++#define GMU_WDOG_BITE		0x1f817u
++#define GMU_WDOG_RESET		0x1f811u
++#define GMU_WDOG_CTRL		0x1f813u	/* enable (3); 0x1f812 = 1 is the pet */
++#define GPUCC_FW_REG		0x1060u		/* written (1) by the firmware's init */
+ #define GMU_PWR_COL_INTER_FRAME_CTRL 0x1f8c0u
+ #define GMU_RPMH_CTRL		0x1f8e8u
+-#define GMU_PWR_COL_CP_MSG	0x1f900u	/* log buffer iova | pages-1: left 0 here */
++#define GMU_PWR_COL_CP_MSG	0x1f900u	/* log buffer iova | pages-1: 0 in 2a */
+ #define GMU_PWR_COL_CP_RESP	0x1f901u
+ #define GMU_HFI_SFR_ADDR	0x1f982u	/* the GMU-format chip id before boot */
+ #define GMU_HFI_QTBL_INFO	0x1f984u
+ #define GMU_HFI_QTBL_ADDR	0x1f985u
+-#define GMU_HFI_CTRL_INIT	0x1f986u	/* never written in 2a */
++#define GMU_HFI_CTRL_INIT	0x1f986u	/* written only in 2b */
+ #define GMU_GENERAL_0		0x1f9c5u
+ #define GMU_GMU2HOST_INTR_INFO	0x1f992u	/* bit 23 CM3_FAULT */
+ #define GMU_AO_AHB_FENCE_CTRL	0x23b10u
+@@ -346,7 +421,7 @@ smmu_report(void)
+ #define PDC_TCS_CMD0_MSGID	3u
+ #define PDC_TCS_CMD0_ADDR	4u
+ #define PDC_TCS_CMD0_DATA	5u
+-#define PDC_A630_GFX_ADDR	0x30080u	/* pdc_address_offset (Linux and KGSL); cmd-db says gfx.lvl 0x30050 */
++#define PDC_A630_GFX_ADDR	0x30080u	/* pdc_address_offset (Linux and KGSL); cmd-db says gfx.lvl 0x30050: stage 3 must resolve */
+ 
+ #define GMU_FW_SIZE		0x8000u		/* a6xx_gmu_fw_load: legacy image must be <= 0x8000 */
+ 
+@@ -546,13 +621,673 @@ rscc_idle_check(void)
+ 	    (idle[0] && idle[1] && idle[2] && idle[3]) ? "idle" : "NOT IDLE: a vote may be outstanding");
+ }
+ 
++/* ---- Stage 2b: Adreno SMMU context for the GMU stream, HFI (bluegpu=4) ---- */
++
++/* Adreno SMMU (arm-smmu.h, SMMUv2): 4K pages, GR0 at 0, GR1 at 0x1000, CBn at 0x8000 + n * 0x1000 */
++#define SMMU_MAP_SIZE		0x10000u	/* adreno_smmu reg size: GR0 .. CB7 */
++#define SMMU_CB_EL1_LAST	4		/* sdm845-gpu.dtsi: "CB5(ATOS) & CB5/6/7 are protected by HYP" */
++#define SMMU_sCR0		0x000u
++#define SMMU_sCR0_CLIENTPD	(1u << 0)
++#define SMMU_sCR0_GFRE		(1u << 1)
++#define SMMU_sCR0_EXIDENABLE	(1u << 3)
++#define SMMU_sCR0_GCFGFRE	(1u << 4)
++#define SMMU_sCR0_USFCFG	(1u << 10)
++#define SMMU_sACR		0x010u
++#define SMMU_IDR0		0x020u		/* 30 S1TS, 26 ATOSNS, [7:0] NUMSMRG */
++#define SMMU_IDR1		0x024u		/* 31 PAGESIZE, [30:28] NUMPAGENDXB, [7:0] NUMCB */
++#define SMMU_IDR2		0x028u		/* 12 PTFS_4K, [7:4] OAS */
++#define SMMU_IDR7		0x03cu
++#define SMMU_sGFSR		0x048u
++#define SMMU_sGFSYNR0		0x050u
++#define SMMU_sGFSYNR1		0x054u
++#define SMMU_SMR(n)		(0x800u + 4u * (n))
++#define SMMU_S2CR(n)		(0xc00u + 4u * (n))
++#define SMMU_SMR_VALID		(1u << 31)
++#define SMMU_CBAR(n)		(4u * (n))		/* in GR1 */
++#define SMMU_CBA2R(n)		(0x800u + 4u * (n))	/* in GR1 */
++#define CB_SCTLR		0x000u
++#define CB_TCR2			0x010u
++#define CB_TTBR0_LO		0x020u
++#define CB_TTBR0_HI		0x024u
++#define CB_TCR			0x030u
++#define CB_CONTEXTIDR		0x034u
++#define CB_MAIR0		0x038u
++#define CB_MAIR1		0x03cu
++#define CB_PAR_LO		0x050u
++#define CB_PAR_HI		0x054u
++#define CB_FSR			0x058u
++#define CB_FAR_LO		0x060u
++#define CB_FAR_HI		0x064u
++#define CB_FSYNR0		0x068u
++#define CB_TLBIASID		0x610u
++#define CB_TLBSYNC		0x7f0u
++#define CB_TLBSTATUS		0x7f4u
++#define CB_ATS1PR_LO		0x800u
++#define CB_ATS1PR_HI		0x804u
++#define CB_ATSR			0x8f0u
++
++/* arm_smmu_write_context_bank + qcom_adreno_smmu_write_sctlr for a non-coherent AArch64 stage-1 domain */
++#define CB_CBA2R_VAL		1u						/* VA64 */
++#define CB_CBAR_VAL		((1u << 16) | (0xfu << 12) | (3u << 8))		/* S1 trans/S2 bypass, WB, NSH */
++#define CB_TCR2_VAL		((1u << 4) | 1u)				/* AS, PASIZE 36 bits: this SMMU reports OAS 36 */
++#define CB_TCR_VAL		((1u << 23) | (2u << 12) | 32u)			/* EPD1, SH0 OS, NC walk, 4K, T0SZ 32 */
++#define CB_MAIR0_VAL		0xf404ff44u	/* io-pgtable-arm: 0 NC, 1 WBRWA, 2 device, 3 inner NC/outer WB */
++#define CB_SCTLR_VAL		((1u << 12) | (1u << 8) | (1u << 5) | (1u << 2) | (1u << 1) | 1u)
++	/* ASIDPNE HUPCF CFRE AFE TRE M; no CFIE (nothing handles the IRQ), CFCFG 0: terminate, never stall */
++#define LPAE_TABLE		3ull
++#define LPAE_PAGE(pa)		((pa) | (3ull << 53) | (1ull << 11) | (1ull << 10) | (2ull << 8) | (1ull << 6) | 3ull)
++	/* XN, nG, AF, SH outer, AP unprivileged RW, AttrIndx 0 (NC): io-pgtable-arm for IOMMU_READ|WRITE */
++
++/* One contiguous buffer, Normal non-cacheable in the kernel, mapped at KGSL's GMU addresses */
++#define GM_SIZE			0x10000u
++#define GM_HFI_OFF		0x0000u		/* 16K: queue table, then command/response/debug queues at +4K/8K/12K */
++#define GM_DBG_OFF		0x4000u		/* 16K: GMU_INIT dbg_buffer (KGSL dump_mem) */
++#define GM_LOG_OFF		0x8000u		/* 16K: PWR_COL_CP_MSG log (Linux gmu->log) */
++#define GM_PT_OFF		0xc000u		/* L1, L2, L3 for 0x60000000, L3 for 0x60200000 */
++#define GM_BUF_SIZE		0x4000u
++#define GMU_VA_HFI		0x60000000u	/* KGSL gmu_kmem: slot 0 of the uncached kernel segment */
++#define GMU_VA_DBG		0x60100000u	/* slot 1 (KGSL dump_mem) */
++#define GMU_VA_LOG		0x60200000u	/* slot 2 (KGSL has none; Linux maps one) */
++
++/* HFI (a6xx_hfi.[ch], kgsl_hfi.h): the legacy (v1) protocol the a630 firmware speaks */
++#define GMU_GMU2HOST_INTR_CLR	0x1f991u
++#define GMU_GMU2HOST_INTR_MASK	0x1f993u
++#define GMU_HOST2GMU_INTR_SET	0x1f994u
++#define GMU_HOST2GMU_INTR_CLR	0x1f995u
++#define GMU_HOST2GMU_INTR_RAW_INFO 0x1f996u
++#define GMU2HOST_MSGQ		(1u << 0)
++#define GMU2HOST_CM3_FAULT	(1u << 23)
++#define HFI_QUEUES		3
++#define HFI_Q_WORDS		1024u		/* SZ_4K >> 2 */
++#define HFI_QTBL_WORDS		6u
++#define HFI_QHDR_WORDS		12u
++#define QH_STATUS		0
++#define QH_IOVA			1
++#define QH_TYPE			2
++#define QH_SIZE			3
++#define QH_DROPPED		5
++#define QH_RX_WM		6
++#define QH_TX_WM		7
++#define QH_RX_REQ		8
++#define QH_READ			10
++#define QH_WRITE		11
++#define HFI_MSG_CMD		0u
++#define HFI_H2F_MSG_INIT	0u
++#define HFI_H2F_MSG_FW_VERSION	1u
++#define HFI_F2H_MSG_ERROR	100u
++#define HFI_RESP_WORDS		19u		/* header, ret_header, error, payload[16] */
++#define HFI_SUPPORTED_V1_10	((1u << 28) | (1u << 19) | (1u << 17))
++#define GMU_COLD_BOOT		1u
++#define HFI_CTRL_REJECTED	0xfeu		/* firmware 0x229c: queue table not usable */
++
++struct gmu_mem {
++	vm_offset_t va;		/* kernel VA of the GM_SIZE buffer */
++	uint64_t pa;
++	uint32_t seq;		/* HFI command sequence number */
++	bool hfi_ok;
++};
++
++static struct gmu_mem gm;
++static vm_offset_t smmu;
++static uint32_t smmu_pgsz, smmu_cbbase, smmu_gfsr_was;
++static int smmu_cb = -1, smmu_smr = -1;
++
++/* SMMU configuration writes, separate from stage 2a's log (gmu_boot resets that one). */
++#define SU_MAX			24
++static struct {
++	uint32_t off, v;
++} su[SU_MAX];
++static int nsu;
++
++static vm_offset_t
++cbr(uint32_t off)
++{
++	return smmu + smmu_cbbase + (uint32_t)smmu_cb * smmu_pgsz + off;
++}
++
++/* Write an SMMU register (offset from the SMMU base), keeping the old value; true if it reads back as written. */
++static bool
++su_wr(uint32_t off, uint32_t v)
++{
++	if (nsu >= SU_MAX) {
++		printf("BLUELINE GPU: SMMU undo log full at %#x: not written\n", off);
++		return false;
++	}
++	su[nsu].off = off;
++	su[nsu].v = rd(smmu + off);
++	nsu++;
++	wr(smmu + off, v);
++	uint32_t rb = rd(smmu + off);
++	if (rb != v) {
++		printf("BLUELINE GPU: SMMU +%#x: wrote %#x, reads %#x: write blocked (hypervisor?) or field not"
++		    " implemented\n", off, v, rb);
++	}
++	return rb == v;
++}
++
++static void
++su_undo(void)
++{
++	int n = nsu, bad = 0;
++	while (nsu > 0) {
++		nsu--;
++		wr(smmu + su[nsu].off, su[nsu].v);
++		if (rd(smmu + su[nsu].off) != su[nsu].v) {
++			printf("BLUELINE GPU: SMMU +%#x restore to %#x reads %#x\n", su[nsu].off, su[nsu].v,
++			    rd(smmu + su[nsu].off));
++			bad++;
++		}
++	}
++	printf("BLUELINE GPU: %d SMMU registers restored (%d did not read back)\n", n, bad);
++}
++
++/* Invalidate our bank's ASID and wait for it (arm_smmu_tlb_inv_context_s1). */
++static bool
++smmu_tlbi(void)
++{
++	wr(cbr(CB_TLBIASID), (uint32_t)smmu_cb);
++	wr(cbr(CB_TLBSYNC), 0);
++	bool ok = poll(cbr(CB_TLBSTATUS), 1, 0, 1000);
++	if (!ok) {
++		printf("BLUELINE GPU: SMMU cb%d TLB sync timeout (status %#x)\n", smmu_cb, rd(cbr(CB_TLBSTATUS)));
++	}
++	return ok;
++}
++
++/* Ask the bank itself to translate va (privileged read); true if it lands on want. */
++static bool
++smmu_ats(uint32_t va, uint64_t want)
++{
++	wr(cbr(CB_ATS1PR_LO), va);
++	wr(cbr(CB_ATS1PR_HI), 0);
++	bool done = poll(cbr(CB_ATSR), 1, 0, 1000);
++	uint64_t par = ((uint64_t)rd(cbr(CB_PAR_HI)) << 32) | rd(cbr(CB_PAR_LO));
++	bool ok = done && !(par & 1) && (par & 0xfffffff000ull) == want;
++	printf("BLUELINE GPU: SMMU ATS1PR %#x: atsr %#x par %#llx, want pa %#llx: %s\n", va, rd(cbr(CB_ATSR)),
++	    (unsigned long long)par, (unsigned long long)want, ok ? "ok" : !done ? "TIMEOUT" : "WRONG");
++	if (rd(cbr(CB_FSR))) {
++		printf("BLUELINE GPU: SMMU cb%d fsr %#x after ATS (cleared)\n", smmu_cb, rd(cbr(CB_FSR)));
++		wr(cbr(CB_FSR), rd(cbr(CB_FSR)));
++	}
++	return ok;
++}
++
++static void
++gm_map(vm_offset_t pt, uint64_t pt_pa, uint32_t gva, uint32_t off)
++{
++	volatile uint64_t *l2 = (volatile uint64_t *)(pt + 0x1000);
++	uint32_t l3i = (gva >> 21) == (GMU_VA_HFI >> 21) ? 2 : 3;
++	volatile uint64_t *l3 = (volatile uint64_t *)(pt + 0x1000u * l3i);
++
++	l2[(gva >> 21) & 0x1ff] = (pt_pa + 0x1000u * l3i) | LPAE_TABLE;
++	for (uint32_t o = 0; o < GM_BUF_SIZE; o += 0x1000u) {
++		l3[((gva + o) >> 12) & 0x1ff] = LPAE_PAGE(gm.pa + off + o);
++	}
++}
++
++static void
++gm_free(void)
++{
++	for (uint32_t o = 0; o < GM_SIZE; o += PAGE_SIZE) {
++		pmap_set_cache_attributes(pmap_find_phys(kernel_pmap, (addr64_t)(gm.va + o)), VM_WIMG_DEFAULT);
++	}
++	kmem_free(kernel_map, gm.va, GM_SIZE);
++	printf("BLUELINE GPU: GMU memory (pa %#llx) back to default cacheability and freed\n",
++	    (unsigned long long)gm.pa);
++	gm.va = 0;
++}
++
++static volatile uint32_t *
++hfi_qhdr(const struct gmu_mem *m, int q)
++{
++	return (volatile uint32_t *)(m->va + GM_HFI_OFF + 4u * (HFI_QTBL_WORDS + HFI_QHDR_WORDS * (uint32_t)q));
++}
++
++static volatile uint32_t *
++hfi_qdata(const struct gmu_mem *m, int q)
++{
++	return (volatile uint32_t *)(m->va + GM_HFI_OFF + 0x1000u * (uint32_t)(q + 1));
++}
++
++/* a6xx_hfi_init, legacy: table header, then command (id 0), response (4) and debug (5) queues */
++static void
++hfi_table_init(struct gmu_mem *m)
++{
++	static const uint32_t ids[HFI_QUEUES] = { 0, 4, 5 };
++	volatile uint32_t *t = (volatile uint32_t *)(m->va + GM_HFI_OFF);
++
++	t[0] = 0;					/* version */
++	t[1] = 4u * (HFI_QTBL_WORDS + HFI_QUEUES * HFI_QHDR_WORDS);	/* size in bytes (Linux): 168 */
++	t[2] = HFI_QTBL_WORDS;				/* qhdr0_offset, dwords */
++	t[3] = HFI_QHDR_WORDS;				/* qhdr_size, dwords */
++	t[4] = HFI_QUEUES;				/* num_queues */
++	t[5] = HFI_QUEUES;				/* active_queues */
++	for (int q = 0; q < HFI_QUEUES; q++) {
++		volatile uint32_t *h = hfi_qhdr(m, q);
++		for (uint32_t i = 0; i < HFI_QHDR_WORDS; i++) {
++			h[i] = 0;
++		}
++		h[QH_STATUS] = 1;
++		h[QH_IOVA] = GMU_VA_HFI + 0x1000u * (uint32_t)(q + 1);
++		h[QH_TYPE] = (10u << 8) | ids[q];
++		h[QH_SIZE] = HFI_Q_WORDS;
++		h[QH_RX_WM] = 1;
++		h[QH_TX_WM] = 1;
++		h[QH_RX_REQ] = 1;
++	}
++	m->seq = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Stage 2b SMMU half: a read-only survey, a write probe that is undone at
++ * once, then our own stage-1 bank for the GMU stream. Returns the HFI memory
++ * mapped at the GMU's addresses, or NULL with nothing left changed.
++ */
++static struct gmu_mem *
++gmu_smmu_setup(void)
++{
++	int cb = 1, sid = 5, sidmask = 0, dry = 0, ats = 1;
++	(void)PE_parse_boot_argn("bluegpu_cb", &cb, sizeof(cb));
++	(void)PE_parse_boot_argn("bluegpu_sid", &sid, sizeof(sid));
++	(void)PE_parse_boot_argn("bluegpu_sidmask", &sidmask, sizeof(sidmask));
++	(void)PE_parse_boot_argn("bluegpu_smmu_dry", &dry, sizeof(dry));
++	(void)PE_parse_boot_argn("bluegpu_ats", &ats, sizeof(ats));
++	printf("BLUELINE GPU: stage 2b: GMU stream %#x mask %#x through Adreno SMMU cb%d%s\n", sid, sidmask, cb,
++	    dry ? " (dry run: survey and write probe only)" : "");
++	if (cb < 1 || cb > SMMU_CB_EL1_LAST || sid < 0 || sid > 0x7fff || sidmask < 0 || sidmask > 0x7fff) {
++		printf("BLUELINE GPU: bluegpu_cb must be 1-%d (cb0 is the GPU's, cb5-7 the hypervisor's); stop\n",
++		    SMMU_CB_EL1_LAST);
++		return NULL;
++	}
++	smmu = ml_io_map(SMMU_PA, SMMU_MAP_SIZE);
++	if (!smmu) {
++		return NULL;
++	}
++
++	/* 1. Survey, read only: GR0, GR1 and banks 0-4 (never the pages of 5-7). */
++	printf("BLUELINE GPU: about to read the Adreno SMMU global space at %#x\n", SMMU_PA);
++	uint32_t cr0 = rd(smmu + SMMU_sCR0), idr0 = rd(smmu + SMMU_IDR0), idr1 = rd(smmu + SMMU_IDR1);
++	uint32_t idr2 = rd(smmu + SMMU_IDR2);
++	smmu_gfsr_was = rd(smmu + SMMU_sGFSR);
++	printf("BLUELINE GPU: SMMU cr0 %#x acr %#x idr0 %#x idr1 %#x idr2 %#x idr7 %#x gfsr %#x gfsynr0 %#x\n",
++	    cr0, rd(smmu + SMMU_sACR), idr0, idr1, idr2, rd(smmu + SMMU_IDR7), smmu_gfsr_was,
++	    rd(smmu + SMMU_sGFSYNR0));
++	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff, oas_code = (idr2 >> 4) & 0xf;
++	static const uint8_t oas_bits[6] = { 32, 36, 40, 42, 44, 48 };
++	uint32_t oas = oas_code < 6 ? oas_bits[oas_code] : 48;
++	smmu_pgsz = (idr1 >> 31) ? 0x10000u : 0x1000u;
++	smmu_cbbase = (1u << (((idr1 >> 28) & 7) + 1)) * smmu_pgsz;
++	if (smmu_pgsz != 0x1000u || smmu_cbbase != 0x8000u || ncb <= (uint32_t)cb || ncb > 8 || nsmr == 0 ||
++	    !(idr0 & (1u << 30)) || !(idr2 & (1u << 12)) || (cr0 & SMMU_sCR0_EXIDENABLE) || oas < 36) {
++		printf("BLUELINE GPU: SMMU layout not as expected (page %#x, banks at %#x, %u banks, %u SMRs, S1 %d,"
++		    " 4K %d, exid %d, oas %u): stop\n", smmu_pgsz, smmu_cbbase, ncb, nsmr, !!(idr0 & (1u << 30)),
++		    !!(idr2 & (1u << 12)), !!(cr0 & SMMU_sCR0_EXIDENABLE), oas);
++		return NULL;
++	}
++	if (nsmr > 128) {
++		nsmr = 128;	/* arm-smmu-qcom.c: the hypervisor may not emulate the rest */
++	}
++	int free_smr = -1, overlap = -1;
++	uint32_t used = 0;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = rd(smmu + SMMU_SMR(i)), s2cr = rd(smmu + SMMU_S2CR(i));
++		if (!(smr & SMMU_SMR_VALID)) {
++			if (free_smr < 0) {
++				free_smr = (int)i;
++			}
++			continue;
++		}
++		printf("BLUELINE GPU: SMMU smr%u %#x s2cr %#x\n", i, smr, s2cr);
++		if (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) < 32) {
++			used |= 1u << (s2cr & 0xff);
++		}
++		if ((((uint32_t)sid ^ smr) & ~((smr >> 16) | (uint32_t)sidmask) & 0x7fffu) == 0) {
++			overlap = (int)i;
++		}
++	}
++	for (uint32_t n = 0; n <= SMMU_CB_EL1_LAST && n < ncb; n++) {
++		vm_offset_t c = smmu + smmu_cbbase + n * smmu_pgsz;
++		printf("BLUELINE GPU: SMMU cb%u cbar %#x cba2r %#x sctlr %#x ttbr0 %#x:%#x fsr %#x%s\n", n,
++		    rd(smmu + smmu_pgsz + SMMU_CBAR(n)), rd(smmu + smmu_pgsz + SMMU_CBA2R(n)), rd(c + CB_SCTLR),
++		    rd(c + CB_TTBR0_HI), rd(c + CB_TTBR0_LO), rd(c + CB_FSR), (used >> n) & 1 ? " (in use)" : "");
++	}
++	smmu_cb = cb;
++	if (overlap >= 0 || free_smr < 0 || ((used >> cb) & 1) || (rd(cbr(CB_SCTLR)) & 1)) {
++		printf("BLUELINE GPU: SMMU: smr%d already matches stream %#x / free smr %d / cb%d %s: stop\n", overlap,
++		    sid, free_smr, cb, ((used >> cb) & 1) || (rd(cbr(CB_SCTLR)) & 1) ? "in use" : "free");
++		return NULL;
++	}
++	smmu_smr = free_smr;
++	printf("BLUELINE GPU: SMMU: %u SMRs, %u banks, oas %u, translation %s; using smr%d -> cb%d\n", nsmr, ncb, oas,
++	    (cr0 & SMMU_sCR0_CLIENTPD) ? "OFF (CLIENTPD: everything bypasses)" : "on", smmu_smr, smmu_cb);
++
++	/* 2. Write probe on registers with no effect: our idle bank's CONTEXTIDR, the free SMR with VALID clear. */
++	uint32_t ctx_was = rd(cbr(CB_CONTEXTIDR)), smr_was = rd(smmu + SMMU_SMR(smmu_smr));
++	wr(cbr(CB_CONTEXTIDR), 0x5a5a0000u | (uint32_t)cb);
++	wr(smmu + SMMU_SMR(smmu_smr), (uint32_t)sid);
++	uint32_t ctx_rb = rd(cbr(CB_CONTEXTIDR)), smr_rb = rd(smmu + SMMU_SMR(smmu_smr));
++	wr(cbr(CB_CONTEXTIDR), ctx_was);
++	wr(smmu + SMMU_SMR(smmu_smr), smr_was);
++	bool writable = ctx_rb == (0x5a5a0000u | (uint32_t)cb) && smr_rb == (uint32_t)sid;
++	printf("BLUELINE GPU: SMMU write probe: cb%d contextidr reads %#x, smr%d (invalid) reads %#x; restored %#x %#x:"
++	    " %s\n", cb, ctx_rb, smmu_smr, smr_rb, rd(cbr(CB_CONTEXTIDR)), rd(smmu + SMMU_SMR(smmu_smr)),
++	    writable ? "EL1 CAN WRITE THE ADRENO SMMU" : "WRITES DO NOT STICK (hypervisor-owned): stop");
++	if (!writable || dry) {
++		return NULL;
++	}
++
++	/* 3. Memory: contiguous, zeroed, then Normal non-cacheable in every kernel mapping (caches cleaned). */
++	gm = (struct gmu_mem){ 0 };
++	if (kmem_alloc_contig(kernel_map, &gm.va, GM_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("BLUELINE GPU: no contiguous %#x bytes for the GMU: stop\n", GM_SIZE);
++		gm.va = 0;
++		return NULL;
++	}
++	gm.pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gm.va));
++	bool contig = gm.pa != 0 && (gm.pa >> oas) == 0;
++	for (uint32_t o = 0; o < GM_SIZE; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(gm.va + o));
++		contig = contig && ptoa_64(pn) == gm.pa + o;
++		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
++	}
++	printf("BLUELINE GPU: GMU memory va %#lx pa %#llx size %#x, %s, cache attr %#x\n", (unsigned long)gm.va,
++	    (unsigned long long)gm.pa, GM_SIZE, contig ? "contiguous" : "NOT CONTIGUOUS OR TOO HIGH",
++	    pmap_cache_attributes(pmap_find_phys(kernel_pmap, (addr64_t)gm.va)));
++	if (!contig) {
++		gm_free();
++		return NULL;
++	}
++	vm_offset_t pt = gm.va + GM_PT_OFF;
++	uint64_t pt_pa = gm.pa + GM_PT_OFF;
++	((volatile uint64_t *)pt)[GMU_VA_HFI >> 30] = (pt_pa + 0x1000u) | LPAE_TABLE;
++	gm_map(pt, pt_pa, GMU_VA_HFI, GM_HFI_OFF);
++	gm_map(pt, pt_pa, GMU_VA_DBG, GM_DBG_OFF);
++	gm_map(pt, pt_pa, GMU_VA_LOG, GM_LOG_OFF);
++	hfi_table_init(&gm);
++	printf("BLUELINE GPU: GMU map: %#x hfi -> pa %#llx, %#x dbg -> %#llx, %#x log -> %#llx (16K each);"
++	    " L1[1] %#llx L2[0x100] %#llx L3[0] %#llx\n", GMU_VA_HFI, (unsigned long long)(gm.pa + GM_HFI_OFF),
++	    GMU_VA_DBG, (unsigned long long)(gm.pa + GM_DBG_OFF), GMU_VA_LOG,
++	    (unsigned long long)(gm.pa + GM_LOG_OFF), (unsigned long long)((volatile uint64_t *)pt)[1],
++	    (unsigned long long)((volatile uint64_t *)(pt + 0x1000))[0x100],
++	    (unsigned long long)((volatile uint64_t *)(pt + 0x2000))[0]);
++
++	/* 4. The bank, as arm_smmu_write_context_bank orders it, each write read back; then its TLB. */
++	nsu = 0;
++	uint32_t cbo = smmu_cbbase + (uint32_t)cb * smmu_pgsz;
++	bool ok = su_wr(cbo + CB_SCTLR, 0) &&
++	    su_wr(smmu_pgsz + SMMU_CBA2R(cb), CB_CBA2R_VAL) &&
++	    su_wr(smmu_pgsz + SMMU_CBAR(cb), CB_CBAR_VAL) &&
++	    su_wr(cbo + CB_TCR2, CB_TCR2_VAL) &&
++	    su_wr(cbo + CB_TCR, CB_TCR_VAL) &&
++	    su_wr(cbo + CB_TTBR0_LO, (uint32_t)pt_pa) &&
++	    su_wr(cbo + CB_TTBR0_HI, (uint32_t)(pt_pa >> 32) | ((uint32_t)cb << 16)) &&	/* ASID = cb */
++	    su_wr(cbo + CB_MAIR0, CB_MAIR0_VAL) &&
++	    su_wr(cbo + CB_MAIR1, 0);
++	if (ok) {
++		wr(cbr(CB_FSR), 0xffffffffu);
++		ok = su_wr(cbo + CB_SCTLR, CB_SCTLR_VAL) && smmu_tlbi();
++	}
++
++	/* 5. Self-test before any stream is routed here (ID0.ATOSNS clear = ATS supported). */
++	if (ok && ats && !(idr0 & (1u << 26))) {
++		ok = smmu_ats(GMU_VA_HFI, gm.pa + GM_HFI_OFF) && smmu_ats(GMU_VA_LOG + 0x3000u, gm.pa + GM_LOG_OFF + 0x3000u);
++	}
++
++	/* 6. Route the stream: S2CR first, then the SMR that makes it live; translation on if it was off. */
++	if (ok) {
++		ok = su_wr(SMMU_S2CR(smmu_smr), (uint32_t)cb) &&
++		    su_wr(SMMU_SMR(smmu_smr), SMMU_SMR_VALID | ((uint32_t)sidmask << 16) | (uint32_t)sid);
++	}
++	if (ok && (cr0 & SMMU_sCR0_CLIENTPD)) {
++		ok = su_wr(SMMU_sCR0, (cr0 & ~SMMU_sCR0_CLIENTPD) | SMMU_sCR0_USFCFG | SMMU_sCR0_GFRE |
++		    SMMU_sCR0_GCFGFRE);
++	}
++	if (!ok) {
++		printf("BLUELINE GPU: SMMU programming failed: undoing\n");
++		su_undo();
++		(void)smmu_tlbi();
++		gm_free();
++		return NULL;
++	}
++	printf("BLUELINE GPU: SMMU smr%d %#x s2cr %#x -> cb%d sctlr %#x tcr %#x tcr2 %#x ttbr0 %#x:%#x mair0 %#x;"
++	    " cr0 %#x\n", smmu_smr, rd(smmu + SMMU_SMR(smmu_smr)), rd(smmu + SMMU_S2CR(smmu_smr)), cb,
++	    rd(cbr(CB_SCTLR)), rd(cbr(CB_TCR)), rd(cbr(CB_TCR2)), rd(cbr(CB_TTBR0_HI)), rd(cbr(CB_TTBR0_LO)),
++	    rd(cbr(CB_MAIR0)), rd(smmu + SMMU_sCR0));
++	return &gm;
++}
++
++static void
++smmu_faults(const char *when)
++{
++	printf("BLUELINE GPU: SMMU %s: cb%d fsr %#x far %#x:%#x fsynr0 %#x; gfsr %#x gfsynr0 %#x gfsynr1 %#x\n", when,
++	    smmu_cb, rd(cbr(CB_FSR)), rd(cbr(CB_FAR_HI)), rd(cbr(CB_FAR_LO)), rd(cbr(CB_FSYNR0)),
++	    rd(smmu + SMMU_sGFSR), rd(smmu + SMMU_sGFSYNR0), rd(smmu + SMMU_sGFSYNR1));
++}
++
++/* Stage 2b teardown, after gmu_boot put the CM3 back into reset: unroute, disable, invalidate, free. */
++static void
++gmu_smmu_teardown(void)
++{
++	smmu_faults("before teardown");
++	su_undo();		/* sCR0, SMR, S2CR, SCTLR, MAIR, TTBR, TCR, CBAR, CBA2R: reverse order */
++	(void)smmu_tlbi();
++	wr(cbr(CB_FSR), rd(cbr(CB_FSR)));
++	uint32_t gfsr = rd(smmu + SMMU_sGFSR) & ~smmu_gfsr_was;
++	if (gfsr) {
++		wr(smmu + SMMU_sGFSR, gfsr);	/* only the global faults that appeared during 2b */
++	}
++	smmu_faults("after teardown");
++	uint32_t sysreset = gmu_rd(GMU_CM3_SYSRESET), smr = rd(smmu + SMMU_SMR(smmu_smr));
++	if ((sysreset & 1) && !(smr & SMMU_SMR_VALID) && !(rd(cbr(CB_SCTLR)) & 1)) {
++		gm_free();
++	} else {
++		printf("BLUELINE GPU: CM3 sysreset %#x smr%d %#x cb%d sctlr %#x: GMU may still reach pa %#llx;"
++		    " memory LEAKED on purpose\n", sysreset, smmu_smr, smr, smmu_cb, rd(cbr(CB_SCTLR)),
++		    (unsigned long long)gm.pa);
++	}
++}
++
++static bool
++hfi_write(struct gmu_mem *m, const uint32_t *msg, uint32_t dwords)
++{
++	volatile uint32_t *h = hfi_qhdr(m, 0), *d = hfi_qdata(m, 0);
++	uint32_t w = h[QH_WRITE], r = h[QH_READ];
++
++	if (w >= HFI_Q_WORDS || r >= HFI_Q_WORDS) {
++		printf("BLUELINE GPU: HFI command queue indices r %#x w %#x corrupt\n", r, w);
++		return false;
++	}
++	if (((r - w - 1) & (HFI_Q_WORDS - 1)) < dwords) {	/* CIRC_SPACE */
++		h[QH_DROPPED] = h[QH_DROPPED] + 1;
++		return false;
++	}
++	for (uint32_t i = 0; i < dwords; i++) {
++		d[w] = msg[i];
++		w = (w + 1) % HFI_Q_WORDS;	/* legacy: no 4-dword alignment, no 0xfafafafa cookies */
++	}
++	__asm__ volatile ("dmb osh" ::: "memory");
++	h[QH_WRITE] = w;
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1);
++	return true;
++}
++
++/* One message from queue q into out (at most max dwords): its size, 0 if empty, -1 if corrupt (queue reset). */
++static int
++hfi_read(struct gmu_mem *m, int q, uint32_t *out, uint32_t max)
++{
++	volatile uint32_t *h = hfi_qhdr(m, q), *d = hfi_qdata(m, q);
++	uint32_t r = h[QH_READ], w = h[QH_WRITE];
++
++	if (r == w) {
++		h[QH_RX_REQ] = 1;
++		return 0;
++	}
++	__asm__ volatile ("dmb osh" ::: "memory");
++	uint32_t n = r < HFI_Q_WORDS ? (d[r] >> 8) & 0xff : 0;
++	if (w >= HFI_Q_WORDS || n == 0 || n > max) {
++		printf("BLUELINE GPU: HFI queue %d: r %#x w %#x header %#x: corrupt, dropped\n", q, r, w,
++		    r < HFI_Q_WORDS ? d[r] : 0);
++		h[QH_READ] = w;
++		return -1;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = d[r];
++		r = (r + 1) % HFI_Q_WORDS;
++	}
++	__asm__ volatile ("dmb osh" ::: "memory");
++	h[QH_READ] = r;
++	return (int)n;
++}
++
++/* a6xx_hfi_send_msg + a6xx_hfi_wait_for_ack, polled: 0 acked, -1 not sent, -2 timeout, -3 error, -4 corrupt. */
++static int
++hfi_send(struct gmu_mem *m, uint32_t id, uint32_t *msg, uint32_t dwords, uint32_t *resp, int ms)
++{
++	uint32_t seq = ++m->seq % 0xfffu;
++
++	msg[0] = (seq << 20) | (HFI_MSG_CMD << 16) | (dwords << 8) | id;
++	printf("BLUELINE GPU: HFI -> id %u seq %u:", id, seq);
++	for (uint32_t i = 0; i < dwords; i++) {
++		printf(" %#x", msg[i]);
++	}
++	printf("\n");
++	if (!hfi_write(m, msg, dwords)) {
++		printf("BLUELINE GPU: HFI command queue full\n");
++		return -1;
++	}
++	uint64_t t0 = mach_absolute_time(), ns;
++	for (int t = 0; t < ms * 100; t++) {
++		uint32_t info = gmu_rd(GMU_GMU2HOST_INTR_INFO);
++		if (info & GMU2HOST_CM3_FAULT) {
++			printf("BLUELINE GPU: HFI: GMU2HOST %#x: CM3 FAULT\n", info);
++			return -2;
++		}
++		if (info & GMU2HOST_MSGQ) {
++			wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), GMU2HOST_MSGQ);
++		}
++		int n;
++		while ((n = hfi_read(m, 1, resp, HFI_RESP_WORDS)) > 0) {
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			printf("BLUELINE GPU: HFI <- %llu us: hdr %#x (id %u type %u size %u) ret %#x (seq %u) error %u"
++			    " payload", ns / 1000, resp[0], resp[0] & 0xff, (resp[0] >> 16) & 0xf, (uint32_t)n,
++			    n > 1 ? resp[1] : 0, n > 1 ? (resp[1] >> 20) & 0xfff : 0, n > 2 ? resp[2] : 0);
++			for (int i = 3; i < n; i++) {
++				printf(" %#x", resp[i]);
++			}
++			printf("\n");
++			if ((resp[0] & 0xff) == HFI_F2H_MSG_ERROR) {
++				printf("BLUELINE GPU: HFI: firmware error message, code %#x\n", n > 1 ? resp[1] : 0);
++				continue;
++			}
++			if (n < 3 || ((resp[1] >> 20) & 0xfff) != seq) {
++				continue;	/* not our ack */
++			}
++			return resp[2] ? -3 : 0;
++		}
++		if (n < 0) {
++			return -4;
++		}
++		delay(10);
++	}
++	printf("BLUELINE GPU: HFI: no ack for id %u seq %u in %d ms (gmu2host %#x)\n", id, seq, ms,
++	    gmu_rd(GMU_GMU2HOST_INTR_INFO));
++	return -2;
++}
++
++static void
++hfi_dump(struct gmu_mem *m)
++{
++	for (int q = 0; q < HFI_QUEUES; q++) {
++		volatile uint32_t *h = hfi_qhdr(m, q);
++		printf("BLUELINE GPU: HFI q%d status %#x type %#x read %#x write %#x dropped %u\n", q, h[QH_STATUS],
++		    h[QH_TYPE], h[QH_READ], h[QH_WRITE], h[QH_DROPPED]);
++	}
++	volatile uint32_t *h = hfi_qhdr(m, 2), *d = hfi_qdata(m, 2);
++	uint32_t r = h[QH_READ] % HFI_Q_WORDS, w = h[QH_WRITE] % HFI_Q_WORDS;
++	printf("BLUELINE GPU: HFI debug queue:");
++	for (uint32_t k = 0; r != w && k < 64; k++, r = (r + 1) % HFI_Q_WORDS) {
++		printf(" %#x", d[r]);
++	}
++	printf("\n");
++	static const struct {
++		const char *name;
++		uint32_t off;
++	} bufs[2] = { { "dbg", GM_DBG_OFF }, { "log", GM_LOG_OFF } };
++	for (int b = 0; b < 2; b++) {
++		volatile uint32_t *p = (volatile uint32_t *)(m->va + bufs[b].off);
++		uint32_t nz = 0;
++		for (uint32_t i = 0; i < GM_BUF_SIZE / 4; i++) {
++			nz += p[i] != 0;
++		}
++		printf("BLUELINE GPU: GMU %s buffer: %u nonzero words; first: %#x %#x %#x %#x %#x %#x %#x %#x\n",
++		    bufs[b].name, nz, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++	}
++}
++
++/*
++ * a6xx_gmu_hfi_start, then a6xx_hfi_start_v1 as far as GMU_INIT and
++ * FW_VERSION. Not sent: PERF_TABLE/BW_TABLE (they make the GMU vote), TEST.
++ * Linux's legacy path powers the GX rail and SPTPRAC first; not done here.
++ */
++static bool
++hfi_run(struct gmu_mem *m)
++{
++	uint32_t msg[5] = { 0 }, resp[HFI_RESP_WORDS] = { 0 };
++	int ms = 200;
++	(void)PE_parse_boot_argn("bluegpu_hfi_ms", &ms, sizeof(ms));
++	if (ms < 1 || ms > 2000) {
++		ms = 200;
++	}
++
++	printf("BLUELINE GPU: HFI start: ctrl_status %#x version_info %#x gmu2host %#x mask %#x host2gmu raw %#x\n",
++	    gmu_rd(GMU_HFI_CTRL_STATUS), gmu_rd(GMU_HFI_VERSION_INFO), gmu_rd(GMU_GMU2HOST_INTR_INFO),
++	    gmu_rd(GMU_GMU2HOST_INTR_MASK), gmu_rd(GMU_HOST2GMU_INTR_RAW_INFO));
++	wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 0xffffffffu);
++	gmu_wr(GMU_GMU2HOST_INTR_MASK, 0xffffffffu);	/* polled; nothing handles the HFI interrupt */
++	gmu_wr(GMU_HFI_CTRL_INIT, 1);
++	uint64_t t0 = mach_absolute_time(), ns;
++	uint32_t st = 0;
++	for (int t = 0; t < ms * 100 && (st = gmu_rd(GMU_HFI_CTRL_STATUS)) == 0; t++) {
++		delay(10);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUELINE GPU: HFI ctrl_status %#x after %llu us: %s (version_info %#x, gmu2host %#x)\n", st,
++	    ns / 1000, st == 1 ? "HFI UP" : st == HFI_CTRL_REJECTED ? "FIRMWARE REJECTED THE QUEUE TABLE" :
++	    st ? "UNEXPECTED" : "TIMEOUT", gmu_rd(GMU_HFI_VERSION_INFO), gmu_rd(GMU_GMU2HOST_INTR_INFO));
++	if (st != 1) {
++		hfi_dump(m);
++		return false;
++	}
++
++	msg[1] = 0;				/* seg_id */
++	msg[2] = GMU_VA_DBG;			/* dbg_buffer_addr */
++	msg[3] = GM_BUF_SIZE;			/* dbg_buffer_size */
++	msg[4] = GMU_COLD_BOOT;			/* boot_state */
++	int r_init = hfi_send(m, HFI_H2F_MSG_INIT, msg, 5, resp, ms);
++	int r_ver = -2;
++	if (r_init != -2 && r_init != -4) {
++		msg[1] = HFI_SUPPORTED_V1_10;	/* supported_version: 1.10, as Linux */
++		r_ver = hfi_send(m, HFI_H2F_MSG_FW_VERSION, msg, 2, resp, ms);
++	}
++	printf("BLUELINE GPU: HFI GMU_INIT %s, FW_VERSION %s", r_init ? "FAILED" : "acked", r_ver ? "FAILED" : "acked");
++	if (r_ver == 0) {
++		printf(": firmware HFI %u.%u (%#x)", resp[3] >> 28, (resp[3] >> 16) & 0xfff, resp[3]);
++	}
++	printf(" (results %d %d)\n", r_init, r_ver);
++	hfi_dump(m);
++	return r_init == 0 && r_ver == 0;
++}
++
+ /*
+  * Stage 2a. Called with CX on, the GMU clocks running and GX off; returns
+  * whether the GMU reported init done. Unless keep, the CM3 is back in reset
+- * and every register this wrote is restored when it returns.
++ * and every register this wrote is restored when it returns. With mem
++ * (stage 2b) the GMU gets the queue table and log, and HFI runs while it is up.
+  */
+ static bool
+-gmu_boot(bool keep)
++gmu_boot(bool keep, struct gmu_mem *mem)
+ {
+ 	int use_pdc = 1, ms = 200;
+ 	uint32_t chipid = GMU_CHIPID_DEFAULT;
+@@ -564,8 +1299,8 @@ gmu_boot(bool keep)
+ 	if (ms < 1 || ms > 2000) {
+ 		ms = 200;
+ 	}
+-	printf("BLUELINE GPU: stage 2a: GMU firmware boot (pdc %d, timeout %d ms, chipid %#x),"
+-	    " no SMMU, no HFI, no GX\n", use_pdc, ms, chipid);
++	printf("BLUELINE GPU: stage 2a: GMU firmware boot (pdc %d, timeout %d ms, chipid %#x), %s, no GX\n",
++	    use_pdc, ms, chipid, mem ? "with SMMU memory and HFI" : "no SMMU, no HFI");
+ 
+ 	/* 1. Firmware and preconditions: nothing written yet. */
+ 	const uint32_t *fw = gmu_fw_from_adt();
+@@ -596,21 +1331,31 @@ gmu_boot(bool keep)
+ 	uint32_t want = ver <= 0x20010004u ? GMU_INIT_DONE : 0x100u;
+ 	printf("BLUELINE GPU: fw version word %#x: waiting for init result %#x (mask %#x)\n", ver, want, mask);
+ 
+-	/* 4. a6xx_gmu_fw_start registers, HFI and log left at 0, then a6xx_gmu_power_config. */
++	/* 4. a6xx_gmu_fw_start registers (HFI and log 0 without mem), then a6xx_gmu_power_config. */
+ 	gmu_wr(GMU_CM3_FW_INIT_RESULT, 0);
+ 	gmu_wr(GMU_CM3_BOOT_CONFIG, GMU_BOOT_TCM);
+-	gmu_wr(GMU_HFI_QTBL_ADDR, 0);
+-	gmu_wr(GMU_HFI_QTBL_INFO, 0);
++	gmu_wr(GMU_HFI_QTBL_ADDR, mem ? GMU_VA_HFI : 0);
++	gmu_wr(GMU_HFI_QTBL_INFO, mem ? 1 : 0);
+ 	gmu_wr(GMU_AHB_FENCE_RANGE_0, GMU_FENCE_RANGE);
+ 	gmu_wr(GMU_CM3_CFG, GMU_CM3_CFG_VAL);
+ 	gmu_wr(GMU_HFI_SFR_ADDR, chipid);
+-	gmu_wr(GMU_PWR_COL_CP_MSG, 0);
++	gmu_wr(GMU_PWR_COL_CP_MSG, mem ? GMU_VA_LOG | (GM_BUF_SIZE / 0x1000u - 1) : 0);
+ 	gmu_wr(GMU_SYS_BUS_CONFIG, 1);
+ 	gmu_wr(GMU_ICACHE_CONFIG, 1);
+ 	gmu_wr(GMU_DCACHE_CONFIG, 1);
+ 	gmu_wr(GMU_PWR_COL_INTER_FRAME_CTRL, GMU_PWR_COL_VAL);
+ 	gmu_wr(GMU_RPMH_CTRL, gmu_rd(GMU_RPMH_CTRL) | GMU_RPMH_CTRL_ON);
+-	gmu_wr(GMU_CX_GMU_WFI_CONFIG, 0);
++
++	/*
++	 * What the firmware writes by itself (GPU CC 0x1060, its watchdog), recorded
++	 * with their current values so the restore puts them back; the watchdog
++	 * enable is recorded last, so it is cleared first.
++	 */
++	wr_undo(gpucc + GPUCC_FW_REG, rd(gpucc + GPUCC_FW_REG));
++	gmu_wr(GMU_WDOG_BARK, gmu_rd(GMU_WDOG_BARK));
++	gmu_wr(GMU_WDOG_BITE, gmu_rd(GMU_WDOG_BITE));
++	gmu_wr(GMU_WDOG_RESET, gmu_rd(GMU_WDOG_RESET));
++	gmu_wr(GMU_WDOG_CTRL, gmu_rd(GMU_WDOG_CTRL));
+ 
+ 	/* 5. a6xx_gmu_start: reset, clear the log index, release, poll. */
+ 	printf("BLUELINE GPU: releasing the GMU CM3 from reset\n");
+@@ -644,8 +1389,16 @@ gmu_boot(bool keep)
+ 	    rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)), rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)),
+ 	    rd(gpucc + GPUCC_GX_GDSCR));
+ 	gmu_trace_dump();
++	printf("BLUELINE GPU: GMU watchdog bark %#x bite %#x ctrl %#x, gpucc 0x1060 %#x\n", gmu_rd(GMU_WDOG_BARK),
++	    gmu_rd(GMU_WDOG_BITE), gmu_rd(GMU_WDOG_CTRL), rd(gpucc + GPUCC_FW_REG));
++	if (booted && mem) {
++		mem->hfi_ok = hfi_run(mem);
++		gmu_trace_dump();
++		printf("BLUELINE GPU: stage 2b HFI %s\n", mem->hfi_ok ? "OK" : "FAILED");
++	}
+ 	if (keep && booted) {
+-		printf("BLUELINE GPU: stage 2a done; GMU left running, waiting for HFI_CTRL_INIT (bluegpu_keep=1)\n");
++		printf("BLUELINE GPU: stage 2a done; GMU left running%s (bluegpu_keep=1)\n",
++		    mem ? " with its SMMU bank, memory and HFI" : ", waiting for HFI_CTRL_INIT");
+ 		return true;
+ 	}
+ 
+@@ -657,6 +1410,15 @@ out:
+ 		wr(gmu + GMU_REG(GMU_AO_AHB_FENCE_CTRL), 0);
+ 		wr(gmu + GMU_REG(GMU_CM3_SYSRESET), 1);
+ 		printf("BLUELINE GPU: GMU CM3 back in reset (sysreset %#x)\n", gmu_rd(GMU_CM3_SYSRESET));
++		if (mem) {	/* doorbells both ways: nothing pending after us */
++			uint32_t raw = gmu_rd(GMU_HOST2GMU_INTR_RAW_INFO);
++			if (raw) {
++				wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_CLR), raw);
++			}
++			wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 0xffffffffu);
++			printf("BLUELINE GPU: host2gmu raw %#x -> %#x, gmu2host %#x\n", raw,
++			    gmu_rd(GMU_HOST2GMU_INTR_RAW_INFO), gmu_rd(GMU_GMU2HOST_INTR_INFO));
++		}
+ 	}
+ 	undo_all();
+ 	printf("BLUELINE GPU: stage 2a %s\n", booted ? "done" : "FAILED; state restored");
+@@ -786,9 +1548,19 @@ blueline_gpu_probe(void)
+ 
+ 	/* 11. Stage 2a: GMU firmware boot. Never with GX on (checked again inside). */
+ 	if (level >= 3 && !(rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
+-		if (gmu_boot(keep != 0) && keep) {
++		struct gmu_mem *mem = NULL;
++		if (level >= 4) {
++			mem = gmu_smmu_setup();
++			if (!mem) {
++				printf("BLUELINE GPU: stage 2b not set up (nothing left changed): stage 2a alone\n");
++			}
++		}
++		if (gmu_boot(keep != 0, mem) && keep) {
+ 			return;
+ 		}
++		if (mem) {
++			gmu_smmu_teardown();
++		}
+ 		if (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
+ 			printf("BLUELINE GPU: GX GDSC reads ON after stage 2 (%#x): leaving power alone\n",
+ 			    rd(gpucc + GPUCC_GX_GDSCR));
+@@ -822,7 +1594,9 @@ restore:
+ 	if (cx_turned) {
+ 		wr(gpucc + GPUCC_CX_GDSCR, rd(gpucc + GPUCC_CX_GDSCR) | GDSC_SW_COLLAPSE);
+ 		delay(100);	/* downstream: no status check on disable */
+-		printf("BLUELINE GPU: CX GDSC collapsed again (%#x)\n", rd(gpucc + GPUCC_CX_GDSCR));
++		bool down = poll(gpucc + GPUCC_CX_GDSCR, GDSC_PWR_ON, 0, 500000);	/* KGSL: up to 5 s */
++		printf("BLUELINE GPU: CX GDSC %s (%#x)\n", down ? "collapsed again" :
++		    "STILL ON AFTER 500 ms: SOMETHING HOLDS CX (votes/GMU?)", rd(gpucc + GPUCC_CX_GDSCR));
+ 	}
+ 	printf("BLUELINE GPU: stage 1 %s; state restored\n", ok ? "done" : "BACKED OFF");
+ }
+-- 
+2.39.0
+

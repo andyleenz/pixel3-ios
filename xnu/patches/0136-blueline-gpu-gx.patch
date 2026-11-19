@@ -1,0 +1,1116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0136: blueline GPU: stage 3, GX bring-up through the GMU
+ (bluegpu=5)
+
+bluegpu=5 runs stage 2b and, with the GMU booted, brings GX up the way
+Linux's legacy-HFI a630 path does: ARC votes from cmd-db, gfx_rail_on
+(OOB BOOT_SLUMBER), SPTPRAC on, HFI GMU_INIT/FW_VERSION/PERF_TABLE/
+BW_TABLE/TEST, the legacy DCVS request, OOB GPU_SET; then, only if the
+GMU reports GX powered, reads RBBM/VBIF/CP registers and writes and reads
+back CP_SCRATCH[7]. Down as a6xx_gmu_shutdown: VBIF halt, OOB clears,
+SPTPRAC off, slumber, CM3 reset, a6xx_rpmh_stop, GX GDSC collapse if
+still on, every register restored. bluegpu_keep=1 leaves it up.
+
+The PDC gfx address is resolved from cmd-db at run time (gfx.lvl, with
+0x30080 named by reverse lookup); 3/4 keep 0x30080. Optional apps-RSC DDR
+vote (bluegpu_bw=1) on MC0/SH0, dropped to keepalive. 2b teardown: S2CR0
+and CBAR1 restore anomalies handled as equivalent. blueline_touch.c:
+cmd-db mapped once, aux/name lookups and rpmh_write exported.
+
+Boot-args: bluegpu=5, bluegpu_gx_dry, bluegpu_gx_step=1..4, bluegpu_perf,
+bluegpu_pdc_gfx, bluegpu_bw, bluegpu_gx_wr, bluegpu_oob_ms,
+bluegpu_rpmh_stop.
+---
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -8,8 +8,9 @@
+  * SMMU's global ID registers (the hypervisor may emulate or refuse those);
+  * bluegpu=3 runs stage 1, then stage 2a below (no SMMU reads);
+  * bluegpu=4 runs stage 1, then 2a with stage 2b (SMMU context + HFI) around it;
++ * bluegpu=5 runs 4 with stage 3 (GX: the GPU core powered by the GMU) inside;
+  * bluegpu_keep=1 leaves CX and the GMU clocks (and, at 3/4, the running GMU,
+- * at 4 also its SMMU bank and memory) on afterwards.
++ * at 4 also its SMMU bank and memory, at 5 also GX and the votes) on afterwards.
+  *
+  * Stage 2a (0126, bluegpu=3): boot the GMU's Cortex-M3 on its firmware
+  * until it reports FW_INIT_RESULT 0xbabeface, as Linux a6xx_gmu_fw_start /
+@@ -95,6 +96,65 @@
+  *  bluegpu_smmu_dry=1: survey and write probe only, then plain 2a.
+  *  bluegpu_ats=0 skips the ATS self-test; bluegpu_hfi_ms (default 200)
+  *  bounds each HFI wait.
++ *  0128 ran on the phone (2b-1.txt): GMU_INIT and FW_VERSION acked (HFI
++ *  1.6). Its teardown left two SMMU registers that do not take their old
++ *  values: S2CR0 (+0xc00) 0x200ff (fault, CBNDX 0xff: an index beyond the 5
++ *  banks) and CBAR1 (+0x1004) 0 (type 0 = stage 2 only, which this SMMU
++ *  lacks: IDR0.S2TS 0). 0136 restores S2CR as arm_smmu_write_s2cr writes a
++ *  free entry (same type, CBNDX 0; the index is unused for fault/bypass)
++ *  and accepts CBAR as left once the bank's SCTLR.M is 0 (Linux never
++ *  rewrites the CBAR of a free bank either).
++ *
++ * Stage 3 (0136, bluegpu=5): GX, the 3D core, the way Linux's legacy-HFI
++ * a630 path brings it up (a6xx_gmu_resume): no SQE microcode, no commands.
++ *  Prepare (reads only): the PDC gfx address question of 0126. Linux and
++ *  KGSL put 0x30080 in the PDC sleep/wake TCS for A630; this phone's
++ *  cmd-db says gfx.lvl is 0x30050 (and the firmware votes 0x30050 itself).
++ *  cmd-db is asked at run time for both (reverse lookup of 0x30080) and,
++ *  at bluegpu=5 only, the PDC TCS get cmd-db's gfx.lvl/mx.lvl/cx.lvl
++ *  (bluegpu_pdc_gfx=ADDR overrides; 3/4 keep 0x30080 as tested). ARC
++ *  votes as a6xx_gmu_rpmh_arc_votes_init: cmd-db aux levels of gfx.lvl,
++ *  mx.lvl, cx.lvl; vote = vlvl << 16 | mx index << 8 | gfx index for each
++ *  sdm845.dtsi OPP (GPU: off, 257 .. 710 MHz; GMU: off, 200, 400 MHz).
++ *  Then, with the GMU booted and the SMMU/HFI of 2b: a6xx_gmu_gfx_rail_on
++ *  (BOOT_SLUMBER_OPTION 0, GX_VOTE_IDX/MX_VOTE_IDX of bluegpu_perf, default
++ *  1 = 257 MHz LOW_SVS, where Linux takes the highest; OOB BOOT_SLUMBER,
++ *  host2gmu bit 22, ack bit 30), a6xx_sptprac_enable (0x778000), HFI as 2b,
++ *  then a6xx_hfi_start_v1's PERF_TABLE (v1: gx[16]/cx[4] {vote, kHz}),
++ *  BW_TABLE (a6xx_build_bw_table: the a630 GMU does no bus scaling, one
++ *  "off" DDR level, fixed CNOC on/off; the six BCM addresses are named
++ *  from cmd-db in the log) and TEST; the legacy DCVS request
++ *  (a6xx_gmu_set_freq: DCVS_PERF_SETTING 3 << 28 | index, BW 0xff, OOB
++ *  DCVS bit 23/31); then OOB GPU_SET (bit 16, ack 24) as a6xx_hw_init.
++ *  GX is taken as up only if SPTPRAC_PWR_CLK_STATUS has GX_HM_GDSC_OFF and
++ *  GX_HM_CLK_OFF clear (a6xx_gmu_gx_is_on) and the GX GDSC reports power;
++ *  only then is the core mapped and read (RBBM_STATUS/1/2/3, INT_0, clock
++ *  control, VBIF_VERSION, CP fault/status/protect, SQE and RB bases, the CP
++ *  always-on counter twice) and CP_SCRATCH[7] written and read back
++ *  (bluegpu_gx_wr=0: reads only). There is still no chip-id register and
++ *  no CP version before the SQE microcode runs.
++ *  DDR/bus: the GMU's BW table carries no DDR vote on a630; Linux's DDR
++ *  vote for the GPU is the apps-side "gfx-mem" interconnect (icc-rpmh),
++ *  only needed once the GPU reads memory. bluegpu_bw=1 makes that vote
++ *  anyway before the rail goes on: MC0 and SH0 (cmd-db addresses and aux
++ *  unit/width, bcm_aggregate arithmetic) at the lowest GPU OPP's 1648000
++ *  kBps peak, through the apps RSC as blueline_touch.c votes LDO19;
++ *  dropped afterwards to Linux's keepalive vote (x 1, y 1), never 0 (MC0
++ *  and SH0 are keepalive BCMs: 0 could collapse DDR).
++ *  Down, as a6xx_gmu_shutdown (legacy) / a6xx_gmu_stop: VBIF XIN halt,
++ *  OOB GPU clear, POWER_COUNTER_ENABLE 0, SPTPRAC off (GX retention bit,
++ *  0x778001), BOOT_SLUMBER_OPTION 1 + OOB BOOT_SLUMBER set/clear (the GMU
++ *  drops its GX/MX votes and powers GX off; RPMH_POWER_STATE must read
++ *  0xf), CX busy idle; then 2a's path (RSCC TCS idle, fence open, CM3
++ *  reset), a6xx_rpmh_stop (RSCC_CONTROL_REQ 1: the PDC sleep TCS votes
++ *  gfx 0, cx 0, mx 1 for the GPU DRV; bluegpu_rpmh_stop=0 skips), GX GDSC
++ *  collapsed from the CPU if it still reads on (gdsc_disable, CFG_GDSCR
++ *  bit 15), GX clamp/retention/SPTPRAC control put back to their boot
++ *  values, every 2a register restored, the DDR vote dropped.
++ *  bluegpu_gx_dry=1: prepare and log only, then plain 2b (PDC as 2b).
++ *  bluegpu_gx_step=1..4 stops after: 1 rail + SPTPRAC, 2 + tables, 3 +
++ *  DCVS, 4 (default) + OOB GPU and the core reads. bluegpu_oob_ms
++ *  (default 100) bounds each OOB ack.
+  *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+@@ -123,6 +183,23 @@
+  *    0xbabeface within 100 ms), a6xx_reg.h (PDC offsets from 0xb200000),
+  *    kgsl_gmu.c (A630: HFI at GMU VA 0x60000000, only through the SMMU);
+  *    ios-flame gpuprobe.c gmu_boot() (A640, same order, booted at XO).
++ *  - Stage 3: Linux a6xx_gmu.c (a6xx_gmu_resume, a6xx_gmu_fw_start legacy
++ *    branch, a6xx_gmu_gfx_rail_on, a6xx_sptprac_enable/disable,
++ *    a6xx_gmu_set_oob/clear_oob bits, a6xx_gmu_set_freq legacy,
++ *    a6xx_gmu_notify_slumber, a6xx_gmu_shutdown, a6xx_rpmh_stop,
++ *    a6xx_gmu_rpmh_arc_votes_init, a6xx_gmu_build_freq_table), a6xx_hfi.c
++ *    (a6xx_hfi_start_v1, send_perf_table_v1, a6xx_build_bw_table, send_test),
++ *    a6xx_gpu.c (a6xx_bus_clear_pending_transactions VBIF path, gx_is_on),
++ *    a6xx_gmu.xml / a6xx.xml offsets, gdsc.c (gdsc_disable, CLAMP_IO,
++ *    POLL_CFG_GDSCR), gpucc-sdm845.c (gx_gdsc 0x100c, clamp 0x1508),
++ *    sdm845.dtsi (gpu/gmu OPP tables, gfx-mem interconnect); crosshatch
++ *    adreno_a6xx.c (a6xx_gfx_rail_on, a6xx_oob_set, a6xx_sptprac_enable,
++ *    a6xx_gmu_dcvs_nohfi, _load_gmu_rpmh_ucode 0x30080), kgsl_hfi.c/.h
++ *    (hfi_start order, hfi_dcvstable_cmd, hfi_bwtable_cmd), kgsl_gmu.c
++ *    (gmu_start: DDR vote around boot); cmd-db.c (entry/aux layout),
++ *    icc-bcm-voter.c (bcm_aggregate, keepalive, BCM_TCS_CMD); ios-flame
++ *    gpuprobe.c gmu_hfi (A640: cmd-db levels, OOB GPU_SET, RBBM_STATUS,
++ *    CP_SCRATCH write test).
+  *  - Stage 2b: Linux arm-smmu.c/.h (arm_smmu_write_context_bank,
+  *    arm_smmu_init_context_bank), arm-smmu-qcom.c (adreno write_sctlr
+  *    HUPCF, cb0 for the GPU), io-pgtable-arm.c (PTE/TCR/MAIR), a6xx_hfi.c/.h
+@@ -158,6 +235,9 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint32_t blueline_cmddb_addr(const char *id);	/* blueline_touch.c */
++extern uint32_t blueline_cmddb_aux(const char *id, uint8_t *buf, uint32_t max);
++extern bool blueline_cmddb_name(uint32_t addr, char name[9]);
++extern int blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n);
+ extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);	/* osfmk/vm/pmap.h, kernel-private */
+ extern unsigned int pmap_cache_attributes(ppnum_t);
+@@ -421,7 +501,7 @@
+ #define PDC_TCS_CMD0_MSGID	3u
+ #define PDC_TCS_CMD0_ADDR	4u
+ #define PDC_TCS_CMD0_DATA	5u
+-#define PDC_A630_GFX_ADDR	0x30080u	/* pdc_address_offset (Linux and KGSL); cmd-db says gfx.lvl 0x30050: stage 3 must resolve */
++#define PDC_A630_GFX_ADDR	0x30080u	/* pdc_address_offset (Linux and KGSL); cmd-db says gfx.lvl 0x30050: stage 3 resolves */
+ 
+ #define GMU_FW_SIZE		0x8000u		/* a6xx_gmu_fw_load: legacy image must be <= 0x8000 */
+ 
+@@ -429,7 +509,7 @@
+ static const uint32_t pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
+ 
+ /* Every register stage 2 writes (except ITCM/DTCM), with its old value, undone in reverse. */
+-#define UNDO_MAX		96
++#define UNDO_MAX		128
+ static struct {
+ 	vm_offset_t a;
+ 	uint32_t v;
+@@ -525,10 +605,13 @@
+ 	    rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)), rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)));
+ }
+ 
++/* mx, cx, gfx for the PDC TCS: Linux/KGSL's for A630; stage 3 takes cmd-db's (gx_prepare). */
++static uint32_t pdc_addr[3] = { 0x30010u, 0x30000u, PDC_A630_GFX_ADDR };
++
+ static void
+ pdc_tcs(vm_offset_t pdc, uint32_t ctl, const uint32_t data[3])
+ {
+-	static const uint32_t addr[3] = { 0x30010u, 0x30000u, PDC_A630_GFX_ADDR };	/* mx, cx, gfx */
++	const uint32_t *addr = pdc_addr;	/* mx, cx, gfx */
+ 	wr_undo(pdc + 4 * (ctl + PDC_TCS_ENABLE_BANK), 7);
+ 	wr_undo(pdc + 4 * (ctl + PDC_TCS_WAIT_BANK), 0);
+ 	wr_undo(pdc + 4 * ctl, 0);
+@@ -562,7 +645,8 @@
+ 	pdc_tcs(pdc, PDC_GPU_TCS3_CONTROL, wake);
+ 	wr_undo(pdc + 4 * PDC_GPU_SEQ_START_ADDR, 0);
+ 	wr_undo(pdc + 4 * PDC_GPU_ENABLE_PDC, 0x80000001u);
+-	printf("BLUELINE GPU: PDC programmed, enable %#x\n", rd(pdc + 4 * PDC_GPU_ENABLE_PDC));
++	printf("BLUELINE GPU: PDC programmed, enable %#x (TCS mx %#x cx %#x gfx %#x)\n", rd(pdc + 4 * PDC_GPU_ENABLE_PDC),
++	    pdc_addr[0], pdc_addr[1], pdc_addr[2]);
+ 	return true;
+ }
+ 
+@@ -765,20 +849,48 @@
+ 	return rb == v;
+ }
+ 
++/*
++ * Undo in reverse. Two old values do not take on this SMMU (2b-1.txt), and
++ * neither matters once the SMR is invalid and the bank's SCTLR.M is 0:
++ *  - S2CR 0x200ff (fault, CBNDX 0xff, beyond the banks): written as
++ *    arm_smmu_write_s2cr writes a free entry, same type with CBNDX 0;
++ *  - CBAR 0 (type 0, stage 2 only; IDR0.S2TS is 0 here): left as it reads,
++ *    as Linux leaves the CBAR of a free bank (it only clears SCTLR).
++ */
+ static void
+ su_undo(void)
+ {
+-	int n = nsu, bad = 0;
++	int n = nsu, bad = 0, same = 0;
+ 	while (nsu > 0) {
+ 		nsu--;
+-		wr(smmu + su[nsu].off, su[nsu].v);
+-		if (rd(smmu + su[nsu].off) != su[nsu].v) {
+-			printf("BLUELINE GPU: SMMU +%#x restore to %#x reads %#x\n", su[nsu].off, su[nsu].v,
+-			    rd(smmu + su[nsu].off));
+-			bad++;
++		uint32_t off = su[nsu].off, v = su[nsu].v;
++		wr(smmu + off, v);
++		uint32_t rb = rd(smmu + off);
++		if (rb == v) {
++			continue;
++		}
++		if (smmu_smr >= 0 && off == SMMU_S2CR(smmu_smr) && ((v >> 16) & 3) != 0) {
++			wr(smmu + off, v & ~0xffu);
++			uint32_t alt = rd(smmu + off);
++			if (((alt >> 16) & 3) == ((v >> 16) & 3)) {
++				printf("BLUELINE GPU: SMMU s2cr%d: %#x not accepted (read %#x), wrote %#x: same type %u,"
++				    " CBNDX unused\n", smmu_smr, v, rb, alt, (v >> 16) & 3);
++				same++;
++				continue;
++			}
++			rb = alt;
++		}
++		if (smmu_cb >= 0 && off == smmu_pgsz + SMMU_CBAR(smmu_cb) && !(rd(cbr(CB_SCTLR)) & 1) &&
++		    ((v >> 16) & 3) == 0) {
++			printf("BLUELINE GPU: SMMU cbar%d: %#x (stage 2 only) not accepted, left %#x: bank off (sctlr %#x)\n",
++			    smmu_cb, v, rb, rd(cbr(CB_SCTLR)));
++			same++;
++			continue;
+ 		}
++		printf("BLUELINE GPU: SMMU +%#x restore to %#x reads %#x\n", off, v, rb);
++		bad++;
+ 	}
+-	printf("BLUELINE GPU: %d SMMU registers restored (%d did not read back)\n", n, bad);
++	printf("BLUELINE GPU: %d SMMU registers restored (%d equivalent, %d did not read back)\n", n, same, bad);
+ }
+ 
+ /* Invalidate our bank's ASID and wait for it (arm_smmu_tlb_inv_context_s1). */
+@@ -1149,9 +1261,12 @@
+ 
+ 	msg[0] = (seq << 20) | (HFI_MSG_CMD << 16) | (dwords << 8) | id;
+ 	printf("BLUELINE GPU: HFI -> id %u seq %u:", id, seq);
+-	for (uint32_t i = 0; i < dwords; i++) {
++	for (uint32_t i = 0; i < dwords && i < 12; i++) {
+ 		printf(" %#x", msg[i]);
+ 	}
++	if (dwords > 12) {
++		printf(" .. (%u dwords)", dwords);
++	}
+ 	printf("\n");
+ 	if (!hfi_write(m, msg, dwords)) {
+ 		printf("BLUELINE GPU: HFI command queue full\n");
+@@ -1278,9 +1393,618 @@
+ 	printf(" (results %d %d)\n", r_init, r_ver);
+ 	hfi_dump(m);
+ 	return r_init == 0 && r_ver == 0;
++}
++
++/* ---- Stage 3: GX, the GPU core, powered by the GMU (bluegpu=5) ---- */
++
++/* GMU DTCM mailbox words the legacy firmware reads (a6xx_gmu.xml); not undone: the TCM is ours anyway */
++#define GMU_BOOT_SLUMBER_OPTION	0x1cbf8u
++#define GMU_GX_VOTE_IDX		0x1cbf9u
++#define GMU_MX_VOTE_IDX		0x1cbfau
++#define GMU_DCVS_ACK_OPTION	0x1cbfcu
++#define GMU_DCVS_PERF_SETTING	0x1cbfdu
++#define GMU_DCVS_BW_SETTING	0x1cbfeu
++#define GMU_DCVS_RETURN		0x1cbffu
++/* GMU registers */
++#define GMU_GX_SPTPRAC_POWER_CONTROL 0x1a881u
++#define GMU_POWER_COUNTER_ENABLE 0x1f840u
++#define GMU_RSCC_CONTROL_REQ	0x23b07u
++#define CX_BUSY_GPU_IGN_AHB	(1u << 23)	/* GMU_AO_CX_BUSY_STATUS */
++#define SPTPRAC_ON_CTRL		0x778000u
++#define SPTPRAC_OFF_CTRL	0x778001u
++#define SPT_SPTPRAC_OFF		(1u << 2)	/* GMU_SPTPRAC_STATUS */
++#define SPT_SPTPRAC_ON		(1u << 3)
++#define SPT_GX_GDSC_OFF		(1u << 6)
++#define SPT_GX_CLK_OFF		(1u << 7)
++#define RSCC_STATUS0_SLEEP	(1u << 16)	/* a6xx_rpmh_stop waits for it */
++/* GPU CC, GX GDSC (gpucc-sdm845.c gpu_gx_gdsc: CLAMP_IO | AON_RESET | POLL_CFG_GDSCR) */
++#define GPUCC_GX_DOMAIN_MISC	0x1508u		/* clamp_io_ctrl: bit 0 clamps the GX outputs */
++#define GX_RETAIN_FF		(1u << 11)	/* a6xx_sptprac_disable sets it */
++#define GX_CFG_DOWN_DONE	(1u << 15)
++#define GX_CFG_UP_DONE		(1u << 16)
++
++/* OOB requests, legacy bits (a6xx_gmu_oob_bits .set/.ack; the ack bit is also the clear bit) */
++#define OOB_GPU_SET		16u
++#define OOB_GPU_ACK		24u
++#define OOB_BOOT_SLUMBER_SET	22u
++#define OOB_BOOT_SLUMBER_ACK	30u
++#define OOB_DCVS_SET		23u
++#define OOB_DCVS_ACK		31u
++
++/* HFI, legacy (a6xx_hfi.h / kgsl_hfi.h) */
++#define HFI_H2F_MSG_BW_TABLE	3u
++#define HFI_H2F_MSG_PERF_TABLE	4u
++#define HFI_H2F_MSG_TEST	5u
++#define HFI_PERF_WORDS		43u	/* header, num gpu, num gmu, gx[16] {vote, kHz}, cx[4] {vote, kHz} */
++#define HFI_PERF_CX		35u
++#define HFI_BW_WORDS		160u	/* header, 5 counts, cnoc addr[6], data[2][6], ddr addr[8], data[16][8] */
++
++/* GPU core (gpu@5000000, a6xx.xml dwords), in GX */
++#define GPU_MAP_SIZE		0x10000u
++#define GXR(o)			(4u * (o))
++#define GXR_RBBM_INT_0_STATUS	0x0201u
++#define GXR_RBBM_STATUS		0x0210u		/* +1..+3: STATUS1..3 */
++#define GXR_RBBM_CLOCK_CNTL	0x00aeu
++#define GXR_CP_RB_BASE		0x0800u
++#define GXR_CP_HW_FAULT		0x0821u
++#define GXR_CP_PROTECT_STATUS	0x0824u
++#define GXR_CP_STATUS_1		0x0825u
++#define GXR_CP_SQE_INSTR_BASE	0x0830u		/* A6xx-A7xx (0x816 is A8xx) */
++#define GXR_CP_SCRATCH7		0x088au		/* CP_SCRATCH[7] */
++#define GXR_CP_ALWAYS_ON	0x0980u
++#define GXR_VBIF_VERSION	0x3000u
++#define GXR_VBIF_CLKON		0x3001u
++#define GXR_VBIF_XIN_HALT_CTRL0	0x3080u
++#define GXR_VBIF_XIN_HALT_CTRL1	0x3081u
++#define VBIF_XIN_HALT_MASK	0xfu
++#define GX_SCRATCH_PATTERN	0x41363330u	/* "A630" */
++
++/* sdm845.dtsi OPP tables, "off" first as a6xx_gmu_build_freq_table; RPMH_REGULATOR_LEVEL_* */
++#define GX_LEVELS		8
++#define CX_LEVELS		3
++static const uint16_t gpu_lvl[GX_LEVELS] = { 0, 64, 128, 192, 256, 320, 384, 416 };
++static const uint32_t gpu_khz[GX_LEVELS] = { 0, 257000, 342000, 414000, 520000, 596000, 675000, 710000 };
++static const uint16_t gmu_lvl[CX_LEVELS] = { 0, 48, 128 };
++static const uint32_t gmu_khz[CX_LEVELS] = { 0, 200000, 400000 };
++
++/* a6xx_build_bw_table (a630): the BCMs the GMU may vote (CNOC on/off, one "off" DDR level) */
++static const uint32_t bw_cnoc_addr[3] = { 0x50034u, 0x5007cu, 0x5004cu };
++static const uint32_t bw_cnoc_off[3] = { 0x40000000u, 0, 0x40000000u };
++static const uint32_t bw_cnoc_on[3] = { 0x60000001u, 0x20000001u, 0x60000001u };
++static const uint32_t bw_ddr_addr[3] = { 0x50000u, 0x5005cu, 0x5000cu };
++
++/* Optional apps-side DDR vote (bluegpu_bw=1): Linux's gfx-mem path at the lowest GPU OPP */
++#define GX_BW_KBPS		1648000u	/* sdm845.dtsi opp-257000000 opp-peak-kBps */
++#define BCM_CMD(commit, valid, x, y) (((uint32_t)(commit) << 30) | ((uint32_t)(valid) << 29) | \
++	(((uint32_t)(x) & 0x3fffu) << 14) | ((uint32_t)(y) & 0x3fffu))
++
++static struct {
++	bool on;		/* prepared: stage 3 runs inside 2b */
++	int step, perf, bw, wr, ms, hfi_ms, rpmh_stop;
++	uint32_t gx_votes[GX_LEVELS], cx_votes[CX_LEVELS];
++	bool started, rail, sptprac, gpu_oob, up, bw_voted;
++	uint32_t bw_addr[2], bw_data[2];
++	uint32_t gdscr_was, misc_was, spt_ctl_was;
++	vm_offset_t core;
++} gx;
++
++/* cmd-db aux levels of an ARC resource (u16 each, trailing zeros dropped, as a6xx_gmu_rpmh_read_arc). */
++static int
++arc_levels(const char *id, uint16_t *lv, int max)
++{
++	uint8_t b[64] = { 0 };
++	uint32_t len = blueline_cmddb_aux(id, b, sizeof(b));
++	int n = (int)(MIN(len, (uint32_t)sizeof(b)) / 2);
++
++	if (n > max) {
++		n = max;
++	}
++	for (int i = 0; i < n; i++) {
++		lv[i] = (uint16_t)(b[2 * i] | b[2 * i + 1] << 8);
++	}
++	while (n > 0 && !lv[n - 1]) {
++		n--;
++	}
++	printf("BLUELINE GPU: cmd-db %s at %#x, %u aux bytes, %d levels:", id, blueline_cmddb_addr(id), len, n);
++	for (int i = 0; i < n; i++) {
++		printf(" %u", lv[i]);
++	}
++	printf("\n");
++	return n;
+ }
+ 
++/* a6xx_gmu_rpmh_arc_votes_init: vlvl << 16 | secondary index << 8 | primary index, per level. */
++static bool
++arc_votes(uint32_t *votes, const uint16_t *want, int n, const uint16_t *pri, int np, const uint16_t *sec, int ns)
++{
++	for (int i = 0; i < n; i++) {
++		int p = 0, s = 0;
++		while (p < np && pri[p] < want[i]) {
++			p++;
++		}
++		if (p == np) {
++			printf("BLUELINE GPU: level %u not in the RPMh list\n", want[i]);
++			return false;
++		}
++		while (s < ns && sec[s] < pri[p]) {
++			s++;
++		}
++		if (s == ns) {
++			s = ns - 1;	/* clamp the secondary rail to its highest */
++		}
++		votes[i] = (uint32_t)pri[p] << 16 | (uint32_t)s << 8 | (uint32_t)p;
++	}
++	return true;
++}
++
++static void
++bcm_name(const char *what, const uint32_t *addr, int n)
++{
++	char name[9];
++	printf("BLUELINE GPU: BW table %s BCMs:", what);
++	for (int i = 0; i < n; i++) {
++		printf(" %#x = %s", addr[i], blueline_cmddb_name(addr[i], name) ? name : "NOT IN CMD-DB");
++	}
++	printf("\n");
++}
++
+ /*
++ * Reads only: options, the PDC addresses, the ARC votes and the BW table's
++ * names from cmd-db. Returns whether stage 3 runs (false: plain 2b, PDC as 2b).
++ */
++static bool
++gx_prepare(void)
++{
++	int dry = 0, pdc_gfx = 0;
++	char name[9];
++
++	bzero(&gx, sizeof(gx));
++	gx.step = 4;
++	gx.perf = 1;
++	gx.wr = 1;
++	gx.ms = 100;
++	gx.hfi_ms = 200;
++	gx.rpmh_stop = 1;
++	(void)PE_parse_boot_argn("bluegpu_gx_dry", &dry, sizeof(dry));
++	(void)PE_parse_boot_argn("bluegpu_gx_step", &gx.step, sizeof(gx.step));
++	(void)PE_parse_boot_argn("bluegpu_perf", &gx.perf, sizeof(gx.perf));
++	(void)PE_parse_boot_argn("bluegpu_bw", &gx.bw, sizeof(gx.bw));
++	(void)PE_parse_boot_argn("bluegpu_gx_wr", &gx.wr, sizeof(gx.wr));
++	(void)PE_parse_boot_argn("bluegpu_oob_ms", &gx.ms, sizeof(gx.ms));
++	(void)PE_parse_boot_argn("bluegpu_hfi_ms", &gx.hfi_ms, sizeof(gx.hfi_ms));
++	(void)PE_parse_boot_argn("bluegpu_rpmh_stop", &gx.rpmh_stop, sizeof(gx.rpmh_stop));
++	(void)PE_parse_boot_argn("bluegpu_pdc_gfx", &pdc_gfx, sizeof(pdc_gfx));
++	if (gx.step < 1 || gx.step > 4) {
++		gx.step = 4;
++	}
++	if (gx.perf < 1 || gx.perf >= GX_LEVELS) {
++		gx.perf = 1;
++	}
++	if (gx.ms < 1 || gx.ms > 2000) {
++		gx.ms = 100;
++	}
++	if (gx.hfi_ms < 1 || gx.hfi_ms > 2000) {
++		gx.hfi_ms = 200;
++	}
++	printf("BLUELINE GPU: stage 3: GX bring-up (step %d, perf %d = %u kHz, bw %d, scratch write %d, oob %d ms%s)\n",
++	    gx.step, gx.perf, gpu_khz[gx.perf], gx.bw, gx.wr, gx.ms, dry ? ", DRY RUN" : "");
++
++	/* 1. The PDC gfx address: what cmd-db calls Linux/KGSL's 0x30080, and where it puts gfx.lvl. */
++	uint32_t a_gfx = blueline_cmddb_addr("gfx.lvl"), a_mx = blueline_cmddb_addr("mx.lvl");
++	uint32_t a_cx = blueline_cmddb_addr("cx.lvl");
++	bool known = blueline_cmddb_name(PDC_A630_GFX_ADDR, name);
++	printf("BLUELINE GPU: PDC gfx: Linux/KGSL use %#x = cmd-db \"%s\"; cmd-db gfx.lvl %#x mx.lvl %#x cx.lvl %#x\n",
++	    PDC_A630_GFX_ADDR, known ? name : "(no such resource)", a_gfx, a_mx, a_cx);
++	uint32_t want[3] = { a_mx ? a_mx : pdc_addr[0], a_cx ? a_cx : pdc_addr[1],
++		             pdc_gfx > 0 ? (uint32_t)pdc_gfx : a_gfx ? a_gfx : PDC_A630_GFX_ADDR };
++	printf("BLUELINE GPU: PDC TCS for stage 3: mx %#x cx %#x gfx %#x (%s)\n", want[0], want[1], want[2],
++	    pdc_gfx > 0 ? "bluegpu_pdc_gfx" : a_gfx ? "cmd-db" : "gfx.lvl not in cmd-db: Linux's");
++
++	/* 2. ARC votes for the perf table and the rail. */
++	uint16_t gfx[32], mx[32], cx[32];
++	int ng = arc_levels("gfx.lvl", gfx, 32), nm = arc_levels("mx.lvl", mx, 32), nc = arc_levels("cx.lvl", cx, 32);
++	if (!ng || !nm || !nc || !arc_votes(gx.gx_votes, gpu_lvl, GX_LEVELS, gfx, ng, mx, nm) ||
++	    !arc_votes(gx.cx_votes, gmu_lvl, CX_LEVELS, cx, nc, mx, nm)) {
++		printf("BLUELINE GPU: no usable ARC levels in cmd-db: stage 3 skipped, plain 2b\n");
++		return false;
++	}
++	printf("BLUELINE GPU: perf table gx:");
++	for (int i = 0; i < GX_LEVELS; i++) {
++		printf(" %u kHz %#x", gpu_khz[i], gx.gx_votes[i]);
++	}
++	printf("\nBLUELINE GPU: perf table cx:");
++	for (int i = 0; i < CX_LEVELS; i++) {
++		printf(" %u kHz %#x", gmu_khz[i], gx.cx_votes[i]);
++	}
++	printf("\n");
++
++	/* 3. The fixed BW table's BCMs, by name (a6xx_build_bw_table hard-codes them for sdm845). */
++	bcm_name("cnoc", bw_cnoc_addr, 3);
++	bcm_name("ddr", bw_ddr_addr, 3);
++
++	if (dry) {
++		printf("BLUELINE GPU: stage 3 dry run: nothing powered; plain 2b with the PDC as 2b\n");
++		return false;
++	}
++	for (int i = 0; i < 3; i++) {
++		pdc_addr[i] = want[i];
++	}
++	gx.on = true;
++	return true;
++}
++
++static void
++gx_report(const char *when)
++{
++	printf("BLUELINE GPU: %s: sptprac %#x rpmh_power_state %#x gx_gdscr %#x gx_cfg %#x gx_misc %#x cx_busy %#x"
++	    " rscc status0 %#x seq_busy %#x gmu2host %#x\n", when, gmu_rd(GMU_SPTPRAC_STATUS),
++	    gmu_rd(GMU_RPMH_POWER_STATE), rd(gpucc + GPUCC_GX_GDSCR), rd(gpucc + GPUCC_GX_CFG_GDSCR),
++	    rd(gpucc + GPUCC_GX_DOMAIN_MISC), gmu_rd(GMU_AO_CX_BUSY_STATUS), rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)),
++	    rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)), gmu_rd(GMU_GMU2HOST_INTR_INFO));
++}
++
++/* a6xx_gmu_set_oob, legacy bits, polled; the ack is cleared either way. */
++static bool
++gmu_oob_set(const char *name, uint32_t req, uint32_t ack)
++{
++	uint64_t t0 = mach_absolute_time(), ns;
++	uint32_t info = 0;
++	bool ok = false;
++
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << req);
++	for (int t = 0; t < gx.ms * 100; t++) {
++		info = gmu_rd(GMU_GMU2HOST_INTR_INFO);
++		if ((info & (1u << ack)) || (info & GMU2HOST_CM3_FAULT)) {
++			ok = (info & (1u << ack)) != 0;
++			break;
++		}
++		delay(10);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1u << ack);
++	printf("BLUELINE GPU: OOB %s (host2gmu bit %u): %s after %llu us (gmu2host %#x)\n", name, req,
++	    ok ? "acked" : (info & GMU2HOST_CM3_FAULT) ? "CM3 FAULT" : "NO ACK", ns / 1000, info);
++	return ok;
++}
++
++static void
++gmu_oob_clear(const char *name, uint32_t bit)
++{
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << bit);
++	printf("BLUELINE GPU: OOB %s cleared (host2gmu bit %u)\n", name, bit);
++}
++
++/* Optional: the apps-side gfx-mem vote (icc-rpmh bcm_aggregate: peak * width / buswidth * 1000 / unit). */
++static void
++gx_bw_vote(void)
++{
++	static const struct {
++		const char *id;
++		uint32_t buswidth;	/* icc-sdm845: ebi 4 bytes, qns_llcc 16 */
++	} bcm[2] = { { "MC0", 4 }, { "SH0", 16 } };
++
++	for (int i = 0; i < 2; i++) {
++		uint8_t a[8] = { 0 };
++		uint32_t len = blueline_cmddb_aux(bcm[i].id, a, sizeof(a)), addr = blueline_cmddb_addr(bcm[i].id);
++		uint32_t unit = a[0] | (uint32_t)a[1] << 8 | (uint32_t)a[2] << 16 | (uint32_t)a[3] << 24;
++		uint32_t width = a[4] | (uint32_t)a[5] << 8;
++		if (!addr || len < 6 || !unit || !width) {
++			printf("BLUELINE GPU: BCM %s: addr %#x aux %u bytes: unusable, no DDR vote\n", bcm[i].id, addr, len);
++			return;
++		}
++		uint64_t y = ((uint64_t)GX_BW_KBPS * width + bcm[i].buswidth - 1) / bcm[i].buswidth;
++		y = (y * 1000 + unit - 1) / unit;
++		if (y > 0x3fff) {
++			y = 0x3fff;
++		}
++		gx.bw_addr[i] = addr;
++		gx.bw_data[i] = BCM_CMD(1, 1, 0, y);
++		printf("BLUELINE GPU: BCM %s at %#x unit %u width %u: %u kBps peak -> y %llu, cmd %#x\n", bcm[i].id, addr,
++		    unit, width, GX_BW_KBPS, (unsigned long long)y, gx.bw_data[i]);
++	}
++	printf("BLUELINE GPU: about to vote DDR through the apps RSC (DRV 2 active TCS)\n");
++	int err = blueline_rpmh_write(gx.bw_addr, gx.bw_data, 2);
++	gx.bw_voted = err != ENXIO && err != EBUSY;	/* a timeout may still have reached RPMh */
++	printf("BLUELINE GPU: DDR vote: err %d\n", err);
++}
++
++/* Back to Linux's keepalive vote for MC0/SH0 (x 1, y 1): never 0, which could collapse DDR. */
++static void
++gx_bw_drop(void)
++{
++	uint32_t data[2] = { BCM_CMD(1, 1, 1, 1), BCM_CMD(1, 1, 1, 1) };
++	int err = blueline_rpmh_write(gx.bw_addr, data, 2);
++	printf("BLUELINE GPU: DDR vote dropped to keepalive (%#x): err %d\n", data[0], err);
++	gx.bw_voted = false;
++}
++
++/* a6xx_gmu_gfx_rail_on: the GMU votes GX/MX through its RSCC for the boot level. */
++static bool
++gx_rail_on(void)
++{
++	uint32_t v = gx.gx_votes[gx.perf];
++
++	printf("BLUELINE GPU: GX rail on: BOOT_SLUMBER_OPTION 0, GX_VOTE_IDX %u, MX_VOTE_IDX %u (%u kHz, vlvl %u)\n",
++	    v & 0xff, (v >> 8) & 0xff, gpu_khz[gx.perf], v >> 16);
++	wr(gmu + GMU_REG(GMU_BOOT_SLUMBER_OPTION), 0);
++	wr(gmu + GMU_REG(GMU_GX_VOTE_IDX), v & 0xff);
++	wr(gmu + GMU_REG(GMU_MX_VOTE_IDX), (v >> 8) & 0xff);
++	gx.rail = true;
++	bool ok = gmu_oob_set("BOOT_SLUMBER", OOB_BOOT_SLUMBER_SET, OOB_BOOT_SLUMBER_ACK);
++	gx_report("after rail on");
++	return ok;
++}
++
++/* a6xx_sptprac_enable (Linux polls 100 us and carries on; KGSL waits 10 ms for bit 3). */
++static void
++gx_sptprac_on(void)
++{
++	wr(gmu + GMU_REG(GMU_GX_SPTPRAC_POWER_CONTROL), SPTPRAC_ON_CTRL);
++	gx.sptprac = true;
++	bool on = poll(gmu + GMU_REG(GMU_SPTPRAC_STATUS), SPT_SPTPRAC_ON, SPT_SPTPRAC_ON, 10000);
++	uint32_t st = gmu_rd(GMU_SPTPRAC_STATUS);
++	printf("BLUELINE GPU: SPTPRAC control %#x -> %#x: status %#x (%s; Linux's (status & 0x38) == 0x28: %s)\n",
++	    gx.spt_ctl_was, gmu_rd(GMU_GX_SPTPRAC_POWER_CONTROL), st, on ? "on" : "NOT ON after 10 ms",
++	    (st & 0x38) == 0x28 ? "yes" : "no");
++}
++
++/* a6xx_hfi_start_v1 after FW_VERSION: PERF_TABLE, BW_TABLE, TEST. */
++static bool
++gx_hfi_tables(struct gmu_mem *m)
++{
++	uint32_t msg[HFI_BW_WORDS], resp[HFI_RESP_WORDS] = { 0 };
++
++	bzero(msg, sizeof(msg));
++	msg[1] = GX_LEVELS;
++	msg[2] = CX_LEVELS;
++	for (int i = 0; i < GX_LEVELS; i++) {
++		msg[3 + 2 * i] = gx.gx_votes[i];
++		msg[4 + 2 * i] = gpu_khz[i];
++	}
++	for (int i = 0; i < CX_LEVELS; i++) {
++		msg[HFI_PERF_CX + 2 * i] = gx.cx_votes[i];
++		msg[HFI_PERF_CX + 1 + 2 * i] = gmu_khz[i];
++	}
++	int r_perf = hfi_send(m, HFI_H2F_MSG_PERF_TABLE, msg, HFI_PERF_WORDS, resp, gx.hfi_ms);
++	if (r_perf == -2 || r_perf == -4) {
++		printf("BLUELINE GPU: HFI PERF_TABLE failed (%d): no BW table\n", r_perf);
++		return false;
++	}
++
++	bzero(msg, sizeof(msg));
++	msg[1] = 1;			/* bw_level_num: one "off" level, the a630 GMU does no bus scaling */
++	msg[2] = 3;			/* cnoc_cmds_num */
++	msg[3] = 3;			/* ddr_cmds_num */
++	msg[4] = 0x05;			/* cnoc_wait_bitmask */
++	msg[5] = 0x07;			/* ddr_wait_bitmask */
++	for (int j = 0; j < 3; j++) {
++		msg[6 + j] = bw_cnoc_addr[j];
++		msg[12 + j] = bw_cnoc_off[j];		/* cnoc_cmds_data[0][j] */
++		msg[18 + j] = bw_cnoc_on[j];		/* cnoc_cmds_data[1][j] */
++		msg[24 + j] = bw_ddr_addr[j];
++		msg[32 + j] = 0x40000000u;		/* ddr_cmds_data[0][j]: commit, no vote */
++	}
++	int r_bw = hfi_send(m, HFI_H2F_MSG_BW_TABLE, msg, HFI_BW_WORDS, resp, gx.hfi_ms);
++	int r_test = -2;
++	if (r_bw != -2 && r_bw != -4) {
++		msg[0] = 0;
++		r_test = hfi_send(m, HFI_H2F_MSG_TEST, msg, 1, resp, gx.hfi_ms);
++	}
++	printf("BLUELINE GPU: HFI PERF_TABLE %s, BW_TABLE %s, TEST %s (results %d %d %d)\n", r_perf ? "FAILED" : "acked",
++	    r_bw ? "FAILED" : "acked", r_test ? "failed (Linux ignores it)" : "acked", r_perf, r_bw, r_test);
++	return r_perf == 0 && r_bw == 0;
++}
++
++/* a6xx_gmu_set_freq, legacy: DCVS registers, OOB DCVS set + clear, DCVS_RETURN. */
++static void
++gx_dcvs(void)
++{
++	printf("BLUELINE GPU: DCVS: perf index %d (%u kHz, at least), bw 0xff (the firmware's choice)\n", gx.perf,
++	    gpu_khz[gx.perf]);
++	wr(gmu + GMU_REG(GMU_DCVS_ACK_OPTION), 0);
++	wr(gmu + GMU_REG(GMU_DCVS_PERF_SETTING), (3u << 28) | (uint32_t)gx.perf);
++	wr(gmu + GMU_REG(GMU_DCVS_BW_SETTING), 0xff);
++	bool ok = gmu_oob_set("DCVS", OOB_DCVS_SET, OOB_DCVS_ACK);
++	gmu_oob_clear("DCVS", OOB_DCVS_ACK);
++	uint32_t ret = gmu_rd(GMU_DCVS_RETURN);
++	printf("BLUELINE GPU: DCVS %s, DCVS_RETURN %#x%s\n", ok ? "acked" : "NOT ACKED", ret, ret ? " (ERROR)" : "");
++}
++
++/* a6xx_gmu_gx_is_on, plus the GDSC's own word; only then is the core read. */
++static bool
++gx_probe(void)
++{
++	uint32_t spt = gmu_rd(GMU_SPTPRAC_STATUS), gd = rd(gpucc + GPUCC_GX_GDSCR);
++	uint32_t cfg = rd(gpucc + GPUCC_GX_CFG_GDSCR);
++	bool on = !(spt & (SPT_GX_GDSC_OFF | SPT_GX_CLK_OFF)) && ((gd & GDSC_PWR_ON) || (cfg & GX_CFG_UP_DONE));
++
++	printf("BLUELINE GPU: GX: sptprac %#x (gx hm gdsc %s, clk %s) gx_gdscr %#x gx_cfg %#x misc %#x: %s\n", spt,
++	    (spt & SPT_GX_GDSC_OFF) ? "off" : "on", (spt & SPT_GX_CLK_OFF) ? "off" : "on", gd, cfg,
++	    rd(gpucc + GPUCC_GX_DOMAIN_MISC), on ? "GX POWERED" : "GX NOT POWERED: core not touched");
++	if (!on) {
++		return false;
++	}
++	gx.core = ml_io_map(GPU_PA, GPU_MAP_SIZE);
++	if (!gx.core) {
++		return false;
++	}
++	vm_offset_t g = gx.core;
++	printf("BLUELINE GPU: about to read the GPU core at %#x (GX)\n", GPU_PA);
++	uint32_t st = rd(g + GXR(GXR_RBBM_STATUS));
++	printf("BLUELINE GPU: RBBM status %#x status1 %#x status2 %#x status3 %#x int_0 %#x clock_cntl %#x\n", st,
++	    rd(g + GXR(GXR_RBBM_STATUS + 1)), rd(g + GXR(GXR_RBBM_STATUS + 2)), rd(g + GXR(GXR_RBBM_STATUS + 3)),
++	    rd(g + GXR(GXR_RBBM_INT_0_STATUS)), rd(g + GXR(GXR_RBBM_CLOCK_CNTL)));
++	printf("BLUELINE GPU: VBIF version %#x clkon %#x; CP hw_fault %#x status_1 %#x protect_status %#x"
++	    " sqe_instr_base %#x:%#x rb_base %#x:%#x\n", rd(g + GXR(GXR_VBIF_VERSION)), rd(g + GXR(GXR_VBIF_CLKON)),
++	    rd(g + GXR(GXR_CP_HW_FAULT)), rd(g + GXR(GXR_CP_STATUS_1)), rd(g + GXR(GXR_CP_PROTECT_STATUS)),
++	    rd(g + GXR(GXR_CP_SQE_INSTR_BASE + 1)), rd(g + GXR(GXR_CP_SQE_INSTR_BASE)),
++	    rd(g + GXR(GXR_CP_RB_BASE + 1)), rd(g + GXR(GXR_CP_RB_BASE)));
++	uint32_t c0 = rd(g + GXR(GXR_CP_ALWAYS_ON));
++	delay(100);
++	uint32_t c1 = rd(g + GXR(GXR_CP_ALWAYS_ON));
++	printf("BLUELINE GPU: CP always-on counter %#x:%#x -> %#x over 100 us (%s)\n", rd(g + GXR(GXR_CP_ALWAYS_ON + 1)),
++	    c0, c1, c1 != c0 ? "counting" : "not counting");
++	if (gx.wr) {
++		uint32_t was = rd(g + GXR(GXR_CP_SCRATCH7));
++		wr(g + GXR(GXR_CP_SCRATCH7), GX_SCRATCH_PATTERN);
++		uint32_t rb = rd(g + GXR(GXR_CP_SCRATCH7));
++		wr(g + GXR(GXR_CP_SCRATCH7), was);
++		printf("BLUELINE GPU: CP_SCRATCH[7] %#x, wrote %#x, reads %#x, restored %#x: %s\n", was, GX_SCRATCH_PATTERN,
++		    rb, rd(g + GXR(GXR_CP_SCRATCH7)), rb == GX_SCRATCH_PATTERN ? "GPU CORE REGISTERS WORK" :
++		    "WRITE DID NOT STICK (AHB fence?)");
++	}
++	printf("BLUELINE GPU: no chip-id or CP version register before the SQE microcode: chip id stays DT %#x\n",
++	    A630_CHIPID_DOWNSTREAM);
++	gx.up = true;
++	return true;
++}
++
++/* a6xx_bus_clear_pending_transactions, VBIF (no GBIF on a630). */
++static void
++gx_bus_halt(void)
++{
++	vm_offset_t g = gx.core;
++	wr(g + GXR(GXR_VBIF_XIN_HALT_CTRL0), VBIF_XIN_HALT_MASK);
++	bool ok = poll(g + GXR(GXR_VBIF_XIN_HALT_CTRL1), VBIF_XIN_HALT_MASK, VBIF_XIN_HALT_MASK, 1000);
++	uint32_t c1 = rd(g + GXR(GXR_VBIF_XIN_HALT_CTRL1));
++	wr(g + GXR(GXR_VBIF_XIN_HALT_CTRL0), 0);
++	printf("BLUELINE GPU: VBIF XIN halt %s (ctrl1 %#x), released\n", ok ? "acked" : "NOT ACKED in 1 ms", c1);
++}
++
++/* a6xx_gmu_shutdown, legacy, up to the CM3 reset (gmu_boot's teardown does that and the rest). */
++static void
++gx_down(void)
++{
++	printf("BLUELINE GPU: GX down (a6xx_gmu_shutdown, legacy)\n");
++	if (gx.up && gx.core) {
++		gx_bus_halt();
++	}
++	if (gx.gpu_oob) {
++		gmu_oob_clear("GPU", OOB_GPU_ACK);
++		gx.gpu_oob = false;
++	}
++	gmu_wr(GMU_POWER_COUNTER_ENABLE, 0);
++	if (gx.sptprac) {	/* a6xx_sptprac_disable */
++		wr(gpucc + GPUCC_GX_GDSCR, rd(gpucc + GPUCC_GX_GDSCR) | GX_RETAIN_FF);
++		wr(gmu + GMU_REG(GMU_GX_SPTPRAC_POWER_CONTROL), SPTPRAC_OFF_CTRL);
++		bool off = poll(gmu + GMU_REG(GMU_SPTPRAC_STATUS), SPT_SPTPRAC_OFF, SPT_SPTPRAC_OFF, 10000);
++		printf("BLUELINE GPU: SPTPRAC off: status %#x (%s)\n", gmu_rd(GMU_SPTPRAC_STATUS),
++		    off ? "off" : "NOT OFF after 10 ms");
++	}
++	/* a6xx_gmu_notify_slumber */
++	wr(gmu + GMU_REG(GMU_BOOT_SLUMBER_OPTION), 1);
++	bool ok = gmu_oob_set("BOOT_SLUMBER (slumber)", OOB_BOOT_SLUMBER_SET, OOB_BOOT_SLUMBER_ACK);
++	gmu_oob_clear("BOOT_SLUMBER", OOB_BOOT_SLUMBER_ACK);
++	uint32_t ps = gmu_rd(GMU_RPMH_POWER_STATE);
++	bool idle = poll(gmu + GMU_REG(GMU_AO_CX_BUSY_STATUS), CX_BUSY_GPU_IGN_AHB, 0, 10000);
++	printf("BLUELINE GPU: slumber %s, rpmh_power_state %#x (%s), cx_busy %#x (%s)\n", ok ? "acked" : "NOT ACKED",
++	    ps, ps == 0xf ? "slumber" : "NOT IN SLUMBER", gmu_rd(GMU_AO_CX_BUSY_STATUS), idle ? "idle" : "STILL BUSY");
++	gx_report("after slumber");
++}
++
++/* a6xx_rpmh_stop, with the CM3 in reset: the RSC sleeps and the PDC sends its sleep TCS for the GPU DRV. */
++static void
++gx_rpmh_sleep(void)
++{
++	printf("BLUELINE GPU: RSC sleep: RSCC_CONTROL_REQ 1 (PDC sleep TCS: mx %#x=1 cx %#x=0 gfx %#x=0)\n",
++	    pdc_addr[0], pdc_addr[1], pdc_addr[2]);
++	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 1);
++	bool ok = poll(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0), RSCC_STATUS0_SLEEP, RSCC_STATUS0_SLEEP, 10000);
++	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 0);
++	printf("BLUELINE GPU: RSC %s (status0 %#x seq_busy %#x control_ack %#x)\n", ok ? "asleep" : "DID NOT SLEEP in 10 ms",
++	    rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)), rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)),
++	    gmu_rd(GMU_RSCC_CONTROL_ACK));
++}
++
++/* a6xx_gmu_stop's gxpd_put (gdsc_disable) if GX still reads on; then GX's GPU CC words back to boot values. */
++static void
++gx_off_check(void)
++{
++	uint32_t gd = rd(gpucc + GPUCC_GX_GDSCR);
++
++	if (!gx.started) {
++		return;		/* nothing of stage 3 ran */
++	}
++	if (gd & GDSC_PWR_ON) {
++		printf("BLUELINE GPU: GX GDSC still on (%#x cfg %#x): collapsing it from the CPU\n", gd,
++		    rd(gpucc + GPUCC_GX_CFG_GDSCR));
++		wr(gpucc + GPUCC_GX_GDSCR, gd | GDSC_SW_COLLAPSE);
++		bool down = poll(gpucc + GPUCC_GX_CFG_GDSCR, GX_CFG_DOWN_DONE, GX_CFG_DOWN_DONE, 2000);
++		wr(gpucc + GPUCC_GX_DOMAIN_MISC, rd(gpucc + GPUCC_GX_DOMAIN_MISC) | 1u);	/* clamp the outputs */
++		printf("BLUELINE GPU: GX GDSC %#x cfg %#x: %s\n", rd(gpucc + GPUCC_GX_GDSCR), rd(gpucc + GPUCC_GX_CFG_GDSCR),
++		    down ? "collapsed" : "STILL ON after 2 ms");
++	}
++	gd = rd(gpucc + GPUCC_GX_GDSCR);
++	uint32_t misc = rd(gpucc + GPUCC_GX_DOMAIN_MISC), spt = gmu_rd(GMU_GX_SPTPRAC_POWER_CONTROL);
++	if (!(gd & GDSC_PWR_ON)) {
++		if (misc != gx.misc_was) {
++			wr(gpucc + GPUCC_GX_DOMAIN_MISC, gx.misc_was);
++		}
++		if ((gd ^ gx.gdscr_was) == GX_RETAIN_FF) {
++			wr(gpucc + GPUCC_GX_GDSCR, gx.gdscr_was);	/* only the retention bit differs */
++		}
++		if (spt != gx.spt_ctl_was && (gx.spt_ctl_was & 1u)) {
++			wr(gmu + GMU_REG(GMU_GX_SPTPRAC_POWER_CONTROL), gx.spt_ctl_was);	/* an "off" word */
++		}
++	}
++	printf("BLUELINE GPU: GX after stage 3: gdscr %#x (boot %#x) misc %#x (boot %#x) sptprac control %#x (boot %#x)%s\n",
++	    rd(gpucc + GPUCC_GX_GDSCR), gx.gdscr_was, rd(gpucc + GPUCC_GX_DOMAIN_MISC), gx.misc_was,
++	    gmu_rd(GMU_GX_SPTPRAC_POWER_CONTROL), gx.spt_ctl_was,
++	    (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) ? ": GX STILL POWERED" : "");
++}
++
++/*
++ * Stage 3 with the GMU just booted (0xbabeface) and its SMMU memory mapped:
++ * Linux's a6xx_gmu_fw_start legacy tail, a6xx_hfi_start, the initial freq,
++ * a6xx_hw_init's OOB GPU_SET; reads; then down unless keep. Returns whether
++ * HFI came up (as hfi_run).
++ */
++static bool
++gx_stage(struct gmu_mem *m, bool keep)
++{
++	bool hfi = false;
++
++	gx.gdscr_was = rd(gpucc + GPUCC_GX_GDSCR);
++	gx.misc_was = rd(gpucc + GPUCC_GX_DOMAIN_MISC);
++	gx.spt_ctl_was = gmu_rd(GMU_GX_SPTPRAC_POWER_CONTROL);
++	gx.started = true;
++	gx_report("stage 3 start");
++	if (gx.bw) {
++		gx_bw_vote();
++	}
++	if (gx_rail_on()) {
++		gx_sptprac_on();
++		hfi = hfi_run(m);
++	} else {
++		printf("BLUELINE GPU: no BOOT_SLUMBER ack: no HFI, straight to slumber\n");
++	}
++	if (hfi && gx.step >= 2) {
++		hfi = gx_hfi_tables(m);
++	}
++	if (hfi && gx.step >= 3) {
++		gx_dcvs();
++	}
++	if (hfi && gx.step >= 4) {
++		printf("BLUELINE GPU: OOB GPU_SET: asking the GMU for GX (a6xx_hw_init)\n");
++		gx.gpu_oob = true;
++		if (gmu_oob_set("GPU_SET", OOB_GPU_SET, OOB_GPU_ACK)) {
++			(void)gx_probe();
++		}
++		gx_report("after OOB GPU_SET");
++	}
++	hfi_dump(m);
++	printf("BLUELINE GPU: stage 3 %s (step %d)\n", gx.up ? "GX UP: THE GPU CORE ANSWERS" :
++	    gx.step < 4 ? "stopped early" : "GX NOT UP", gx.step);
++	if (keep) {
++		printf("BLUELINE GPU: GX, its votes%s and the OOB requests left as they are (bluegpu_keep=1)\n",
++		    gx.bw_voted ? ", the DDR vote" : "");
++		return hfi;
++	}
++	gx_down();
++	return hfi;
++}
++
++/*
+  * Stage 2a. Called with CX on, the GMU clocks running and GX off; returns
+  * whether the GMU reported init done. Unless keep, the CM3 is back in reset
+  * and every register this wrote is restored when it returns. With mem
+@@ -1299,8 +2023,9 @@
+ 	if (ms < 1 || ms > 2000) {
+ 		ms = 200;
+ 	}
+-	printf("BLUELINE GPU: stage 2a: GMU firmware boot (pdc %d, timeout %d ms, chipid %#x), %s, no GX\n",
+-	    use_pdc, ms, chipid, mem ? "with SMMU memory and HFI" : "no SMMU, no HFI");
++	printf("BLUELINE GPU: stage 2a: GMU firmware boot (pdc %d, timeout %d ms, chipid %#x), %s, %s\n",
++	    use_pdc, ms, chipid, mem ? "with SMMU memory and HFI" : "no SMMU, no HFI",
++	    gx.on ? "then stage 3 (GX)" : "no GX");
+ 
+ 	/* 1. Firmware and preconditions: nothing written yet. */
+ 	const uint32_t *fw = gmu_fw_from_adt();
+@@ -1391,7 +2116,11 @@
+ 	gmu_trace_dump();
+ 	printf("BLUELINE GPU: GMU watchdog bark %#x bite %#x ctrl %#x, gpucc 0x1060 %#x\n", gmu_rd(GMU_WDOG_BARK),
+ 	    gmu_rd(GMU_WDOG_BITE), gmu_rd(GMU_WDOG_CTRL), rd(gpucc + GPUCC_FW_REG));
+-	if (booted && mem) {
++	if (booted && mem && gx.on) {
++		mem->hfi_ok = gx_stage(mem, keep);	/* stage 3: HFI runs inside, after the rail is up */
++		gmu_trace_dump();
++		printf("BLUELINE GPU: stage 2b HFI %s\n", mem->hfi_ok ? "OK" : "FAILED");
++	} else if (booted && mem) {
+ 		mem->hfi_ok = hfi_run(mem);
+ 		gmu_trace_dump();
+ 		printf("BLUELINE GPU: stage 2b HFI %s\n", mem->hfi_ok ? "OK" : "FAILED");
+@@ -1419,8 +2148,18 @@
+ 			printf("BLUELINE GPU: host2gmu raw %#x -> %#x, gmu2host %#x\n", raw,
+ 			    gmu_rd(GMU_HOST2GMU_INTR_RAW_INFO), gmu_rd(GMU_GMU2HOST_INTR_INFO));
+ 		}
++		if (gx.on && booted && gx.rpmh_stop) {
++			gx_rpmh_sleep();	/* before undo_all puts the RSCC/PDC words back */
++		}
+ 	}
+ 	undo_all();
++	if (gx.on) {
++		gx_off_check();
++		if (gx.bw_voted) {
++			gx_bw_drop();
++		}
++		gx.on = false;
++	}
+ 	printf("BLUELINE GPU: stage 2a %s\n", booted ? "done" : "FAILED; state restored");
+ 	return booted;
+ }
+@@ -1438,8 +2177,9 @@
+ 	if (level <= 0) {
+ 		return;
+ 	}
+-	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads%s, no GX\n",
+-	    level, keep ? ", keep" : "", level >= 3 ? ", then GMU firmware boot" : ", no firmware");
++	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads%s\n",
++	    level, keep ? ", keep" : "", level >= 5 ? ", then GMU firmware boot and GX" :
++	    level >= 3 ? ", then GMU firmware boot, no GX" : ", no firmware, no GX");
+ 
+ 	/* 1. GCC: always clocked, read only first. */
+ 	gcc = ml_io_map(GCC_PA, GCC_SIZE);
+@@ -1555,6 +2295,11 @@
+ 				printf("BLUELINE GPU: stage 2b not set up (nothing left changed): stage 2a alone\n");
+ 			}
+ 		}
++		if (level >= 5 && mem) {
++			(void)gx_prepare();	/* reads only; sets gx.on and the PDC addresses */
++		} else if (level >= 5) {
++			printf("BLUELINE GPU: stage 3 needs stage 2b's SMMU memory: skipped\n");
++		}
+ 		if (gmu_boot(keep != 0, mem) && keep) {
+ 			return;
+ 		}
+diff --git a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+--- a/bsd/dev/blueline_touch.c
++++ b/bsd/dev/blueline_touch.c
+@@ -217,55 +217,132 @@
+ 	return *(volatile uint8_t *)a;
+ }
+ 
++/* cmd-db (cmd-db.c): the header, then rsc_hdr[8] (slv_id, header_offset, data_offset, cnt, ...),
++ * checksum, reserved, then the entries (id[8], priority[2], addr, len, offset) and their aux data. */
++#define CMDDB_SIZE	0x20000u	/* the word after the address is not a usable size here: SDM845's 128 KiB */
++#define CMDDB_DATA	144u
++
+ static uint32_t
+-cmddb_addr(const char *id)
++rd16(vm_offset_t a)
+ {
++	return rd8(a) | (uint32_t)rd8(a + 1) << 8;
++}
++
++/* Mapped once: every lookup used to map the region again. */
++static vm_offset_t
++cmddb_map(void)
++{
++	static vm_offset_t db;
++
++	if (db) {
++		return db;
++	}
+ 	vm_offset_t loc = ml_io_map(CMDDB_LOC_PA & ~0xfffu, 0x1000);
+ 	if (!loc) {
+ 		return 0;
+ 	}
+-	/* the word after the address is not a usable size here: map SDM845's 128 KiB cmd-db region */
+-	uint32_t pa = rd(loc + (CMDDB_LOC_PA & 0xfffu)), size = 0x20000;
++	uint32_t pa = rd(loc + (CMDDB_LOC_PA & 0xfffu));
+ 	if (!pa) {
+ 		return 0;
+ 	}
+-	vm_offset_t db = ml_io_map(pa, size);
+-	if (!db || rd(db + 4) != 0x0c0330dbu) {		/* magic db 30 03 0c */
++	vm_offset_t m = ml_io_map(pa, CMDDB_SIZE);
++	if (!m || rd(m + 4) != 0x0c0330dbu) {		/* magic db 30 03 0c */
+ 		return 0;
+ 	}
++	db = m;
++	return db;
++}
++
++/*
++ * The entry named id (or, with id NULL, the one whose address is addr); 0 if
++ * none. With aux, also where its aux data is and how long (0 if out of range).
++ */
++static vm_offset_t
++cmddb_find(const char *id, uint32_t addr, vm_offset_t *aux, uint32_t *auxlen)
++{
++	vm_offset_t db = cmddb_map();
++	if (!db) {
++		return 0;
++	}
+ 	for (uint32_t i = 0; i < 8; i++) {
+-		vm_offset_t h = db + 8 + 16 * i;	/* rsc_hdr: slv_id, header_offset, data_offset, cnt */
+-		uint32_t slv = rd8(h) | (uint32_t)rd8(h + 1) << 8;
+-		if (!slv) {
++		vm_offset_t h = db + 8 + 16 * i;
++		if (!rd16(h)) {
+ 			break;
+ 		}
+-		uint32_t hoff = rd8(h + 2) | (uint32_t)rd8(h + 3) << 8;
+-		uint32_t cnt = rd8(h + 6) | (uint32_t)rd8(h + 7) << 8;
+-		vm_offset_t e = db + 144 + hoff;	/* entry_header: id[8], priority[2], addr, len, offset */
+-		for (uint32_t j = 0; j < cnt && 144 + hoff + 24 * (j + 1) <= size; j++, e += 24) {
++		uint32_t hoff = rd16(h + 2), doff = rd16(h + 4), cnt = rd16(h + 6);
++		vm_offset_t e = db + CMDDB_DATA + hoff;
++		for (uint32_t j = 0; j < cnt && CMDDB_DATA + hoff + 24 * (j + 1) <= CMDDB_SIZE; j++, e += 24) {
+ 			bool same = true;
+-			for (int k = 0; k < 8 && same; k++) {
+-				same = rd8(e + k) == (uint8_t)id[k];
+-				if (!id[k]) {
+-					break;
++			if (id) {
++				for (int k = 0; k < 8 && same; k++) {
++					same = rd8(e + k) == (uint8_t)id[k];
++					if (!id[k]) {
++						break;
++					}
+ 				}
++			} else {
++				same = rd(e + 16) == addr;
+ 			}
+-			if (same) {
+-				return rd(e + 16);
++			if (!same) {
++				continue;
+ 			}
++			if (aux) {
++				uint32_t len = rd16(e + 20), off = CMDDB_DATA + doff + rd16(e + 22);
++				*aux = off + len <= CMDDB_SIZE ? db + off : 0;
++				*auxlen = *aux ? len : 0;
++			}
++			return e;
+ 		}
+ 	}
+ 	return 0;
+ }
+ 
++static uint32_t
++cmddb_addr(const char *id)
++{
++	vm_offset_t e = cmddb_find(id, 0, NULL, NULL);
++	return e ? rd(e + 16) : 0;
++}
++
+ /* For other blueline drivers (blueline_gpu.c): a resource's RPMh address, 0 if not in cmd-db. */
+ uint32_t blueline_cmddb_addr(const char *id);
+ uint32_t
+ blueline_cmddb_addr(const char *id)
+ {
+ 	return cmddb_addr(id);
++}
++
++/* Its aux data (ARC: u16 levels; BCM: unit, width, vcd): up to max bytes into buf; returns the full length. */
++uint32_t blueline_cmddb_aux(const char *id, uint8_t *buf, uint32_t max);
++uint32_t
++blueline_cmddb_aux(const char *id, uint8_t *buf, uint32_t max)
++{
++	vm_offset_t aux = 0;
++	uint32_t len = 0;
++
++	if (!cmddb_find(id, 0, &aux, &len) || !aux) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < len && i < max; i++) {
++		buf[i] = rd8(aux + i);
++	}
++	return len;
+ }
+ 
++/* The name of the resource at an RPMh address ("" and false if cmd-db has none). */
++bool blueline_cmddb_name(uint32_t addr, char name[9]);
++bool
++blueline_cmddb_name(uint32_t addr, char name[9])
++{
++	vm_offset_t e = cmddb_find(NULL, addr, NULL, NULL);
++
++	for (int k = 0; k < 8; k++) {
++		name[k] = e ? (char)rd8(e + k) : 0;
++	}
++	name[8] = 0;
++	return e != 0;
++}
++
+ /* n commands (addr, data) in an idle active TCS, triggered and waited for. */
+ static int
+ rpmh_write(const uint32_t *addr, const uint32_t *data, int n)
+@@ -309,6 +386,20 @@
+ 	return done ? 0 : ETIMEDOUT;
+ }
+ 
++/* For blueline_gpu.c: the same, mapping the apps RSC if touch did not (bluetouch=0). */
++int blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n);
++int
++blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n)
++{
++	if (!rsc) {
++		rsc = ml_io_map(RSC_DRV_PA, 0x4000);
++	}
++	if (!rsc || n < 1 || n > 16) {
++		return ENXIO;
++	}
++	return rpmh_write(addr, data, n);
++}
++
+ static int
+ touch_power(void)
+ {
+-- 
+2.39.0

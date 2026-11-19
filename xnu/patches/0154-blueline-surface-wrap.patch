@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 14:00:00 +0100
+Subject: [PATCH] 0154: SweetSurface: IOSurfaceWrapClientImage (selector 6)
+
+CoreAnimation's OpenGL ES renderer (stage 6f) asks for a surface around each
+picture it draws from: by selector 6 (IOSurfaceWrapClientImage: gradients,
+glyph masks), refused by sailfish's 0206, and by a create whose properties
+carry IOSurfaceAddress (app icons), which got fresh zeroed memory: every app
+icon drew blank. Here the
+surface's pixels are the caller's memory itself (IOMemoryDescriptor over the
+range, prepared while the surface lives), as HackiOS's MiniIOSurface does
+(APSL; request layout from there). bluesurf_wrap=0 keeps the refusal.
+---
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,7 @@
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	bool                      wrapped;      /* 0154: memory is a client's own range (prepared; completed in free) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -94,6 +94,9 @@
+ 		blue_dpu_pool_put(memory);      /* back to the scanout pool if it came from there */
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();     /* 0154: the client's pages, wired by prepare() */
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -108,7 +111,8 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/* 0154: a wrapped client range is cacheable user memory: no write-combined alias of it */
++		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -420,6 +424,7 @@
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapClientImage(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -437,7 +442,36 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
++
++static TUNABLE(uint32_t, sweet_surf_wrap, "bluesurf_wrap", 1);  /* 0154: 0 = refuse selector 6 as before */
++
++/*
++ * 0154: a surface whose pixels are a range of the caller's own memory (wired
++ * while the surface lives; completed in SweetSurface::free), for writing if it
++ * can be, else for reading (a picture that is only shown).
++ */
++static IOReturn
++sweet_surface_wrap_range(SweetSurface *s, uint64_t address, uint32_t size, task_t task)
++{
++	IOMemoryDescriptor *md = NULL;
++	bool ro = false;
+ 
++	for (int attempt = 0; attempt < 2 && md == NULL; attempt++) {
++		ro = attempt == 1;
++		md = IOMemoryDescriptor::withAddressRange(address, size, ro ? kIODirectionOut : kIODirectionInOut, task);
++		if (md != NULL && md->prepare() != kIOReturnSuccess) {
++			OSSafeReleaseNULL(md);
++		}
++	}
++	if (md == NULL) {
++		IOLog("SWEET SURF: wrap: %u bytes at %#llx cannot be held\n", size, address);
++		return kIOReturnVMError;
++	}
++	s->memory = md;
++	s->wrapped = true;
++	s->mapCache = kIOMapDefaultCache | (ro ? kIOMapReadOnly : 0);
++	return kIOReturnSuccess;
++}
+ static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+ 
+ static void
+@@ -682,7 +716,31 @@
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	/*
++	 * 0154: IOSurfaceAddress = a surface around memory the caller has already
++	 * (CoreAnimation's GL renderer makes them around app icons and layer contents).
++	 * The owner's row and size stand as given; the pixels are that memory itself.
++	 */
++	OSNumber *wrapAt = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && wrapAt != NULL && sweet_surf_wrap) {
++		uint32_t bpr = sweet_dict_u32(props, "IOSurfaceBytesPerRow", s->bytesPerRow);
++		uint32_t size = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		uint64_t need = (uint64_t)s->offset + (uint64_t)bpr * (s->height ? s->height - 1 : 0) +
++		    (uint64_t)s->width * s->bytesPerElement;
++		if (size == 0) {
++			size = (uint32_t)need;
++		}
++		if (s->planeCount != 0 || size < need || size > SWEET_SURFACE_MAX_ALLOC) {
++			ret = kIOReturnBadArgument;
++		} else {
++			s->bytesPerRow = bpr;
++			s->allocSize = size;
++			ret = sweet_surface_wrap_range(s, wrapAt->unsigned64BitValue(), size, fTask);
++			if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		char creator[32];
+ 		proc_selfname(creator, sizeof(creator));
+@@ -713,9 +771,9 @@
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u%s -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), s->wrapped ? " (wraps the caller's memory)" : "", ret);
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+@@ -727,13 +785,80 @@
+ 	return ret;
+ }
+ 
++/*
++ * 0154: IOSurfaceWrapClientImage (selector 6), as HackiOS's MiniIOSurface
++ * methodWrapClientImage (APSL, https://github.com/hakios -- the request layout
++ * and the approach). CoreAnimation's OpenGL ES renderer asks it for every
++ * picture it draws from (app icons, glyph masks, gradients). The request is
++ * 32 bytes:
++ *     address (8), width, height, pixel format, bytes per element, bytes per row, size (4 each)
++ * in the caller's address space. The surface's pixels are that memory itself
++ * (wired while the surface lives), so what the caller wrote is what a reader
++ * of the surface sees. Refused (0206) when bluesurf_wrap=0: CA then made
++ * empty surfaces of its own, and the icons were blank on the GPU path.
++ */
+ IOReturn
++IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
++{
++	struct {
++		uint64_t address;
++		uint32_t width, height, format, bpe, bpr, size;
++	} r;
++	static uint32_t said;
++
++	if (args->structureInput == NULL || args->structureInputSize < sizeof(r)) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&r, args->structureInput, sizeof(r));
++	bool ok = r.address != 0 && r.size != 0 && r.size <= SWEET_SURFACE_MAX_ALLOC && r.width != 0 && r.height != 0 &&
++	    r.width <= SWEET_SURFACE_MAX_DIM && r.height <= SWEET_SURFACE_MAX_DIM && r.bpe != 0 && r.bpe <= 64 &&
++	    r.bpr >= r.width * r.bpe &&
++	    (uint64_t)r.size >= (uint64_t)r.bpr * (r.height - 1) + (uint64_t)r.width * r.bpe;   /* (a mask's last row may end early) */
++	if (said < 8 || !ok) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		said++;
++		IOLog("SWEET SURF: %s wrap client image at %#llx: %ux%u fmt %#x bpe %u bpr %u size %u%s\n", name,
++		    r.address, r.width, r.height, r.format, r.bpe, r.bpr, r.size, ok ? "" : ": refused (bad request)");
++	}
++	if (!ok) {
++		return kIOReturnBadArgument;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return kIOReturnNoMemory;
++	}
++	s->width = r.width;
++	s->height = r.height;
++	s->pixelFormat = r.format;
++	s->bytesPerElement = (uint16_t)r.bpe;
++	s->bytesPerRow = r.bpr;
++	s->elementWidth = s->elementHeight = 1;
++	s->allocSize = r.size;
++	IOReturn ret = sweet_surface_wrap_range(s, r.address, r.size, fTask);
++	if (ret != kIOReturnSuccess) {
++		s->release();
++		return ret;
++	}
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return kIOReturnNoResources;
++	}
++	ret = returnSurface(s, args);   /* takes the caller's user count, as create */
++	s->release();
++	return ret;
++}
++
++IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
+ 	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+ 
++	if (selector == 6 && sweet_surf_wrap) {
++		return wrapClientImage(args);   /* 0154 */
++	}
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+ 		uint8_t limits[0x18] = { 0 };

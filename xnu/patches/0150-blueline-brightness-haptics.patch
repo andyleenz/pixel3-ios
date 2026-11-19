@@ -1,0 +1,1739 @@
+From 1f77a6b0a9575afa6b9b7efd28cd2fb702e77f4d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 11:39:21 +1100
+Subject: [PATCH] 0150: blueline brightness (DCS 0x51, bluebl) and CS40L20
+ haptics (bluehaptic)
+
+Brightness (iokit/Kernel/arm/BlueBacklight.cpp, bluebl=1 default): the
+SW43408's SET_DISPLAY_BRIGHTNESS (0x51, two bytes big-endian, panel range
+8..900 = 2.74..399.81 nits, crosshatch dsi-panel-sw43408-dsc-fhd-cmd.dtsi)
+as a DSI0 command-FIFO long write (DT 0x39) with the pingpong's autorefresh
+stopped and drained around it, on AppleCLCD's vsync workloop thread, at
+most every 2 vsyncs, never while the display is off, never below
+bluebl_min (default 32). Requests are only recorded, from AppleCLCD
+setProperties (brightness / IODisplayParameters / nits keys) and, at
+bluebl=2, an AppleARMBacklight service with backlight-control = true (what
+CoreBrightness matches; experimental). IOMFB selectors 50/66/67/68 are
+logged. bluebl_test=1: 100 -> 20 -> 100 % ramp from 5 s, each write logged.
+Any failed write turns the DCS path off for the boot.
+
+Haptics (bsd/dev/blueline_haptic.c, off by default): the production
+vibrator is a Cirrus CS40L20 at 0x43 on qupv3_se5 (GPIO 85/86, reset 87;
+dtbo entry 8), bit-banged as 0141's MAX1720x. bluehaptic=1 probes (reset
+pulse, OTP boot, DEVID/REVID/OTPID) and puts the reset pin back;
+bluehaptic=2 runs the A0 bring-up (errata, OTP trims, boost 1 uH/4 uF/
+4.5 A, routing, MPU, cs40l20.wmfw + cs40l20.bin from the ADT
+/blueline-haptic, DSP start, 2 s playback cap) and makes /dev/bluehaptic
+("click N", "vibe MS" <= 1000, "stop"). bluehaptic_test=1: three 50 ms
+buzzes; =2: every wavetable click. Register sequence from Linux
+drivers/misc/cs40l2x.c (as hardware documentation; rewritten).
+BBI2C_MAX_BUSES 2 -> 4.
+---
+ bsd/conf/files                        |   1 +
+ bsd/dev/blueline_haptic.c             | 914 ++++++++++++++++++++++++++
+ bsd/dev/blueline_touch.c              |   2 +-
+ bsd/dev/sweet_ufs.c                   |   5 +
+ iokit/Kernel/arm/BlueBacklight.cpp    | 646 ++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  19 +
+ iokit/conf/files.arm64                |   1 +
+ 7 files changed, 1587 insertions(+), 1 deletion(-)
+ create mode 100644 bsd/dev/blueline_haptic.c
+ create mode 100644 iokit/Kernel/arm/BlueBacklight.cpp
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index dfc34cb89..787318263 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/blueline_scm.c			standard
+ bsd/dev/blueline_wdt.c			standard
+ bsd/dev/blueline_wifi.c			standard
+ bsd/dev/blueline_gpu.c			standard
++bsd/dev/blueline_haptic.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/blueline_haptic.c b/bsd/dev/blueline_haptic.c
+new file mode 100644
+index 000000000..2ded04d1a
+--- /dev/null
++++ b/bsd/dev/blueline_haptic.c
+@@ -0,0 +1,914 @@
++/*
++ * Pixel 3 (blueline) haptics (patch 0150): Cirrus Logic CS40L20 boosted
++ * haptic driver with a HALO DSP.
++ *
++ * Hardware, from the production device tree overlay (stock dtbo.img entry 8,
++ * "B1 DVT1.1"; the DRV2624 nodes are only on the dev/proto entries 0-2, and
++ * PMI8998's haptics block is disabled):
++ *   cs40l20@43 on qupv3_se5_i2c (i2c@894000): SDA GPIO 85, SCL GPIO 86 (TLMM
++ *   east tile), reset GPIO 87 (active high, pinctrl default output-low),
++ *   no VA/VP supplies listed (always on), boost 1.0 uH / 4 uF / 4.5 A peak,
++ *   f0-default 0x265c50, redc-default 0x50030, gpio1-mode 2 (auto).
++ * Firmware: vendor /firmware/cs40l20.wmfw (the DSP program) and cs40l20.bin
++ * (the wavetable, "WMDR"). Not redistributable: tools/mkadt.py --haptic-fw
++ * copies them into the ADT (/blueline-haptic "wmfw", "wavetable").
++ *
++ * The sequence is the one Linux's drivers/misc/cs40l2x.c (Cirrus Logic,
++ * GPL) runs for revision A0, used here only as a description of the chip
++ * (register addresses, values, file layouts); this file is written from
++ * scratch: reset pulse, OTP boot done, DEVID 0x35A40 / REVID 0xA0, the A0
++ * register fixes, OTP trim unpack (trim tables: register, shift, width,
++ * from that driver's cs40l2x-tables.c), boost, signal routing, DSP memory
++ * protection opened, program and wavetable written, DSP started, playback
++ * timeout set. Playback: an index into the wavetable on MBOX 1 (a click,
++ * ends by itself), or MBOX 2 = 0 for the continuous "vibe" waveform, ended
++ * by the firmware's ENDPLAYBACK control.
++ *
++ * The bus is bit-banged on the SE's pins (blueline_touch.c's
++ * blueline_bbi2c_*, as the MAX1720x in 0141): 32-bit register addresses and
++ * values, big-endian, auto-increment. Program and wavetable go in 16-byte
++ * writes (interrupts are masked per transfer), about 40 KB in all: several
++ * seconds, on a thread of its own. Any failure parks the chip in reset.
++ *
++ * Boot-args:
++ *   bluehaptic=0      off (default)
++ *   bluehaptic=1      probe only: log pins 85-87, pulse reset, wait for OTP
++ *                     boot, read DEVID/REVID/OTPID, put the reset pin back
++ *                     as found
++ *   bluehaptic=2      full bring-up (needs the ADT firmware), then
++ *                     /dev/bluehaptic
++ *   bluehaptic_test=1 after bring-up: three 50 ms buzzes, 300 ms apart
++ *   bluehaptic_test=2 after bring-up: each wavetable entry (click) once, 400 ms apart
++ *   bluehaptic_amp=N  not used yet (the firmware's default gain)
++ * /dev/bluehaptic (0666) takes text lines: "click N" (wavetable entry
++ * N >= 1), "vibe MS" (continuous, capped at 1000 ms, then stopped), "stop".
++ * Log prefix "BLUE HAPTIC:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/stat.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);	/* blueline_touch.c */
++extern int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
++    uint32_t rlen);
++extern void IOSleep(unsigned int milliseconds);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void blueline_haptic_start(void);
++
++#define HAP_TLMM_PA	0x03500000u	/* TLMM east: GPIO 85, 86, 87 */
++#define HAP_SDA		85
++#define HAP_SCL		86
++#define HAP_RESET	87
++#define GPIO_CFG(n)	(0x1000u * (n))
++#define GPIO_IO(n)	(0x1000u * (n) + 4u)
++#define HAP_ADDR	0x43u
++#define HAP_CHUNK	16u		/* bytes per bulk write */
++
++/* CS40L20 registers */
++#define R_DEVID			0x00000000u
++#define R_REVID			0x00000004u
++#define R_OTPID			0x00000010u
++#define R_TEST_KEY_CTL		0x00000040u
++#define R_CTRL_ASYNC1		0x00000054u
++#define R_OTP_MEM0		0x00000400u
++#define R_PWR_CTRL1		0x00002014u
++#define R_PLL_LOOP_PARAM	0x00003008u
++#define R_PLL_MISC_CTRL		0x00003014u
++#define R_BST_PEAK_CUR		0x00003808u
++#define R_BST_COEFF		0x00003810u
++#define R_BST_SLOPE_LBST	0x00003814u
++#define R_BST_DCM_CTRL		0x0000381cu
++#define R_OTP_TRIM_30		0x00007418u
++#define R_DAC_PCM1_SRC		0x00004c00u
++#define R_DSP1_RX2_SRC		0x00004c44u
++#define R_DSP1_RX3_SRC		0x00004c48u
++#define R_DSP1_RX4_SRC		0x00004c4cu
++#define R_IRQ1_STATUS3		0x00010018u
++#define R_IRQ1_STATUS4		0x0001001cu
++#define R_IRQ1_DB3		0x00010318u
++#define R_IRQ2_DB3		0x00010b18u
++#define R_MBOX_TRIGGERINDEX	0x00013020u
++#define R_MBOX_TRIGGER_MS	0x00013024u
++#define R_XMEM_PACK0		0x02000000u
++#define R_XMEM_UNPACK24		0x02800000u
++#define R_XM_FW_ID		(R_XMEM_UNPACK24 + 12u)
++#define R_XM_NUM_ALGOS		(R_XMEM_UNPACK24 + 36u)
++#define R_DSP1_CCM_CORE_CTRL	0x02bc1000u
++#define R_MPU_LOCK_CONFIG	0x02bc3140u
++#define R_YMEM_PACK0		0x02c00000u
++#define R_YMEM_UNPACK24		0x03400000u
++#define R_PMEM0			0x03800000u
++
++#define DEVID_L20		0x035a40u
++#define REVID_A0		0xa0u
++#define FW_REV_MIN		0x040200u
++#define ALGO_LIST_TERM		0xbedeadu
++#define HALO_RUNNING		2u
++#define T_XM_UNPACKED		0x05u
++#define T_YM_UNPACKED		0x06u
++#define T_PM_PACKED		0x10u
++#define T_XM_PACKED		0x11u
++#define T_YM_PACKED		0x12u
++#define T_ALGO_INFO		0xf2u
++#define HAP_TIMEOUT_MS		2000u	/* DSP playback cap (Linux uses ~174 s) */
++#define HAP_VIBE_MAX_MS		1000u
++
++#define F0_DEFAULT		0x265c50u
++#define REDC_DEFAULT		0x050030u
++
++struct hap_trim {
++	uint32_t reg;
++	uint8_t shift, size;
++};
++
++/* OTP map 0xC trims (map 0xD: entry 93 is 0x4000 bit 11; map 0xE: also 0x3010 bits 7:2 at the end). */
++static const struct hap_trim hap_trims[] = {
++	{ 0x2030,  0,  4 }, { 0x2030,  7,  1 }, { 0x208c, 24,  6 }, { 0x2090, 14,  4 },
++	{ 0x2090, 10,  4 }, { 0x300c, 11,  4 }, { 0x394c, 23,  2 }, { 0x3950,  0,  7 },
++	{ 0x3950,  8,  7 }, { 0x3950, 16,  8 }, { 0x3950, 24,  8 }, { 0x3954,  0,  7 },
++	{ 0x3954,  8,  7 }, { 0x3954, 16,  8 }, { 0x3954, 24,  8 }, { 0x3958,  0,  7 },
++	{ 0x3958,  8,  7 }, { 0x3958, 16,  8 }, { 0x3958, 24,  8 }, { 0x395c,  0,  7 },
++	{ 0x395c,  8,  7 }, { 0x395c, 16,  8 }, { 0x395c, 24,  8 }, { 0x416c,  0,  8 },
++	{ 0x4160,  0,  7 }, { 0x416c,  8,  8 }, { 0x4160, 16, 10 }, { 0x416c, 16, 12 },
++	{ 0x416c, 28,  1 }, { 0x4170,  0,  6 }, { 0x4170,  6,  1 }, { 0x4170,  8,  6 },
++	{ 0x4170, 14,  1 }, { 0x4170, 16,  9 }, { 0x4360,  0,  5 }, { 0x4360,  6,  9 },
++	{ 0x4448,  0,  8 }, { 0x4448,  8,  8 }, { 0x4448, 16,  8 }, { 0x4448, 24,  8 },
++	{ 0x444c,  0,  3 }, { 0x6e30,  0,  5 }, { 0x6e30,  8,  5 }, { 0x6e30, 16,  5 },
++	{ 0x6e30, 24,  5 }, { 0x6e34,  0,  5 }, { 0x6e34,  8,  5 }, { 0x6e34, 16,  5 },
++	{ 0x6e34, 24,  5 }, { 0x6e38,  0,  5 }, { 0x6e38,  8,  5 }, { 0x6e38, 16,  5 },
++	{ 0x6e38, 24,  5 }, { 0x6e3c,  0,  5 }, { 0x6e3c,  8,  5 }, { 0x6e3c, 16,  5 },
++	{ 0x6e3c, 24,  5 }, { 0x6e40,  0,  5 }, { 0x6e40,  8,  5 }, { 0x6e40, 16,  5 },
++	{ 0x6e40, 24,  5 }, { 0x6e44,  0,  5 }, { 0x6e48,  0, 10 }, { 0x6e48, 10, 10 },
++	{ 0x6e48, 20, 10 }, { 0x6e4c,  0, 10 }, { 0x6e4c, 10, 10 }, { 0x6e4c, 20, 10 },
++	{ 0x6e50,  0, 10 }, { 0x6e50, 10, 10 }, { 0x6e50, 20, 10 }, { 0x6e54,  0, 10 },
++	{ 0x6e54, 10, 10 }, { 0x6e54, 20, 10 }, { 0x6e58,  0, 10 }, { 0x6e58, 10, 10 },
++	{ 0x6e58, 20, 10 }, { 0x6e5c,  0, 10 }, { 0x6e5c, 10, 10 }, { 0x6e5c, 20, 10 },
++	{ 0x6e60,  0, 10 }, { 0x6e60, 10, 10 }, { 0x6e60, 20, 10 }, { 0x6e64,  0, 10 },
++	{ 0x7418,  7,  5 }, { 0x741c,  0,  5 }, { 0x741c, 11,  4 }, { 0x741c, 19,  4 },
++	{ 0x7434, 17,  1 }, { 0x7434, 18,  7 }, { 0x7068,  0,  9 }, { 0x410c,  7,  1 },
++	{ 0x400c,  0,  7 }, { 0x0000,  0,  1 }, { 0x17040,  0,  8 }, { 0x17040,  8,  8 },
++	{ 0x17040, 16,  8 }, { 0x17040, 24,  8 }, { 0x17044,  0, 24 },
++};
++#define HAP_NTRIMS	(sizeof(hap_trims) / sizeof(hap_trims[0]))
++_Static_assert(HAP_NTRIMS == 99, "cs40l2x trim table C has 99 entries");
++
++/* Firmware controls (coefficients) named by the .wmfw's algorithm blocks. */
++struct hap_coeff {
++	uint32_t algo;
++	uint16_t offset, type;
++	uint32_t reg;
++	char name[32];
++};
++#define HAP_MAX_COEFFS	96
++
++static struct {
++	void *bus;
++	vm_offset_t rst;		/* GPIO 87's registers */
++	uint32_t rst_cfg, rst_io;	/* as found */
++	struct hap_coeff coeff[HAP_MAX_COEFFS];
++	int ncoeff;
++	uint32_t vibegen_id, vibegen_rev;
++	uint32_t wt_limit_xm, wt_limit_ym;
++	uint32_t nwaves;
++	uint32_t r_endplayback;		/* 0 until running */
++	bool ready;
++	int errors;
++} hap;
++
++static int hap_mode, hap_test;
++LCK_GRP_DECLARE(hap_lck_grp, "blueline_haptic");
++LCK_MTX_DECLARE(hap_lock, &hap_lck_grp);
++static thread_call_t hap_stop_call;
++
++static uint32_t
++rd32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)a = v;
++}
++
++/* GPIO 87: plain GPIO output, 2 mA, no pull. */
++static void
++hap_reset_pin(int high)
++{
++	wr32(hap.rst + 4u, high ? 2u : 0u);
++	wr32(hap.rst, 1u << 9);
++}
++
++/* ---- registers ---- */
++
++static int
++hap_rd(uint32_t reg, uint32_t *val)
++{
++	uint8_t a[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg };
++	uint8_t v[4];
++	int err = blueline_bbi2c_xfer(hap.bus, HAP_ADDR, a, 4, v, 4);
++	if (err == 0) {
++		*val = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
++	} else {
++		*val = 0;
++		if (hap.errors++ < 8) {
++			printf("BLUE HAPTIC: read 0x%08x: NACK (%d)\n", reg, err);
++		}
++	}
++	return err;
++}
++
++/* len bytes (a multiple of 4), as stored (big-endian words), from reg on. */
++static int
++hap_raw(uint32_t reg, const uint8_t *data, uint32_t len)
++{
++	uint8_t buf[4 + HAP_CHUNK];
++	for (uint32_t i = 0; i < len; i += HAP_CHUNK) {
++		uint32_t n = len - i < HAP_CHUNK ? len - i : HAP_CHUNK;
++		uint32_t r = reg + i;
++		buf[0] = (uint8_t)(r >> 24);
++		buf[1] = (uint8_t)(r >> 16);
++		buf[2] = (uint8_t)(r >> 8);
++		buf[3] = (uint8_t)r;
++		memcpy(buf + 4, data + i, n);
++		int err = blueline_bbi2c_xfer(hap.bus, HAP_ADDR, buf, 4 + n, NULL, 0);
++		if (err) {
++			if (hap.errors++ < 8) {
++				printf("BLUE HAPTIC: write 0x%08x (+%u bytes): NACK (%d)\n", r, n, err);
++			}
++			return err;
++		}
++	}
++	return 0;
++}
++
++static int
++hap_wr(uint32_t reg, uint32_t val)
++{
++	uint8_t v[4] = { (uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val };
++	return hap_raw(reg, v, 4);
++}
++
++static int
++hap_upd(uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t old;
++	int err = hap_rd(reg, &old);
++	if (err == 0 && ((old & ~mask) | (val & mask)) != old) {
++		err = hap_wr(reg, (old & ~mask) | (val & mask));
++	}
++	return err;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint32_t
++hap_coeff_reg(const char *name, uint16_t type)
++{
++	for (int i = 0; i < hap.ncoeff; i++) {
++		if (hap.coeff[i].type == type && hap.coeff[i].reg != 0 && !strcmp(hap.coeff[i].name, name)) {
++			return hap.coeff[i].reg;
++		}
++	}
++	return 0;
++}
++
++static void
++hap_park(const char *why)
++{
++	hap.ready = false;
++	hap.r_endplayback = 0;
++	hap_reset_pin(0);
++	printf("BLUE HAPTIC: %s: chip parked in reset\n", why);
++}
++
++/* ---- bring-up steps ---- */
++
++/* Reset pulse, OTP boot. Returns REVID, or 0. */
++static uint32_t
++hap_boot(void)
++{
++	uint32_t v = 0, devid = 0, revid = 0, otpid = 0, st3 = 0;
++	hap_reset_pin(0);
++	IOSleep(3);
++	hap_reset_pin(1);
++	IOSleep(2);
++	int i;
++	for (i = 0; i < 10; i++) {
++		IOSleep(10);
++		if (hap_rd(R_IRQ1_STATUS4, &v) == 0 && (v & 2u)) {
++			break;
++		}
++	}
++	hap_rd(R_IRQ1_STATUS3, &st3);
++	hap_rd(R_DEVID, &devid);
++	hap_rd(R_REVID, &revid);
++	hap_rd(R_OTPID, &otpid);
++	printf("BLUE HAPTIC: after reset: OTP boot %s (status4 0x%x, %d ms), status3 0x%x%s, DEVID 0x%x%s"
++	    " REVID 0x%x%s OTPID 0x%x\n", (v & 2u) ? "done" : "NOT done", v, (i + 1) * 10, st3,
++	    (st3 & (1u << 31)) ? " (OTP ERROR)" : "", devid, devid == DEVID_L20 ? " (CS40L20)" : " (unexpected)",
++	    revid, revid == REVID_A0 ? " (A0)" : " (unexpected)", otpid);
++	if (!(v & 2u) || (st3 & (1u << 31)) || devid != DEVID_L20) {
++		return 0;
++	}
++	return revid;
++}
++
++static int
++hap_otp_unpack(void)
++{
++	uint32_t otpid, otp[32];
++	if (hap_rd(R_OTPID, &otpid)) {
++		return EIO;
++	}
++	otpid &= 0xfu;
++	if (otpid != 0xc && otpid != 0xd && otpid != 0xe) {
++		printf("BLUE HAPTIC: OTP map 0x%x unknown (untrimmed part?)\n", otpid);
++		return ENODEV;
++	}
++	for (int i = 0; i < 32; i++) {
++		if (hap_rd(R_OTP_MEM0 + 4u * i, &otp[i])) {
++			return EIO;
++		}
++	}
++	if (hap_wr(R_TEST_KEY_CTL, 0x55) || hap_wr(R_TEST_KEY_CTL, 0xaa)) {
++		return EIO;
++	}
++	uint32_t row = 2, col = 16, n = HAP_NTRIMS + (otpid == 0xe ? 1 : 0), written = 0;
++	int err = 0;
++	for (uint32_t i = 0; i < n && !err; i++) {
++		struct hap_trim t = i < HAP_NTRIMS ? hap_trims[i] : (struct hap_trim){ 0x3010, 2, 6 };
++		if (i == 93 && otpid != 0xc) {
++			t = (struct hap_trim){ 0x4000, 11, 1 };
++		}
++		if (row >= 32) {
++			err = EINVAL;
++			break;
++		}
++		uint64_t pair = (uint64_t)otp[row] | (row + 1 < 32 ? (uint64_t)otp[row + 1] << 32 : 0);
++		uint32_t val = (uint32_t)((pair >> col) & ((1ull << t.size) - 1));
++		col += t.size;
++		if (col > 31) {
++			col -= 32;
++			row++;
++		}
++		if (t.reg == 0) {
++			continue;
++		}
++		uint32_t mask = (uint32_t)(((1ull << t.size) - 1) << t.shift);
++		err = hap_upd(t.reg, mask, val << t.shift);
++		written++;
++	}
++	hap_wr(R_TEST_KEY_CTL, 0xcc);
++	hap_wr(R_TEST_KEY_CTL, 0x33);
++	printf("BLUE HAPTIC: OTP map 0x%x: %u trims written%s\n", otpid, written, err ? ", FAILED" : "");
++	return err;
++}
++
++static int
++hap_chip_init(void)
++{
++	static const uint32_t a0_fix[][2] = {
++		{ R_OTP_TRIM_30, 0x9091a1c8u }, { R_PLL_LOOP_PARAM, 0x000c1837u },
++		{ R_PLL_MISC_CTRL, 0x03008e0eu }, { R_BST_DCM_CTRL, 0x51u },
++		{ R_CTRL_ASYNC1, 4u }, { R_IRQ1_DB3, 0 }, { R_IRQ2_DB3, 0 },
++	};
++	for (unsigned i = 0; i < sizeof(a0_fix) / sizeof(a0_fix[0]); i++) {
++		if (hap_wr(a0_fix[i][0], a0_fix[i][1])) {
++			return EIO;
++		}
++	}
++	int err = hap_otp_unpack();
++	if (err) {
++		return err;
++	}
++	/* Boost: 1.0 uH, 4 uF (K1 = K2 = 0x24, slope 0x75), 4500 mA peak ((4500 - 1600) / 50 + 0x10). */
++	err = hap_upd(R_BST_COEFF, 0xffu, 0x24u) ||
++	    hap_upd(R_BST_COEFF, 0xff00u, 0x24u << 8) ||
++	    hap_upd(R_BST_SLOPE_LBST, 0xff00u, 0x75u << 8) ||
++	    hap_upd(R_BST_SLOPE_LBST, 0x3u, 0) ||
++	    hap_upd(R_BST_PEAK_CUR, 0x7fu, 0x4au) ||
++	    /* DAC from DSP TX1; DSP RX2..4 from VMON, IMON, VPMON */
++	    hap_upd(R_DAC_PCM1_SRC, 0x7fu, 0x32u) ||
++	    hap_upd(R_DSP1_RX2_SRC, 0x7fu, 0x18u) ||
++	    hap_upd(R_DSP1_RX3_SRC, 0x7fu, 0x19u) ||
++	    hap_upd(R_DSP1_RX4_SRC, 0x7fu, 0x28u);
++	if (err) {
++		return EIO;
++	}
++	/* DSP memory protection: everything accessible. */
++	static const uint16_t mpu[] = {
++		0x3000, 0x3004, 0x3008, 0x300c, 0x3014, 0x3020, 0x3024, 0x302c,
++		0x3038, 0x303c, 0x3044, 0x3050, 0x3054, 0x305c,
++	};
++	err = hap_wr(R_MPU_LOCK_CONFIG, 0x5555) || hap_wr(R_MPU_LOCK_CONFIG, 0xaaaa);
++	for (unsigned i = 0; i < sizeof(mpu) / sizeof(mpu[0]) && !err; i++) {
++		err = hap_wr(0x02bc0000u + mpu[i], 0xffffffffu);
++	}
++	err = err || hap_wr(R_MPU_LOCK_CONFIG, 0);
++	printf("BLUE HAPTIC: A0 fixes, trims, boost (1.0 uH, 4 uF, 4.5 A), routing, MPU open%s\n",
++	    err ? ": FAILED" : "");
++	return err ? EIO : 0;
++}
++
++static void
++hap_algo_info(const uint8_t *d, uint32_t len)
++{
++	if (len < 12) {
++		return;
++	}
++	uint32_t pos = 0, id = le32(d);
++	pos += 4;
++	pos += (d[pos] / 4u) * 4u + 4u;                         /* name */
++	if (pos + 2 > len) {
++		return;
++	}
++	pos += ((uint32_t)(d[pos] | d[pos + 1] << 8) / 4u) * 4u + 4u;   /* description */
++	if (pos + 4 > len) {
++		return;
++	}
++	uint32_t count = le32(d + pos);
++	pos += 4;
++	for (uint32_t i = 0; i < count && pos + 9 <= len; i++) {
++		uint16_t off = (uint16_t)(d[pos] | d[pos + 1] << 8);
++		uint16_t type = (uint16_t)(d[pos + 2] | d[pos + 3] << 8);
++		uint32_t blen = le32(d + pos + 4);
++		uint32_t nlen = d[pos + 8];
++		if (hap.ncoeff < HAP_MAX_COEFFS) {
++			struct hap_coeff *c = &hap.coeff[hap.ncoeff++];
++			c->algo = id;
++			c->offset = off;
++			c->type = type;
++			c->reg = 0;
++			uint32_t m = nlen < sizeof(c->name) - 1 ? nlen : sizeof(c->name) - 1;
++			if (pos + 9 + m > len) {
++				m = 0;
++			}
++			memcpy(c->name, d + pos + 9, m);
++			c->name[m] = 0;
++		}
++		pos += 8 + blen;
++	}
++}
++
++static int
++hap_load_wmfw(const uint8_t *fw, uint32_t size)
++{
++	if (size < 40 || memcmp(fw, "WMFW", 4)) {
++		printf("BLUE HAPTIC: wmfw: not a WMFW file\n");
++		return EINVAL;
++	}
++	uint32_t pos = 40, blocks = 0, bytes = 0;
++	uint64_t t0 = mach_absolute_time();
++	while (pos + 8 <= size) {
++		uint32_t off = (uint32_t)fw[pos] | (uint32_t)fw[pos + 1] << 8 | (uint32_t)fw[pos + 2] << 16;
++		uint8_t type = fw[pos + 3];
++		uint32_t len = le32(fw + pos + 4);
++		pos += 8;
++		if (len > size - pos) {
++			printf("BLUE HAPTIC: wmfw: block at %u runs past the end\n", pos - 8);
++			return EINVAL;
++		}
++		uint32_t reg = 0;
++		switch (type) {
++		case T_PM_PACKED: reg = R_PMEM0 + off * 5u; break;
++		case T_XM_PACKED: reg = R_XMEM_PACK0 + off * 3u; break;
++		case T_YM_PACKED: reg = R_YMEM_PACK0 + off * 3u; break;
++		case T_ALGO_INFO: hap_algo_info(fw + pos, len); break;
++		default: break;
++		}
++		if (reg != 0) {
++			if (len & 3u) {
++				printf("BLUE HAPTIC: wmfw: type 0x%x block of %u bytes\n", type, len);
++				return EINVAL;
++			}
++			if (hap_raw(reg, fw + pos, len)) {
++				return EIO;
++			}
++			blocks++;
++			bytes += len;
++		}
++		pos += len;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUE HAPTIC: wmfw: %u blocks, %u bytes written in %llu ms, %d controls\n", blocks, bytes,
++	    ns / 1000000, hap.ncoeff);
++	return 0;
++}
++
++/* Algorithm list in XM: place the controls, find VIBEGEN's wavetable. */
++static int
++hap_coeff_init(void)
++{
++	uint32_t num, reg = R_XM_FW_ID, term = 0;
++	if (hap_rd(R_XM_NUM_ALGOS, &num) || num > 16) {
++		printf("BLUE HAPTIC: algorithm count %u bad\n", num);
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < num + 1; i++) {
++		uint32_t e[6];
++		for (int k = 0; k < 6; k++) {
++			if (hap_rd(reg + 4u * k, &e[k])) {
++				return EIO;
++			}
++		}
++		printf("BLUE HAPTIC: algo %u: id 0x%x rev %u.%u.%u XM base 0x%x size 0x%x YM base 0x%x size 0x%x\n",
++		    i, e[0], (e[1] >> 16) & 0xff, (e[1] >> 8) & 0xff, e[1] & 0xff, e[2], e[3], e[4], e[5]);
++		if (i == 0 && e[1] < FW_REV_MIN) {
++			printf("BLUE HAPTIC: firmware revision below 4.2.0\n");
++			return EINVAL;
++		}
++		for (int c = 0; c < hap.ncoeff; c++) {
++			struct hap_coeff *co = &hap.coeff[c];
++			if (co->algo != e[0]) {
++				continue;
++			}
++			if (co->type == T_XM_UNPACKED) {
++				co->reg = R_XMEM_UNPACK24 + e[2] * 4u + co->offset * 4u;
++				if (!strcmp(co->name, "WAVETABLE")) {
++					hap.wt_limit_xm = (e[3] - co->offset) * 4u;
++					hap.vibegen_id = e[0];
++					hap.vibegen_rev = e[1];
++				}
++			} else if (co->type == T_YM_UNPACKED) {
++				co->reg = R_YMEM_UNPACK24 + e[4] * 4u + co->offset * 4u;
++				if (!strcmp(co->name, "WAVETABLEYM")) {
++					hap.wt_limit_ym = (e[5] - co->offset) * 4u;
++				}
++			}
++		}
++		reg += i ? 24u : 28u;
++	}
++	hap_rd(reg, &term);
++	if (term != ALGO_LIST_TERM) {
++		printf("BLUE HAPTIC: algorithm list terminator 0x%x\n", term);
++		return EINVAL;
++	}
++	printf("BLUE HAPTIC: wavetable room %u bytes XM, %u YM (VIBEGEN 0x%x)\n", hap.wt_limit_xm,
++	    hap.wt_limit_ym, hap.vibegen_id);
++	return hap.vibegen_id ? 0 : ENOENT;
++}
++
++static int
++hap_load_wavetable(const uint8_t *wt, uint32_t size)
++{
++	if (size < 16 || memcmp(wt, "WMDR", 4)) {
++		printf("BLUE HAPTIC: wavetable: not a WMDR file\n");
++		return EINVAL;
++	}
++	uint32_t pos = 16;
++	while (pos + 20 <= size) {
++		uint32_t type = (uint32_t)wt[pos + 2] | (uint32_t)wt[pos + 3] << 8;
++		uint32_t algo = le32(wt + pos + 4), rev = le32(wt + pos + 8), len = le32(wt + pos + 16);
++		pos += 20;
++		if (len > size - pos) {
++			printf("BLUE HAPTIC: wavetable: block runs past the end\n");
++			return EINVAL;
++		}
++		if (type == T_XM_UNPACKED || type == T_YM_UNPACKED) {
++			bool xm = type == T_XM_UNPACKED;
++			uint32_t reg = hap_coeff_reg(xm ? "WAVETABLE" : "WAVETABLEYM", (uint16_t)type);
++			uint32_t limit = xm ? hap.wt_limit_xm : hap.wt_limit_ym;
++			if (algo != hap.vibegen_id || ((rev >> 8) & 0xff0000u) != (hap.vibegen_rev & 0xff0000u) ||
++			    reg == 0 || len > limit || (len & 3u)) {
++				printf("BLUE HAPTIC: wavetable %s block: algo 0x%x rev 0x%x, %u bytes (room %u, reg 0x%x):"
++				    " does not fit this firmware\n", xm ? "XM" : "YM", algo, rev, len, limit, reg);
++				return EINVAL;
++			}
++			if (hap_raw(reg, wt + pos, len)) {
++				return EIO;
++			}
++			printf("BLUE HAPTIC: wavetable %s: %u bytes at 0x%x\n", xm ? "XM" : "YM", len, reg);
++		}
++		pos += len;
++	}
++	return 0;
++}
++
++static int
++hap_dsp_start(void)
++{
++	uint32_t r_gpio = hap_coeff_reg("GPIO_ENABLE", T_XM_UNPACKED);
++	uint32_t r_halo = hap_coeff_reg("HALO_STATE", T_XM_UNPACKED);
++	uint32_t r_tmo = hap_coeff_reg("TIMEOUT_MS", T_XM_UNPACKED);
++	uint32_t r_nw = hap_coeff_reg("NUMBEROFWAVES", T_XM_UNPACKED);
++	uint32_t r_f0 = hap_coeff_reg("F0_STORED", T_XM_UNPACKED);
++	uint32_t r_redc = hap_coeff_reg("REDC_STORED", T_XM_UNPACKED);
++	uint32_t r_end = hap_coeff_reg("ENDPLAYBACK", T_XM_UNPACKED);
++	printf("BLUE HAPTIC: controls: GPIO_ENABLE 0x%x HALO_STATE 0x%x TIMEOUT_MS 0x%x NUMBEROFWAVES 0x%x"
++	    " F0_STORED 0x%x REDC_STORED 0x%x ENDPLAYBACK 0x%x\n", r_gpio, r_halo, r_tmo, r_nw, r_f0, r_redc, r_end);
++	if (!r_halo || !r_tmo || !r_nw || !r_end) {
++		return ENOENT;
++	}
++	if (r_gpio && hap_wr(r_gpio, 0)) {                      /* GPIO1 button trigger off */
++		return EIO;
++	}
++	if (hap_upd(R_PWR_CTRL1, 1u, 1u) || hap_upd(R_DSP1_CCM_CORE_CTRL, 0x201u, 0x201u)) {
++		return EIO;
++	}
++	uint32_t st = 0;
++	int i;
++	for (i = 0; i < 10; i++) {
++		IOSleep(10);
++		if (hap_rd(r_halo, &st) == 0 && st == HALO_RUNNING) {
++			break;
++		}
++	}
++	if (st != HALO_RUNNING) {
++		printf("BLUE HAPTIC: DSP state %u after 100 ms, not running\n", st);
++		return ETIMEDOUT;
++	}
++	if (hap_wr(r_tmo, HAP_TIMEOUT_MS) || hap_rd(r_nw, &hap.nwaves)) {
++		return EIO;
++	}
++	if ((r_f0 && hap_wr(r_f0, F0_DEFAULT)) || (r_redc && hap_wr(r_redc, REDC_DEFAULT))) {
++		return EIO;
++	}
++	printf("BLUE HAPTIC: DSP running after %d ms, %u waveforms, playback cap %u ms, f0 0x%x ReDC 0x%x\n",
++	    (i + 1) * 10, hap.nwaves, HAP_TIMEOUT_MS, F0_DEFAULT, REDC_DEFAULT);
++	if (hap.nwaves == 0) {
++		return ENOENT;
++	}
++	hap.r_endplayback = r_end;
++	return 0;
++}
++
++/* ---- playback (hap_lock held) ---- */
++
++static int
++hap_stop_locked(void)
++{
++	if (!hap.ready) {
++		return ENXIO;
++	}
++	for (int i = 0; i < 10; i++) {
++		if (hap_wr(hap.r_endplayback, 1) == 0) {
++			return 0;
++		}
++		IOSleep(10);
++	}
++	hap_park("ENDPLAYBACK not taken");
++	return EIO;
++}
++
++static int
++hap_click_locked(uint32_t index)
++{
++	if (!hap.ready) {
++		return ENXIO;
++	}
++	if (index < 1 || index > hap.nwaves || index > 0x7fff) {
++		return EINVAL;
++	}
++	return hap_wr(R_MBOX_TRIGGERINDEX, index) ? EIO : 0;
++}
++
++static int
++hap_vibe_locked(uint32_t ms)
++{
++	if (!hap.ready) {
++		return ENXIO;
++	}
++	if (ms == 0) {
++		return hap_stop_locked();
++	}
++	if (ms > HAP_VIBE_MAX_MS) {
++		ms = HAP_VIBE_MAX_MS;
++	}
++	if (hap_wr(R_MBOX_TRIGGER_MS, 0)) {                     /* index 0: the continuous waveform */
++		return EIO;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(hap_stop_call, deadline);
++	return 0;
++}
++
++static void
++hap_stop_fired(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	lck_mtx_lock(&hap_lock);
++	hap_stop_locked();
++	lck_mtx_unlock(&hap_lock);
++}
++
++/* ---- /dev/bluehaptic ---- */
++
++static uint32_t hap_cmds;
++
++static int
++hap_dev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++static int
++hap_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++static int
++hap_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char buf[64];
++	user_ssize_t n = uio_resid(uio);
++	if (n <= 0) {
++		return 0;
++	}
++	if (n > (user_ssize_t)sizeof(buf) - 1) {
++		n = sizeof(buf) - 1;
++	}
++	int err = uiomove(buf, (int)n, uio);
++	if (err) {
++		return err;
++	}
++	buf[n] = 0;
++	uio_setresid(uio, 0);                                   /* the rest of a long write is dropped */
++	char *nl = strchr(buf, '\n');
++	if (nl != NULL) {
++		*nl = 0;
++	}
++	uint32_t arg = 0;
++	const char *num = strchr(buf, ' ');
++	if (num != NULL) {
++		while (*num == ' ') {
++			num++;
++		}
++		while (*num >= '0' && *num <= '9' && arg < 1000000) {
++			arg = arg * 10 + (uint32_t)(*num++ - '0');
++		}
++	}
++	lck_mtx_lock(&hap_lock);
++	if (!strncmp(buf, "click", 5)) {
++		err = hap_click_locked(arg);
++	} else if (!strncmp(buf, "vibe", 4)) {
++		err = hap_vibe_locked(arg);
++	} else if (!strncmp(buf, "stop", 4)) {
++		thread_call_cancel(hap_stop_call);
++		err = hap_stop_locked();
++	} else {
++		err = EINVAL;
++	}
++	uint32_t c = ++hap_cmds;
++	lck_mtx_unlock(&hap_lock);
++	if (c <= 32 || err) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("BLUE HAPTIC: %s: \"%s\" -> %d\n", name, buf, err);
++	}
++	return err;
++}
++
++static const struct cdevsw hap_cdevsw = {
++	.d_open = hap_dev_open, .d_close = hap_dev_close,
++	.d_read = eno_rdwrt, .d_write = hap_dev_write, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++/* ---- bring-up thread ---- */
++
++static void
++hap_log_pins(const char *when)
++{
++	vm_offset_t t = ml_io_map(HAP_TLMM_PA + GPIO_CFG(HAP_SDA), 0x3000);
++	if (t == 0) {
++		return;
++	}
++	printf("BLUE HAPTIC: pins %s: SDA85 cfg 0x%x io 0x%x, SCL86 cfg 0x%x io 0x%x, RST87 cfg 0x%x io 0x%x\n",
++	    when, rd32(t), rd32(t + 4), rd32(t + 0x1000), rd32(t + 0x1004), rd32(t + 0x2000), rd32(t + 0x2004));
++}
++
++static void
++hap_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int err = 0;
++	hap_log_pins("as found");
++	hap.rst = ml_io_map(HAP_TLMM_PA + GPIO_CFG(HAP_RESET), 0x1000);
++	if (hap.rst == 0) {
++		printf("BLUE HAPTIC: no TLMM mapping\n");
++		return;
++	}
++	hap.rst_cfg = rd32(hap.rst);
++	hap.rst_io = rd32(hap.rst + 4u);
++	hap.bus = blueline_bbi2c_open(HAP_TLMM_PA, HAP_SDA, HAP_SCL);
++	if (hap.bus == NULL) {
++		printf("BLUE HAPTIC: no bit-banged bus (BBI2C_MAX_BUSES?)\n");
++		return;
++	}
++	lck_mtx_lock(&hap_lock);
++	uint32_t revid = hap_boot();
++	if (hap_mode == 1 || revid == 0) {
++		wr32(hap.rst + 4u, hap.rst_io);
++		wr32(hap.rst, hap.rst_cfg);
++		lck_mtx_unlock(&hap_lock);
++		hap_log_pins("restored");
++		printf("BLUE HAPTIC: probe %s, reset pin restored (cfg 0x%x io 0x%x)\n",
++		    revid ? "done" : "FAILED", hap.rst_cfg, hap.rst_io);
++		return;
++	}
++	if (revid != REVID_A0) {
++		lck_mtx_unlock(&hap_lock);
++		hap_park("only revision A0 (cs40l20.wmfw) is handled");
++		return;
++	}
++
++	DTEntry node;
++	void const *wmfw = NULL, *wt = NULL;
++	unsigned wmfw_size = 0, wt_size = 0;
++	if (SecureDTLookupEntry(NULL, "/blueline-haptic", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "wmfw", &wmfw, &wmfw_size) != kSuccess ||
++	    SecureDTGetProperty(node, "wavetable", &wt, &wt_size) != kSuccess) {
++		lck_mtx_unlock(&hap_lock);
++		hap_park("no /blueline-haptic wmfw + wavetable in the ADT (tools/mkadt.py --haptic-fw)");
++		return;
++	}
++	printf("BLUE HAPTIC: ADT wmfw %u bytes, wavetable %u bytes\n", wmfw_size, wt_size);
++	err = hap_chip_init();
++	err = err ? err : hap_load_wmfw(wmfw, wmfw_size);
++	err = err ? err : hap_coeff_init();
++	err = err ? err : hap_load_wavetable(wt, wt_size);
++	err = err ? err : hap_dsp_start();
++	if (err) {
++		lck_mtx_unlock(&hap_lock);
++		hap_park("bring-up failed");
++		return;
++	}
++	hap.ready = true;
++	lck_mtx_unlock(&hap_lock);
++
++	int major = cdevsw_add(-1, &hap_cdevsw);
++	if (major >= 0) {
++		devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "bluehaptic");
++	}
++	printf("BLUE HAPTIC: ready, /dev/bluehaptic %s (\"click N\" 1..%u, \"vibe MS\" <= %u, \"stop\")\n",
++	    major >= 0 ? "made" : "NOT made", hap.nwaves, HAP_VIBE_MAX_MS);
++
++	if (hap_test == 1) {
++		for (int i = 0; i < 3; i++) {
++			lck_mtx_lock(&hap_lock);
++			err = hap_wr(R_MBOX_TRIGGER_MS, 0) ? EIO : 0;
++			lck_mtx_unlock(&hap_lock);
++			IOSleep(50);
++			lck_mtx_lock(&hap_lock);
++			int err2 = hap_stop_locked();
++			lck_mtx_unlock(&hap_lock);
++			printf("BLUE HAPTIC: test buzz %d/3 (50 ms): start %d stop %d\n", i + 1, err, err2);
++			IOSleep(300);
++		}
++	} else if (hap_test == 2) {
++		for (uint32_t i = 1; i <= hap.nwaves && i <= 64; i++) {
++			lck_mtx_lock(&hap_lock);
++			err = hap_click_locked(i);
++			lck_mtx_unlock(&hap_lock);
++			printf("BLUE HAPTIC: test click %u/%u: %d\n", i, hap.nwaves, err);
++			IOSleep(400);
++		}
++	}
++}
++
++/* bsd/dev/sweet_ufs.c, after the touchscreen. */
++void
++blueline_haptic_start(void)
++{
++	PE_parse_boot_argn("bluehaptic", &hap_mode, sizeof(hap_mode));
++	PE_parse_boot_argn("bluehaptic_test", &hap_test, sizeof(hap_test));
++	if (hap_mode <= 0) {
++		return;
++	}
++	hap_stop_call = thread_call_allocate(hap_stop_fired, NULL);
++	thread_t th;
++	if (hap_stop_call == NULL || kernel_thread_start(hap_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("BLUE HAPTIC: no thread\n");
++		return;
++	}
++	thread_deallocate(th);
++	printf("BLUE HAPTIC: bluehaptic=%d test=%d: CS40L20 at 0x43 on GPIO 85/86, reset GPIO 87\n", hap_mode, hap_test);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+index 1bce11196..f8af27f7d 100644
+--- a/bsd/dev/blueline_touch.c
++++ b/bsd/dev/blueline_touch.c
+@@ -257,7 +257,7 @@ fts_xfer(const uint8_t *cmd, uint32_t clen, uint8_t *out, uint32_t len)
+  * no device sees a command. Then: blueline_bbi2c_xfer(), 0 or EIO (NACK) /
+  * EINVAL. Thread context; one caller at a time per bus.
+  */
+-#define BBI2C_MAX_BUSES	2
++#define BBI2C_MAX_BUSES	4	/* touch-script, MAX1720x (0141), CS40L20 (0150) */
+ void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);
+ int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
+     uint32_t rlen);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e7cebb43c..e8cd45d9a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -651,6 +651,11 @@ sweet_ufs_init(void)
+ 	blueline_touch_init();
+ 	/* bluetouchscript= (patch 0146, blueline_touch.c) */
+ 	blueline_touchscript_start();
++	{
++		/* CS40L20 haptics, off unless bluehaptic=1|2 (patch 0150, blueline_haptic.c). */
++		extern void blueline_haptic_start(void);
++		blueline_haptic_start();
++	}
+ 	/* Wi-Fi stage 1: SCM queries and read-only state, off unless bluewifi=1 (blueline_wifi.c). */
+ 	blueline_wifi_probe();
+ 	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
+diff --git a/iokit/Kernel/arm/BlueBacklight.cpp b/iokit/Kernel/arm/BlueBacklight.cpp
+new file mode 100644
+index 000000000..b00e0c4fc
+--- /dev/null
++++ b/iokit/Kernel/arm/BlueBacklight.cpp
+@@ -0,0 +1,646 @@
++/*
++ * Pixel 3 (blueline) display brightness (patch 0150).
++ *
++ * The panel: LG SW43408 AMOLED, DSC, DSI command mode on DSI0 (0xae94000),
++ * brightness by the DCS command SET_DISPLAY_BRIGHTNESS (0x51) with two
++ * parameter bytes, most significant first. Downstream crosshatch
++ * dsi-panel-sw43408-dsc-fhd-cmd.dtsi: qcom,mdss-dsi-bl-pmic-control-type =
++ * "bl_ctrl_dcs" (no PWM, no WLED), bl-min-level 0x8 ("2.74 nits"),
++ * bl-max-level 0x384 = 900 ("399.81 nits"), up to 0x3ff in its HBM range;
++ * its own lp-mode commands write "39 .. 03 51 03 87" (0x387, big-endian).
++ * Mainline panel-lg-sw43408.c: mipi_dsi_dcs_set_display_brightness_large()
++ * (big-endian u16). No WRCTRLD (0x53) is sent here: ABL's init sequence
++ * (the dtsi's on-command, "53 0C 30") already enables brightness control.
++ *
++ * The write: a DCS long write (data type 0x39, 3 bytes: 51 hi lo) from the
++ * DSI0 command FIFO, low-power mode, as 0123's short writes (dcsWrite() in
++ * SweetFramebuffer.cpp; downstream dsi_ctrl_hw_cmn_kickoff_fifo_command(),
++ * header bytes as upstream dsi_host.c dsi_cmd_dma_add(): WC lo, WC hi,
++ * VC|DT, flags 0x80 last | 0x40 long; payload padded with 0xff). Before it,
++ * the MDP's autorefresh on the pingpong feeding DSI0 is stopped and the
++ * frame in flight drained, and it is put back afterwards (a command-mode
++ * panel keeps showing its own frame memory meanwhile).
++ *
++ * All DSI writes run on AppleCLCD's vsync workloop thread (blue_bl_tick()),
++ * so they never overlap 0123's display off/on DCS writes, and (with the
++ * 0145 flip on) only while the framebuffer's present lock is free. A request
++ * only records the wanted level; the tick sends the latest one at most
++ * every BL_MIN_TICKS vsyncs. Never while the display is off: the level is
++ * sent again once it is back on. Any write that does not complete turns
++ * the DCS path off for the boot (autorefresh restored); requests are still
++ * logged.
++ *
++ * Where iOS asks (none confirmed yet; everything is logged so the first
++ * boot with the brightness slider moved says which):
++ *   - backboardd/SpringBoard (CoreBrightness CBDisplayContaineriOS, PowerLog,
++ *     BiometricKit) look for an "AppleARMBacklight" service matching
++ *     IOPropertyMatch { backlight-control = true } (seen on this phone:
++ *     "matching ... backlight-control -> 0 found"). bluebl=2 publishes one,
++ *     with IODisplayParameters { brightness { min 0, max 65536, value } },
++ *     and takes setProperties: "brightness" (or IODisplayParameters'
++ *     brightness, a number or { value }) as a fraction of max; nits keys
++ *     ("brightness-nits", "DisplayNits", "IOMFBBrightnessLevel", "nits"; 16.16
++ *     fixed point when above 0xffff) as nits, 400 nits = level 900.
++ *   - the IOMobileFramebuffer service (AppleCLCD) itself: the same keys
++ *     through its setProperties (bluebl=1 and up).
++ *   - IOMobileFramebuffer user-client selectors 50 SetBrightnessCorrection,
++ *     66 SPLCSetBrightness, 67 SPLCGetBrightness and 68 SetParameter
++ *     (backboardd calls 50 and 68 on every boot): arguments logged, nothing
++ *     applied (the scale is unknown).
++ *
++ * Boot-args:
++ *   bluebl=0         off (no DSI access, no hooks)
++ *   bluebl=1         default: DCS backend and the AppleCLCD hooks
++ *   bluebl=2         also publish AppleARMBacklight (experimental: what
++ *                    CoreBrightness does with it is not known yet)
++ *   bluebl_min=N     lowest level ever sent (default 32 of 900, about 14 nits;
++ *                    never below 8, the panel's minimum): the screen is never
++ *                    turned fully dark by a brightness request
++ *   bluebl_max=N     level for 100 % (default 900, at most 1023)
++ *   bluebl_test=1    5 s after the framebuffer starts: 100 % -> 20 % -> 100 %
++ *                    in 10 % steps, 0.5 s each, 2 s at 20 %, every write logged
++ *   bluebl_log=N     log the first N requests individually (default 64), then
++ *                    one line in 32
++ * Log prefix "BLUE BL:".
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include <machine/atomic.h>     /* DSB_SY */
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* Registers as 0123 (SweetFramebuffer.cpp): DSI 6G offsets, SDM845 PINGPONG_0..3. */
++#define BL_DSI0_PA              0x0ae94000ULL
++#define BL_PP_PAGE_PA           0x0ae70000ULL   /* 16K page: PINGPONG_0..3 at +0x1000 + 0x800 * n */
++#define BL_PANEL_LINES          2160
++
++#define DSI_CTRL_REG            0x004
++#define DSI_STATUS_REG          0x008
++#define DSI_CMD_DMA_CTRL        0x03c
++#define DSI_DMA_CMD_LENGTH      0x04c
++#define DSI_TRIG_CTRL           0x084
++#define DSI_DMA_SW_TRIGGER      0x090
++#define DSI_INT_CTRL            0x110
++#define DSI_TPG_CTRL            0x15c
++#define DSI_TPG_CMD_DMA_INIT    0x17c
++#define DSI_TPG_DMA_FIFO_RESET  0x1ec
++
++#define PP_SYNC_CONFIG_VSYNC    0x004
++#define PP_LINE_COUNT           0x02c
++#define PP_AUTOREFRESH_CONFIG   0x030
++
++#define BL_PANEL_MIN            8       /* qcom,mdss-dsi-bl-min-level */
++#define BL_PANEL_MAX            900     /* qcom,mdss-dsi-bl-max-level, 399.81 nits */
++#define BL_HW_MAX               1023    /* 0x3ff, the HBM range's top */
++#define BL_NITS_AT_MAX          400
++#define BL_MIN_TICKS            2       /* at most one write every 2 vsyncs (33 ms) */
++#define BL_TEST_START_TICKS     300     /* 5 s */
++#define BL_TEST_STEP_TICKS      30      /* 0.5 s */
++#define BL_FRACTION_ONE         65536   /* published IODisplayParameters brightness max */
++
++static int gBlMode;                     /* bluebl */
++static uint32_t gBlMin = 32, gBlMax = BL_PANEL_MAX;
++static int gBlTest;
++static uint32_t gBlLogN = 64;
++static bool gBlDcsOk;                   /* DSI0 as expected, no failed write yet */
++static volatile uint32_t *gDsi;
++static volatile uint32_t *gPP;          /* the pingpong ABL left on autorefresh */
++static IOLock *gBlLock;                 /* the request fields below */
++static uint32_t gBlWant;                /* level wanted, 0 = none yet */
++static uint32_t gBlSent;                /* level last sent, 0 = none */
++static uint32_t gBlRequests;            /* requests recorded */
++static uint32_t gBlMerged;              /* requests since the last write */
++static const char *gBlFrom = "none";
++static uint64_t gBlTicks, gBlLastWriteTick;
++static uint32_t gBlWrites, gBlFails;
++static IOService *gBlService;           /* AppleARMBacklight (bluebl=2) */
++static IOService *gBlFb;                /* AppleCLCD until then */
++
++/* Called from SweetFramebuffer.cpp. */
++void blue_bl_start(IOService *fb);
++void blue_bl_tick(IOLock *present);
++void blue_bl_display_on(void);
++bool blue_bl_set_properties(OSObject *props);
++void blue_bl_iomfb(uint32_t selector, IOExternalMethodArguments *args, uint64_t *out, uint32_t *outCount);
++
++#define DSI_R(off)      (gDsi[(off) / 4])
++#define DSI_W(off, v)   (gDsi[(off) / 4] = (v))
++#define PP_R(off)       (gPP[(off) / 4])
++#define PP_W(off, v)    (gPP[(off) / 4] = (v))
++
++/*
++ * One DCS write of len bytes (data[0] the command) from the DSI command
++ * FIFO in low-power mode: short (0x05 / 0x15) for 1 or 2 bytes, long
++ * (0x39) for more. False if the DMA did not complete in 20 ms.
++ */
++static bool
++bl_dcs_write(const uint8_t *data, uint32_t len)
++{
++	uint32_t words[4] = { 0, 0, 0, 0 };
++	uint32_t nwords, bytes;
++
++	if (len == 0 || len > 8) {
++		return false;
++	}
++	if (len <= 2) {
++		uint32_t dt = len == 1 ? 0x05u : 0x15u;
++		words[0] = 1u << 31 | dt << 16 | (len == 2 ? (uint32_t)data[1] << 8 : 0u) | data[0];
++		nwords = 2;                     /* the FIFO takes an even number of words */
++		bytes = 4;
++	} else {
++		words[0] = 1u << 31 | 1u << 30 | 0x39u << 16 | len;    /* WC hi = 0 */
++		uint8_t pay[8];
++		memset(pay, 0xff, sizeof(pay));
++		memcpy(pay, data, len);
++		uint32_t pw = (len + 3) / 4;
++		for (uint32_t i = 0; i < pw; i++) {
++			words[1 + i] = (uint32_t)pay[4 * i] | (uint32_t)pay[4 * i + 1] << 8 |
++			    (uint32_t)pay[4 * i + 2] << 16 | (uint32_t)pay[4 * i + 3] << 24;
++		}
++		bytes = 4 + 4 * pw;
++		nwords = (1 + pw + 1) & ~1u;
++	}
++
++	uint32_t dmactrl = DSI_R(DSI_CMD_DMA_CTRL);
++	DSI_W(DSI_INT_CTRL, (DSI_R(DSI_INT_CTRL) & ~(1u << 24)) | 1u);  /* clear a stale DMA done */
++	DSI_W(DSI_TPG_CTRL, 3u << 16 | 1u << 2 | 1u << 1);     /* FIFO pattern, FIFO mode, CMD DMA TPG on */
++	for (uint32_t i = 0; i < nwords; i++) {
++		DSI_W(DSI_TPG_CMD_DMA_INIT, words[i]);
++	}
++	DSI_W(DSI_CMD_DMA_CTRL, (dmactrl & ~(3u << 30)) | 1u << 28 | 1u << 26);
++	DSI_W(DSI_DMA_CMD_LENGTH, bytes);
++	__builtin_arm_dsb(DSB_SY);
++	DSI_W(DSI_DMA_SW_TRIGGER, 1);
++	__builtin_arm_dsb(DSB_SY);
++	bool done = false;
++	for (int i = 0; i < 400 && !done; i++) {
++		done = (DSI_R(DSI_INT_CTRL) & 1u) != 0;
++		if (!done) {
++			IODelay(50);
++		}
++	}
++	DSI_W(DSI_INT_CTRL, (DSI_R(DSI_INT_CTRL) & ~(1u << 24)) | 1u);
++	DSI_W(DSI_TPG_CTRL, 0);
++	DSI_W(DSI_TPG_DMA_FIFO_RESET, 1);
++	__builtin_arm_dsb(DSB_SY);
++	IODelay(1);
++	DSI_W(DSI_TPG_DMA_FIFO_RESET, 0);
++	DSI_W(DSI_CMD_DMA_CTRL, dmactrl);
++	__builtin_arm_dsb(DSB_SY);
++	if (!done) {
++		IOLog("BLUE BL: DCS 0x%02x (%u bytes) not done (int 0x%x status 0x%x)\n", data[0], len,
++		    DSI_R(DSI_INT_CTRL), DSI_R(DSI_STATUS_REG));
++	}
++	return done;
++}
++
++/* Autorefresh off, wait (100 ms at most) until no frame is in flight. Returns the old config in *ar. */
++static bool
++bl_pp_idle(uint32_t *ar)
++{
++	*ar = PP_R(PP_AUTOREFRESH_CONFIG);
++	uint32_t sync = PP_R(PP_SYNC_CONFIG_VSYNC);
++	PP_W(PP_SYNC_CONFIG_VSYNC, sync & ~(1u << 20));         /* external TE off */
++	PP_W(PP_AUTOREFRESH_CONFIG, 0);
++	__builtin_arm_dsb(DSB_SY);
++	bool idle = false;
++	for (int i = 0; i < 1000 && !idle; i++) {
++		uint32_t line = PP_R(PP_LINE_COUNT) & 0xffff;
++		idle = (line == 0 || line >= BL_PANEL_LINES) && !(DSI_R(DSI_STATUS_REG) & (1u << 2));
++		if (!idle) {
++			IODelay(100);
++		}
++	}
++	PP_W(PP_SYNC_CONFIG_VSYNC, sync);
++	__builtin_arm_dsb(DSB_SY);
++	return idle;
++}
++
++/* SET_DISPLAY_BRIGHTNESS level, vsync workloop thread. */
++static bool
++bl_send(uint32_t level, uint64_t *us)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint32_t ar = 0;
++	if (!(PP_R(PP_AUTOREFRESH_CONFIG) & (1u << 31))) {
++		IOLog("BLUE BL: autorefresh off (0x%x), DCS off for this boot\n", PP_R(PP_AUTOREFRESH_CONFIG));
++		gBlDcsOk = false;
++		return false;
++	}
++	bool idle = bl_pp_idle(&ar);
++	const uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
++	bool ok = idle && bl_dcs_write(cmd, sizeof(cmd));
++	PP_W(PP_AUTOREFRESH_CONFIG, ar);
++	__builtin_arm_dsb(DSB_SY);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, us);
++	*us /= 1000;
++	if (!ok) {
++		IOLog("BLUE BL: level %u: %s, autorefresh 0x%x restored, DCS off for this boot\n", level,
++		    idle ? "DCS write failed" : "pingpong did not go idle", ar);
++		gBlDcsOk = false;
++	}
++	return ok;
++}
++
++static uint32_t
++bl_clamp(uint32_t level)
++{
++	if (level < gBlMin) {
++		level = gBlMin;
++	}
++	if (level > gBlMax) {
++		level = gBlMax;
++	}
++	return level;
++}
++
++/* Record a wanted level (any thread). */
++static void
++bl_request(uint32_t level, const char *from, uint64_t raw)
++{
++	if (gBlMode == 0 || gBlLock == NULL) {
++		return;
++	}
++	level = bl_clamp(level);
++	IOLockLock(gBlLock);
++	uint32_t n = ++gBlRequests;
++	gBlWant = level;
++	gBlFrom = from;
++	gBlMerged++;
++	IOLockUnlock(gBlLock);
++	if (n <= gBlLogN || (n % 32) == 0) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("BLUE BL: request %u from %s (%s): raw %llu -> level %u (%u%%)%s\n", n, name, from, raw,
++		    level, level * 100 / gBlMax, gBlDcsOk ? "" : ", no DCS: not sent");
++	}
++}
++
++static void
++bl_request_fraction(uint64_t value, uint64_t max, const char *from)
++{
++	if (max == 0) {
++		return;
++	}
++	if (value > max) {
++		value = max;
++	}
++	bl_request((uint32_t)((value * gBlMax + max / 2) / max), from, value);
++}
++
++static void
++bl_request_nits(uint64_t value, const char *from)
++{
++	uint64_t nits16 = value > 0xffff ? value : value << 16;  /* 16.16 */
++	uint64_t level = (nits16 * BL_PANEL_MAX / BL_NITS_AT_MAX + 0x8000) >> 16;
++	bl_request((uint32_t)MIN(level, (uint64_t)BL_HW_MAX), from, value);
++}
++
++/* Short description of a property value for the log. */
++static void
++bl_describe(const OSObject *v, char *buf, size_t size)
++{
++	const OSNumber *n = OSDynamicCast(OSNumber, v);
++	const OSString *s = OSDynamicCast(OSString, v);
++	const OSBoolean *b = OSDynamicCast(OSBoolean, v);
++	const OSDictionary *d = OSDynamicCast(OSDictionary, v);
++	if (n != NULL) {
++		snprintf(buf, size, "%llu (0x%llx)", n->unsigned64BitValue(), n->unsigned64BitValue());
++	} else if (s != NULL) {
++		snprintf(buf, size, "\"%s\"", s->getCStringNoCopy());
++	} else if (b != NULL) {
++		snprintf(buf, size, "%s", b->isTrue() ? "true" : "false");
++	} else if (d != NULL) {
++		snprintf(buf, size, "dict of %u", d->getCount());
++	} else {
++		snprintf(buf, size, "%s", v != NULL ? v->getMetaClass()->getClassName() : "null");
++	}
++}
++
++static const char *const kNitsKeys[] = { "brightness-nits", "DisplayNits", "IOMFBBrightnessLevel", "nits", NULL };
++
++/*
++ * setProperties() of AppleCLCD and AppleARMBacklight: log every key (and one
++ * level of a dictionary's keys), act on the brightness ones. Returns true
++ * if a key was used.
++ */
++static bool
++bl_properties(OSObject *props, const char *who, int depth)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, props);
++	if (dict == NULL || depth > 2) {
++		return false;
++	}
++	bool used = false;
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (it == NULL) {
++		return false;
++	}
++	static uint32_t logged;
++	while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSObject *v = dict->getObject(key);
++		const char *k = key->getCStringNoCopy();
++		if (logged < 4 * gBlLogN) {
++			char desc[64];
++			bl_describe(v, desc, sizeof(desc));
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("BLUE BL: %s setProperties from %s:%s %s = %s\n", who, name, depth ? " (nested)" : "", k, desc);
++			logged++;
++		}
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		OSDictionary *d = OSDynamicCast(OSDictionary, v);
++		if (!strcmp(k, "brightness")) {
++			if (d != NULL) {
++				n = OSDynamicCast(OSNumber, d->getObject("value"));
++			}
++			if (n != NULL) {
++				bl_request_fraction(n->unsigned64BitValue(), BL_FRACTION_ONE, "brightness");
++				used = true;
++			}
++		} else if (!strcmp(k, "IODisplayParameters") && d != NULL) {
++			used = bl_properties(d, who, depth + 1) || used;
++		} else if (n != NULL) {
++			for (int i = 0; kNitsKeys[i] != NULL; i++) {
++				if (!strcmp(k, kNitsKeys[i])) {
++					bl_request_nits(n->unsigned64BitValue(), kNitsKeys[i]);
++					used = true;
++				}
++			}
++		} else if (d != NULL && depth == 0) {
++			used = bl_properties(d, who, depth + 1) || used;
++		}
++	}
++	it->release();
++	return used;
++}
++
++/* ---- AppleARMBacklight (bluebl=2) ---- */
++
++class AppleARMBacklight : public IOService
++{
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static void
++bl_publish_value(uint32_t level)
++{
++	if (gBlService == NULL) {
++		return;
++	}
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *bright = OSDictionary::withCapacity(3);
++	OSNumber *mn = OSNumber::withNumber(0ULL, 32);
++	OSNumber *mx = OSNumber::withNumber((unsigned long long)BL_FRACTION_ONE, 32);
++	OSNumber *val = OSNumber::withNumber((unsigned long long)level * BL_FRACTION_ONE / gBlMax, 32);
++	if (params != NULL && bright != NULL && mn != NULL && mx != NULL && val != NULL) {
++		bright->setObject("min", mn);
++		bright->setObject("max", mx);
++		bright->setObject("value", val);
++		params->setObject("brightness", bright);
++		gBlService->setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(params);
++	OSSafeReleaseNULL(bright);
++	OSSafeReleaseNULL(mn);
++	OSSafeReleaseNULL(mx);
++	OSSafeReleaseNULL(val);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	bl_properties(properties, "AppleARMBacklight", 0);
++	return kIOReturnSuccess;        /* accept everything: the keys are only being discovered */
++}
++
++/* ---- interface for AppleCLCD (SweetFramebuffer.cpp) ---- */
++
++/* AppleCLCD::start, after powerStart(). provider: the AppleCLCD. */
++void
++blue_bl_start(IOService *fb)
++{
++	gBlMode = 1;
++	PE_parse_boot_argn("bluebl", &gBlMode, sizeof(gBlMode));
++	PE_parse_boot_argn("bluebl_min", &gBlMin, sizeof(gBlMin));
++	PE_parse_boot_argn("bluebl_max", &gBlMax, sizeof(gBlMax));
++	PE_parse_boot_argn("bluebl_test", &gBlTest, sizeof(gBlTest));
++	PE_parse_boot_argn("bluebl_log", &gBlLogN, sizeof(gBlLogN));
++	if (gBlMode <= 0) {
++		gBlMode = 0;
++		return;
++	}
++	if (gBlMax > BL_HW_MAX) {
++		gBlMax = BL_HW_MAX;
++	}
++	if (gBlMax < 64) {
++		gBlMax = BL_PANEL_MAX;
++	}
++	if (gBlMin < BL_PANEL_MIN) {
++		gBlMin = BL_PANEL_MIN;
++	}
++	if (gBlMin > gBlMax / 2) {
++		gBlMin = gBlMax / 2;
++	}
++	gBlLock = IOLockAlloc();
++	gDsi = (volatile uint32_t *)ml_io_map(BL_DSI0_PA, 0x4000);
++	volatile uint32_t *page = (volatile uint32_t *)ml_io_map(BL_PP_PAGE_PA, 0x4000);
++	if (gBlLock == NULL || gDsi == NULL || page == NULL) {
++		IOLog("BLUE BL: setup failed (lock %p, DSI %p, PP %p), off\n", gBlLock, gDsi, page);
++		gBlMode = 0;
++		return;
++	}
++	int pp = -1;
++	for (uint32_t i = 0; i < 4; i++) {
++		volatile uint32_t *p = page + (0x1000 + 0x800 * i) / 4;
++		if (gPP == NULL && (p[PP_AUTOREFRESH_CONFIG / 4] & (1u << 31))) {
++			gPP = p;
++			pp = (int)i;
++		}
++	}
++	uint32_t ctrl = DSI_R(DSI_CTRL_REG), trig = DSI_R(DSI_TRIG_CTRL), dma = DSI_R(DSI_CMD_DMA_CTRL);
++	gBlDcsOk = gPP != NULL && (ctrl & 0x5) == 0x5 && (trig & 0x7) == 4;
++	IOLog("BLUE BL: DSI0 ctrl 0x%x trig 0x%x dma_ctrl 0x%x status 0x%x, autorefresh PP_%d 0x%x: DCS %s;"
++	    " levels %u..%u (panel 8..900, 0x51 big-endian), bluebl=%d test=%d\n",
++	    ctrl, trig, dma, DSI_R(DSI_STATUS_REG), pp, gPP != NULL ? PP_R(PP_AUTOREFRESH_CONFIG) : 0,
++	    gBlDcsOk ? "ready" : "OFF (DSI0 not command mode + sw trigger, or no autorefresh)",
++	    gBlMin, gBlMax, gBlMode, gBlTest);
++
++	if (gBlMode >= 2) {
++		gBlFb = fb;                     /* published from the 60th vsync on, once AppleCLCD is registered */
++		fb->retain();
++	}
++}
++
++static void
++bl_publish_service(void)
++{
++	IOService *fb = gBlFb;
++	gBlFb = NULL;
++	AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++	if (bl != NULL && bl->init() && bl->attach(fb)) {
++		bl->setName("backlight");
++		bl->setProperty("backlight-control", true);
++		gBlService = bl;
++		bl_publish_value(gBlSent != 0 ? gBlSent : gBlMax);
++		bl->registerService();
++		IOLog("BLUE BL: AppleARMBacklight published (backlight-control, IODisplayParameters brightness 0..%u)\n",
++		    BL_FRACTION_ONE);
++	} else {
++		IOLog("BLUE BL: AppleARMBacklight not published\n");
++		OSSafeReleaseNULL(bl);
++	}
++	fb->release();
++}
++
++/* Test ramp (bluebl_test=1): 100 % down to 20 % in 10 % steps, 4 steps at 20 %, back up. */
++static const uint8_t kTestPercent[] = { 100, 90, 80, 70, 60, 50, 40, 30, 20, 20, 20, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
++
++static void
++bl_test_tick(void)
++{
++	static uint32_t step;
++	if (gBlTicks < BL_TEST_START_TICKS || step >= sizeof(kTestPercent) ||
++	    (gBlTicks - BL_TEST_START_TICKS) % BL_TEST_STEP_TICKS != 0) {
++		return;
++	}
++	uint32_t pct = kTestPercent[step];
++	IOLog("BLUE BL: test step %u/%u: %u%%\n", step + 1, (uint32_t)sizeof(kTestPercent), pct);
++	bl_request((gBlMax * pct + 50) / 100, "bluebl_test", pct);
++	if (++step == sizeof(kTestPercent)) {
++		IOLog("BLUE BL: test done: %u writes, %u failed\n", gBlWrites + 1, gBlFails);
++	}
++}
++
++/*
++ * Every vsync while the display is on (AppleCLCD::vsyncFired, workloop
++ * thread, no framebuffer lock held). present: the 0145 present lock or NULL.
++ */
++void
++blue_bl_tick(IOLock *present)
++{
++	if (gBlMode == 0) {
++		return;
++	}
++	gBlTicks++;
++	if (gBlFb != NULL && gBlTicks >= 60) {
++		bl_publish_service();
++	}
++	if (gBlTest) {
++		bl_test_tick();
++	}
++	if (!gBlDcsOk || gBlTicks - gBlLastWriteTick < BL_MIN_TICKS) {
++		return;
++	}
++	IOLockLock(gBlLock);
++	uint32_t want = gBlWant, merged = gBlMerged;
++	const char *from = gBlFrom;
++	IOLockUnlock(gBlLock);
++	if (want == 0 || want == gBlSent) {
++		return;
++	}
++	if (present != NULL && !IOLockTryLock(present)) {
++		return;                         /* a flip is in progress: next tick */
++	}
++	uint64_t us = 0;
++	bool ok = bl_send(want, &us);
++	if (present != NULL) {
++		IOLockUnlock(present);
++	}
++	gBlLastWriteTick = gBlTicks;
++	uint32_t n = ++gBlWrites;
++	if (ok) {
++		gBlSent = want;
++		IOLockLock(gBlLock);
++		gBlMerged = 0;
++		IOLockUnlock(gBlLock);
++		bl_publish_value(want);
++	} else {
++		gBlFails++;
++	}
++	if (n <= gBlLogN || !ok || (n % 32) == 0) {
++		IOLog("BLUE BL: write %u: 0x51 %02x %02x = level %u (%u%%) from %s (%u requests) -> %s in %llu us\n",
++		    n, want >> 8, want & 0xff, want, want * 100 / gBlMax, from, merged, ok ? "ok" : "FAILED", us);
++	}
++}
++
++/* Display back on (after RequestPowerChange(1)): send the wanted level again. */
++void
++blue_bl_display_on(void)
++{
++	gBlSent = 0;
++}
++
++/* AppleCLCD::setProperties. */
++bool
++blue_bl_set_properties(OSObject *props)
++{
++	return gBlMode != 0 && bl_properties(props, "AppleCLCD", 0);
++}
++
++/*
++ * IOMobileFramebuffer user-client selectors not handled by AppleCLCD.
++ * Logs the brightness-related ones; out/outCount: scalar outputs.
++ */
++void
++blue_bl_iomfb(uint32_t selector, IOExternalMethodArguments *args, uint64_t *out, uint32_t *outCount)
++{
++	static uint32_t counts[4];
++	int slot;
++	switch (selector) {
++	case 50: slot = 0; break;               /* SetBrightnessCorrection */
++	case 66: slot = 1; break;               /* SPLCSetBrightness */
++	case 67: slot = 2; break;               /* SPLCGetBrightness */
++	case 68: slot = 3; break;               /* SetParameter */
++	default: return;
++	}
++	if (gBlMode == 0) {
++		return;
++	}
++	uint32_t n = ++counts[slot];
++	if (selector == 67 && args->scalarOutputCount >= 1) {
++		out[0] = gBlSent != 0 ? gBlSent : gBlMax;
++		*outCount = 1;
++	}
++	if (n > 16 && (n % 64) != 0) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	uint64_t s[4] = { 0, 0, 0, 0 };
++	for (uint32_t i = 0; i < args->scalarInputCount && i < 4; i++) {
++		s[i] = args->scalarInput[i];
++	}
++	uint8_t b[16];
++	uint32_t blen = 0;
++	if (args->structureInputDescriptor == NULL && args->structureInput != NULL) {
++		blen = MIN(args->structureInputSize, (uint32_t)sizeof(b));
++		memcpy(b, args->structureInput, blen);
++	}
++	char hex[40];
++	for (uint32_t i = 0; i < blen; i++) {
++		snprintf(hex + 2 * i, 3, "%02x", b[i]);
++	}
++	hex[2 * blen] = 0;
++	IOLog("BLUE BL: %s IOMFB sel %u #%u scalars %u [0x%llx 0x%llx 0x%llx 0x%llx] struct %u [%s]\n", name,
++	    selector, n, args->scalarInputCount, s[0], s[1], s[2], s[3], args->structureInputSize, hex);
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bfa112c8c..70c5223fc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -84,6 +84,12 @@ extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t off
+ extern "C" int blue_dpu_unflip(const char *why);
+ extern "C" int blue_dpu_scanout(void);
+ extern "C" int blue_dpu_flip_tick(void);
++/* Brightness (0150, BlueBacklight.cpp). */
++extern void blue_bl_start(IOService *fb);
++extern void blue_bl_tick(IOLock *present);
++extern void blue_bl_display_on(void);
++extern bool blue_bl_set_properties(OSObject *props);
++extern void blue_bl_iomfb(uint32_t selector, IOExternalMethodArguments *args, uint64_t *out, uint32_t *outCount);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -185,6 +191,8 @@ public:
+ 	void present(const uint8_t *rec);
+ 	void presentFit(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -291,6 +299,7 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	powerStart();
++	blue_bl_start(this);
+ 	blue_dpu_start(fPhys, fWidth, fHeight, fRowBytes, fPixels, fLogicalW, fLogicalH);
+ 	gBlueSnapW = fWidth;
+ 	gBlueSnapH = fHeight;
+@@ -377,6 +386,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fPanelAsleep) {
+ 		IOLockUnlock(fb->fLock);
+ 		fb->panelWake();
++		blue_bl_display_on();
+ 		IOLockLock(fb->fLock);
+ 	}
+ 	blue_dpu_stat(0, 0);
+@@ -414,9 +424,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOLockUnlock(fb->fPresentLock);
+ 	}
++	blue_bl_tick(fb->fFlip ? fb->fPresentLock : NULL);
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	return blue_bl_set_properties(properties) ? kIOReturnSuccess : IOMobileFramebuffer::setProperties(properties);
++}
++
+ /*
+  * Display power (blueline). backboardd calls RequestPowerChange(0) when the
+  * power button locks the phone or auto-lock fires, and (1) on wake. As
+@@ -1036,7 +1053,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		break;
+ 	default:
++		blue_bl_iomfb(selector, args, out, &outCount);
+ 		break;
+ 	}
+ 
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 01c725d57..2478394ab 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/BlueBattery.cpp                                 optional iokitcpp
++iokit/Kernel/arm/BlueBacklight.cpp                               optional iokitcpp
+ iokit/Kernel/arm/BlueDPU.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/BlueGPUPresent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+-- 
+2.54.0 (Apple Git-157)
+

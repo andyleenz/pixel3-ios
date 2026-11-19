@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 15:30:00 +0100
+Subject: [PATCH] 0157: flips return without waiting for the latch
+
+backboardd waited ~7 ms of every frame for the DPU to latch its flip
+(scrolling Settings: ~15 ms of drawing + 7 ms wait = ~45 fps). A flip now
+returns after the flush. backboardd alternates two buffers, so its next
+frame is drawn into the buffer still being fetched until the latch: GPU
+work that writes an IOSurface waits for the pending latch first
+(blue_dpu_flip_settle, from the submit), overlapping CoreAnimation's CPU
+work for the frame. bluedpu_flip_sync=1 waits in the flip as before.
+---
+--- a/iokit/Kernel/arm/BlueDPU.cpp
++++ b/iokit/Kernel/arm/BlueDPU.cpp
+@@ -121,6 +121,7 @@
+     uint32_t w, uint32_t h, uint32_t fmt);
+ extern "C" int blue_dpu_unflip(const char *why);
+ extern "C" int blue_dpu_scanout(void);
++extern "C" uint32_t blue_dpu_flip_settle(void);
+ extern "C" int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
+ extern "C" int blue_dpu_flip_tick(void);
+ extern "C" void blue_dpu_panic(void);
+@@ -1439,6 +1440,20 @@
+ static struct bd_plan bd_fplan;
+ static uint32_t bd_fplan_stride;        /* stride bd_fplan was made for, 0 none */
+ static uint64_t bd_flip_pa;             /* buffer being fetched */
++/*
++ * 0157: a flip returns without waiting for the DPU to latch it (backboardd
++ * spent ~7 ms of every frame in that wait). Safe while backboardd cycles 3+
++ * buffers: the next flip waits for this one's latch first, so the buffer it
++ * replaced is free before it is drawn into again. Two buffers (a flip of the
++ * buffer replaced one flip ago) put it back to waiting for the boot.
++ */
++static uint64_t bd_flip_pa_prev;        /* buffer fetched before bd_flip_pa */
++static bool bd_latch_pending;           /* bd_flip_pa flushed, latch not seen yet */
++static bool bd_flip_sync;               /* wait for every latch (bluedpu_flip_sync=1) */
++static uint32_t bd_n_cycle2, bd_n_cycle3;       /* flips of the buffer replaced 1 / 2+ flips ago */
++static char bd_slots[48];               /* pool slot of the first flips, for the log */
++static uint32_t bd_n_settle, bd_settle_max_us;  /* GPU frames held for a latch */
++static uint64_t bd_settle_us;
+ static IOBufferMemoryDescriptor *bd_pool[BD_POOL_MAX];
+ static uint64_t bd_pool_pa[BD_POOL_MAX];
+ static bool bd_pool_used[BD_POOL_MAX];
+@@ -1568,11 +1583,37 @@
+ 		bd_fplan_stride = bpr;
+ 		bd_plan_log(bd_fit ? "flip plan (fit)" : "flip plan (crop)", &bd_fplan);
+ 	}
++	/* 0157: the previous flip's latch, if it is still pending (rarely: a frame takes > 1 vsync) */
++	int64_t lat = 0;
+ 	if (mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) {
+-		IOLockUnlock(bd_flip_lock);
+-		bd_once("a flush is still pending", NULL);
+-		return 0;
++		uint64_t tw = mach_absolute_time();
++		while ((mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) != 0 &&
++		    bd_us(mach_absolute_time() - tw) < (uint64_t)BD_FLIP_WAIT_MS * 1000) {
++			IODelay(200);
++		}
++		lat = (int64_t)bd_us(mach_absolute_time() - tw);
++		if (mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) {
++			bd_flip_off("previous flush did not latch");
++			IOLockUnlock(bd_flip_lock);
++			return 0;
++		}
+ 	}
++	bd_latch_pending = false;
++	if (bd_geom && pa == bd_flip_pa_prev) {
++		bd_n_cycle2++;
++	} else if (bd_geom && pa != bd_flip_pa) {
++		bd_n_cycle3++;
++	}
++	{
++		size_t n = strlen(bd_slots);
++		if (n + 1 < sizeof(bd_slots)) {
++			bd_slots[n] = (char)('0' + slot);
++			bd_slots[n + 1] = 0;
++			if (n + 2 == sizeof(bd_slots)) {
++				IOLog("BLUE DPU: first flips' pool slots %s\n", bd_slots);
++			}
++		}
++	}
+ 
+ 	/* The DPU is not IO-coherent: the frame has to be in DRAM before it is fetched. */
+ 	uint64_t t0 = mach_absolute_time();
+@@ -1584,11 +1625,20 @@
+ 		mdp_wr(MDP_INTR_CLEAR, INTR_INTF_UNDERRUN(bd_st.intf) | INTR_PP_DONE(bd_st.pp));
+ 	}
+ 	bool first = bd_n_flip == 0;
++	bool wait = first || !bd_geom || bd_flip_sync;
+ 	bd_plan_write(&bd_fplan, pa, !bd_geom);
+ 	bd_geom = true;
+ 	bd_flipped = true;
++	if (pa != bd_flip_pa) {
++		bd_flip_pa_prev = bd_flip_pa;
++	}
+ 	bd_flip_pa = pa;
+-	int64_t lat = bd_flush(&bd_st, bd_fplan.flush, first ? "first flip" : NULL, true, BD_FLIP_WAIT_MS);
++	if (wait) {
++		lat = bd_flush(&bd_st, bd_fplan.flush, first ? "first flip" : NULL, true, BD_FLIP_WAIT_MS);
++	} else {
++		(void)bd_flush(&bd_st, bd_fplan.flush, NULL, true, 0);
++		bd_latch_pending = true;
++	}
+ 	if (lat < 0) {
+ 		bd_flip_off("flush did not latch");
+ 		IOLockUnlock(bd_flip_lock);
+@@ -1623,6 +1673,36 @@
+ 	return was;
+ }
+ 
++/*
++ * 0157: called before the GPU runs work that draws into an IOSurface
++ * (BlueGPUUserClient.cpp): with a flip still waiting for its latch, the
++ * buffer it replaces may still be fetched, and backboardd draws its next
++ * frame into exactly that buffer (it alternates two). The wait overlaps
++ * CoreAnimation's CPU work for the frame instead of following the flip.
++ */
++uint32_t
++blue_dpu_flip_settle(void)
++{
++	if (bd_flip_lock == NULL || !bd_latch_pending) {
++		return 0;
++	}
++	IOLockLock(bd_flip_lock);
++	uint64_t t0 = mach_absolute_time();
++	while (bd_latch_pending && (mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) != 0 &&
++	    bd_us(mach_absolute_time() - t0) < (uint64_t)BD_FLIP_WAIT_MS * 1000) {
++		IODelay(200);
++	}
++	uint32_t us = (uint32_t)bd_us(mach_absolute_time() - t0);
++	if (bd_latch_pending) {
++		bd_latch_pending = false;
++		bd_n_settle++;
++		bd_settle_us += us;
++		bd_settle_max_us = us > bd_settle_max_us ? us : bd_settle_max_us;
++	}
++	IOLockUnlock(bd_flip_lock);
++	return us;
++}
++
+ int
+ blue_dpu_scanout(void)
+ {
+@@ -1851,9 +1931,11 @@
+ 		    bd_n_vsync, swaps, bd_n_present, bd_n_present ? bd_present_us / bd_n_present : 0, bd_present_max_us);
+ 		if (bd_flip_lock != NULL) {
+ 			uint32_t nf = bd_n_flip, nu = bd_n_unflip;
+-			IOLog("BLUE DPU: 5s: %u flips (total %u), %u unflips, clean avg %llu us, latch avg %llu us max %u us, %s, %s\n",
++			IOLog("BLUE DPU: 5s: %u flips (total %u), %u unflips, clean avg %llu us, latch avg %llu us max %u us, %s, %s; buffers cycled 2: %u, 3+: %u, slots %s; GPU held for a latch %u times, avg %llu us max %u us\n",
+ 			    nf - bd_last_flip, nf, nu - bd_last_unflip, nf ? bd_clean_us / nf : 0, nf ? bd_latch_us / nf : 0,
+-			    bd_latch_max_us, bd_flipped ? "flipped" : "on the panel buffer", bd_flip_on ? "flip on" : "flip off");
++			    bd_latch_max_us, bd_flipped ? "flipped" : "on the panel buffer", bd_flip_on ? "flip on" : "flip off",
++			    bd_n_cycle2, bd_n_cycle3, bd_slots, bd_n_settle, bd_n_settle ? bd_settle_us / bd_n_settle : 0,
++			    bd_settle_max_us);
+ 			bd_last_flip = nf;
+ 			bd_last_unflip = nu;
+ 		}
+@@ -1873,6 +1955,10 @@
+ 	PE_parse_boot_argn("bluedpu", &bd_mode, sizeof(bd_mode));
+ 	PE_parse_boot_argn("bluedpu_stats", &stats, sizeof(stats));
+ 	PE_parse_boot_argn("bluedpu_flip", &bd_flip_arg, sizeof(bd_flip_arg));
++	int sync = 0;
++	if (PE_parse_boot_argn("bluedpu_flip_sync", &sync, sizeof(sync)) && sync != 0) {
++		bd_flip_sync = true;    /* 0157: wait for every latch, as before */
++	}
+ 	bd_stats_on = stats < 0 ? (bd_mode != 0 || bd_flip_arg != 0) : stats != 0;
+ 	if (bd_mode <= 0 && bd_flip_arg == 0) {
+ 		return;
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -71,6 +71,7 @@
+ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
++extern uint32_t blue_dpu_flip_settle(void);     /* 0157, BlueDPU.cpp */
+ }
+ 
+ #define BG_MAX_BOS              4096u           /* handles per connection */
+@@ -702,6 +703,12 @@
+ 	}
+ 	/* imports: CPU writes to PoC; a BO the GPU writes is also invalidated (no dirty line lands on it later) */
+ 	for (uint32_t i = 0; i < a->nr_bos; i++) {
++		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && bg_lookup(c, bos[i].handle)->kind == BG_SURF) {
++			(void)blue_dpu_flip_settle();   /* 0157: maybe the buffer a pending flip replaces */
++			break;
++		}
++	}
++	for (uint32_t i = 0; i < a->nr_bos; i++) {
+ 		BGBo *b = bg_lookup(c, bos[i].handle);
+ 		bool w = bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE;
+ 		if (b->kind == BG_SURF) {

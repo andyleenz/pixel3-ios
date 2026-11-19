@@ -1,0 +1,1401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +0100
+Subject: [PATCH] 0140: blueline DPU probe: read ABL's display pipeline, test
+ pointing the SSPPs at an iOS-layout buffer (no CPU copy)
+
+AppleCLCD copies every presented frame into ABL's cont-splash buffer
+(0x9d400000) with the CPU, capped at sweetfb_hz. The MDSS DPU could fetch
+iOS's frames itself. This patch only measures whether that works.
+
+bluedpu=1: dump. Active CTL (CTL_TOP intf_sel != 0, as the downstream
+sde_rm cont-splash readout), its LM staging decoded to SSPP rects, every
+SSPP (address, stride, format, rects, QSEED3, pixel extension), LMs, PP
+tear check / autorefresh, DSC, INTF_1/2, DSI0, the apps SMMU entries of
+the MDP streams 0x880/0xc80, the latched MDP interrupt bits by name, and
+the refresh rate over 1 s.
+
+bluedpu=2: the dump, then a 1125x2436 stride-4608 buffer (backboardd's
+display surface layout) holding the current panel picture as its centre
+crop plus a magenta frame and a checker, every staged rect re-pointed
+(address, src x/y, ystride) and a CTL_FLUSH of the pipe bits (never
+CTL_START: under autorefresh that wedges the pipe, ios-flame). Logs flush
+latch time, LM MISR before/during/after, refresh rate, underrun, SMMU
+fault state. Reverts (ABL's register values, reverse order, flush) after
+bluedpu_hold_ms (5000), at once on a new underrun / SMMU fault / frames
+no longer sent, unless bluedpu_keep=1. bluedpu_target=1 (default)
+cont_splash at 0x9dd00000, =2 contiguous XNU RAM below 4 GiB (cleaned to
+PoC). bluedpu_delay=S waits S seconds.
+
+v2, after dpu1/dpu2 on the phone:
+- dpu2's revert on "SMMU fault" was cb0 FSR 0x400, which is FSR.FORMAT
+  (bits 10:9 = AArch64 syndrome), present at boot, not a fault. Only the
+  fault bits (0xc00001fe) count, and FSR/FAR/FSYNR0/sGFSR are compared
+  against a snapshot taken right before the switch.
+- MDP INTR_STATUS 0x311100 at boot = pp0_done pp0_rd_ptr pp0_wr_ptr
+  pp0/pp1_autorefresh_done (raw latches, interrupts disabled), decoded by
+  name. The test clears the latches first and only a re-latched INTF
+  underrun counts.
+- PP rd_ptr frame count and INTF frame count do not run in command mode.
+  The rate is counted from the latched pp_done / rd_ptr /
+  autorefresh_done / TE-pin bits (W1C as they are seen, 250 us polling)
+  and the wraps of the PP read pointer line counter.
+
+bluedpu_stats (default on with bluedpu): every 5 s vsync ticks, swaps,
+panel copies and the copy time (baseline for the zero-copy path).
+
+Off unless asked for: without bluedpu nothing is mapped or read.
+---
+diff --git a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+new file mode 100644
+index 0000000..0d2a9e3
+--- /dev/null
++++ b/iokit/Kernel/arm/BlueDPU.cpp
+@@ -0,0 +1,1283 @@
++/*
++ * blueline (Pixel 3, SDM845) display processor probe, patch 0140.
++ *
++ * Today the panel shows ABL's continuous-splash buffer (0x9d400000,
++ * 1080x2160 a8r8g8b8, stride 4320): ABL leaves the DPU (MDSS 4.0 at
++ * 0xae00000, MDP at 0xae01000) scanning it out to the LG SW43408, a DSC
++ * command-mode panel (topology 2 LM / 2 DSC / 1 INTF), with the pingpong's
++ * autorefresh sending a frame on every TE. AppleCLCD copies (and scales)
++ * every presented iOS frame into that buffer with the CPU. The goal is to
++ * let the DPU fetch iOS's frames itself. This file only finds out whether
++ * that works; it changes nothing unless asked.
++ *
++ *   bluedpu=1  dump of the active pipeline: CTL (top, flush, layer mixer
++ *              staging), the staged SSPPs (source address, stride, format,
++ *              rects), layer mixers, pingpongs (tear check, autorefresh,
++ *              TE counters), DSC, INTF_1, DSI0, the apps SMMU entries of the
++ *              MDP streams (0x880 / 0xc80) and the refresh rate measured
++ *              over one second. The only writes are to MDP INTR_CLEAR /
++ *              INTR2_CLEAR (latched status bits; every MDP interrupt is
++ *              disabled, nothing consumes them).
++ *   bluedpu=2  the dump, then a test: a 1125x2436 buffer with a 4608-byte
++ *              stride (the layout of backboardd's display surfaces) gets a
++ *              copy of the current panel picture in its centre (the crop of
++ *              bluefb_fit=0) plus a magenta frame and a checker block, and
++ *              every staged SSPP rect is pointed at it (address, stride,
++ *              source x/y) with a CTL flush, never a CTL_START (autorefresh
++ *              picks a flushed change up; a START under autorefresh wedges
++ *              the pipe, ios-flame). Logged before/after: registers, flush
++ *              latch time, layer-mixer MISR signatures (a static buffer
++ *              gives the same signature every frame), refresh rate, underrun
++ *              and SMMU fault status. Reverted after bluedpu_hold_ms
++ *              (default 5000), at once on a new underrun, a new SMMU fault or
++ *              frames no longer being sent, unless bluedpu_keep=1 (the panel
++ *              then keeps showing the frozen test picture).
++ *   bluedpu_target=1 (default) the buffer is in ABL's cont_splash carve-out
++ *              above the panel buffer (0x9dd00000; the region ABL itself
++ *              scans out of). =2: XNU RAM below 4 GiB (physically
++ *              contiguous, cacheable, cleaned to PoC): the SSPP address
++ *              registers are 32 bits and the MDP streams are untranslated
++ *              (ABL: SMR 0x880/0xc80 -> cb0, SCTLR.M=0).
++ *   bluedpu_delay=S   seconds before the dump/test (default 0; e.g. 60 to
++ *              run it over the iOS UI).
++ *   bluedpu_stats=1   (default on with bluedpu) every 5 s: vsync ticks,
++ *              swaps, panel copies and the copy time, the baseline the
++ *              direct scanout is measured against.
++ *
++ * v2 (after dpu1/dpu2 on the phone):
++ *  - Fault detection is a change from a baseline. The MDP INTR_STATUS
++ *    0x311100 seen before anything was touched is the raw latch of
++ *    pp0_done, pp0_rd_ptr, pp0_wr_ptr, pp0/pp1_autorefresh_done (no
++ *    error); the bits are decoded by name (Linux 5.4 dpu_hw_interrupts.c
++ *    sdm845 table). The test clears the latches first and only treats an
++ *    INTF underrun that latches again as a problem.
++ *  - The "SMMU fault" of dpu2 was cb0 FSR 0x400 = FSR.FORMAT (bits 10:9,
++ *    0b10 = AArch64 syndrome format), not a fault bit, already there at
++ *    boot. The check now masks the fault bits (Linux ARM_SMMU_FSR_FAULT |
++ *    IGN = 0xc00001fe) and compares FSR / FAR / FSYNR0 / sGFSR of the bank
++ *    the MDP streams use against a snapshot taken before the switch.
++ *  - PP_INT_COUNT_VAL[31:16] (rd_ptr frame count) and INTF_FRAME_COUNT
++ *    stay 0 in command mode (the INTF timing engine is off; the frame
++ *    count needs INTF_FRAME_LINE_CNT_EN). The rate is now counted from the
++ *    latched interrupt bits (pp_done = a frame sent to the panel, rd_ptr,
++ *    autorefresh_done, INTR2 pp_te = TE pin edges), cleared as they are
++ *    seen and polled every 250 us for 1 s, plus the wraps of the PP read
++ *    pointer line counter (PP_INT_COUNT_VAL[15:0], reset to init on TE).
++ *
++ * Register layout: Linux drivers/gpu/drm/msm/disp/dpu1 (catalog
++ * dpu_4_0_sdm845.h, dpu_hw_sspp.c, dpu_hw_ctl.c, dpu_hw_lm.c,
++ * dpu_hw_pingpong.c, dpu_hw_intf.c, dpu_hwio.h; interrupt bits from the
++ * 5.4 dpu_hw_interrupts.c), the downstream crosshatch SDE driver (sde_rm.c
++ * cont-splash readout), DSI 6G offsets as 0123, ARM SMMUv2 FSR layout.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
++extern "C" void blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride,
++    uintptr_t panel_va, uint32_t lw, uint32_t lh);
++extern "C" void blue_dpu_stat(int kind, uint64_t dt);
++
++#define BD_MDSS_PA      0x0ae00000ULL   /* sdm845.dtsi mdss */
++#define BD_MDSS_SIZE    0x90000         /* MDSS 0x1000 + MDP 0x8f000 */
++#define BD_MDP          0x1000          /* MDP (dpu "mdp" reg) inside that mapping */
++#define BD_DSI0_PA      0x0ae94000ULL
++#define BD_SMMU_PA      0x15000000ULL   /* apps SMMU */
++#define BD_SMMU_SIZE    0x80000
++#define BD_SPLASH_PA    0x9d400000ULL   /* cont_splash_region, 0x2400000 */
++#define BD_SPLASH_END   0x9f800000ULL
++#define BD_SID_MDP0     0x880
++#define BD_SID_MDP1     0xc80
++
++/* MDP top (dpu_hwio.h) */
++#define MDP_DISP_INTF_SEL       0x004
++#define MDP_INTR2_EN            0x008
++#define MDP_INTR2_STATUS        0x00c
++#define MDP_INTR_EN             0x010
++#define MDP_INTR_STATUS         0x014
++#define MDP_INTR_CLEAR          0x018
++#define MDP_INTR2_CLEAR         0x02c
++#define MDP_SPLIT_DISPLAY_EN    0x2f4
++#define MDP_SPLIT_UPPER         0x2f8
++#define MDP_DANGER_STATUS       0x360
++#define MDP_SAFE_STATUS         0x364
++#define MDP_SPLIT_LOWER         0x3f0
++#define MDP_SPLIT_TE_LINE       0x3f4
++#define MDP_VSYNC_SEL           0x414
++/* INTR / INTR2 bits (Linux 5.4 dpu_hw_interrupts.c, sdm845) */
++#define INTR_PP_DONE(pp)        (1u << (8 + (pp)))
++#define INTR_PP_RDPTR(pp)       (1u << (12 + (pp)))
++#define INTR_PP_WRPTR(pp)       (1u << (16 + (pp)))
++#define INTR_PP_AUTOREF(pp)     (1u << (20 + (pp)))
++#define INTR_INTF_UNDERRUN(i)   (1u << (24 + 2 * (i)))
++#define INTR2_PP_TE(pp)         (1u << (24 + (pp)))
++
++static const char *const bd_intr_names[32] = {
++	"wb0_done", "wb1_done", "wd_timer0", "wd_timer1", "wb2_done", "wd_timer2", "wd_timer3", "wd_timer4",
++	"pp0_done", "pp1_done", "pp2_done", "pp3_done", "pp0_rd_ptr", "pp1_rd_ptr", "pp2_rd_ptr", "pp3_rd_ptr",
++	"pp0_wr_ptr", "pp1_wr_ptr", "pp2_wr_ptr", "pp3_wr_ptr",
++	"pp0_autorefresh_done", "pp1_autorefresh_done", "pp2_autorefresh_done", "pp3_autorefresh_done",
++	"intf0_underrun", "intf0_vsync", "INTF1_UNDERRUN", "intf1_vsync",
++	"INTF2_UNDERRUN", "intf2_vsync", "intf3_underrun", "intf3_vsync",
++};
++
++static const char *const bd_intr2_names[32] = {
++	"pp_s0_autorefresh_done", NULL, NULL, NULL, "pp_s0_wr_ptr", NULL, NULL, NULL,
++	"pp_s0_rd_ptr", "ctl0_start", "ctl1_start", "ctl2_start", "ctl3_start", "ctl4_start",
++	"cwb2_overflow", "cwb3_overflow",
++	"PP0_TEAR", "PP1_TEAR", "PP2_TEAR", "PP3_TEAR", NULL, NULL, "pp_s0_tear", NULL,
++	"pp0_te", "pp1_te", "pp2_te", "pp3_te", "pp_s0_te", NULL, NULL, NULL,
++};
++
++/* CTL (dpu_hw_ctl.c) */
++#define CTL_BASE(n)             (0x1000 + 0x200 * (n))
++#define CTL_COUNT               5
++#define CTL_TOP                 0x014
++#define CTL_FLUSH               0x018
++#define CTL_START               0x01c
++#define CTL_LAYER(lm)           ((lm) == 5 ? 0x024 : 4 * (lm))
++#define CTL_LAYER_EXT(lm)       (0x40 + 4 * (lm))
++#define CTL_LAYER_EXT2(lm)      (0x70 + 4 * (lm))
++#define CTL_LAYER_EXT3(lm)      (0xa0 + 4 * (lm))
++
++/* SSPP (dpu_hw_sspp.c) */
++#define SSPP_SRC_SIZE           0x00
++#define SSPP_SRC_XY             0x08
++#define SSPP_OUT_SIZE           0x0c
++#define SSPP_OUT_XY             0x10
++#define SSPP_SRC0_ADDR          0x14
++#define SSPP_SRC1_ADDR          0x18
++#define SSPP_SRC_YSTRIDE0       0x24
++#define SSPP_SRC_YSTRIDE1       0x28
++#define SSPP_SRC_FORMAT         0x30
++#define SSPP_SRC_UNPACK         0x34
++#define SSPP_SRC_OP_MODE        0x38
++#define SSPP_FETCH_CONFIG       0x48
++#define SSPP_QOS_CTRL           0x6c
++#define SSPP_ADDR_SW_STATUS     0x70
++#define SSPP_MULTIRECT_OPMODE   0x170
++#define SSPP_SRC_XY_REC1        0x168
++#define SSPP_SRC_SIZE_REC1      0x16c
++#define SSPP_OUT_SIZE_REC1      0x160
++#define SSPP_OUT_XY_REC1        0x164
++#define SSPP_QSEED3             0xa00   /* VIG: dpu_vig_sblk_qseed3_1_3 */
++
++/* LM (dpu_hw_lm.c), blend stage 0 at 0x20 */
++#define LM_OP_MODE              0x00
++#define LM_OUT_SIZE             0x04
++#define LM_BORDER_COLOR_0       0x08
++#define LM_BORDER_COLOR_1       0x10
++#define LM_MISR_CTRL            0x310
++#define LM_MISR_SIGNATURE       0x314
++#define MISR_CTRL_RUN           0x80000101u     /* free run | enable | 1 frame */
++#define MISR_CTRL_STATUS        (1u << 9)
++#define MISR_CTRL_CLEAR         (1u << 10)
++
++/* PINGPONG (dpu_hw_pingpong.c) */
++#define PP_BASE(n)              (0x70000 + 0x800 * (n))
++#define PP_TEAR_CHECK_EN        0x000
++#define PP_SYNC_CONFIG_VSYNC    0x004   /* 15:0 vsync_count, 19 counter en, 20 external TE */
++#define PP_SYNC_CONFIG_HEIGHT   0x008
++#define PP_SYNC_WRCOUNT         0x00c
++#define PP_VSYNC_INIT_VAL       0x010
++#define PP_INT_COUNT_VAL        0x014   /* 31:16 rd_ptr frame count, 15:0 rd_ptr line */
++#define PP_SYNC_THRESH          0x018
++#define PP_START_POS            0x01c
++#define PP_RD_PTR_IRQ           0x020
++#define PP_LINE_COUNT           0x02c
++#define PP_AUTOREFRESH_CONFIG   0x030
++#define PP_DSC_MODE             0x0a0
++#define BD_VSYNC_CLK            19200000ULL     /* tear check counter clock (XO) */
++
++/* DSC, INTF */
++#define DSC_BASE(n)             (0x80000 + 0x400 * (n))
++#define INTF_BASE(n)            (0x6a000 + 0x800 * (n))
++#define INTF_TIMING_ENGINE_EN   0x000
++#define INTF_CONFIG             0x004
++#define INTF_CONFIG2            0x060
++#define INTF_DSI_CMD_TRIGGER_EN 0x084
++#define INTF_PANEL_FORMAT       0x090
++#define INTF_FRAME_LINE_CNT_EN  0x0a8
++#define INTF_FRAME_COUNT        0x0ac
++#define INTF_LINE_COUNT         0x0b0
++#define INTF_PROG_FETCH_START   0x170
++#define INTF_MUX                0x25c
++#define INTF_STATUS             0x26c
++
++/* DSI 6G (downstream dsi_ctrl_reg.h) */
++#define DSI_HW_VERSION          0x000
++#define DSI_CTRL                0x004   /* 0 enable, 1 video mode, 2 command mode */
++#define DSI_STATUS              0x008
++#define DSI_CMD_MDP_CTRL        0x040
++#define DSI_CMD_MDP_DCS_CTRL    0x044
++#define DSI_CMD_STREAM0_CTRL    0x058
++#define DSI_CMD_STREAM0_TOTAL   0x05c
++#define DSI_TRIG_CTRL           0x084
++#define DSI_INT_CTRL            0x110
++#define DSI_CLK_CTRL            0x118
++
++/* ARM SMMUv2: global space 0, context bank */
++#define SMMU_sCR0               0x000
++#define SMMU_IDR0               0x020
++#define SMMU_IDR1               0x024
++#define SMMU_sGFAR              0x040
++#define SMMU_sGFSR              0x048
++#define SMMU_sGFSYNR0           0x050
++#define SMMU_SMR(n)             (0x800 + 4 * (n))
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
++#define SMMU_CB_SCTLR           0x000
++#define SMMU_CB_TTBR0           0x020
++#define SMMU_CB_TCR             0x030
++#define SMMU_CB_FSR             0x058
++#define SMMU_CB_FAR             0x060
++#define SMMU_CB_FSYNR0          0x068
++/* MULTI SS | UUT ASF TLBLKF TLBMCF EF PF AFF TF; bits 10:9 are FORMAT, not a fault */
++#define SMMU_FSR_FAULT          0xc00001feu
++
++struct bd_pipe_desc {
++	const char *name;
++	uint32_t    base;
++	uint32_t    flush;          /* CTL_FLUSH bit */
++	int8_t      idx0, sh0, ext0;        /* rect 0 stage field (ctl_blend_config) */
++	int8_t      idx1, sh1;              /* rect 1 */
++	bool        vig;
++};
++
++static const struct bd_pipe_desc bd_pipes[8] = {
++	{ "VIG0", 0x04000, 1u << 0, 0, 0, 0, 3, 0, true },
++	{ "VIG1", 0x06000, 1u << 1, 0, 3, 2, 3, 4, true },
++	{ "VIG2", 0x08000, 1u << 2, 0, 6, 4, 3, 8, true },
++	{ "VIG3", 0x0a000, 1u << 18, 0, 26, 6, 3, 12, true },
++	{ "DMA0", 0x24000, 1u << 11, 0, 18, 16, 2, 8, false },
++	{ "DMA1", 0x26000, 1u << 12, 0, 21, 18, 2, 12, false },
++	{ "DMA2", 0x28000, 1u << 24, 2, 0, -1, 2, 16, false },
++	{ "DMA3", 0x2a000, 1u << 25, 2, 4, -1, 2, 20, false },
++};
++
++static const struct {
++	const char *name;
++	uint32_t    base;
++	uint32_t    id;             /* LM_n: CTL_LAYER index */
++} bd_lms[4] = {
++	{ "LM0", 0x44000, 0 }, { "LM1", 0x45000, 1 }, { "LM2", 0x46000, 2 }, { "LM5", 0x49000, 5 },
++};
++
++/* One staged source rect of the active pipeline. */
++struct bd_src {
++	int pipe, rect, lm, stage;
++};
++
++struct bd_state {
++	int      ctl;           /* active CTL, -1 none */
++	uint32_t top;
++	int      pp;            /* pingpong with autorefresh on, -1 none */
++	int      intf;          /* INTF index from CTL_TOP, -1 unknown */
++	int      nlm;
++	int      lm[4];         /* index into bd_lms */
++	int      nsrc;
++	struct bd_src src[16];
++	uint32_t flush;         /* CTL_FLUSH bits of the staged pipes */
++	int      smmu_cb;       /* context bank of SID 0x880, -1 none */
++};
++
++/* What the MDP streams' SMMU fault state looked like (compared, never cleared). */
++struct bd_smmu_snap {
++	uint32_t sgfsr, sgfsynr0, sgfar, fsr, fsynr0, far_lo, far_hi;
++};
++
++/* Refresh measurement: latched interrupt bits counted over a window. */
++struct bd_rate {
++	uint32_t us, te, rdptr, done, autoref, wrptr, wraps, maxline;
++	uint32_t rd_min_us, rd_max_us;
++};
++
++static volatile uint32_t *bd_mdss, *bd_dsi, *bd_smmu;
++static uint32_t bd_smmu_cbbase, bd_smmu_pagesz;
++static uint64_t bd_panel_pa;
++static uint32_t bd_w, bd_h, bd_stride, bd_lw, bd_lh;
++static uintptr_t bd_panel_va;
++static bool bd_done_live;       /* pp_done latched during the survey: frames are being sent */
++static int bd_mode, bd_delay, bd_hold_ms = 5000, bd_keep, bd_target = 1;
++static struct bd_state bd_st;
++static struct bd_smmu_snap bd_smmu_base;
++
++static inline uint32_t
++mdp_rd(uint32_t off)
++{
++	return bd_mdss[(BD_MDP + off) / 4];
++}
++
++static inline void
++mdp_wr(uint32_t off, uint32_t v)
++{
++	bd_mdss[(BD_MDP + off) / 4] = v;
++}
++
++static inline void
++bd_dsb(void)
++{
++	__builtin_arm_dsb(0xf);
++}
++
++static uint64_t
++bd_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++static uint32_t
++smmu_rd(uint32_t off)
++{
++	return off < BD_SMMU_SIZE ? bd_smmu[off / 4] : 0xdeadbeefu;
++}
++
++/* "name name bitN" for the set bits of v. */
++static void
++bd_decode(char *buf, size_t len, uint32_t v, const char *const *names)
++{
++	size_t n = 0;
++	buf[0] = '\0';
++	for (uint32_t b = 0; b < 32 && n + 1 < len; b++) {
++		if (!(v & (1u << b))) {
++			continue;
++		}
++		int k = names[b] != NULL ? snprintf(buf + n, len - n, "%s%s", n ? " " : "", names[b]) :
++		    snprintf(buf + n, len - n, "%sbit%u", n ? " " : "", b);
++		if (k < 0) {
++			break;
++		}
++		n += (size_t)k;
++	}
++	if (n == 0) {
++		snprintf(buf, len, "none");
++	}
++}
++
++static void
++bd_log_intr(const char *tag, uint32_t intr, uint32_t intr2)
++{
++	char a[256], b[160];
++	bd_decode(a, sizeof(a), intr, bd_intr_names);
++	bd_decode(b, sizeof(b), intr2, bd_intr2_names);
++	IOLog("BLUE DPU: %s: intr 0x%x = %s; intr2 0x%x = %s\n", tag, intr, a, intr2, b);
++}
++
++/* ---------------- read-only survey ---------------- */
++
++static int
++bd_stage(const struct bd_pipe_desc *p, const uint32_t *L, int rect)
++{
++	uint32_t v;
++	if (rect == 0) {
++		if (p->idx0 == 0) {
++			v = (L[0] >> p->sh0) & 7;
++			v |= ((L[1] >> p->ext0) & 1) << 3;
++		} else {
++			v = (L[p->idx0] >> p->sh0) & 0xf;
++		}
++	} else {
++		v = (L[p->idx1] >> p->sh1) & 0xf;
++	}
++	return (int)v;          /* 0: not staged, else blend stage + 1 */
++}
++
++static void
++bd_dump_pipe(const char *tag, int i)
++{
++	const struct bd_pipe_desc *p = &bd_pipes[i];
++	uint32_t b = p->base;
++	IOLog("BLUE DPU: %s %s src_size 0x%x src_xy 0x%x out_size 0x%x out_xy 0x%x addr0 0x%x addr1 0x%x\n",
++	    tag, p->name, mdp_rd(b + SSPP_SRC_SIZE), mdp_rd(b + SSPP_SRC_XY), mdp_rd(b + SSPP_OUT_SIZE),
++	    mdp_rd(b + SSPP_OUT_XY), mdp_rd(b + SSPP_SRC0_ADDR), mdp_rd(b + SSPP_SRC1_ADDR));
++	IOLog("BLUE DPU: %s %s ystride0 0x%x ystride1 0x%x format 0x%x unpack 0x%x op_mode 0x%x fetch 0x%x qos 0x%x secure 0x%x multirect 0x%x\n",
++	    tag, p->name, mdp_rd(b + SSPP_SRC_YSTRIDE0), mdp_rd(b + SSPP_SRC_YSTRIDE1),
++	    mdp_rd(b + SSPP_SRC_FORMAT), mdp_rd(b + SSPP_SRC_UNPACK), mdp_rd(b + SSPP_SRC_OP_MODE),
++	    mdp_rd(b + SSPP_FETCH_CONFIG), mdp_rd(b + SSPP_QOS_CTRL), mdp_rd(b + SSPP_ADDR_SW_STATUS),
++	    mdp_rd(b + SSPP_MULTIRECT_OPMODE));
++	if (mdp_rd(b + SSPP_MULTIRECT_OPMODE) != 0) {
++		IOLog("BLUE DPU: %s %s rec1 src_size 0x%x src_xy 0x%x out_size 0x%x out_xy 0x%x\n", tag, p->name,
++		    mdp_rd(b + SSPP_SRC_SIZE_REC1), mdp_rd(b + SSPP_SRC_XY_REC1),
++		    mdp_rd(b + SSPP_OUT_SIZE_REC1), mdp_rd(b + SSPP_OUT_XY_REC1));
++	}
++	if (p->vig) {
++		uint32_t q = b + SSPP_QSEED3;
++		IOLog("BLUE DPU: %s %s qseed3 ver 0x%x op 0x%x step_h 0x%x step_v 0x%x src 0x%x dst 0x%x, pix_ext lr 0x%x tb 0x%x req 0x%x\n",
++		    tag, p->name, mdp_rd(q + 0x00), mdp_rd(q + 0x04), mdp_rd(q + 0x10), mdp_rd(q + 0x14),
++		    mdp_rd(q + 0x40), mdp_rd(q + 0x48), mdp_rd(b + 0x100), mdp_rd(b + 0x104), mdp_rd(b + 0x108));
++	}
++}
++
++static uint32_t
++bd_cb_off(const struct bd_state *st)
++{
++	return bd_smmu_cbbase + (uint32_t)st->smmu_cb * bd_smmu_pagesz;
++}
++
++static void
++bd_smmu_snapshot(const struct bd_state *st, struct bd_smmu_snap *s)
++{
++	bzero(s, sizeof(*s));
++	if (bd_smmu == NULL) {
++		return;
++	}
++	s->sgfsr = smmu_rd(SMMU_sGFSR);
++	s->sgfsynr0 = smmu_rd(SMMU_sGFSYNR0);
++	s->sgfar = smmu_rd(SMMU_sGFAR);
++	if (st->smmu_cb >= 0) {
++		uint32_t cbo = bd_cb_off(st);
++		s->fsr = smmu_rd(cbo + SMMU_CB_FSR);
++		s->fsynr0 = smmu_rd(cbo + SMMU_CB_FSYNR0);
++		s->far_lo = smmu_rd(cbo + SMMU_CB_FAR);
++		s->far_hi = smmu_rd(cbo + SMMU_CB_FAR + 4);
++	}
++}
++
++static void
++bd_smmu_log(const char *tag, const struct bd_smmu_snap *s)
++{
++	IOLog("BLUE DPU: %s: SMMU sGFSR 0x%x sGFSYNR0 0x%x sGFAR 0x%x, cb fsr 0x%x (fault bits 0x%x, format %u) fsynr0 0x%x far 0x%x_%08x\n",
++	    tag, s->sgfsr, s->sgfsynr0, s->sgfar, s->fsr, s->fsr & SMMU_FSR_FAULT, (s->fsr >> 9) & 3, s->fsynr0,
++	    s->far_hi, s->far_lo);
++}
++
++static void
++bd_smmu_survey(struct bd_state *st)
++{
++	st->smmu_cb = -1;
++	IOLog("BLUE DPU: about to read the apps SMMU at 0x%llx\n", BD_SMMU_PA);
++	if (bd_smmu == NULL) {
++		bd_smmu = (volatile uint32_t *)ml_io_map(BD_SMMU_PA, BD_SMMU_SIZE);
++	}
++	if (bd_smmu == NULL) {
++		IOLog("BLUE DPU: SMMU mapping failed\n");
++		return;
++	}
++	uint32_t idr0 = smmu_rd(SMMU_IDR0), idr1 = smmu_rd(SMMU_IDR1);
++	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	bd_smmu_pagesz = (idr1 >> 31) ? 0x10000 : 0x1000;
++	bd_smmu_cbbase = (1u << (((idr1 >> 28) & 7) + 1)) * bd_smmu_pagesz;
++	if (nsmr > 128) {
++		nsmr = 128;
++	}
++	IOLog("BLUE DPU: SMMU sCR0 0x%x sGFSR 0x%x idr0 0x%x idr1 0x%x: %u SMRs %u banks\n",
++	    smmu_rd(SMMU_sCR0), smmu_rd(SMMU_sGFSR), idr0, idr1, nsmr, ncb);
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t m = smmu_rd(SMMU_SMR(i));
++		if (!(m >> 31)) {
++			continue;
++		}
++		uint32_t id = m & 0x7fff, mask = (m >> 16) & 0x7fff;
++		bool mdp0 = ((BD_SID_MDP0 ^ id) & ~mask & 0x7fff) == 0;
++		bool mdp1 = ((BD_SID_MDP1 ^ id) & ~mask & 0x7fff) == 0;
++		if (!mdp0 && !mdp1) {
++			continue;
++		}
++		uint32_t c = smmu_rd(SMMU_S2CR(i)), type = (c >> 16) & 3, cb = c & 0xff;
++		IOLog("BLUE DPU: SMMU smr%u 0x%08x (stream 0x%x mask 0x%x) s2cr 0x%08x: %s\n", i, m, id, mask, c,
++		    type == 0 ? "translate" : type == 1 ? "bypass" : "fault");
++		if (type == 0 && cb < ncb) {
++			uint32_t cbo = bd_smmu_cbbase + cb * bd_smmu_pagesz;
++			uint32_t fsr = smmu_rd(cbo + SMMU_CB_FSR);
++			IOLog("BLUE DPU: SMMU cb%u cbar 0x%x sctlr 0x%x (M=%u) ttbr0 0x%x_%08x tcr 0x%x fsr 0x%x (fault bits 0x%x) far 0x%x_%08x fsynr0 0x%x\n",
++			    cb, smmu_rd(bd_smmu_pagesz + 4 * cb), smmu_rd(cbo + SMMU_CB_SCTLR), smmu_rd(cbo + SMMU_CB_SCTLR) & 1,
++			    smmu_rd(cbo + SMMU_CB_TTBR0 + 4), smmu_rd(cbo + SMMU_CB_TTBR0), smmu_rd(cbo + SMMU_CB_TCR), fsr,
++			    fsr & SMMU_FSR_FAULT, smmu_rd(cbo + SMMU_CB_FAR + 4), smmu_rd(cbo + SMMU_CB_FAR),
++			    smmu_rd(cbo + SMMU_CB_FSYNR0));
++			if ((mdp0 || mdp1) && st->smmu_cb < 0) {
++				st->smmu_cb = (int)cb;
++			}
++		}
++	}
++}
++
++/*
++ * Refresh rate over ms milliseconds: the PP's done / rd_ptr / wr_ptr /
++ * autorefresh_done and TE latches, cleared as they are seen (the only
++ * writes; all MDP interrupts are disabled), plus the wraps of the read
++ * pointer line counter.
++ */
++static void
++bd_rate_measure(const struct bd_state *st, const char *tag, uint32_t ms, struct bd_rate *r)
++{
++	bzero(r, sizeof(*r));
++	r->rd_min_us = ~0u;
++	if (st->pp < 0) {
++		IOLog("BLUE DPU: %s: no autorefresh pingpong, no rate\n", tag);
++		return;
++	}
++	uint32_t pp = (uint32_t)st->pp, ppb = PP_BASE(pp);
++	uint32_t m1 = INTR_PP_DONE(pp) | INTR_PP_RDPTR(pp) | INTR_PP_WRPTR(pp) | INTR_PP_AUTOREF(pp);
++	uint32_t m2 = INTR2_PP_TE(pp);
++	mdp_wr(MDP_INTR_CLEAR, m1);
++	mdp_wr(MDP_INTR2_CLEAR, m2);
++	bd_dsb();
++	uint32_t lastline = mdp_rd(ppb + PP_INT_COUNT_VAL) & 0xffff;
++	uint64_t t0 = mach_absolute_time(), last_rd = 0, now = t0;
++	uint64_t limit = (uint64_t)ms * 1000;
++	while (bd_us((now = mach_absolute_time()) - t0) < limit) {
++		uint32_t s1 = mdp_rd(MDP_INTR_STATUS) & m1, s2 = mdp_rd(MDP_INTR2_STATUS) & m2;
++		if (s1 != 0) {
++			mdp_wr(MDP_INTR_CLEAR, s1);
++		}
++		if (s2 != 0) {
++			mdp_wr(MDP_INTR2_CLEAR, s2);
++		}
++		if (s1 | s2) {
++			bd_dsb();
++		}
++		r->done += (s1 & INTR_PP_DONE(pp)) != 0;
++		r->wrptr += (s1 & INTR_PP_WRPTR(pp)) != 0;
++		r->autoref += (s1 & INTR_PP_AUTOREF(pp)) != 0;
++		r->te += (s2 & INTR2_PP_TE(pp)) != 0;
++		if (s1 & INTR_PP_RDPTR(pp)) {
++			r->rdptr++;
++			if (last_rd != 0) {
++				uint32_t d = (uint32_t)bd_us(now - last_rd);
++				r->rd_min_us = d < r->rd_min_us ? d : r->rd_min_us;
++				r->rd_max_us = d > r->rd_max_us ? d : r->rd_max_us;
++			}
++			last_rd = now;
++		}
++		uint32_t line = mdp_rd(ppb + PP_INT_COUNT_VAL) & 0xffff;
++		if (line < lastline) {
++			r->wraps++;
++		}
++		r->maxline = line > r->maxline ? line : r->maxline;
++		lastline = line;
++		IODelay(250);
++	}
++	r->us = (uint32_t)bd_us(now - t0);
++	if (r->rd_min_us == ~0u) {
++		r->rd_min_us = 0;
++	}
++#define BD_HZ10(n) (r->us ? (uint32_t)((uint64_t)(n) * 10000000ULL / r->us) : 0)
++	uint32_t vs = mdp_rd(ppb + PP_SYNC_CONFIG_VSYNC) & 0xffff, init = mdp_rd(ppb + PP_VSYNC_INIT_VAL) & 0xffff;
++	uint32_t fl = r->maxline > init ? r->maxline - init : 0;
++	uint64_t frame_us = vs ? (uint64_t)fl * vs * 1000000ULL / BD_VSYNC_CLK : 0;
++	IOLog("BLUE DPU: %s: %u us: pp%u_done %u (%u.%u Hz, frames sent), rd_ptr %u (%u.%u Hz, interval %u..%u us), TE pin %u (%u.%u Hz), autorefresh_done %u, wr_ptr %u, rd line wraps %u (%u.%u Hz, max line %u = %u lines after init %u, %llu us at %llu Hz line clock)\n",
++	    tag, r->us, pp, r->done, BD_HZ10(r->done) / 10, BD_HZ10(r->done) % 10, r->rdptr,
++	    BD_HZ10(r->rdptr) / 10, BD_HZ10(r->rdptr) % 10, r->rd_min_us, r->rd_max_us, r->te,
++	    BD_HZ10(r->te) / 10, BD_HZ10(r->te) % 10, r->autoref, r->wrptr, r->wraps,
++	    BD_HZ10(r->wraps) / 10, BD_HZ10(r->wraps) % 10, r->maxline, fl, init, frame_us,
++	    vs ? BD_VSYNC_CLK / vs : 0ULL);
++#undef BD_HZ10
++}
++
++static void
++bd_survey(struct bd_state *st)
++{
++	bzero(st, sizeof(*st));
++	st->ctl = st->pp = st->intf = st->smmu_cb = -1;
++
++	IOLog("BLUE DPU: about to read MDSS/MDP at 0x%llx\n", BD_MDSS_PA);
++	IOLog("BLUE DPU: MDSS hw 0x%x intr 0x%x, MDP hw 0x%x intf_sel 0x%x split %u upper 0x%x lower 0x%x te_line 0x%x vsync_sel 0x%x\n",
++	    bd_mdss[0], bd_mdss[0x10 / 4], mdp_rd(0), mdp_rd(MDP_DISP_INTF_SEL), mdp_rd(MDP_SPLIT_DISPLAY_EN),
++	    mdp_rd(MDP_SPLIT_UPPER), mdp_rd(MDP_SPLIT_LOWER), mdp_rd(MDP_SPLIT_TE_LINE), mdp_rd(MDP_VSYNC_SEL));
++	IOLog("BLUE DPU: MDP intr en 0x%x status 0x%x, intr2 en 0x%x status 0x%x, danger 0x%x safe 0x%x, clk_ctrl 0x%x 0x%x 0x%x 0x%x\n",
++	    mdp_rd(MDP_INTR_EN), mdp_rd(MDP_INTR_STATUS), mdp_rd(MDP_INTR2_EN), mdp_rd(MDP_INTR2_STATUS),
++	    mdp_rd(MDP_DANGER_STATUS), mdp_rd(MDP_SAFE_STATUS), mdp_rd(0x2ac), mdp_rd(0x2b4), mdp_rd(0x2bc), mdp_rd(0x2c4));
++	bd_log_intr("latched at boot (raw status, interrupts disabled)", mdp_rd(MDP_INTR_STATUS), mdp_rd(MDP_INTR2_STATUS));
++
++	/* CTLs: the one with an interface selected is ABL's (sde_rm cont-splash readout). */
++	for (int c = 0; c < CTL_COUNT; c++) {
++		uint32_t cb = CTL_BASE(c), top = mdp_rd(cb + CTL_TOP);
++		IOLog("BLUE DPU: CTL_%d top 0x%x (intf_sel %u pp_sel %u mode %s) flush 0x%x start 0x%x layer lm0 0x%x lm1 0x%x lm2 0x%x lm5 0x%x\n",
++		    c, top, (top >> 4) & 0xf, (top >> 8) & 7, (top >> 17) & 1 ? "cmd" : "video",
++		    mdp_rd(cb + CTL_FLUSH), mdp_rd(cb + CTL_START), mdp_rd(cb + CTL_LAYER(0)),
++		    mdp_rd(cb + CTL_LAYER(1)), mdp_rd(cb + CTL_LAYER(2)), mdp_rd(cb + CTL_LAYER(5)));
++		if (((top >> 4) & 0xf) != 0 && st->ctl < 0) {
++			st->ctl = c;
++			st->top = top;
++			st->intf = (int)((top >> 4) & 0xf) - 1;    /* sde enum: INTF_0 = 1 */
++		}
++	}
++	if (st->ctl < 0) {
++		IOLog("BLUE DPU: no CTL drives an interface\n");
++	} else {
++		uint32_t cb = CTL_BASE(st->ctl);
++		for (int l = 0; l < 4; l++) {
++			uint32_t id = bd_lms[l].id;
++			uint32_t L[4] = {
++				mdp_rd(cb + CTL_LAYER(id)), mdp_rd(cb + CTL_LAYER_EXT(id)),
++				mdp_rd(cb + CTL_LAYER_EXT2(id)), mdp_rd(cb + CTL_LAYER_EXT3(id)),
++			};
++			if ((L[0] | L[1] | L[2] | L[3]) == 0) {
++				continue;
++			}
++			st->lm[st->nlm++] = l;
++			IOLog("BLUE DPU: CTL_%d %s layer 0x%x ext 0x%x ext2 0x%x ext3 0x%x\n", st->ctl, bd_lms[l].name,
++			    L[0], L[1], L[2], L[3]);
++			for (int p = 0; p < 8; p++) {
++				for (int r = 0; r < 2; r++) {
++					int s = bd_stage(&bd_pipes[p], L, r);
++					if (s == 0 || st->nsrc >= 16) {
++						continue;
++					}
++					st->src[st->nsrc++] = (struct bd_src){ p, r, l, s - 1 };
++					st->flush |= bd_pipes[p].flush;
++					IOLog("BLUE DPU: %s <- %s rect %d stage %d\n", bd_lms[l].name, bd_pipes[p].name, r, s - 1);
++				}
++			}
++		}
++	}
++
++	for (int l = 0; l < 4; l++) {
++		uint32_t b = bd_lms[l].base;
++		IOLog("BLUE DPU: %s op 0x%x out_size 0x%x border 0x%x 0x%x blend0 op 0x%x fg 0x%x bg 0x%x misr ctrl 0x%x sig 0x%x\n",
++		    bd_lms[l].name, mdp_rd(b + LM_OP_MODE), mdp_rd(b + LM_OUT_SIZE), mdp_rd(b + LM_BORDER_COLOR_0),
++		    mdp_rd(b + LM_BORDER_COLOR_1), mdp_rd(b + 0x20), mdp_rd(b + 0x24), mdp_rd(b + 0x28),
++		    mdp_rd(b + LM_MISR_CTRL), mdp_rd(b + LM_MISR_SIGNATURE));
++	}
++
++	/* Every pipe: the staged ones in full, the others by size and address. */
++	for (int p = 0; p < 8; p++) {
++		bool staged = false;
++		for (int s = 0; s < st->nsrc; s++) {
++			staged |= st->src[s].pipe == p;
++		}
++		if (staged) {
++			bd_dump_pipe("staged", p);
++		} else {
++			uint32_t b = bd_pipes[p].base;
++			IOLog("BLUE DPU: idle %s src_size 0x%x addr0 0x%x ystride0 0x%x format 0x%x\n", bd_pipes[p].name,
++			    mdp_rd(b + SSPP_SRC_SIZE), mdp_rd(b + SSPP_SRC0_ADDR), mdp_rd(b + SSPP_SRC_YSTRIDE0),
++			    mdp_rd(b + SSPP_SRC_FORMAT));
++		}
++	}
++
++	for (int i = 0; i < 4; i++) {
++		uint32_t b = PP_BASE(i);
++		uint32_t vs = mdp_rd(b + PP_SYNC_CONFIG_VSYNC), ht = mdp_rd(b + PP_SYNC_CONFIG_HEIGHT);
++		uint32_t ar = mdp_rd(b + PP_AUTOREFRESH_CONFIG), cnt = mdp_rd(b + PP_INT_COUNT_VAL);
++		IOLog("BLUE DPU: PP_%d te_en 0x%x sync_vsync 0x%x (count %u%s%s, line clock %llu Hz) height %u init %u thresh 0x%x start %u rdptr_irq %u\n",
++		    i, mdp_rd(b + PP_TEAR_CHECK_EN), vs, vs & 0xffff, (vs >> 19) & 1 ? " counter" : "",
++		    (vs >> 20) & 1 ? " externalTE" : "", (vs & 0xffff) ? BD_VSYNC_CLK / (vs & 0xffff) : 0ULL,
++		    ht & 0xffff, mdp_rd(b + PP_VSYNC_INIT_VAL) & 0xffff,
++		    mdp_rd(b + PP_SYNC_THRESH), mdp_rd(b + PP_START_POS), mdp_rd(b + PP_RD_PTR_IRQ));
++		IOLog("BLUE DPU: PP_%d autorefresh 0x%x (%s, every %u TE) rdptr frame %u line %u, wr line %u, dsc_mode 0x%x\n",
++		    i, ar, (ar >> 31) ? "on" : "off", ar & 0xffff, cnt >> 16, cnt & 0xffff,
++		    mdp_rd(b + PP_LINE_COUNT) & 0xffff, mdp_rd(b + PP_DSC_MODE));
++		if ((ar >> 31) && st->pp < 0) {
++			st->pp = i;
++		}
++	}
++	for (int i = 0; i < 4; i++) {
++		uint32_t b = DSC_BASE(i);
++		IOLog("BLUE DPU: DSC_%d 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n", i, mdp_rd(b), mdp_rd(b + 4), mdp_rd(b + 8),
++		    mdp_rd(b + 0xc), mdp_rd(b + 0x10), mdp_rd(b + 0x14));
++	}
++	for (int i = 1; i <= 2; i++) {          /* the DSI interfaces; INTF_0/3 are DP */
++		uint32_t b = INTF_BASE(i);
++		IOLog("BLUE DPU: INTF_%d timing_en %u config 0x%x config2 0x%x cmd_trigger 0x%x panel_fmt 0x%x cnt_en 0x%x frame %u line %u prog_fetch 0x%x mux 0x%x status 0x%x\n",
++		    i, mdp_rd(b + INTF_TIMING_ENGINE_EN), mdp_rd(b + INTF_CONFIG), mdp_rd(b + INTF_CONFIG2),
++		    mdp_rd(b + INTF_DSI_CMD_TRIGGER_EN), mdp_rd(b + INTF_PANEL_FORMAT), mdp_rd(b + INTF_FRAME_LINE_CNT_EN),
++		    mdp_rd(b + INTF_FRAME_COUNT), mdp_rd(b + INTF_LINE_COUNT), mdp_rd(b + INTF_PROG_FETCH_START),
++		    mdp_rd(b + INTF_MUX), mdp_rd(b + INTF_STATUS));
++	}
++
++	IOLog("BLUE DPU: about to read DSI0 at 0x%llx\n", BD_DSI0_PA);
++	if (bd_dsi == NULL) {
++		bd_dsi = (volatile uint32_t *)ml_io_map(BD_DSI0_PA, 0x4000);
++	}
++	if (bd_dsi != NULL) {
++		uint32_t ctrl = bd_dsi[DSI_CTRL / 4];
++		IOLog("BLUE DPU: DSI0 hw 0x%x ctrl 0x%x (%s%s%s) status 0x%x mdp_ctrl 0x%x dcs_ctrl 0x%x stream0 0x%x total 0x%x trig 0x%x int 0x%x clk 0x%x\n",
++		    bd_dsi[DSI_HW_VERSION / 4], ctrl, ctrl & 1 ? "on" : "off", ctrl & 2 ? " video" : "",
++		    ctrl & 4 ? " command" : "", bd_dsi[DSI_STATUS / 4], bd_dsi[DSI_CMD_MDP_CTRL / 4],
++		    bd_dsi[DSI_CMD_MDP_DCS_CTRL / 4], bd_dsi[DSI_CMD_STREAM0_CTRL / 4], bd_dsi[DSI_CMD_STREAM0_TOTAL / 4],
++		    bd_dsi[DSI_TRIG_CTRL / 4], bd_dsi[DSI_INT_CTRL / 4], bd_dsi[DSI_CLK_CTRL / 4]);
++	}
++
++	bd_smmu_survey(st);
++
++	IOLog("BLUE DPU: summary: CTL_%d (%s mode) -> INTF_%d, %d LM, %d source rects (flush 0x%x), autorefresh PP_%d, MDP stream cb %d\n",
++	    st->ctl, (st->top >> 17) & 1 ? "command" : "video", st->intf, st->nlm, st->nsrc, st->flush, st->pp,
++	    st->smmu_cb);
++}
++
++/* ---------------- alternate scanout: registers, plan, enter / leave ---------------- */
++
++/*
++ * Every SSPP register an alternate scanout writes, with the value ABL left
++ * (read the first time it is touched, while ABL's setup is still live).
++ * Leaving restores the touched ones in reverse order.
++ */
++struct bd_reg {
++	uint32_t off, abl;
++	bool     touched;
++};
++
++static struct bd_reg bd_regs[96];
++static int bd_nregs;
++
++static int
++bd_reg(uint32_t off)
++{
++	for (int i = 0; i < bd_nregs; i++) {
++		if (bd_regs[i].off == off) {
++			return i;
++		}
++	}
++	if (bd_nregs >= (int)(sizeof(bd_regs) / sizeof(bd_regs[0]))) {
++		return -1;
++	}
++	bd_regs[bd_nregs] = (struct bd_reg){ off, mdp_rd(off), false };
++	return bd_nregs++;
++}
++
++/* ABL's value of a register (live value if it was never recorded). */
++static uint32_t
++bd_abl(uint32_t off)
++{
++	int i = bd_reg(off);
++	return i >= 0 ? bd_regs[i].abl : mdp_rd(off);
++}
++
++static bool
++bd_set(uint32_t off, uint32_t v)
++{
++	int i = bd_reg(off);
++	if (i < 0) {
++		return false;
++	}
++	bd_regs[i].touched = true;
++	mdp_wr(off, v);
++	return true;
++}
++
++/* Record ABL's values of everything a staged rect may change (survey time). */
++static void
++bd_regs_record(const struct bd_state *st)
++{
++	static const uint32_t offs[] = {
++		SSPP_SRC_SIZE, SSPP_SRC_XY, SSPP_OUT_SIZE, SSPP_OUT_XY, SSPP_SRC0_ADDR, SSPP_SRC1_ADDR,
++		SSPP_SRC_YSTRIDE0, SSPP_SRC_YSTRIDE1, SSPP_SRC_SIZE_REC1, SSPP_SRC_XY_REC1,
++		SSPP_OUT_SIZE_REC1, SSPP_OUT_XY_REC1,
++	};
++	for (int s = 0; s < st->nsrc; s++) {
++		for (size_t k = 0; k < sizeof(offs) / sizeof(offs[0]); k++) {
++			(void)bd_reg(bd_pipes[st->src[s].pipe].base + offs[k]);
++		}
++	}
++}
++
++/* One staged rect pointed at a buffer laid out as the iOS display. */
++struct bd_rect_plan {
++	uint32_t base;          /* SSPP */
++	int      rect;
++	uint32_t addr_off;      /* SRC0/1_ADDR */
++	uint32_t xy_off;        /* SRC_XY(_REC1) */
++	uint32_t byte_off;      /* address = buffer + byte_off */
++	uint32_t xy;            /* new source x/y */
++};
++
++struct bd_plan {
++	int      n;
++	uint32_t stride;        /* bytes per row of the buffer */
++	uint32_t flush;
++	struct bd_rect_plan r[16];
++};
++
++/*
++ * Crop: the panel picture is the centre of a lw x lh buffer, as with
++ * bluefb_fit=0. Each rect keeps its size and output and reads from the same
++ * panel position, now (offx, offy) further into the bigger buffer.
++ * NULL if every rect can do that, else why not.
++ */
++static const char *
++bd_plan_crop(const struct bd_state *st, uint32_t lw, uint32_t lh, uint32_t stride, struct bd_plan *pl)
++{
++	static char why[160];
++	uint32_t offx = (lw - bd_w) / 2, offy = (lh - bd_h) / 2;
++	bzero(pl, sizeof(*pl));
++	pl->stride = stride;
++	pl->flush = st->flush;
++	if (st->ctl < 0 || st->pp < 0 || st->nsrc == 0 || st->intf < 0) {
++		snprintf(why, sizeof(why), "pipeline not as expected (ctl %d pp %d rects %d intf %d)",
++		    st->ctl, st->pp, st->nsrc, st->intf);
++		return why;
++	}
++	if (lw < bd_w || lh < bd_h || stride < lw * 4 || (stride & 15)) {
++		snprintf(why, sizeof(why), "buffer %ux%u stride %u cannot hold the %ux%u panel", lw, lh, stride, bd_w, bd_h);
++		return why;
++	}
++	for (int s = 0; s < st->nsrc; s++) {
++		const struct bd_pipe_desc *p = &bd_pipes[st->src[s].pipe];
++		int r = st->src[s].rect;
++		uint32_t a_off = p->base + (r ? SSPP_SRC1_ADDR : SSPP_SRC0_ADDR);
++		uint32_t x_off = p->base + (r ? SSPP_SRC_XY_REC1 : SSPP_SRC_XY);
++		uint32_t sz = bd_abl(p->base + (r ? SSPP_SRC_SIZE_REC1 : SSPP_SRC_SIZE));
++		uint32_t ys = bd_abl(p->base + SSPP_SRC_YSTRIDE0);
++		uint32_t fmt = mdp_rd(p->base + SSPP_SRC_FORMAT);
++		uint32_t addr = bd_abl(a_off), xy = bd_abl(x_off);
++		uint64_t off = (uint64_t)addr - bd_panel_pa;
++		uint32_t row0 = (uint32_t)(off / bd_stride), col0 = (uint32_t)((off % bd_stride) / 4);
++		uint32_t x = (xy & 0xffff) + offx, y = (xy >> 16) + offy;
++		const char *bad = NULL;
++		if (addr < bd_panel_pa || off >= (uint64_t)bd_stride * bd_h || (off % bd_stride) % 4) {
++			bad = "source address outside the panel buffer";
++		} else if (((ys >> (r ? 16 : 0)) & 0xffff) != bd_stride) {
++			bad = "stride is not the panel's";
++		} else if (((fmt >> 9) & 3) != 3 || ((fmt >> 30) & 3) != 0 || (fmt & (1u << 22))) {
++			bad = "not a linear 32-bit source";
++		} else if (mdp_rd(p->base + SSPP_ADDR_SW_STATUS) != 0) {
++			bad = "secure fetch";
++		} else if (col0 + x + (sz & 0xffff) > lw || row0 + y + (sz >> 16) > lh) {
++			bad = "rect would leave the buffer";
++		}
++		if (bad != NULL) {
++			snprintf(why, sizeof(why), "%s rect %d: %s (addr 0x%x xy 0x%x size 0x%x ystride 0x%x fmt 0x%x)",
++			    p->name, r, bad, addr, xy, sz, ys, fmt);
++			return why;
++		}
++		pl->r[pl->n++] = (struct bd_rect_plan){
++			p->base, r, a_off, x_off, row0 * stride + col0 * 4, y << 16 | x,
++		};
++	}
++	return NULL;
++}
++
++/* Flush the planned pipes and wait until the CTL took the change (the next frame start). */
++static int64_t
++bd_flush(const struct bd_state *st, uint32_t bits, const char *tag, bool sleep, uint32_t max_ms)
++{
++	uint32_t cb = CTL_BASE(st->ctl);
++	uint64_t t0 = mach_absolute_time();
++	bd_dsb();
++	mdp_wr(cb + CTL_FLUSH, bits);
++	bd_dsb();
++	if (max_ms == 0) {
++		return 0;
++	}
++	for (;;) {
++		uint64_t us = bd_us(mach_absolute_time() - t0);
++		if ((mdp_rd(cb + CTL_FLUSH) & bits) == 0) {
++			if (tag != NULL) {
++				IOLog("BLUE DPU: %s: flush 0x%x latched after %llu us (rd line %u)\n", tag, bits, us,
++				    mdp_rd(PP_BASE(st->pp) + PP_INT_COUNT_VAL) & 0xffff);
++			}
++			return (int64_t)us;
++		}
++		if (us >= (uint64_t)max_ms * 1000) {
++			break;
++		}
++		if (sleep) {
++			IOSleep(1);
++		} else {
++			IODelay(100);
++		}
++	}
++	IOLog("BLUE DPU: %s: flush 0x%x NOT latched after %u ms (CTL_FLUSH 0x%x)\n", tag != NULL ? tag : "flip",
++	    bits, max_ms, mdp_rd(cb + CTL_FLUSH));
++	return -1;
++}
++
++/* Point every planned rect at pa (registers only; the caller flushes). */
++static void
++bd_plan_write(const struct bd_plan *pl, uint64_t pa, bool all)
++{
++	for (int i = 0; i < pl->n; i++) {
++		const struct bd_rect_plan *r = &pl->r[i];
++		bd_set(r->addr_off, (uint32_t)(pa + r->byte_off));
++		if (!all) {
++			continue;
++		}
++		bd_set(r->xy_off, r->xy);
++		uint32_t sh = r->rect ? 16 : 0, ys = mdp_rd(r->base + SSPP_SRC_YSTRIDE0);
++		bd_set(r->base + SSPP_SRC_YSTRIDE0, (ys & ~(0xffffu << sh)) | (pl->stride << sh));
++	}
++}
++
++/* Back to ABL's registers (reverse order); flush, and wait unless max_ms is 0. */
++static int64_t
++bd_restore(const struct bd_state *st, const char *tag, bool sleep, uint32_t max_ms)
++{
++	int n = 0;
++	for (int i = bd_nregs - 1; i >= 0; i--) {
++		if (bd_regs[i].touched) {
++			mdp_wr(bd_regs[i].off, bd_regs[i].abl);
++			bd_regs[i].touched = false;
++			n++;
++		}
++	}
++	if (tag != NULL) {
++		IOLog("BLUE DPU: %s: %d registers back to ABL's values\n", tag, n);
++	}
++	return bd_flush(st, st->flush, tag, sleep, max_ms);
++}
++
++/* ---------------- bluedpu=2: point the pipes at another buffer ---------------- */
++
++/* One frame's MISR of each active LM (writes only the LM's MISR control). */
++static void
++bd_misr(const struct bd_state *st, const char *tag)
++{
++	uint32_t sig[4] = { 0, 0, 0, 0 };
++	bool ok[4] = { false, false, false, false };
++	for (int k = 0; k < st->nlm; k++) {
++		uint32_t b = bd_lms[st->lm[k]].base;
++		mdp_wr(b + LM_MISR_CTRL, MISR_CTRL_CLEAR);
++		bd_dsb();
++		mdp_wr(b + LM_MISR_CTRL, MISR_CTRL_RUN);
++	}
++	bd_dsb();
++	for (int i = 0; i < 100; i++) {
++		bool all = true;
++		for (int k = 0; k < st->nlm; k++) {
++			uint32_t b = bd_lms[st->lm[k]].base;
++			if (!ok[k] && (mdp_rd(b + LM_MISR_CTRL) & MISR_CTRL_STATUS)) {
++				sig[k] = mdp_rd(b + LM_MISR_SIGNATURE);
++				ok[k] = true;
++			}
++			all &= ok[k];
++		}
++		if (all) {
++			break;
++		}
++		IODelay(500);
++	}
++	IOLog("BLUE DPU: %s: MISR %s %08x%s %s %08x%s\n", tag,
++	    st->nlm > 0 ? bd_lms[st->lm[0]].name : "-", sig[0], ok[0] ? "" : "(none)",
++	    st->nlm > 1 ? bd_lms[st->lm[1]].name : "-", sig[1], ok[1] ? "" : "(none)");
++}
++
++/*
++ * Clear the latches the health check looks at; the SMMU state becomes the
++ * baseline. Logs what latched again within 40 ms (still nothing touched).
++ */
++static void
++bd_health_baseline(const struct bd_state *st, const char *tag)
++{
++	uint32_t m1 = INTR_INTF_UNDERRUN(st->intf) | INTR_PP_DONE(st->pp);
++	mdp_wr(MDP_INTR_CLEAR, 0xffffffffu);
++	mdp_wr(MDP_INTR2_CLEAR, 0xffffffffu);
++	bd_dsb();
++	IOSleep(40);
++	uint32_t i1 = mdp_rd(MDP_INTR_STATUS), i2 = mdp_rd(MDP_INTR2_STATUS);
++	bd_log_intr(tag, i1, i2);
++	if (i1 & INTR_INTF_UNDERRUN(st->intf)) {
++		IOLog("BLUE DPU: %s: the INTF underrun latches again by itself\n", tag);
++	}
++	mdp_wr(MDP_INTR_CLEAR, m1);
++	bd_dsb();
++	bd_smmu_snapshot(st, &bd_smmu_base);
++	bd_smmu_log(tag, &bd_smmu_base);
++}
++
++/*
++ * Since the last call: a new INTF underrun, a change of the MDP streams'
++ * SMMU fault state, or (if frames were being sent) no pp_done at all.
++ * The reason, or NULL.
++ */
++static const char *
++bd_health(const struct bd_state *st, bool check_done)
++{
++	uint32_t intr = mdp_rd(MDP_INTR_STATUS);
++	uint32_t m1 = INTR_INTF_UNDERRUN(st->intf) | INTR_PP_DONE(st->pp);
++	if (intr & m1) {
++		mdp_wr(MDP_INTR_CLEAR, intr & m1);
++		bd_dsb();
++	}
++	if (intr & INTR_INTF_UNDERRUN(st->intf)) {
++		bd_log_intr("underrun", intr, mdp_rd(MDP_INTR2_STATUS));
++		return "INTF underrun";
++	}
++	struct bd_smmu_snap now;
++	bd_smmu_snapshot(st, &now);
++	if (now.sgfsr != bd_smmu_base.sgfsr || now.fsr != bd_smmu_base.fsr || now.far_lo != bd_smmu_base.far_lo ||
++	    now.far_hi != bd_smmu_base.far_hi || now.fsynr0 != bd_smmu_base.fsynr0 ||
++	    (now.fsr & SMMU_FSR_FAULT) != 0) {
++		bd_smmu_log("SMMU baseline", &bd_smmu_base);
++		bd_smmu_log("SMMU now", &now);
++		if ((now.fsr & SMMU_FSR_FAULT) != 0 || now.sgfsr != bd_smmu_base.sgfsr) {
++			return "SMMU fault";
++		}
++		bd_smmu_base = now;             /* FAR / syndrome moved without a fault bit: note it, go on */
++	}
++	if (check_done && bd_done_live && !(intr & INTR_PP_DONE(st->pp))) {
++		return "no frame sent (pp_done) since the last check";
++	}
++	return NULL;
++}
++
++static void
++bd_test(struct bd_state *st)
++{
++	if (st->ctl < 0 || st->pp < 0 || st->nsrc == 0 || st->intf < 0) {
++		IOLog("BLUE DPU: test skipped: pipeline not as expected (ctl %d pp %d rects %d intf %d)\n",
++		    st->ctl, st->pp, st->nsrc, st->intf);
++		return;
++	}
++	if (mdp_rd(CTL_BASE(st->ctl) + CTL_FLUSH) & st->flush) {
++		IOLog("BLUE DPU: test skipped: a flush is already pending (0x%x)\n", mdp_rd(CTL_BASE(st->ctl) + CTL_FLUSH));
++		return;
++	}
++
++	/* The buffer: iOS's display surface layout, the panel picture as its centre crop. */
++	uint32_t lw = bd_lw > bd_w ? bd_lw : bd_w, lh = bd_lh > bd_h ? bd_lh : bd_h;
++	uint32_t bstride = (lw * 4 + 255) & ~255u;
++	uint32_t offx = (lw - bd_w) / 2, offy = (lh - bd_h) / 2;
++	uint64_t size = round_page((uint64_t)bstride * lh);
++	uint64_t pa = 0;
++	uint8_t *va = NULL;
++	IOBufferMemoryDescriptor *ram = NULL;
++	IOMemoryDescriptor *md = NULL;
++	IOMemoryMap *map = NULL;
++	struct bd_plan plan;
++	struct bd_rate rate;
++
++	const char *bad = bd_plan_crop(st, lw, lh, bstride, &plan);
++	if (bad != NULL) {
++		IOLog("BLUE DPU: test skipped: %s\n", bad);
++		return;
++	}
++	if (bd_target == 2) {
++		ram = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000ffffc000ULL);
++		if (ram != NULL) {
++			pa = ram->getPhysicalAddress();
++			va = (uint8_t *)ram->getBytesNoCopy();
++		}
++		if (ram == NULL || pa == 0 || pa + size > 0x100000000ULL) {
++			IOLog("BLUE DPU: test skipped: no contiguous %llu bytes below 4 GiB (pa 0x%llx)\n", size, pa);
++			OSSafeReleaseNULL(ram);
++			return;
++		}
++	} else {
++		pa = (bd_panel_pa + (uint64_t)bd_stride * bd_h + 0xfffff) & ~0xfffffULL;
++		if (bd_panel_pa != BD_SPLASH_PA || pa + size > BD_SPLASH_END) {
++			IOLog("BLUE DPU: test skipped: splash buffer 0x%llx+0x%llx outside cont_splash\n", pa, size);
++			return;
++		}
++		md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++		map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++		va = map != NULL ? (uint8_t *)map->getVirtualAddress() : NULL;
++		if (va == NULL) {
++			IOLog("BLUE DPU: test skipped: cannot map 0x%llx\n", pa);
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(md);
++			return;
++		}
++	}
++	IOLog("BLUE DPU: test buffer %ux%u stride %u at pa 0x%llx (%s), %llu bytes, panel crop at %u,%u\n",
++	    lw, lh, bstride, pa, ram != NULL ? "RAM, cacheable" : "cont_splash, write-combined", size, offx, offy);
++
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t y = 0; y < lh; y++) {
++		uint32_t *row = (uint32_t *)(void *)(va + (uint64_t)y * bstride);
++		bool in = y >= offy && y < offy + bd_h;
++		for (uint32_t x = 0; x < lw; x++) {
++			if (!in || x < offx || x >= offx + bd_w) {
++				row[x] = 0xff202020u;
++			}
++		}
++		if (in) {
++			memcpy(row + offx, (const void *)(bd_panel_va + (uint64_t)(y - offy) * bd_stride), (size_t)bd_w * 4);
++		}
++		/* marker: 12 px magenta frame around the visible part, 160 px checker below the status bar */
++		if (in) {
++			uint32_t vy = y - offy;
++			for (uint32_t x = 0; x < bd_w; x++) {
++				bool frame = vy < 12 || vy >= bd_h - 12 || x < 12 || x >= bd_w - 12;
++				bool check = vy >= 200 && vy < 360 && x >= 60 && x < 220;
++				if (frame) {
++					row[offx + x] = 0xffff00ffu;
++				} else if (check) {
++					row[offx + x] = (((x - 60) / 20 + (vy - 200) / 20) & 1) ? 0xff00ff00u : 0xff000000u;
++				}
++			}
++		}
++	}
++	if (ram != NULL) {
++		CleanPoC_DcacheRegion((vm_offset_t)va, (size_t)size);
++	}
++	bd_dsb();
++	IOLog("BLUE DPU: test buffer filled in %llu us\n", bd_us(mach_absolute_time() - t0));
++
++	bd_health_baseline(st, "before");
++	uint32_t misr_saved[4];
++	for (int k = 0; k < st->nlm; k++) {
++		misr_saved[k] = mdp_rd(bd_lms[st->lm[k]].base + LM_MISR_CTRL);
++	}
++	bd_misr(st, "before 1");
++	bd_misr(st, "before 2");
++
++	/* Write: per rect address / xy, the stride, then one flush. */
++	bd_plan_write(&plan, pa, true);
++	for (int i = 0; i < plan.n; i++) {
++		const struct bd_rect_plan *r = &plan.r[i];
++		IOLog("BLUE DPU: rect %d of SSPP 0x%x: addr 0x%x -> 0x%x, xy 0x%x -> 0x%x, ystride0 0x%x -> 0x%x\n", r->rect,
++		    r->base, bd_abl(r->addr_off), mdp_rd(r->addr_off), bd_abl(r->xy_off), mdp_rd(r->xy_off),
++		    bd_abl(r->base + SSPP_SRC_YSTRIDE0), mdp_rd(r->base + SSPP_SRC_YSTRIDE0));
++	}
++	if (bd_flush(st, st->flush, "switch", false, 100) < 0) {
++		bd_restore(st, "revert (flush not taken)", false, 100);
++		goto out;
++	}
++	for (int s = 0; s < st->nsrc; s++) {
++		bd_dump_pipe("after", st->src[s].pipe);
++	}
++	{
++		const char *why = NULL;
++		IOSleep(20);
++		why = bd_health(st, false);
++		bd_misr(st, "test 1");
++		bd_misr(st, "test 2");
++		bd_misr(st, "test 3");
++		bd_rate_measure(st, "rate on the test buffer", 1000, &rate);
++		(void)bd_health(st, false);     /* the measurement cleared pp_done; start a fresh window */
++		uint64_t start = mach_absolute_time();
++		while (why == NULL && bd_us(mach_absolute_time() - start) < (uint64_t)bd_hold_ms * 1000) {
++			IOSleep(100);
++			why = bd_health(st, true);
++		}
++		if (why != NULL) {
++			bd_log_intr("problem on the test buffer", mdp_rd(MDP_INTR_STATUS), mdp_rd(MDP_INTR2_STATUS));
++			IOLog("BLUE DPU: problem on the test buffer: %s, reverting\n", why);
++			bd_restore(st, "revert", false, 100);
++		} else if (bd_keep) {
++			IOLog("BLUE DPU: kept on the test buffer (bluedpu_keep=1): the panel shows this snapshot from now on\n");
++			for (int k = 0; k < st->nlm; k++) {
++				mdp_wr(bd_lms[st->lm[k]].base + LM_MISR_CTRL, misr_saved[k]);
++			}
++			return;         /* buffer stays allocated and scanned out */
++		} else {
++			IOLog("BLUE DPU: held %d ms without new underrun, SMMU fault or stall\n", bd_hold_ms);
++			bd_restore(st, "revert (hold time over)", false, 100);
++		}
++	}
++	IOSleep(50);            /* a few frames: nothing fetches the test buffer any more */
++	for (int s = 0; s < st->nsrc; s++) {
++		bd_dump_pipe("reverted", st->src[s].pipe);
++	}
++	bd_misr(st, "after revert 1");
++	bd_misr(st, "after revert 2");
++	bd_rate_measure(st, "rate after revert", 1000, &rate);
++	{
++		const char *why = bd_health(st, false);
++		IOLog("BLUE DPU: after revert: %s\n", why != NULL ? why : "no new underrun or SMMU fault");
++	}
++out:
++	for (int k = 0; k < st->nlm; k++) {
++		mdp_wr(bd_lms[st->lm[k]].base + LM_MISR_CTRL, misr_saved[k]);
++	}
++	IOSleep(50);
++	OSSafeReleaseNULL(ram);
++	OSSafeReleaseNULL(map);
++	OSSafeReleaseNULL(md);
++	IOLog("BLUE DPU: test done\n");
++}
++
++static void
++bd_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	struct bd_rate rate;
++	if (bd_delay > 0) {
++		IOLog("BLUE DPU: waiting %d s\n", bd_delay);
++		IOSleep((uint32_t)bd_delay * 1000);
++	}
++	bd_survey(&bd_st);
++	bd_regs_record(&bd_st);
++	bd_rate_measure(&bd_st, "rate", 1000, &rate);
++	bd_done_live = rate.done != 0;
++	if (bd_mode >= 2) {
++		bd_test(&bd_st);
++	}
++}
++
++/* ---------------- baseline statistics of the CPU copy ---------------- */
++
++static bool bd_stats_on;
++static uint32_t bd_n_vsync, bd_n_swap, bd_n_present, bd_present_max_us;
++static uint64_t bd_present_us, bd_stats_t0;
++
++/* kind 0: vsync tick (workloop), 1: swap (any thread), 2: panel copy of dt (workloop) */
++void
++blue_dpu_stat(int kind, uint64_t dt)
++{
++	if (!bd_stats_on) {
++		return;
++	}
++	if (kind == 1) {
++		__atomic_add_fetch(&bd_n_swap, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	if (kind == 2) {
++		uint64_t us = bd_us(dt);
++		bd_n_present++;
++		bd_present_us += us;
++		if (us > bd_present_max_us) {
++			bd_present_max_us = (uint32_t)us;
++		}
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	bd_n_vsync++;
++	if (bd_stats_t0 == 0) {
++		bd_stats_t0 = now;
++	} else if (bd_us(now - bd_stats_t0) >= 5000000) {
++		uint32_t swaps = __atomic_exchange_n(&bd_n_swap, 0, __ATOMIC_RELAXED);
++		IOLog("BLUE DPU: 5s: %u vsync ticks, %u swaps, %u panel copies, copy avg %llu us max %u us\n",
++		    bd_n_vsync, swaps, bd_n_present, bd_n_present ? bd_present_us / bd_n_present : 0, bd_present_max_us);
++		bd_n_vsync = bd_n_present = bd_present_max_us = 0;
++		bd_present_us = 0;
++		bd_stats_t0 = now;
++	}
++}
++
++void
++blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride, uintptr_t panel_va,
++    uint32_t lw, uint32_t lh)
++{
++	int stats = -1;
++	PE_parse_boot_argn("bluedpu", &bd_mode, sizeof(bd_mode));
++	PE_parse_boot_argn("bluedpu_stats", &stats, sizeof(stats));
++	bd_stats_on = stats < 0 ? bd_mode != 0 : stats != 0;
++	if (bd_mode <= 0) {
++		return;
++	}
++	PE_parse_boot_argn("bluedpu_delay", &bd_delay, sizeof(bd_delay));
++	PE_parse_boot_argn("bluedpu_hold_ms", &bd_hold_ms, sizeof(bd_hold_ms));
++	PE_parse_boot_argn("bluedpu_keep", &bd_keep, sizeof(bd_keep));
++	PE_parse_boot_argn("bluedpu_target", &bd_target, sizeof(bd_target));
++	if (bd_hold_ms < 0 || bd_hold_ms > 600000) {
++		bd_hold_ms = 5000;
++	}
++	bd_panel_pa = panel_pa;
++	bd_w = w;
++	bd_h = h;
++	bd_stride = stride;
++	bd_panel_va = panel_va;
++	bd_lw = lw;
++	bd_lh = lh;
++	IOLog("BLUE DPU: mode %d, delay %d s, hold %d ms, keep %d, target %s; panel %ux%u stride %u at 0x%llx, iOS %ux%u\n",
++	    bd_mode, bd_delay, bd_hold_ms, bd_keep, bd_target == 2 ? "RAM below 4 GiB" : "cont_splash",
++	    w, h, stride, panel_pa, lw, lh);
++	if (w == 0 || h == 0 || stride < w * 4 || panel_va == 0 || lw > 4096 || lh > 4096) {
++		IOLog("BLUE DPU: no panel framebuffer\n");
++		return;
++	}
++	bd_mdss = (volatile uint32_t *)ml_io_map(BD_MDSS_PA, BD_MDSS_SIZE);
++	if (bd_mdss == NULL) {
++		IOLog("BLUE DPU: MDSS mapping failed\n");
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(&bd_thread, NULL, &thread) != KERN_SUCCESS) {
++		IOLog("BLUE DPU: no thread\n");
++		return;
++	}
++	thread_deallocate(thread);
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2a05af5..9fd328d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -35,6 +35,10 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/* blueline DPU probe and copy statistics (BlueDPU.cpp, boot-arg bluedpu) */
++extern "C" void blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride,
++    uintptr_t panel_va, uint32_t lw, uint32_t lh);
++extern "C" void blue_dpu_stat(int kind, uint64_t dt);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -246,6 +250,7 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	powerStart();
++	blue_dpu_start(fPhys, fWidth, fHeight, fRowBytes, fPixels, fLogicalW, fLogicalH);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -307,6 +312,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->panelWake();
+ 		IOLockLock(fb->fLock);
+ 	}
++	blue_dpu_stat(0, 0);
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -318,7 +324,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		blue_dpu_stat(2, mach_absolute_time() - t0);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -571,6 +579,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	blue_dpu_stat(1, 0);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 706286d..47fe162 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/BlueBattery.cpp                                 optional iokitcpp
++iokit/Kernel/arm/BlueDPU.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+-- 
+2.54.0 (Apple Git-157)
+

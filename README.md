@@ -1,18 +1,28 @@
 # pixel3-ios
 
-> **About this fork.** This is a fork of **[erikkunz/pixel3-ios](https://github.com/erikkunz/pixel3-ios)**. The
-> port, its design and nearly all of the work are by **Erik Kunz** ([@erikkunz](https://github.com/erikkunz)); the README below is his. The fork follows his
-> project on a second Pixel 3 and sends fixes back upstream:
->
-> - [#3](https://github.com/erikkunz/pixel3-ios/pull/3): build the kernel locally on a Mac (`tools/build-xnu.sh`),
->   since GitHub retired the `macos-14` runner
-> - [#2](https://github.com/erikkunz/pixel3-ios/issues/2) / [#4](https://github.com/erikkunz/pixel3-ios/pull/4):
->   a freshly built iOS root stays at the Apple logo; let the first-boot migration run
->
-> Work in progress (branch [`linux-host`](https://github.com/andyleenz/pixel3-ios/tree/linux-host), see its
-> [docs/LOG.md](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md)): screen off on lock, USB
-> diagnostics, and the first Adreno 630 GPU steps (the GMU boots its firmware). Please report problems with the
-> port itself upstream.
+> **Independently maintained.** This project started as a fork of
+> **[erikkunz/pixel3-ios](https://github.com/erikkunz/pixel3-ios)** by Erik Kunz
+> ([@erikkunz](https://github.com/erikkunz)), who did the original port to the Pixel 3 and wrote most of the
+> README below. It is now developed here on its own. The main additions are the Adreno 630 GPU, a GPU-drawn
+> iOS UI, zero-copy display flips and more board support. Thanks to Erik for the foundation, and to
+> [ios-sweet](https://github.com/dipa-studio/ios-sweet) and HakiOS (the EAGL shim in `gpu/eagl-ios`, MIT).
+> Please report problems [here](https://github.com/andyleenz/pixel3-ios/issues).
+
+<p>
+<img src="docs/screenshots/2026-11-19-gpu-home.png" width="180" alt="Home screen">
+<img src="docs/screenshots/2026-11-19-gpu-settings.png" width="180" alt="Settings">
+<img src="docs/screenshots/2026-11-19-gpu-settings-scrolled.png" width="180" alt="Settings, scrolled">
+<img src="docs/screenshots/2026-11-19-gpu-safari.png" width="180" alt="Safari">
+</p>
+
+**New since the fork (2026-11):**
+- The UI is drawn by the Adreno 630 at about 60 fps (`blueui=1`). CoreAnimation runs over Mesa freedreno
+  ([`gpu/`](gpu/README.md)).
+- The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
+- Brightness, haptics, battery gauge, RTC, CPU clocks and thermal limits, watchdog, modem boot.
+- A hands-off test loop with scripted touches and screenshots ([docs/TESTING.md](docs/TESTING.md)). The
+  engineering log is on the [`linux-host`](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md)
+  branch.
 
 **Apple's iOS 16 running on a Google Pixel 3.**
 
@@ -100,8 +110,10 @@ Rough outline; [docs/LOG.md](docs/LOG.md) has the details and the reasons.
 
 1. **Phone:** Pixel 3 with an unlocked bootloader and LineageOS recovery in slot B. Back up first
    (`tools/backup-phone.sh`).
-2. **Kernel:** push to your fork, and the `xnu` workflow builds `kernel.development.sweet` (Xcode 15 on GitHub's
-   macOS runners).
+2. **Kernel:** `tools/build-xnu.sh` builds `kernel.development.sweet` locally on a Mac with Xcode 15.x installed
+   next to your normal Xcode (`xcodes install 15.4`; no sudo, same pins as the workflow). The `xnu` workflow
+   did the same on GitHub's `macos-14` runners, which have been retired; the newer images only have Xcode 16+,
+   whose `iig` does not fit xnu-8796.
 3. **Payload and shim:** `tools/mkadt.py` (the iPhone X device tree from the IPSW, plus the Pixel 3's
    CPUs, memory and display), `tools/mkpayload.py KERNEL ADT OUT --cmdline '...'`, then
    `p2-shim/build.sh PAYLOAD stock/boot.img`. Toolchain: `brew install llvm lld`.

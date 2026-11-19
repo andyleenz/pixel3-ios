@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 18 Nov 2026 23:30:00 +0100
+Subject: [PATCH] 0124: blueline USB: DWC3 PIPE clock from UTMI, longer endpoint
+ commands, SMMU stream 0x740 with ABL's own mappings
+
+Draft, not yet run. Applies after 0122 (bsd/dev/sweet_usb.c is staged by
+0108-stage-sweet-usb.sh: ios-sweet 0072-0077/0081 + ios-flame 0088/0089/0091).
+
+The first sweetusb=2 run stopped at "ep0 cmd 0x1 timeout": DEPSTARTCFG
+completed, SETEPCONFIG did not within the 1 ms poll. Neither command does
+DMA, and flame ran the identical command sequence up to its first TRB fetch,
+so the apps SMMU (0122, stream 0x740) is the next blocker, not this one.
+ABL leaves the DWC3 3.00a at SuperSpeed (DCFG/DSTS speed 4, link
+SS.Disabled, halted) and the QMP USB3 PHY in an unknown state; this driver
+runs high speed only. As Linux does (dwc3-qcom.c, dwc3/gadget.c):
+- before the soft reset, QSCRATCH_GENERAL_CFG: PIPE_UTMI_CLK_DIS,
+  PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW, clear PIPE_UTMI_CLK_DIS
+  (dwc3_qcom_select_utmi_clk; blueusbpipe=0 skips);
+- endpoint commands poll up to blueusbcmdms ms (default 20) and clear
+  GUSB2PHYCFG SUSPHY/ENBLSLPM around the command; slow ones are logged;
+- blueusb3susp=1: GUSB3PIPECTL.SUSPHY (the dropped 0110), default off;
+- a timeout prints DCFG/DSTS/GSTS/GCTL/GUSB2PHYCFG/GUSB3PIPECTL, QSCRATCH,
+  the GCC USB3 pipe clock (CBCR 0xf054) and QUSB2 power state.
+SMMU (ud_smmu_setup): logs sCR0/IDRs and every SMR ABL left (with S2CR and
+bank CBAR/SCTLR), copies a translation-off ABL bank's CBAR/SCTLR (flame's
+0x1f000/0xe0 if none), caps SMRs at 128 (arm-smmu-qcom.c), and keeps or
+retargets an SMR ABL left for 0x740 instead of refusing to start.
+
+Boot-arg blueusbfix=0 restores 0122's behaviour.
+
+---
+ bsd/dev/sweet_usb.c | 195 ++++++++++++++++++++++++++++++++++++++++---
+ bsd/dev/sweet_usb.c | 195 +++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 185 insertions(+), 10 deletions(-)
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -279,30 +279,157 @@
+ 	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
++
++/*
++ * blueline 0124 (boot-arg blueusbfix=0 turns all of it off). The first
++ * sweetusb=2 run stopped at "ep0 cmd 0x1 timeout": DEPSTARTCFG completed,
++ * SETEPCONFIG did not, within 1 ms. Neither command does DMA (that starts
++ * with the first STARTTRANSFER), and flame ran the identical sequence
++ * through to its TRB fetch, so the SMMU (0122) is not what stops it.
++ * ABL leaves the DWC3 at SuperSpeed (DCFG/DSTS speed 4, link SS.Disabled,
++ * controller halted) with the QMP USB3 PHY in an unknown state; a DWC3
++ * whose PIPE clock is gone runs its SS-side logic slowly or not at all.
++ * So, as Linux does:
++ *  - endpoint commands wait up to blueusbcmdms (default 20; Linux 5 ms,
++ *    sweet 1 ms) and clear GUSB2PHYCFG SUSPHY/ENBLSLPM around the command
++ *    (gadget.c dwc3_send_gadget_ep_cmd); slow ones are logged with time;
++ *  - before the soft reset the core takes the UTMI clock as its PIPE clock
++ *    (dwc3-qcom.c dwc3_qcom_select_utmi_clk, QSCRATCH_GENERAL_CFG), since
++ *    this driver runs high speed only (blueusbpipe=0 skips);
++ *  - blueusb3susp=1 also lets the USB3 PHY suspend (GUSB3PIPECTL bit 17,
++ *    the old 0110; Linux sets it once ep0 is running);
++ *  - a timeout prints the clock/PHY state (GCC pipe clock, QSCRATCH,
++ *    QUSB2 power) for the next step.
++ */
++#define GUSB2PHYCFG             0xc200
++#define   GUSB2PHYCFG_SUSPHY    (1u << 6)
++#define   GUSB2PHYCFG_ENBLSLPM  (1u << 8)
++#define GUSB3PIPECTL            0xc2c0
++#define   GUSB3PIPECTL_SUSPHY   (1u << 17)
++#define GSTS                    0xc118
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++#define GCC_USB3_PRIM_PIPE_CBCR 0x0f054         /* gcc-sdm845.c gcc_usb3_prim_phy_pipe_clk */
++#define GCC_AHB2PHY_CBCR        0x6a004         /* gcc_usb_phy_cfg_ahb2phy_clk (QUSB2/QMP registers) */
+ 
++static int ud_blue_fix = 1;
++static int ud_cmd_us = 1000;
++static unsigned ud_slow_cmds;
++static vm_offset_t ud_blue_gcc, ud_blue_qs, ud_blue_qusb;
++
++static void
++ud_blue_diag(const char *when)
++{
++	if (ud_blue_gcc == 0 || ud_blue_qs == 0) {
++		return;
++	}
++	uint32_t pipe = usb_rd(ud_blue_gcc, GCC_USB3_PRIM_PIPE_CBCR);
++	uint32_t ahb2phy = usb_rd(ud_blue_gcc, GCC_AHB2PHY_CBCR);
++	printf("SWEET USB: [%s] DCFG %08x DSTS %08x GSTS %08x GCTL %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x\n",
++	    when, dwc_rd(DCFG), dwc_rd(DSTS), dwc_rd(GSTS), dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG),
++	    dwc_rd(GUSB3PIPECTL));
++	printf("SWEET USB: [%s] QSCRATCH GENERAL_CFG %08x HS_PHY_CTRL %08x SS_PHY_CTRL %08x; pipe clk %08x (%s), ahb2phy %08x (%s)\n",
++	    when, usb_rd(ud_blue_qs, QSCRATCH_GENERAL_CFG), usb_rd(ud_blue_qs, QSCRATCH_HS_PHY_CTRL),
++	    usb_rd(ud_blue_qs, QSCRATCH_SS_PHY_CTRL), pipe, (pipe & CBCR_CLK_OFF) ? "off" : "on",
++	    ahb2phy, (ahb2phy & CBCR_CLK_OFF) ? "off" : "on");
++	if (ud_blue_qusb != 0 && !(ahb2phy & CBCR_CLK_OFF)) {
++		/* QUSB2 v2 (phy-qcom-qusb2.c sdm845): PLL_STATUS 0x1a0 bit 0 locked, PWR_CTRL1 0x210 bit 0 power down */
++		printf("SWEET USB: [%s] QUSB2 PLL_STATUS %08x PWR_CTRL1 %08x\n", when,
++		    usb_rd(ud_blue_qusb, 0x1a0), usb_rd(ud_blue_qusb, 0x210));
++	}
++}
++
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
++	uint32_t saved = 0, g2 = 0;
++	int rc = -2, i;
++
++	if (ud_blue_fix) {
++		g2 = dwc_rd(GUSB2PHYCFG);
++		saved = g2 & (GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM);
++		if (saved) {
++			dwc_wr(GUSB2PHYCFG, g2 & ~saved);
++		}
++	}
+ 	dwc_wr(DEPCMDPAR0(ep), p0);
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	for (i = 0; i < ud_cmd_us; i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+ 			if (status) {
+ 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+-				return -1;
+ 			}
+-			return 0;
++			rc = status ? -1 : 0;
++			break;
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
+-	return -1;
++	if (saved) {
++		dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) | saved);
++	}
++	if (rc == -2) {
++		printf("SWEET USB: ep%u cmd 0x%x timeout (%d us)\n", ep, cmd & 0xf, ud_cmd_us);
++		if (ud_blue_fix) {
++			ud_blue_diag("cmd timeout");
++		}
++		return -1;
++	}
++	if (ud_blue_fix && i >= 100 && ud_slow_cmds++ < 16) {
++		printf("SWEET USB: ep%u cmd 0x%x took ~%d us\n", ep, cmd & 0xf, i);
++	}
++	return rc;
+ }
+ 
++/*
++ * blueline 0124: map what ud_blue_diag reads, and (blueusbpipe, default 1)
++ * clock the DWC3's PIPE side from UTMI before the soft reset.
++ */
++static void
++ud_blue_prepare(void)
++{
++	PE_parse_boot_argn("blueusbfix", &ud_blue_fix, sizeof(ud_blue_fix));
++	if (!ud_blue_fix) {
++		return;
++	}
++	int ms = 20;
++	PE_parse_boot_argn("blueusbcmdms", &ms, sizeof(ms));
++	ud_cmd_us = (ms > 0 ? ms : 1) * 1000;
++	ud_blue_gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	ud_blue_qs = ml_io_map(QSCRATCH_PA, 0x100);
++	ud_blue_qusb = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	ud_blue_diag("as ABL left it");
++	if (ud_blue_qs == 0) {
++		return;
++	}
++	int pipe = 1;
++	PE_parse_boot_argn("blueusbpipe", &pipe, sizeof(pipe));
++	if (pipe) {
++		vm_offset_t g = ud_blue_qs + QSCRATCH_GENERAL_CFG;
++		*(volatile uint32_t *)g = usb_rd(ud_blue_qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_DIS;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(200);
++		*(volatile uint32_t *)g = usb_rd(ud_blue_qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(200);
++		*(volatile uint32_t *)g = usb_rd(ud_blue_qs, QSCRATCH_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(200);
++	}
++	int susp = 0;
++	PE_parse_boot_argn("blueusb3susp", &susp, sizeof(susp));
++	if (susp) {
++		dwc_wr(GUSB3PIPECTL, dwc_rd(GUSB3PIPECTL) | GUSB3PIPECTL_SUSPHY);
++	}
++	printf("SWEET USB: blueline: utmi-as-pipe %d, usb3 susphy %d, cmd timeout %d ms\n", pipe, susp, ud_cmd_us / 1000);
++	ud_blue_diag("prepared");
++}
++
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+ static void
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+@@ -1024,6 +1151,22 @@
+ 	uint32_t cbbase = (1u << (((idr1 >> 28) & 7) + 1)) * pagesz;
+ 	uint64_t used[2] = {0, 0};
+ 	int free_smr = -1, cb = -1;
++	/*
++	 * blueline 0124 (blueusbfix=0: as 0122). Log ABL's stream mappings
++	 * (none of them are known on SDM845 yet), copy the attributes of a
++	 * translation-off bank it left (flame's 0x1f000/0xe0 otherwise), use
++	 * at most 128 SMRs (Linux arm-smmu-qcom.c: the hypervisor may not
++	 * emulate the ones above), and if ABL left an SMR for 0x740, keep it
++	 * when it already reaches memory untranslated, else retarget it.
++	 */
++	uint32_t abl_cbar = 0x1f000, abl_sctlr = 0xe0;
++	int match_smr = -1, blue = 1, abl_found = 0;
++	PE_parse_boot_argn("blueusbfix", &blue, sizeof(blue));
++	if (blue && nsmr > 128) {
++		nsmr = 128;
++	}
++	printf("SWEET USB: SMMU idr0 %x idr1 %x sCR0 %x: %u SMRs, %u banks, page 0x%x\n",
++	    idr0, idr1, usb_rd(as, 0x0), nsmr, ncb, pagesz);
+ 	for (unsigned i = 0; i < nsmr; i++) {
+ 		uint32_t m = usb_rd(as, 0x800 + 4 * i), c = usb_rd(as, 0xc00 + 4 * i);
+ 		if (!(m >> 31)) {
+@@ -1035,11 +1178,38 @@
+ 		if (((c >> 16) & 3) == 0) {
+ 			used[(c & 0xff) / 64] |= 1ULL << ((c & 0xff) % 64);
+ 		}
++		if (blue) {
++			uint32_t bcbar = 0, bsctlr = 0;
++			if (((c >> 16) & 3) == 0 && (c & 0xff) < ncb) {
++				bcbar = usb_rd(as, pagesz + 4 * (c & 0xff));
++				bsctlr = usb_rd(as, cbbase + (c & 0xff) * pagesz);
++				if (!(bsctlr & 1) && !abl_found && ((bcbar >> 16) & 3) == 1) {
++					abl_found = 1;
++					abl_cbar = bcbar & ~0xffu;
++					abl_sctlr = bsctlr;
++				}
++			}
++			printf("SWEET USB: SMMU ABL smr%u %08x s2cr %08x cbar %08x sctlr %08x\n", i, m, c, bcbar, bsctlr);
++		}
+ 		if (((UD_USB_SID ^ (m & 0x7fff)) & ~((m >> 16) & 0x7fff) & 0x7fff) == 0) {
+ 			printf("SWEET USB: SMMU smr%u %x already matches 0x740 (s2cr %x)\n", i, m, c);
+-			return -1;
++			if (!blue) {
++				return -1;
++			}
++			if (((c >> 16) & 3) == 0 && (c & 0xff) < ncb &&
++			    !(usb_rd(as, cbbase + (c & 0xff) * pagesz) & 1)) {
++				ud_smmu_cb = as + cbbase + (c & 0xff) * pagesz;
++				printf("SWEET USB: SMMU 0x740 -> cb%u, translation off: kept as ABL left it\n", c & 0xff);
++				return 0;
++			}
++			if (match_smr < 0) {
++				match_smr = (int)i;
++			}
+ 		}
+ 	}
++	if (match_smr >= 0) {
++		free_smr = match_smr;   /* retarget ABL's entry instead of adding a second match */
++	}
+ 	/* Lowest free bank, as Linux allocates: the top banks may be secure (sCR1.NSNUMCBO). */
+ 	for (int c = 0; c < (int)ncb; c++) {
+ 		if (!(used[c / 64] & (1ULL << (c % 64))) && !(usb_rd(as, cbbase + c * pagesz) & 1) &&
+@@ -1060,12 +1230,14 @@
+ 	PE_parse_boot_argn("sweetusbsmmu", &mode, sizeof(mode));
+ 	if (mode == 0 && free_smr >= 0 && cb >= 0) {
+ 		vm_offset_t cbv = as + cbbase + cb * pagesz;
+-		*(volatile uint32_t *)(cbv + 0x00) = 0xe0;                      /* SCTLR: M=0, like ABL */
++		*(volatile uint32_t *)(cbv + 0x00) = abl_sctlr & ~1u;          /* SCTLR: M=0, like ABL */
+ 		*(volatile uint32_t *)(as + pagesz + 0x800 + 4 * cb) = 1;      /* CBA2R: AArch64 */
+-		*(volatile uint32_t *)(as + pagesz + 4 * cb) = 0x1f000;        /* CBAR as ABL's banks */
++		*(volatile uint32_t *)(as + pagesz + 4 * cb) = abl_cbar;       /* CBAR as ABL's banks */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		*(volatile uint32_t *)(as + 0xc00 + 4 * free_smr) = (uint32_t)cb;
+-		*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | UD_USB_SID;
++		if (match_smr < 0) {	/* a retargeted ABL entry keeps its id/mask */
++			*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | UD_USB_SID;
++		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		ud_smmu_cb = cbv;
+ 		printf("SWEET USB: SMMU smr%d %x s2cr %x -> cb%d cbar %x cba2r %x sctlr %x (translation off, as ABL)\n",
+@@ -1124,7 +1296,9 @@
+ 		delay(1);
+ 	}
+ 	*(volatile uint32_t *)(as + 0xc00 + 4 * free_smr) = (uint32_t)cb;      /* translate via cb */
+-	*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | UD_USB_SID;
++	if (match_smr < 0) {	/* a retargeted ABL entry keeps its id/mask */
++		*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | UD_USB_SID;
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	/* Self-test: read back our descriptors and ask the SMMU to translate (ATS1PR). */
+ 	printf("SWEET USB: SMMU pt L1[%llu] %llx L2[%llu] %llx tcr %x tcr2 %x mair0 %x ttbr0 %x:%x\n",
+@@ -1261,6 +1435,7 @@
+ 		printf("SWEET USB: SMMU setup failed; not starting the device\n");
+ 		return;
+ 	}
++	ud_blue_prepare();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+-- 
+2.54.0 (Apple Git-157)

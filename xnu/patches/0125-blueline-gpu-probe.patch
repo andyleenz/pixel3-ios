@@ -1,0 +1,471 @@
+From ced7542f676b101601b685bab622e16c61e99597 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 01:47:25 +1100
+Subject: [PATCH] 0125: blueline GPU: Adreno 630 stage 1 probe (CX power, GMU
+ reads), bluegpu=1
+
+---
+ bsd/conf/files           |   1 +
+ bsd/dev/blueline_gpu.c   | 396 +++++++++++++++++++++++++++++++++++++++
+ bsd/dev/blueline_touch.c |   8 +
+ bsd/dev/sweet_ufs.c      |   3 +
+ 4 files changed, 408 insertions(+)
+ create mode 100644 bsd/dev/blueline_gpu.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d94b227b9..18e214747 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/blueline_keys.c			standard
+ bsd/dev/blueline_touch.c		standard
+ bsd/dev/blueline_cpufreq.c		standard
++bsd/dev/blueline_gpu.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+new file mode 100644
+index 000000000..7993c2df7
+--- /dev/null
++++ b/bsd/dev/blueline_gpu.c
+@@ -0,0 +1,396 @@
++/*
++ * Pixel 3 (blueline) Adreno 630, bring-up stage 1: power the GPU block's CX
++ * half (GMU, RSCC, Adreno SMMU) far enough to read its registers, log what
++ * the bootloader left, then put everything back. No firmware, no GX (3D
++ * core) power, no RPMh votes. Off by default.
++ *
++ * Boot-args: bluegpu=1 runs the probe; bluegpu=2 also reads the Adreno
++ * SMMU's global ID registers (the hypervisor may emulate or refuse those);
++ * bluegpu_keep=1 leaves CX and the GMU clocks on afterwards.
++ *
++ * Sources (copies and SHAs in pixel3-ios-gpu/ref):
++ *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
++ *    gpucc@5090000, adreno_smmu@5040000), gpucc-sdm845.c (gmu_clk_src RCG
++ *    0x1120, cx_gmu 0x1098, cxo 0x109c, cx_gdsc 0x106c hw_ctrl 0x1540
++ *    clk_dis_wait 8, gx_gdsc 0x100c POLL_CFG_GDSCR), gcc-sdm845.c
++ *    (gpu_cfg_ahb 0x71004 critical/hwcg bit 1, gpu_memnoc_gfx 0x7100c,
++ *    gpu_snoc_dvm_gfx 0x71018, ddrss_gpu_axi 0x44038, GPLL0 GPU votes
++ *    0x52004 bits 15/16), gdsc.c (wait fields, 2 ms status poll),
++ *    clk-branch.c (CLK_OFF bit 31, 200 us), a6xx_gmu.xml (dword offsets
++ *    from the GPU base: GMU = 0x1a800.., RSCC = GMU + 0x23000 per
++ *    a6xx_gmu_init for A630), a6xx_gmu.c, a6xx_catalog.c (A630 = chip ids
++ *    0x06030001/0x06030002).
++ *  - Pixel 3 kernel (android-msm-crosshatch-4.9, 862f51ba): sdm845-v2.dtsi
++ *    qcom,chipid = 0x06030001; msm-gdsc-sdm845.dtsi; sdm845.dtsi (CX GDSC on
++ *    pm8998 S9 = cx, GX GDSC on pm8005 S1 = gfx); no gpu_cc_ahb branch.
++ *  - ios-flame 745c4341 shim/gpuprobe.c (A640 stage 1, same order) and
++ *    HackiOS 63fc2b46 drivers/gpu/hakios.adreno.c (A642L steps 1-9:
++ *    announce before touching, reads before writes, stop on surprise).
++ *
++ * There is no chip-id register on A6xx: the id is a device-tree constant
++ * (Linux and KGSL both). The 3D core's registers (RBBM, CP, VBIF) are in
++ * GX, which only the GMU firmware powers (gfx.lvl via its RSCC, then the GX
++ * GDSC and SPTPRAC); an access to them while GX is off can hang the bus, so
++ * this probe never touches them unless the GX GDSC already reports on.
++ *
++ * Bus safety: GCC is always clocked. The GPU CC answers only while
++ * gcc_gpu_cfg_ahb runs; the GMU/RSCC/SMMU only with the CX GDSC on and
++ * cx_gmu/cxo running. Each gate is checked before the block behind it is
++ * read, every poll is bounded, and a failed step undoes what it turned on.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint32_t blueline_cmddb_addr(const char *id);	/* blueline_touch.c */
++void blueline_gpu_probe(void);
++
++/* GCC (gcc-sdm845.c) */
++#define GCC_PA			0x00100000u
++#define GCC_SIZE		0x00090000u
++#define GCC_GPLL0_VOTE		0x52004u	/* bit 15 gpu_gpll0, 16 gpu_gpll0_div (read only) */
++#define GCC_GPU_CFG_AHB		0x71004u
++#define GCC_GPU_MEMNOC_GFX	0x7100cu
++#define GCC_GPU_SNOC_DVM_GFX	0x71018u
++#define GCC_DDRSS_GPU_AXI	0x44038u
++#define GCC_GPU_IREF		0x8c010u
++
++/* GPU CC (gpucc-sdm845.c, gdsc.c) */
++#define GPUCC_PA		0x05090000u
++#define GPUCC_SIZE		0x9000u
++#define GPUCC_PLL1_MODE		0x0100u
++#define GPUCC_GX_GDSCR		0x100cu
++#define GPUCC_GX_CFG_GDSCR	0x1010u		/* bit 16 power-up complete, 15 power-down complete */
++#define GPUCC_CX_GDSCR		0x106cu
++#define GPUCC_CX_GMU_CBCR	0x1098u
++#define GPUCC_CXO_CBCR		0x109cu
++#define GPUCC_GMU_CMD_RCGR	0x1120u		/* +4 CFG: [10:8] source (0 = XO), [4:0] 2*div-1 */
++#define GPUCC_CX_HW_CTRL	0x1540u		/* gds_hw_ctrl: bit 31 = CX on */
++
++#define GDSC_PWR_ON		(1u << 31)
++#define GDSC_SW_COLLAPSE	(1u << 0)
++#define GDSC_HW_CONTROL		(1u << 1)
++#define GDSC_SW_OVERRIDE	(1u << 2)
++#define GDSC_WAIT_MASK		0x00fff000u	/* EN_REST [23:20], EN_FEW [19:16], CLK_DIS [15:12] */
++#define GDSC_CX_WAITS		((2u << 20) | (8u << 16) | (8u << 12))
++#define CBCR_CLK_OFF		(1u << 31)
++#define CBCR_HWCG		(1u << 1)
++#define CBCR_ENABLE		(1u << 0)
++#define CX_GMU_WAKE_SLEEP	0xff0u		/* gpu_cc_sdm845_probe: wake/sleep 0xf each */
++
++/* GMU (gmu@506a000; a6xx_gmu.xml offsets are dwords from the GPU base 0x5000000) */
++#define GMU_PA			0x0506a000u
++#define GMU_SIZE		0x30000u
++#define GMU_REG(o)		(4u * ((o) - 0x1a800u))
++#define GMU_CORE_FW_VERSION	0x1d3f8u
++#define GMU_CM3_SYSRESET	0x1f800u
++#define GMU_CM3_BOOT_CONFIG	0x1f801u
++#define GMU_CM3_FW_INIT_RESULT	0x1f81cu
++#define GMU_CM3_CFG		0x1f82du
++#define GMU_AO_COUNTER_L	0x1f888u
++#define GMU_AO_COUNTER_H	0x1f889u
++#define GMU_SPTPRAC_STATUS	0x1f8d0u	/* bit 2 SPTPRAC off, 6 GX HM GDSC off, 7 GX HM clk off */
++#define GMU_RPMH_POWER_STATE	0x1f8ecu
++#define GMU_HFI_CTRL_STATUS	0x1f980u
++#define GMU_HFI_VERSION_INFO	0x1f981u
++#define GMU_GENERAL_7		0x1f9ccu
++#define GMU_AO_HOST_INT_STATUS	0x23b05u
++#define GMU_RSCC_CONTROL_ACK	0x23b08u
++#define GMU_AO_CX_BUSY_STATUS	0x23b0cu
++#define GMU_AHB_FENCE_STATUS	0x23b13u
++
++/* RSCC = GMU mmio + 0x23000 for A630 (a6xx_gmu_init); dword offsets, domain A6XX_RSCC */
++#define RSCC_OFF		0x23000u
++#define RSCC_REG(o)		(RSCC_OFF + 4u * (o))
++#define RSCC_RSC_STATUS0_DRV0	0x004u
++#define RSCC_PDC_SLAVE_ID_DRV0	0x00bu
++#define RSCC_SEQ_BUSY_DRV0	0x101u
++static const uint32_t rscc_tcs_status[4] = { 0x346u, 0x3eeu, 0x496u, 0x53eu };
++
++/* Adreno SMMU (adreno_smmu@5040000, arm-smmu.h) */
++#define SMMU_PA			0x05040000u
++#define SMMU_SIZE		0x1000u
++
++/* 3D core (gpu@5000000, a6xx.xml), GX: read only if the GX GDSC is already on */
++#define GPU_PA			0x05000000u
++#define RBBM_STATUS		(4u * 0x0210u)
++
++#define A630_CHIPID_DOWNSTREAM	0x06030001u	/* sdm845-v2.dtsi qcom,chipid */
++#define A630_CHIPID_MAINLINE	0x06030002u	/* "qcom,adreno-630.2" */
++
++static vm_offset_t gcc, gpucc, gmu;
++
++static uint32_t
++rd(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Poll until (reg & mask) == want, at most us microseconds. */
++static bool
++poll(vm_offset_t a, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t i = 0; i < us; i++) {
++		if ((rd(a) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return (rd(a) & mask) == want;
++}
++
++static bool
++branch_running(uint32_t v)
++{
++	return (v & CBCR_ENABLE) && (!(v & CBCR_CLK_OFF) || (v & CBCR_HWCG));
++}
++
++/* clk_branch2 enable: set bit 0, wait up to 200 us for CLK_OFF to clear. Returns whether we turned it on. */
++static bool
++branch_on(vm_offset_t base, uint32_t off, const char *name, bool *running)
++{
++	uint32_t was = rd(base + off);
++	bool turned = false;
++
++	if (!(was & CBCR_ENABLE)) {
++		printf("BLUELINE GPU: %s: enable (CBCR %#x)\n", name, was);
++		wr(base + off, was | CBCR_ENABLE);
++		turned = true;
++	}
++	(void)poll(base + off, CBCR_CLK_OFF, 0, 200);
++	uint32_t now = rd(base + off);
++	*running = branch_running(now);
++	printf("BLUELINE GPU: %s CBCR %#x -> %#x (%s)\n", name, was, now,
++	    *running ? "running" : "STILL OFF");
++	return turned;
++}
++
++static void
++branch_off(vm_offset_t base, uint32_t off, const char *name)
++{
++	wr(base + off, rd(base + off) & ~CBCR_ENABLE);
++	delay(10);
++	printf("BLUELINE GPU: %s off again (CBCR %#x)\n", name, rd(base + off));
++}
++
++static bool
++cx_on(void)
++{
++	return ((rd(gpucc + GPUCC_CX_GDSCR) | rd(gpucc + GPUCC_CX_HW_CTRL)) & GDSC_PWR_ON) != 0;
++}
++
++static uint32_t
++gmu_rd(uint32_t o)
++{
++	return rd(gmu + GMU_REG(o));
++}
++
++static void
++gmu_report(void)
++{
++	printf("BLUELINE GPU: about to read the GMU at %#x (first access to the GPU block)\n", GMU_PA);
++	uint32_t c0 = gmu_rd(GMU_AO_COUNTER_L);
++	uint64_t t0 = mach_absolute_time(), ns;
++	delay(1000);
++	uint32_t c1 = gmu_rd(GMU_AO_COUNTER_L);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	uint32_t hz = ns ? (uint32_t)((uint64_t)(c1 - c0) * NSEC_PER_SEC / ns) : 0;
++	printf("BLUELINE GPU: GMU always-on counter %#x:%#x, %u Hz (%s)\n", gmu_rd(GMU_AO_COUNTER_H), c1, hz,
++	    (hz > 18000000 && hz < 20500000) ? "the 19.2 MHz crystal: GMU registers live" : "not counting at 19.2 MHz");
++	printf("BLUELINE GPU: GMU cm3 sysreset %#x boot_config %#x init_result %#x cfg %#x fw_version %#x\n",
++	    gmu_rd(GMU_CM3_SYSRESET), gmu_rd(GMU_CM3_BOOT_CONFIG), gmu_rd(GMU_CM3_FW_INIT_RESULT),
++	    gmu_rd(GMU_CM3_CFG), gmu_rd(GMU_CORE_FW_VERSION));
++	printf("BLUELINE GPU: GMU general_7 %#x rpmh_power_state %#x sptprac %#x hfi_ctrl %#x hfi_version %#x\n",
++	    gmu_rd(GMU_GENERAL_7), gmu_rd(GMU_RPMH_POWER_STATE), gmu_rd(GMU_SPTPRAC_STATUS),
++	    gmu_rd(GMU_HFI_CTRL_STATUS), gmu_rd(GMU_HFI_VERSION_INFO));
++	printf("BLUELINE GPU: GMU ao_host_int %#x rscc_ack %#x cx_busy %#x ahb_fence %#x\n",
++	    gmu_rd(GMU_AO_HOST_INT_STATUS), gmu_rd(GMU_RSCC_CONTROL_ACK), gmu_rd(GMU_AO_CX_BUSY_STATUS),
++	    gmu_rd(GMU_AHB_FENCE_STATUS));
++
++	printf("BLUELINE GPU: about to read the GPU RSCC at %#x\n", GMU_PA + RSCC_OFF);
++	printf("BLUELINE GPU: RSCC status0 %#x pdc_slave_id %#x seq_busy %#x tcs0-3 %#x %#x %#x %#x\n",
++	    rd(gmu + RSCC_REG(RSCC_RSC_STATUS0_DRV0)), rd(gmu + RSCC_REG(RSCC_PDC_SLAVE_ID_DRV0)),
++	    rd(gmu + RSCC_REG(RSCC_SEQ_BUSY_DRV0)), rd(gmu + RSCC_REG(rscc_tcs_status[0])),
++	    rd(gmu + RSCC_REG(rscc_tcs_status[1])), rd(gmu + RSCC_REG(rscc_tcs_status[2])),
++	    rd(gmu + RSCC_REG(rscc_tcs_status[3])));
++}
++
++static void
++smmu_report(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		return;
++	}
++	printf("BLUELINE GPU: about to read Adreno SMMU ID registers at %#x (may be hypervisor-emulated)\n", SMMU_PA);
++	printf("BLUELINE GPU: SMMU cr0 %#x idr0 %#x idr1 %#x idr2 %#x idr7 %#x\n", rd(smmu + 0x0),
++	    rd(smmu + 0x20), rd(smmu + 0x24), rd(smmu + 0x28), rd(smmu + 0x3c));
++}
++
++void
++blueline_gpu_probe(void)
++{
++	int level = 0, keep = 0;
++	bool run, cx_turned = false, ok = false;
++	bool t_memnoc = false, t_axi = false, t_gmu = false, t_cxo = false, rcg_set = false;
++	uint32_t cx_was = 0, rcg_cfg_was = 0;
++
++	(void)PE_parse_boot_argn("bluegpu", &level, sizeof(level));
++	(void)PE_parse_boot_argn("bluegpu_keep", &keep, sizeof(keep));
++	if (level <= 0) {
++		return;
++	}
++	printf("BLUELINE GPU: stage 1 probe (bluegpu=%d%s): CX power + GMU reads, no firmware, no GX\n",
++	    level, keep ? ", keep" : "");
++
++	/* 1. GCC: always clocked, read only first. */
++	gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!gcc || !gpucc || !gmu) {
++		printf("BLUELINE GPU: MMIO mapping failed\n");
++		return;
++	}
++	printf("BLUELINE GPU: gcc gpu_cfg_ahb %#x memnoc_gfx %#x snoc_dvm_gfx %#x ddrss_gpu_axi %#x iref %#x gpll0 votes %#x\n",
++	    rd(gcc + GCC_GPU_CFG_AHB), rd(gcc + GCC_GPU_MEMNOC_GFX), rd(gcc + GCC_GPU_SNOC_DVM_GFX),
++	    rd(gcc + GCC_DDRSS_GPU_AXI), rd(gcc + GCC_GPU_IREF), rd(gcc + GCC_GPLL0_VOTE));
++
++	/* 2. RPMh names (cmd-db lookup only, nothing is voted). */
++	printf("BLUELINE GPU: cmd-db gfx.lvl %#x cx.lvl %#x mx.lvl %#x\n", blueline_cmddb_addr("gfx.lvl"),
++	    blueline_cmddb_addr("cx.lvl"), blueline_cmddb_addr("mx.lvl"));
++
++	/* 3. The GPU CC's register clock (critical in Linux; normally on). */
++	(void)branch_on(gcc, GCC_GPU_CFG_AHB, "gcc gpu_cfg_ahb", &run);
++	if (!run) {
++		printf("BLUELINE GPU: gpu_cfg_ahb not running: GPU CC not touched; stop\n");
++		return;
++	}
++
++	/* 4. GPU CC as the bootloader left it. */
++	printf("BLUELINE GPU: about to read GPU CC at %#x\n", GPUCC_PA);
++	cx_was = rd(gpucc + GPUCC_CX_GDSCR);
++	rcg_cfg_was = rd(gpucc + GPUCC_GMU_CMD_RCGR + 4);
++	printf("BLUELINE GPU: gpucc cx_gdscr %#x cx_hw_ctrl %#x gx_gdscr %#x gx_cfg %#x pll1 %#x\n", cx_was,
++	    rd(gpucc + GPUCC_CX_HW_CTRL), rd(gpucc + GPUCC_GX_GDSCR), rd(gpucc + GPUCC_GX_CFG_GDSCR),
++	    rd(gpucc + GPUCC_PLL1_MODE));
++	printf("BLUELINE GPU: gpucc gmu_rcg cmd %#x cfg %#x cx_gmu %#x cxo %#x\n", rd(gpucc + GPUCC_GMU_CMD_RCGR),
++	    rcg_cfg_was, rd(gpucc + GPUCC_CX_GMU_CBCR), rd(gpucc + GPUCC_CXO_CBCR));
++	if (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++		printf("BLUELINE GPU: GX already powered (left by someone else): not touching the GPU; stop\n");
++		return;
++	}
++
++	/* 5. CX GDSC on (gdsc_init waits, then clear SW_COLLAPSE, poll 2 ms). */
++	if (!cx_on()) {
++		if (cx_was & GDSC_HW_CONTROL) {
++			printf("BLUELINE GPU: CX GDSC under hardware control: not ours; stop\n");
++			return;
++		}
++		uint32_t v = (cx_was & ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | GDSC_WAIT_MASK)) | GDSC_CX_WAITS;
++		printf("BLUELINE GPU: CX GDSC: configure %#x, then clear SW_COLLAPSE\n", v);
++		wr(gpucc + GPUCC_CX_GDSCR, v);
++		wr(gpucc + GPUCC_CX_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		cx_turned = true;
++		for (int i = 0; i < 2000 && !cx_on(); i++) {
++			delay(1);
++		}
++		printf("BLUELINE GPU: CX GDSC %#x hw_ctrl %#x: %s\n", rd(gpucc + GPUCC_CX_GDSCR),
++		    rd(gpucc + GPUCC_CX_HW_CTRL), cx_on() ? "on" : "TIMEOUT");
++		if (!cx_on()) {
++			goto restore;
++		}
++	} else {
++		printf("BLUELINE GPU: CX GDSC already on\n");
++	}
++
++	/* 6. GMU bus clocks from GCC (the gmu node's "axi" and "memnoc"). */
++	t_memnoc = branch_on(gcc, GCC_GPU_MEMNOC_GFX, "gcc gpu_memnoc_gfx", &run);
++	t_axi = branch_on(gcc, GCC_DDRSS_GPU_AXI, "gcc ddrss_gpu_axi", &run);
++
++	/* 7. gmu_clk_src = XO / 1 (19.2 MHz, no PLL), then cx_gmu and cxo. */
++	if (!branch_running(rd(gpucc + GPUCC_CX_GMU_CBCR))) {
++		vm_offset_t rcg = gpucc + GPUCC_GMU_CMD_RCGR;
++		wr(rcg + 4, (rcg_cfg_was & ~0x71fu) | 1u);
++		wr(rcg, rd(rcg) | 1u);
++		rcg_set = true;
++		bool upd = poll(rcg, 1u, 0, 10000);
++		printf("BLUELINE GPU: gmu_rcg -> XO: cmd %#x cfg %#x%s\n", rd(rcg), rd(rcg + 4), upd ? "" : " UPDATE TIMEOUT");
++		if (!upd) {
++			goto restore;
++		}
++		wr(gpucc + GPUCC_CX_GMU_CBCR, rd(gpucc + GPUCC_CX_GMU_CBCR) | CX_GMU_WAKE_SLEEP);
++	}
++	t_gmu = branch_on(gpucc, GPUCC_CX_GMU_CBCR, "gpucc cx_gmu", &run);
++	if (!run) {
++		goto restore;
++	}
++	t_cxo = branch_on(gpucc, GPUCC_CXO_CBCR, "gpucc cxo", &run);
++	if (!run) {
++		goto restore;
++	}
++
++	/* 8-9. GMU, RSCC; SMMU only on request. */
++	gmu_report();
++	if (level >= 2) {
++		smmu_report();
++	}
++
++	/* 10. The 3D core: GX is the GMU firmware's to power. */
++	if (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++		vm_offset_t gpu = ml_io_map(GPU_PA, 0x1000);
++		if (gpu) {
++			printf("BLUELINE GPU: GX on: RBBM_STATUS %#x\n", rd(gpu + RBBM_STATUS));
++		}
++	} else {
++		printf("BLUELINE GPU: GX off (gx_gdscr %#x): RBBM/CP not read. A6xx has no chip-id register;"
++		    " DT says %#x (downstream v2) / %#x (mainline 630.2)\n", rd(gpucc + GPUCC_GX_GDSCR),
++		    A630_CHIPID_DOWNSTREAM, A630_CHIPID_MAINLINE);
++	}
++	ok = true;
++	if (keep) {
++		printf("BLUELINE GPU: stage 1 done; CX and GMU clocks left on (bluegpu_keep=1)\n");
++		return;
++	}
++
++restore:
++	/* Reverse order: branches, RCG source, then collapse CX if we raised it. */
++	if (t_cxo) {
++		branch_off(gpucc, GPUCC_CXO_CBCR, "gpucc cxo");
++	}
++	if (t_gmu) {
++		branch_off(gpucc, GPUCC_CX_GMU_CBCR, "gpucc cx_gmu");
++	}
++	if (rcg_set) {
++		wr(gpucc + GPUCC_GMU_CMD_RCGR + 4, rcg_cfg_was);
++		wr(gpucc + GPUCC_GMU_CMD_RCGR, rd(gpucc + GPUCC_GMU_CMD_RCGR) | 1u);
++		(void)poll(gpucc + GPUCC_GMU_CMD_RCGR, 1u, 0, 10000);
++	}
++	if (t_axi) {
++		branch_off(gcc, GCC_DDRSS_GPU_AXI, "gcc ddrss_gpu_axi");
++	}
++	if (t_memnoc) {
++		branch_off(gcc, GCC_GPU_MEMNOC_GFX, "gcc gpu_memnoc_gfx");
++	}
++	if (cx_turned) {
++		wr(gpucc + GPUCC_CX_GDSCR, rd(gpucc + GPUCC_CX_GDSCR) | GDSC_SW_COLLAPSE);
++		delay(100);	/* downstream: no status check on disable */
++		printf("BLUELINE GPU: CX GDSC collapsed again (%#x)\n", rd(gpucc + GPUCC_CX_GDSCR));
++	}
++	printf("BLUELINE GPU: stage 1 %s; state restored\n", ok ? "done" : "BACKED OFF");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+index 64e647e47..d4ee48cb1 100644
+--- a/bsd/dev/blueline_touch.c
++++ b/bsd/dev/blueline_touch.c
+@@ -258,6 +258,14 @@ cmddb_addr(const char *id)
+ 	return 0;
+ }
+ 
++/* For other blueline drivers (blueline_gpu.c): a resource's RPMh address, 0 if not in cmd-db. */
++uint32_t blueline_cmddb_addr(const char *id);
++uint32_t
++blueline_cmddb_addr(const char *id)
++{
++	return cmddb_addr(id);
++}
++
+ /* n commands (addr, data) in an idle active TCS, triggered and waited for. */
+ static int
+ rpmh_write(const uint32_t *addr, const uint32_t *data, int n)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b70a9a60..6ae77b622 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,7 @@ extern void sweet_sample_start(void);
+ extern void blueline_keys_init(void);
+ extern void blueline_touch_init(void);
+ extern void blueline_cpufreq_init(void);
++extern void blueline_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -607,6 +608,8 @@ sweet_ufs_init(void)
+ 	blueline_cpufreq_init();
+ 	blueline_keys_init();
+ 	blueline_touch_init();
++	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
++	blueline_gpu_probe();
+ 	/* USB device mode, CDC-ECM, live console log (sweet_usb.c, boot-arg sweetusb). */
+ 	sweet_usb_probe();
+ 	{
+-- 
+2.54.0 (Apple Git-157)
+

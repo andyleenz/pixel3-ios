@@ -1,0 +1,351 @@
+From 86a870c779bae8fd8890fab28f1e1ff4a8d0fd35 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 08:44:29 +1100
+Subject: [PATCH] 0134: blueline Wi-Fi stage 1 probe (SCM queries, read-only
+ MSS state), bluewifi=1
+
+---
+ bsd/conf/files          |   1 +
+ bsd/dev/blueline_wifi.c | 289 ++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_ufs.c     |   3 +
+ 3 files changed, 293 insertions(+)
+ create mode 100644 bsd/dev/blueline_wifi.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 18e2147..f252b39 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/blueline_keys.c			standard
+ bsd/dev/blueline_touch.c		standard
+ bsd/dev/blueline_cpufreq.c		standard
++bsd/dev/blueline_wifi.c			standard
+ bsd/dev/blueline_gpu.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+diff --git a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+new file mode 100644
+index 0000000..abe8b6b
+--- /dev/null
++++ b/bsd/dev/blueline_wifi.c
+@@ -0,0 +1,296 @@
++/*
++ * Pixel 3 (blueline) Wi-Fi, bring-up stage 1: ask TrustZone which secure
++ * calls the modem / WLAN path will need, and (bluewifi=2) read, never
++ * write, the always-on registers that say what state the bootloader left
++ * the modem subsystem in. No votes, no clocks, no resets, no firmware.
++ * Off by default. Plan: pixel3-ios-gpu/wifi-plan.md.
++ *
++ * Boot-args:
++ *   bluewifi=1   SCM queries only: the SMC calling convention, whether
++ *                each SCM call we need exists (INFO is_call_avail), and
++ *                PAS is_supported for every peripheral id (modem 4, adsp 1,
++ *                slpi 12, gpu zap 13, cdsp 18, ...). Linux makes the same
++ *                queries at boot on every SDM845 phone.
++ *   bluewifi=2   also reads GCC's MSS clock branches, the AOSS MSS/WCSS
++ *                restart registers, the PDC modem sync reset, and lists the
++ *                SMEM partition table (DDR, read 32 bits at a time).
++ *
++ * Sources:
++ *  - Linux 20eef29b: drivers/firmware/qcom/qcom_scm.c (__get_convention:
++ *    the convention probe is a fast SMC64 INFO/IS_CALL_AVAIL whose argument
++ *    is its own function id with OWNER_SIP; __qcom_scm_is_call_available;
++ *    qcom_scm_pas_supported), qcom_scm.h (service/command numbers, error
++ *    codes, QCOM_SCM_INTERRUPTED = 1), qcom_scm-smc.c (std calls; on
++ *    INTERRUPTED call again with x0 = 1 and the same x1..x7, x6 carrying
++ *    the value TZ returned: ARM_SMCCC_QUIRK_QCOM_A6), qcom_q6v5_mss.c
++ *    (sdm845_mss: MBA self-authentication, need_mem_protection,
++ *    has_alt_reset), qcom_q6v5_pas.c, reset-qcom-aoss.c (sdm845:
++ *    MSS_RESTART 0x10000, WCSS_RESTART 0x20000 from 0xc2a0000),
++ *    reset-qcom-pdc.c (sdm845 sync reset register 0x100, modem bit 9),
++ *    smem.c (partition table "$TOC" in the last 4 KiB), gcc-sdm845.c
++ *    (mss branches), sdm845.dtsi (smem@86000000 0x200000, pdc_reset
++ *    @b2e0000, aoss_reset @c2a0000).
++ *  - Pixel 3 kernel (android-msm-crosshatch-4.9, 862f51ba) sdm845.dtsi:
++ *    qcom,mss@4080000 "qcom,pil-q6v55-mss" with qcom,pil-self-auth (no PAS
++ *    id), restart_reg 0xc2b0000, pdc_sync 0xb2e0100; lpass pas-id 1, slpi
++ *    12, spss 14, cdsp 18, venus 9.
++ *  - ios-flame 745c4341 phone/wifi/wland.c, scm.c (the same SCM calls made
++ *    from userland on the Pixel 4's WCN3990: PAS modem id 4, MP_ASSIGN).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void blueline_wifi_probe(void);
++
++/* SMCCC function ids (qcom_scm-smc.c, ARM_SMCCC_CALL_VAL) */
++#define SCM_FNID(svc, cmd)	((((uint32_t)(svc) & 0xffu) << 8) | ((uint32_t)(cmd) & 0xffu))
++#define SCM_OWNER_SIP		(2u << 24)
++#define SCM_SMC64		(1u << 30)
++#define SCM_FAST		(1u << 31)
++#define SCM_INTERRUPTED		1
++#define SCM_WAITQ_SLEEP		2
++#define SCM_MAX_RESUMES		1000
++#define SCM_GAVE_UP		(-1000)
++
++#define SVC_BOOT		0x01
++#define SVC_PIL			0x02
++#define SVC_INFO		0x06
++#define SVC_MP			0x0c
++#define INFO_IS_CALL_AVAIL	0x01
++#define PIL_IS_SUPPORTED	0x07
++
++/* bluewifi=2: always-on blocks, read only */
++#define GCC_PA			0x00100000u
++#define GCC_SIZE		0x00090000u
++#define GCC_VOTE		0x52004u	/* bit 10 boot_rom_ahb, 13 prng_ahb, 17 mss_gpll0_div */
++#define GCC_MSS_CFG_AHB		0x8a000u
++#define GCC_MSS_MFAB_AXIS	0x8a004u
++#define GCC_MSS_SNOC_AXI	0x8a150u
++#define GCC_MSS_Q6_MEMNOC_AXI	0x8a154u
++#define GCC_BOOT_ROM_HALT	0x38004u
++#define GCC_PRNG_HALT		0x34004u
++#define AOSS_CC_PA		0x0c2a0000u
++#define AOSS_CC_SIZE		0x31000u
++#define AOSS_MSS_RESTART	0x10000u
++#define AOSS_WCSS_RESTART	0x20000u
++#define PDC_RESET_PA		0x0b2e0000u
++#define PDC_RESET_SIZE		0x1000u
++#define PDC_SYNC_RESET		0x100u		/* bit 9 modem */
++#define SMEM_PA			0x86000000u
++#define SMEM_SIZE		0x200000u
++#define SMEM_TOC		(SMEM_SIZE - 0x1000u)
++#define SMEM_TOC_MAGIC		0x434f5424u	/* "$TOC" */
++#define SMEM_TOC_MAX		32u
++
++static const char *const host_name[] = { "apps", "modem", "adsp", "?", "slpi", "?", "?", "?", "spss", "?", "cdsp" };
++
++static uint32_t
++rd(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/*
++ * One SCM call with a single argument, results in res[0..2] (x1..x3).
++ * Standard (yielding) calls may come back INTERRUPTED; they are resumed as
++ * Linux does. WAITQ_SLEEP (newer TZ only) is reported, not handled.
++ */
++static int64_t
++scm_call(bool fast, uint32_t fnid, uint64_t arginfo, uint64_t arg0, uint64_t res[3], unsigned *resumes)
++{
++	uint64_t id = (fast ? SCM_FAST : 0) | SCM_SMC64 | SCM_OWNER_SIP | fnid, a6 = 0;
++
++	*resumes = 0;
++	res[0] = res[1] = res[2] = 0;
++	for (unsigned i = 0; i <= SCM_MAX_RESUMES; i++) {
++		register uint64_t x0 __asm__("x0") = id;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = arg0;
++		register uint64_t x3 __asm__("x3") = 0;
++		register uint64_t x4 __asm__("x4") = 0;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = a6;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    :
++		    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		if (x0 == SCM_INTERRUPTED && !fast) {
++			id = SCM_INTERRUPTED;
++			a6 = x6;
++			*resumes = i + 1;
++			continue;
++		}
++		res[0] = x1;
++		res[1] = x2;
++		res[2] = x3;
++		return (int64_t)(int32_t)x0;
++	}
++	return SCM_GAVE_UP;
++}
++
++static const char *
++scm_err(int64_t rc)
++{
++	switch (rc) {
++	case 0: return "ok";
++	case SCM_WAITQ_SLEEP: return "WAITQ_SLEEP (not handled)";
++	case -2: return "EINVAL_ARG";
++	case -3: return "EINVAL_ADDR";
++	case -4: return "EOPNOTSUPP";
++	case -5: return "ENOMEM";
++	case -12: return "EBUSY";
++	case SCM_GAVE_UP: return "still INTERRUPTED, gave up";
++	default: return "error";
++	}
++}
++
++/* INFO/IS_CALL_AVAIL for (svc, cmd): 1 = available, 0 = not, -1 = the query failed. */
++static int
++scm_avail(uint32_t svc, uint32_t cmd)
++{
++	uint64_t res[3];
++	unsigned resumes;
++	int64_t rc = scm_call(false, SCM_FNID(SVC_INFO, INFO_IS_CALL_AVAIL), 1,
++	    SCM_FNID(svc, cmd) | SCM_OWNER_SIP, res, &resumes);
++	if (rc) {
++		printf("BLUELINE WIFI: scm is_call_avail(%#x, %#x) -> %lld %s\n", svc, cmd, (long long)rc, scm_err(rc));
++		return -1;
++	}
++	return res[0] ? 1 : 0;
++}
++
++static void
++scm_probe(void)
++{
++	static const struct { uint8_t svc, cmd; const char *what; } calls[] = {
++		{ SVC_PIL, 0x01, "PAS init_image (PAS boot: adsp/cdsp/slpi/zap)" },
++		{ SVC_PIL, 0x02, "PAS mem_setup" },
++		{ SVC_PIL, 0x05, "PAS auth_and_reset" },
++		{ SVC_PIL, 0x06, "PAS shutdown" },
++		{ SVC_PIL, PIL_IS_SUPPORTED, "PAS is_supported" },
++		{ SVC_PIL, 0x0a, "PAS mss_reset" },
++		{ SVC_MP, 0x16, "MP assign_mem (MBA/MPSS/MSA/rmtfs ownership)" },
++		{ SVC_MP, 0x02, "MP restore_sec_cfg" },
++		{ SVC_BOOT, 0x0a, "BOOT set_remote_state" },
++		{ SVC_BOOT, 0x10, "BOOT set_dload_mode" },
++	};
++	static const struct { uint32_t id; const char *what; } pas[] = {
++		{ 1, "adsp/lpass" }, { 4, "modem (mpss)" }, { 6, "wcnss" }, { 9, "venus" },
++		{ 12, "slpi" }, { 13, "gpu zap" }, { 14, "spss" }, { 18, "cdsp" },
++	};
++	uint64_t res[3];
++	unsigned resumes;
++
++	/* 1. The convention probe, exactly as Linux __get_convention (fast SMC64). */
++	uint32_t self = SCM_FNID(SVC_INFO, INFO_IS_CALL_AVAIL) | SCM_OWNER_SIP;
++	printf("BLUELINE WIFI: about to SMC fast %#x (INFO is_call_avail of itself)\n",
++	    (unsigned)(SCM_FAST | SCM_SMC64 | self));
++	int64_t rc = scm_call(true, SCM_FNID(SVC_INFO, INFO_IS_CALL_AVAIL), 1, self, res, &resumes);
++	printf("BLUELINE WIFI: scm convention probe -> %lld %s, x1 %#llx x2 %#llx x3 %#llx: %s\n", (long long)rc,
++	    scm_err(rc), res[0], res[1], res[2], (!rc && res[0] == 1) ? "SMC64 SIP convention, as Linux" : "NOT the ARM_64 convention");
++	if (rc || res[0] != 1) {
++		printf("BLUELINE WIFI: stopping: Linux would fall back to ARM_32/legacy here\n");
++		return;
++	}
++
++	/* 2. Is each call we will need there? (standard calls, resumable) */
++	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
++		int a = scm_avail(calls[i].svc, calls[i].cmd);
++		printf("BLUELINE WIFI: scm %02x/%02x %-46s %s\n", calls[i].svc, calls[i].cmd, calls[i].what,
++		    a < 0 ? "query failed" : a ? "available" : "absent");
++	}
++
++	/* 3. Which peripherals TZ will PAS-authenticate (qcom_scm_pas_supported). */
++	if (scm_avail(SVC_PIL, PIL_IS_SUPPORTED) != 1) {
++		printf("BLUELINE WIFI: no PAS is_supported: skipping the PAS ids\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(pas) / sizeof(pas[0]); i++) {
++		rc = scm_call(false, SCM_FNID(SVC_PIL, PIL_IS_SUPPORTED), 1, pas[i].id, res, &resumes);
++		printf("BLUELINE WIFI: PAS id %2u %-13s -> %lld %s, %s%s\n", pas[i].id, pas[i].what, (long long)rc,
++		    scm_err(rc), rc ? "unknown" : res[0] ? "SUPPORTED" : "not supported",
++		    resumes ? " (resumed)" : "");
++	}
++}
++
++static void
++state_probe(void)
++{
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	vm_offset_t aoss = ml_io_map(AOSS_CC_PA, AOSS_CC_SIZE);
++	vm_offset_t pdc = ml_io_map(PDC_RESET_PA, PDC_RESET_SIZE);
++	vm_offset_t toc = ml_io_map(SMEM_PA + SMEM_TOC, 0x1000);	/* the table only */
++
++	if (!gcc || !aoss || !pdc || !toc) {
++		printf("BLUELINE WIFI: MMIO mapping failed\n");
++		return;
++	}
++	printf("BLUELINE WIFI: about to read GCC mss branches\n");
++	uint32_t vote = rd(gcc + GCC_VOTE);
++	printf("BLUELINE WIFI: gcc mss_cfg_ahb %#x mfab_axis %#x snoc_axi %#x q6_memnoc_axi %#x boot_rom %#x prng %#x; "
++	    "votes %#x (boot_rom %u prng %u gpll0_mss %u)\n",
++	    rd(gcc + GCC_MSS_CFG_AHB), rd(gcc + GCC_MSS_MFAB_AXIS), rd(gcc + GCC_MSS_SNOC_AXI),
++	    rd(gcc + GCC_MSS_Q6_MEMNOC_AXI), rd(gcc + GCC_BOOT_ROM_HALT), rd(gcc + GCC_PRNG_HALT), vote,
++	    (vote >> 10) & 1, (vote >> 13) & 1, (vote >> 17) & 1);
++
++	/* reading these hung the phone on 2026-11-19: only with bluewifi_aoss=1 */
++	uint32_t want_aoss = 0;
++	PE_parse_boot_argn("bluewifi_aoss", &want_aoss, sizeof(want_aoss));
++	if (want_aoss) {
++		printf("BLUELINE WIFI: about to read AOSS CC and PDC resets\n");
++		uint32_t pdcr = rd(pdc + PDC_SYNC_RESET);
++		printf("BLUELINE WIFI: aoss mss_restart %#x wcss_restart %#x; pdc sync_reset %#x (modem %u)\n",
++		    rd(aoss + AOSS_MSS_RESTART), rd(aoss + AOSS_WCSS_RESTART), pdcr, (pdcr >> 9) & 1);
++	} else {
++		printf("BLUELINE WIFI: AOSS CC / PDC reset reads skipped (they hung; bluewifi_aoss=1 to try)\n");
++	}
++
++	printf("BLUELINE WIFI: about to read the SMEM partition table at %#x\n", SMEM_PA + SMEM_TOC);
++	uint32_t magic = rd(toc), ver = rd(toc + 4), n = rd(toc + 8);
++	printf("BLUELINE WIFI: smem toc magic %#x%s version %u entries %u\n", magic,
++	    magic == SMEM_TOC_MAGIC ? " ($TOC)" : " (NOT $TOC)", ver, n);
++	if (magic != SMEM_TOC_MAGIC) {
++		return;
++	}
++	if (n > SMEM_TOC_MAX) {
++		n = SMEM_TOC_MAX;
++	}
++	for (uint32_t i = 0; i < n && 32 + 48 * (i + 1) <= 0x1000; i++) {
++		vm_offset_t e = toc + 32 + 48 * i;	/* struct smem_ptable_entry: 48 bytes */
++		uint32_t off = rd(e), size = rd(e + 4), flags = rd(e + 8), hosts = rd(e + 12);
++		uint32_t h0 = hosts & 0xffffu, h1 = hosts >> 16;
++		if (!size) {
++			continue;
++		}
++		printf("BLUELINE WIFI: smem part %2u: %#x+%#x flags %#x hosts %u(%s)-%u(%s) cacheline %u\n", i, off, size,
++		    flags, h0, h0 < 11 ? host_name[h0] : (h0 == 0xfffe ? "global" : "?"),
++		    h1, h1 < 11 ? host_name[h1] : (h1 == 0xfffe ? "global" : "?"), rd(e + 16));
++	}
++}
++
++void
++blueline_wifi_probe(void)
++{
++	int level = 0;
++
++	(void)PE_parse_boot_argn("bluewifi", &level, sizeof(level));
++	if (level <= 0) {
++		return;
++	}
++	printf("BLUELINE WIFI: stage 1 probe (bluewifi=%d): SCM queries%s; no writes, no votes\n",
++	    level, level >= 2 ? " + always-on register and SMEM reads" : "");
++	scm_probe();
++	if (level >= 2) {
++		state_probe();
++	}
++	printf("BLUELINE WIFI: stage 1 done\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 219bbff..c7b6a0c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -51,6 +51,7 @@ extern void sweet_sample_start(void);
+ extern void blueline_keys_init(void);
+ extern void blueline_touch_init(void);
+ extern void blueline_cpufreq_init(void);
++extern void blueline_wifi_probe(void);
+ extern void blueline_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ static void bluereboot_arm(void);
+@@ -612,6 +613,8 @@ sweet_ufs_init(void)
+ 	blueline_cpufreq_init();
+ 	blueline_keys_init();
+ 	blueline_touch_init();
++	/* Wi-Fi stage 1: SCM queries and read-only state, off unless bluewifi=1 (blueline_wifi.c). */
++	blueline_wifi_probe();
+ 	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
+ 	blueline_gpu_probe();
+ 	/* Test-loop reboot, bluereboot_after=gpu (patch 0127). */
+-- 
+2.54.0 (Apple Git-157)
+

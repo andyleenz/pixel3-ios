@@ -1,0 +1,743 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 18:00:00 +1100
+Subject: [PATCH] 0144: blueline GPU: zap shader through PAS 13 and
+ CP_SET_SECURE_MODE 0 before the draw stage (bluegpu=7)
+
+draw1 (bluegpu=7 step 1): CP_BLIT fills complete, every fence (MEM_WRITE,
+CACHE_FLUSH_TS, CCU colour/depth flush TS) lands, no SMMU or CP fault, but
+no pixel changes. The GPU comes up in secure mode and nothing took it out.
+
+Between stage 4's WHERE_AM_I and the draw stage, as mainline a6xx hw_init
+does after a6xx_cp_init (a6xx_zap_shader_init -> zap_shader_load_mdt):
+
+ - image from /blueline-gpu "zap-elf" (tools/mkadt.py --gpu-fw squashes the
+   phone's /vendor/firmware a630_zap.mdt + .b00-.b02; Google-signed, not
+   committed), checked as mdt_header_valid / qcom_mdt_read_metadata /
+   qcom_mdt_get_size / qcom_mdt_load_no_init check it;
+ - is_call_available(PIL, AUTH_AND_RESET) (qcom_pas_is_available);
+ - PAS INIT_IMAGE(13, meta_pa): x0 0x42000201 x1 0x82, metadata (ELF
+   header + phdrs, then the hash segment: 6684 bytes) in a fresh contiguous
+   page below 4G made Normal NC (dma_alloc_coherent), leaked;
+ - PAS MEM_SETUP(13, 0x8c415000, 0x1000) (relocatable image): x0 0x42000202
+   x1 3; region = sdm845.dtsi gpu_mem 0x8c415000 size 0x2000, outside
+   XNU's RAM (0xf4000000+);
+ - the loadable segment (p_paddr 0x5000, 0x7b0 bytes) to region +
+   p_paddr - min(p_paddr) through a Device mapping, read back, dsb;
+ - PAS AUTH_AND_RESET(13): x0 0x42000205 x1 1;
+ - ring: CP_SET_SECURE_MODE 0 (0x70e60001 0), flushed and idled, then a
+   CP_MEM_WRITE 0xcafef00d check.
+SMCs as 0134 (SMC64 SIP standard calls, INTERRUPTED resumed with x0 = 1 and
+TZ's x6) plus V2_EBUSY retries; every rc, x1 and resume count is logged.
+Fallback only with bluegpu_secvid=1 and no zap: RBBM_SECVID_TRUST_CNTL
+(0xF400) = 0 by the CPU (may be XPU-protected; not read).
+
+Draw stage diagnostic: RB perf counters (2D_ALIVE_CYCLES, 2D_VALID_PIXELS,
+2D_OUTPUT_RB_DST_TRANS, C_WRITE) and CP counter 0 around each fill, and
+RBBM_STATUS/1..3 with the A2D/CCU/RB/VBIF busy bits, so "the blit never
+ran" and "it ran, the writes went elsewhere" read differently.
+
+Also: the draw stage's framebuffer check mappings come from
+ml_io_map_unmappable, the mapping ml_io_unmap can free (ml_io_map's are
+permanent io_submap entries).
+
+Boot-args: bluegpu_zap=0|1|2 (default 1 at bluegpu=7: load; 2: only
+set_remote_state(0, 13), the a5xx zap resume), bluegpu_secvid=1.
+---
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c	2026-11-19 10:13:28
++++ b/bsd/dev/blueline_gpu.c	2026-11-19 10:16:20
+@@ -10,7 +10,8 @@
+  * bluegpu=4 runs stage 1, then 2a with stage 2b (SMMU context + HFI) around it;
+  * bluegpu=5 runs 4 with stage 3 (GX: the GPU core powered by the GMU) inside;
+  * bluegpu=6 runs 5 with stage 4 (SQE microcode, ringbuffer, first commands) inside 3;
+- * bluegpu=7 runs 6, then the draw stage (2D engine fills: own buffer, then the panel);
++ * bluegpu=7 runs 6, then the zap shader (bluegpu_zap, default 1; 0144) and the draw
++ *  stage (2D engine fills: own buffer, then the panel);
+  * bluegpu_keep=1 leaves CX and the GMU clocks (and, at 3/4, the running GMU,
+  * at 4 also its SMMU bank and memory, at 5 also GX and the votes) on afterwards.
+  *
+@@ -231,6 +232,62 @@
+  *  Down: both mappings cleared from the page tables and cb0's TLB
+  *  invalidated before anything else, whatever happened; our buffer is
+  *  freed with the CP memory (same conditions), the framebuffer never.
++ *  Diagnostic (0144): RB perf counters around each fill (RB_PERFCTR_RB_SEL
++ *  0..3 = 2D_ALIVE_CYCLES 23, 2D_VALID_PIXELS 28, 2D_OUTPUT_RB_DST_TRANS
++ *  40, C_WRITE 15; RBBM_PERFCTR_RB_0..3 at 0x4d6) with CP counter 0
++ *  (ALWAYS_COUNT) as a check that counters run, and RBBM_STATUS/1..3 with
++ *  the A2D/CCU/RB/VBIF busy bits: 2D counters at 0 mean the blit never ran,
++ *  pixels counted with nothing in memory mean the writes went elsewhere.
++ *
++ * Zap shader (0144, bluegpu=7, bluegpu_zap=1 by default there): between
++ * stage 4's WHERE_AM_I and the draw stage, the GPU leaves secure mode as
++ * mainline a6xx hw_init does after a6xx_cp_init: a6xx_zap_shader_init ->
++ * adreno_zap_shader_load -> zap_shader_load_mdt (qcom_mdt_load into the
++ * zap-shader memory-region, then qcom_pas_auth_and_reset(13)), then
++ * CP_SET_SECURE_MODE 0 in the ring, flushed and idled.
++ *  Image: /blueline-gpu "zap-elf" (tools/mkadt.py --gpu-fw: the phone's
++ *  /vendor/firmware a630_zap.mdt + .b00-.b02 squashed into one ELF as
++ *  pil-squasher does, the same bytes as the vendor's a630_zap.elf; Google
++ *  signed for blueline, never committed). Checked as mdt_header_valid;
++ *  metadata built as qcom_mdt_read_metadata (ELF header + phdrs = phdr[0]
++ *  p_filesz, then the hash segment, the first phdr with (p_flags >> 24) &
++ *  7 == 2, from its p_offset); loadable = PT_LOAD, not hash, p_memsz != 0
++ *  (mdt_phdr_loadable); relocatable if any has bit 27; size =
++ *  ALIGN(max(p_paddr + p_memsz), 4K) - min(p_paddr) (qcom_mdt_get_size).
++ *  This image: one loadable segment (p_paddr 0x5000, 0x7b0 bytes,
++ *  relocatable), hash 0x1988 bytes, metadata 6684 bytes, size 0x1000.
++ *  Region: zap-shader memory-region = gpu_mem 0x8c415000 size 0x2000
++ *  (mainline sdm845.dtsi gpu@8c415000; crosshatch pil_gpu_mem; the
++ *  phone's own carve-out list, LOG.md), below XNU's RAM (0xf4000000+,
++ *  tools/mkadt.py), so never XNU memory. Mapped Device (ml_io_map: no
++ *  speculative reads into a range TZ is about to XPU-lock, and the 16K
++ *  page also covers the ipa_gsi tail), written and read back as words,
++ *  then never touched again; the mapping is left in place.
++ *  PAS (qcom_scm.c, SMC64 SIP standard calls as 0134; INTERRUPTED resumed
++ *  with x0 = 1 and TZ's x6, EBUSY retried 20 x 30 ms; each rc and x1 and
++ *  the resume count logged; Linux's result is rc ? rc : x1):
++ *   is_call_available(PIL, AUTH_AND_RESET) (qcom_pas_is_available);
++ *   INIT_IMAGE x0 0x42000201 x1 0x82 x2 13 x3 meta_pa, the metadata in a
++ *   fresh physically contiguous page below 4G made Normal NC
++ *   (dma_alloc_coherent "non-cachable to avoid XPU violations"; Linux
++ *   frees it after the call, this leaks it);
++ *   MEM_SETUP x0 0x42000202 x1 3 x2 13 x3 0x8c415000 x4 size (relocatable
++ *   images only, as __qcom_mdt_pas_init);
++ *   segments copied to region + p_paddr - min(p_paddr), tails zeroed
++ *   (qcom_mdt_load_no_init), dsb;
++ *   AUTH_AND_RESET x0 0x42000205 x1 1 x2 13 (GX on, CP running, as
++ *   mainline). -4 (EOPNOTSUPP) = no zap on this target.
++ *  Then ring: CP_SET_SECURE_MODE (0x66) 0, submitted and idled, and a
++ *  CP_MEM_WRITE 0xcafef00d to target + 0x40 to check the CP still writes.
++ *  bluegpu_zap=2 instead asks TZ to resume a zap it already holds
++ *  (BOOT set_remote_state(0 = SCM_GPU_ZAP_SHADER_RESUME, 13), as a5xx's
++ *  zap resume; only meaningful after a GPU restart in the same boot).
++ *  bluegpu_zap=0: none. Fallback only if the zap was not authenticated and
++ *  bluegpu_secvid=1: RBBM_SECVID_TRUST_CNTL (0xF400) = 0 by the CPU, as
++ *  Linux does when the DT has no zap node; on a zap-required part it may
++ *  be XPU-protected (Linux: "a permissions violation will soon follow"),
++ *  so it is not read before or after. Nothing here can be undone: the zap
++ *  stays authenticated until the next reset; PAS shutdown is never called.
+  *
+  * Sources (copies and SHAs in pixel3-ios-gpu/ref):
+  *  - Linux 20eef29b: sdm845.dtsi (gpu@5000000, gmu@506a000 "gmu" 0x30000,
+@@ -327,6 +384,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);	/* osfmk/arm64/machine_routines.c */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);	/* the mapping ml_io_unmap frees */
+ extern uint32_t blueline_cmddb_addr(const char *id);	/* blueline_touch.c */
+ extern uint32_t blueline_cmddb_aux(const char *id, uint8_t *buf, uint32_t max);
+ extern bool blueline_cmddb_name(uint32_t addr, char name[9]);
+@@ -2242,7 +2300,7 @@
+ 		cp.sidmask = 0;
+ 	}
+ 	printf("BLUELINE GPU: stage 4: CP bring-up (step %d, wait %d ms, sw reset on hang %d, stream 0 mask %#x);"
+-	    " no zap, RBBM_SECVID_TRUST_CNTL never touched\n", cp.step, cp.ms, cp.reset, cp.sidmask);
++	    " zap (bluegpu_zap) only at bluegpu=7, after WHERE_AM_I\n", cp.step, cp.ms, cp.reset, cp.sidmask);
+ 	if (SecureDTLookupEntry(NULL, "/blueline-gpu", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "sqe-firmware", &fw, &size) != kSuccess) {
+ 		printf("BLUELINE GPU: no /blueline-gpu sqe-firmware in the device tree (tools/mkadt.py --gpu-fw with"
+@@ -2572,7 +2630,454 @@
+ 		delay(10);
+ 		v = cp_mem(off)[0];
+ 	}
++	return v;
++}
++
++/*
++ * Zap shader (0144): see the top of the file. Linux 20eef29b
++ * drivers/soc/qcom/mdt_loader.c, drivers/firmware/qcom/qcom_scm.c,
++ * qcom_scm-smc.c, drivers/gpu/drm/msm/adreno/adreno_gpu.c
++ * (zap_shader_load_mdt), a6xx_gpu.c (hw_init, a6xx_zap_shader_init).
++ */
++#define ZAP_PAS_ID		13u		/* a6xx_gpu.c GPU_PAS_ID; crosshatch qcom,pas-id = <13> */
++#define ZAP_REGION_PA		0x8c415000u	/* sdm845.dtsi gpu_mem / crosshatch pil_gpu_mem */
++#define ZAP_REGION_SIZE		0x2000u
++#define ZAP_META_MAX		0x4000u
++#define ZAP_FILE_MAX		0x10000u
++#define ZAP_CHECK_OFF		(CP_TARGET_OFF + 0x40u)	/* below the draw fences at +0x100 */
++#define ZAP_MEM_WRITE_VAL	0xcafef00du
++#define CP_SET_SECURE_MODE	0x66u
++#define GXR_RBBM_SECVID_TRUST_CNTL 0xf400u
++
++#define ELF_PT_LOAD		1u
++#define MDT_TYPE_MASK		(7u << 24)	/* QCOM_MDT_TYPE_MASK */
++#define MDT_TYPE_HASH		(2u << 24)
++#define MDT_RELOCATABLE		(1u << 27)
++
++/* SMCCC / qcom_scm.h */
++#define ZSCM_SMC64		(1u << 30)
++#define ZSCM_OWNER_SIP		(2u << 24)
++#define ZSCM_FNID(svc, cmd)	((((uint32_t)(svc) & 0xffu) << 8) | ((uint32_t)(cmd) & 0xffu))
++#define ZSCM_INTERRUPTED	1
++#define ZSCM_V2_EBUSY		(-12)
++#define ZSCM_MAX_RESUMES	1000u
++#define ZSCM_EBUSY_RETRIES	20u		/* QCOM_SCM_EBUSY_MAX_RETRY, 30 ms apart */
++#define ZSCM_GAVE_UP		(-1000)
++#define ZSCM_SVC_BOOT		0x01u
++#define ZSCM_SVC_PIL		0x02u
++#define ZSCM_SVC_INFO		0x06u
++#define ZSCM_BOOT_SET_REMOTE_STATE 0x0au
++#define ZSCM_PIL_INIT_IMAGE	0x01u
++#define ZSCM_PIL_MEM_SETUP	0x02u
++#define ZSCM_PIL_AUTH_AND_RESET	0x05u
++#define ZSCM_INFO_IS_CALL_AVAIL	0x01u
++#define ZSCM_ARGS_VAL_RW	0x82u		/* QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW) */
++
++struct zap_phdr {	/* elf32_phdr */
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++static struct {
++	int mode, secvid;
++	const uint8_t *elf;
++	uint32_t size, phoff, phnum;
++	uint32_t ehdr_size, hash_off, hash_size;	/* metadata = elf[0, ehdr_size) + elf[hash_off, + hash_size) */
++	uint32_t min, max;				/* loadable p_paddr span, max 4K aligned */
++	bool relocate, ok, loaded;
++} zap;
++
++static struct zap_phdr
++zap_ph(uint32_t i)
++{
++	struct zap_phdr p;
++	memcpy(&p, zap.elf + zap.phoff + i * sizeof(p), sizeof(p));
++	return p;
++}
++
++static uint32_t
++zap_u32(uint32_t off)
++{
++	uint32_t v;
++	memcpy(&v, zap.elf + off, 4);
+ 	return v;
++}
++
++static uint16_t
++zap_u16(uint32_t off)
++{
++	uint16_t v;
++	memcpy(&v, zap.elf + off, 2);
++	return v;
++}
++
++/* mdt_phdr_loadable */
++static bool
++zap_loadable(const struct zap_phdr *p)
++{
++	return p->type == ELF_PT_LOAD && (p->flags & MDT_TYPE_MASK) != MDT_TYPE_HASH && p->memsz != 0;
++}
++
++/*
++ * Options and the image (reads only). The checks are mdt_header_valid,
++ * qcom_mdt_read_metadata, qcom_mdt_get_size and qcom_mdt_load_no_init's,
++ * all done here so nothing is sent to TZ for an image Linux would refuse.
++ */
++static void
++zap_prepare(void)
++{
++	DTEntry node;
++	void const *p;
++	unsigned size;
++
++	bzero(&zap, sizeof(zap));
++	zap.mode = 1;
++	(void)PE_parse_boot_argn("bluegpu_zap", &zap.mode, sizeof(zap.mode));
++	(void)PE_parse_boot_argn("bluegpu_secvid", &zap.secvid, sizeof(zap.secvid));
++	if (zap.mode < 0 || zap.mode > 2) {
++		zap.mode = 1;
++	}
++	printf("BLUELINE GPU: zap: bluegpu_zap=%d (%s), bluegpu_secvid=%d (RBBM_SECVID_TRUST_CNTL fallback %s)\n", zap.mode,
++	    zap.mode == 1 ? "load PAS 13 after WHERE_AM_I" : zap.mode == 2 ? "resume only: set_remote_state(0, 13)" : "off",
++	    zap.secvid, zap.secvid ? "ARMED if the zap fails" : "off");
++	if (zap.mode != 1) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/blueline-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "zap-elf", &p, &size) != kSuccess) {
++		printf("BLUELINE GPU: no /blueline-gpu zap-elf in the device tree (tools/mkadt.py --gpu-fw with"
++		    " work/fw/vendor/a630_zap.mdt + .b0N): no zap\n");
++		return;
++	}
++	zap.elf = p;
++	zap.size = size;
++	uint32_t sum = 0;
++	for (unsigned i = 0; i + 4 <= size; i += 4) {
++		sum += zap_u32(i);
++	}
++	if (size < 52 || size > ZAP_FILE_MAX || memcmp(zap.elf, "\177ELF", 4) || zap.elf[4] != 1) {
++		printf("BLUELINE GPU: zap-elf %u bytes, word sum %#x: not a 32-bit ELF: no zap\n", size, sum);
++		return;
++	}
++	zap.phoff = zap_u32(0x1c);
++	zap.phnum = zap_u16(0x2c);
++	uint32_t entry = zap_u32(0x18), phentsize = zap_u16(0x2a), shentsize = zap_u16(0x2e), shnum = zap_u16(0x30);
++	printf("BLUELINE GPU: ADT zap-elf %u bytes, word sum %#x, entry %#x, %u phdrs at %#x\n", size, sum, entry, zap.phnum,
++	    zap.phoff);
++	/* mdt_header_valid (section headers: none expected; refused if present, the file is ours to check) */
++	if (phentsize != sizeof(struct zap_phdr) || zap.phnum < 2 || zap.phnum > 64 ||
++	    zap.phoff + zap.phnum * sizeof(struct zap_phdr) > size || shentsize || shnum) {
++		printf("BLUELINE GPU: zap-elf header not valid (phentsize %u, shentsize %u shnum %u): no zap\n", phentsize,
++		    shentsize, shnum);
++		return;
++	}
++	int hash = -1;
++	zap.min = 0xffffffffu;
++	zap.max = 0;
++	for (uint32_t i = 0; i < zap.phnum; i++) {
++		struct zap_phdr h = zap_ph(i);
++		bool ld = zap_loadable(&h);
++		printf("BLUELINE GPU: zap ph%u type %u off %#x paddr %#x filesz %#x memsz %#x flags %#x%s%s\n", i, h.type,
++		    h.offset, h.paddr, h.filesz, h.memsz, h.flags, ld ? " LOAD" : "",
++		    (h.flags & MDT_TYPE_MASK) == MDT_TYPE_HASH ? " HASH" : "");
++		if (i >= 1 && hash < 0 && (h.flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			hash = (int)i;
++		}
++		if (!ld) {
++			continue;
++		}
++		zap.relocate |= (h.flags & MDT_RELOCATABLE) != 0;
++		if ((uint64_t)h.paddr + h.memsz > 0xffffffffull - 0xfffu || h.filesz > h.memsz ||
++		    (uint64_t)h.offset + h.filesz > size) {
++			printf("BLUELINE GPU: zap ph%u: p_filesz > p_memsz, or its bytes are not in the file: no zap\n", i);
++			return;
++		}
++		zap.min = MIN(zap.min, h.paddr);
++		zap.max = MAX(zap.max, (h.paddr + h.memsz + 0xfffu) & ~0xfffu);
++	}
++	struct zap_phdr h0 = zap_ph(0);
++	if (h0.type == ELF_PT_LOAD || hash < 0 || zap.max <= zap.min) {
++		printf("BLUELINE GPU: zap: phdr 0 is PT_LOAD, or no hash segment, or nothing to load: no zap\n");
++		return;
++	}
++	struct zap_phdr hh = zap_ph((uint32_t)hash);
++	zap.ehdr_size = h0.filesz;
++	zap.hash_size = hh.filesz;
++	/* qcom_mdt_read_metadata: the hash follows the header in a bare .mdt, else it is at its p_offset */
++	zap.hash_off = zap.ehdr_size + zap.hash_size == size ? zap.ehdr_size : hh.offset;
++	uint32_t meta = zap.ehdr_size + zap.hash_size, need = zap.max - zap.min;
++	if (zap.ehdr_size < zap.phoff + zap.phnum * sizeof(struct zap_phdr) || zap.hash_off + zap.hash_size > size ||
++	    meta > ZAP_META_MAX || need > ZAP_REGION_SIZE) {
++		printf("BLUELINE GPU: zap: header %#x + hash %#x at %#x (metadata max %#x), image %#x (region %#x):"
++		    " does not fit: no zap\n", zap.ehdr_size, zap.hash_size, zap.hash_off, ZAP_META_MAX, need,
++		    ZAP_REGION_SIZE);
++		return;
++	}
++	printf("BLUELINE GPU: zap image ok: metadata %u bytes (header %#x + hash segment %d, %#x bytes at %#x), load"
++	    " %#x-%#x = %#x bytes, %s; region %#x size %#x\n", meta, zap.ehdr_size, hash, zap.hash_size, zap.hash_off,
++	    zap.min, zap.max, need, zap.relocate ? "relocatable (mem_setup)" : "not relocatable", ZAP_REGION_PA,
++	    ZAP_REGION_SIZE);
++	zap.ok = true;
++}
++
++/*
++ * One SCM standard call, as __scm_smc_call / __scm_smc_do / __scm_smc_do_quirk:
++ * x0 fn id, x1 arginfo, x2..x4 args; INTERRUPTED resumed with x0 = 1, x1..x5
++ * as sent and x6 = TZ's; V2_EBUSY retried. Returns x0 (signed), x1 in *r1.
++ */
++static int64_t
++zap_smc(uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *r1,
++    unsigned *resumes)
++{
++	int64_t rc = ZSCM_GAVE_UP;
++
++	*resumes = 0;
++	*r1 = 0;
++	for (unsigned b = 0; b <= ZSCM_EBUSY_RETRIES; b++) {
++		uint64_t id = ZSCM_SMC64 | ZSCM_OWNER_SIP | ZSCM_FNID(svc, cmd), a6 = 0;
++		rc = ZSCM_GAVE_UP;
++		for (unsigned i = 0; i <= ZSCM_MAX_RESUMES; i++) {
++			register uint64_t x0 __asm__("x0") = id;
++			register uint64_t x1 __asm__("x1") = arginfo;
++			register uint64_t x2 __asm__("x2") = a0;
++			register uint64_t x3 __asm__("x3") = a1;
++			register uint64_t x4 __asm__("x4") = a2;
++			register uint64_t x5 __asm__("x5") = 0;
++			register uint64_t x6 __asm__("x6") = a6;
++			register uint64_t x7 __asm__("x7") = 0;
++			__asm__ volatile ("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++			if (x0 == ZSCM_INTERRUPTED) {
++				id = ZSCM_INTERRUPTED;
++				a6 = x6;
++				(*resumes)++;
++				continue;
++			}
++			*r1 = x1;
++			rc = (int64_t)(int32_t)x0;
++			break;
++		}
++		if (rc != ZSCM_V2_EBUSY) {
++			break;
++		}
++		delay(30000);
++	}
++	return rc;
++}
++
++static const char *
++zap_err(int64_t rc)
++{
++	switch (rc) {
++	case 0: return "ok";
++	case -1: return "ERROR";
++	case -2: return "EINVAL_ARG";
++	case -3: return "EINVAL_ADDR";
++	case -4: return "EOPNOTSUPP";
++	case -5: return "ENOMEM";
++	case ZSCM_V2_EBUSY: return "EBUSY (retries used up)";
++	case ZSCM_GAVE_UP: return "still INTERRUPTED, gave up";
++	default: return "error";
++	}
++}
++
++/* One logged PAS/BOOT call; returns Linux's "ret ? : res.result[0]". */
++static int64_t
++zap_call(const char *what, uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2)
++{
++	uint64_t r1, t0 = mach_absolute_time(), ns;
++	unsigned resumes;
++
++	printf("BLUELINE GPU: zap: about to SMC %s: x0 %#x x1 %#llx x2 %#llx x3 %#llx x4 %#llx\n", what,
++	    ZSCM_SMC64 | ZSCM_OWNER_SIP | ZSCM_FNID(svc, cmd), (unsigned long long)arginfo, (unsigned long long)a0,
++	    (unsigned long long)a1, (unsigned long long)a2);
++	int64_t rc = zap_smc(svc, cmd, arginfo, a0, a1, a2, &r1, &resumes);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUELINE GPU: zap: %s -> rc %lld %s, x1 %#llx, %u resume(s), %llu us\n", what, (long long)rc, zap_err(rc),
++	    (unsigned long long)r1, resumes, ns / 1000);
++	return rc ? rc : (int64_t)(int32_t)r1;
++}
++
++/*
++ * qcom_mdt_load + qcom_pas_auth_and_reset (zap_shader_load_mdt). Returns
++ * whether TZ authenticated the zap. Each step stops the sequence on error;
++ * nothing sent to TZ can be taken back.
++ */
++static bool
++zap_load(void)
++{
++	/* qcom_pas_is_available = is_call_available(PIL, AUTH_AND_RESET) */
++	int64_t rc = zap_call("is_call_available(PIL, AUTH_AND_RESET)", ZSCM_SVC_INFO, ZSCM_INFO_IS_CALL_AVAIL, 1,
++	    ZSCM_FNID(ZSCM_SVC_PIL, ZSCM_PIL_AUTH_AND_RESET) | ZSCM_OWNER_SIP, 0, 0);
++	if (rc != 1) {
++		printf("BLUELINE GPU: zap: PAS auth_and_reset %s: no zap\n", rc == 0 ? "not available" : "query failed");
++		return false;
++	}
++
++	/* Metadata: physically contiguous, below 4G, Normal NC; leaked afterwards. */
++	uint32_t meta = zap.ehdr_size + zap.hash_size;
++	vm_size_t msz = round_page(meta);
++	vm_offset_t mva = 0;
++	if (kmem_alloc_contig(kernel_map, &mva, msz, PAGE_MASK, (ppnum_t)(atop_64(0x100000000ull) - 1), 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("BLUELINE GPU: zap: no contiguous page below 4G for the metadata: no zap\n");
++		return false;
++	}
++	uint64_t mpa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)mva));
++	bool contig = mpa != 0 && mpa + msz <= 0x100000000ull;
++	for (vm_size_t o = 0; o < msz; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(mva + o));
++		contig = contig && ptoa_64(pn) == mpa + o;
++		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
++	}
++	volatile uint8_t *m = (volatile uint8_t *)mva;
++	for (uint32_t i = 0; i < meta; i++) {
++		m[i] = i < zap.ehdr_size ? zap.elf[i] : zap.elf[zap.hash_off + i - zap.ehdr_size];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t bad = 0;
++	for (uint32_t i = 0; i < meta; i++) {
++		bad += m[i] != (i < zap.ehdr_size ? zap.elf[i] : zap.elf[zap.hash_off + i - zap.ehdr_size]);
++	}
++	printf("BLUELINE GPU: zap metadata va %#lx pa %#llx (%u bytes in %#lx), %s, cache attr %#x, %u bad bytes\n",
++	    (unsigned long)mva, (unsigned long long)mpa, meta, (unsigned long)msz,
++	    contig ? "contiguous, below 4G" : "NOT CONTIGUOUS OR ABOVE 4G",
++	    pmap_cache_attributes(pmap_find_phys(kernel_pmap, (addr64_t)mva)), bad);
++	if (!contig || bad) {
++		printf("BLUELINE GPU: zap: metadata buffer unusable (leaked): no zap\n");
++		return false;
++	}
++
++	/* qcom_scm_pas_init_image: x1 QCOM_SCM_ARGS(2, VAL, RW), x2 pas id, x3 metadata pa */
++	rc = zap_call("PAS init_image(13, metadata)", ZSCM_SVC_PIL, ZSCM_PIL_INIT_IMAGE, ZSCM_ARGS_VAL_RW, ZAP_PAS_ID,
++	    mpa, 0);
++	if (rc) {
++		printf("BLUELINE GPU: zap: init_image refused (%lld): TZ did not accept the metadata: no zap\n",
++		    (long long)rc);
++		return false;
++	}
++	/* __qcom_mdt_pas_init: mem_setup only for relocatable images */
++	if (zap.relocate) {
++		rc = zap_call("PAS mem_setup(13, region, size)", ZSCM_SVC_PIL, ZSCM_PIL_MEM_SETUP, 3, ZAP_PAS_ID,
++		    ZAP_REGION_PA, zap.max - zap.min);
++		if (rc) {
++			printf("BLUELINE GPU: zap: mem_setup refused (%lld): no zap\n", (long long)rc);
++			return false;
++		}
++	}
++
++	/* qcom_mdt_load_no_init: each loadable segment to region + p_paddr - reloc, the tail zeroed */
++	uint32_t reloc = zap.relocate ? zap.min : ZAP_REGION_PA;
++	printf("BLUELINE GPU: zap: about to map and write the zap region at %#x (%#x bytes, Device)\n", ZAP_REGION_PA,
++	    zap.max - zap.min);
++	vm_offset_t rg = ml_io_map(ZAP_REGION_PA, ZAP_REGION_SIZE);	/* kept: io mappings are permanent */
++	if (!rg) {
++		printf("BLUELINE GPU: zap: region mapping failed: no zap (PAS 13 left initialised)\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < zap.phnum; i++) {
++		struct zap_phdr h = zap_ph(i);
++		if (!zap_loadable(&h)) {
++			continue;
++		}
++		uint32_t off = h.paddr - reloc;
++		if (h.paddr < reloc || off + h.memsz > zap.max - zap.min) {
++			printf("BLUELINE GPU: zap ph%u: segment outside the region: no zap\n", i);
++			return false;
++		}
++		volatile uint32_t *d = (volatile uint32_t *)(rg + off);
++		uint32_t words = (h.memsz + 3) / 4, wbad = 0;
++		for (uint32_t w = 0; w < words; w++) {
++			uint32_t v = 0;
++			for (uint32_t k = 0; k < 4; k++) {
++				uint32_t o = w * 4 + k;
++				v |= (o < h.filesz ? (uint32_t)zap.elf[h.offset + o] : 0u) << (8 * k);
++			}
++			d[w] = v;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t w = 0; w < words; w++) {
++			uint32_t v = 0;
++			for (uint32_t k = 0; k < 4; k++) {
++				uint32_t o = w * 4 + k;
++				v |= (o < h.filesz ? (uint32_t)zap.elf[h.offset + o] : 0u) << (8 * k);
++			}
++			wbad += d[w] != v;
++		}
++		printf("BLUELINE GPU: zap ph%u: %#x bytes (+%#x zero) to pa %#x, first word %#x, %u bad words on read-back\n",
++		    i, h.filesz, h.memsz - h.filesz, ZAP_REGION_PA + off, d[0], wbad);
++		if (wbad) {
++			printf("BLUELINE GPU: zap: region did not take the image: no zap\n");
++			return false;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	/* qcom_pas_auth_and_reset(13): GX on, CP running and idle */
++	rc = zap_call("PAS auth_and_reset(13)", ZSCM_SVC_PIL, ZSCM_PIL_AUTH_AND_RESET, 1, ZAP_PAS_ID, 0, 0);
++	if (rc) {
++		printf("BLUELINE GPU: zap: auth_and_reset refused (%lld)%s\n", (long long)rc,
++		    rc == -4 ? ": EOPNOTSUPP, Linux takes this as no zap needed on this target" : ": NOT AUTHENTICATED");
++		return false;
++	}
++	printf("BLUELINE GPU: zap: TZ AUTHENTICATED THE ZAP SHADER (region %#x now TZ's; never touched again)\n",
++	    ZAP_REGION_PA);
++	return true;
++}
++
++/*
++ * Between WHERE_AM_I and the draw stage, CP idle. Returns false only if the
++ * ring stopped being usable (the draw stage is then skipped).
++ */
++static bool
++zap_stage(void)
++{
++	if (zap.mode == 1 && zap.ok) {
++		zap.loaded = zap_load();
++	} else if (zap.mode == 2) {
++		/* a5xx zap resume: qcom_scm_set_remote_state(SCM_GPU_ZAP_SHADER_RESUME = 0, 13) */
++		zap.loaded = zap_call("BOOT set_remote_state(0 = zap resume, 13)", ZSCM_SVC_BOOT,
++		    ZSCM_BOOT_SET_REMOTE_STATE, 2, 0, ZAP_PAS_ID, 0) == 0;
++	}
++	cp_smmu_faults("after zap");
++	if (zap.loaded) {
++		/* a6xx hw_init: OUT_PKT7(CP_SET_SECURE_MODE, 1); OUT_RING(0); a6xx_flush; a6xx_idle */
++		uint32_t from = cp.wptr;
++		cp_put(pkt7(CP_SET_SECURE_MODE, 1));
++		cp_put(0);
++		printf("BLUELINE GPU: zap: about to submit CP_SET_SECURE_MODE 0 (the CP runs the zap shader)\n");
++		if (!cp_submit("CP_SET_SECURE_MODE 0", from)) {
++			printf("BLUELINE GPU: zap: CP_SET_SECURE_MODE 0 did not complete: draw stage skipped\n");
++			return false;
++		}
++	} else if (zap.secvid) {
++		/* a6xx hw_init's -ENODEV branch; KGSL adreno_set_unsecured_mode without zap_loaded */
++		printf("BLUELINE GPU: zap: not loaded; bluegpu_secvid=1: about to write RBBM_SECVID_TRUST_CNTL (%#x) = 0 by the"
++		    " CPU (may be XPU-protected: a violation can reset the phone)\n", GXR_RBBM_SECVID_TRUST_CNTL);
++		cp_wr(GXR_RBBM_SECVID_TRUST_CNTL, 0);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("BLUELINE GPU: zap: RBBM_SECVID_TRUST_CNTL written (not read back)\n");
++	} else {
++		printf("BLUELINE GPU: zap: not loaded, no fallback (bluegpu_secvid=0): the GPU stays in secure mode\n");
++		return true;
++	}
++	/* The CP still writes memory after the switch (as 4a, a new value, a fresh word). */
++	uint32_t from = cp.wptr;
++	cp_mem(ZAP_CHECK_OFF)[0] = CP_TARGET_FILL;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	cp_put(pkt7(CP_MEM_WRITE, 3));
++	cp_put(CP_VA + ZAP_CHECK_OFF);
++	cp_put(0);
++	cp_put(ZAP_MEM_WRITE_VAL);
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	bool sub = cp_submit("CP_MEM_WRITE after secure mode off", from);
++	uint32_t t = cp_mem_wait(ZAP_CHECK_OFF, CP_TARGET_FILL);
++	printf("BLUELINE GPU: zap: CP_MEM_WRITE after the switch: %#x (want %#x): %s; secure mode left by %s\n", t,
++	    ZAP_MEM_WRITE_VAL, t == ZAP_MEM_WRITE_VAL ? "ok" : "NOT WRITTEN",
++	    zap.loaded ? "CP_SET_SECURE_MODE 0 (zap)" : "RBBM_SECVID_TRUST_CNTL 0");
++	cp_smmu_faults("after secure mode off");
++	return sub;
+ }
+ 
+ /*
+@@ -2857,6 +3362,90 @@
+ 	return ok;
+ }
+ 
++/*
++ * 0144 diagnostic: RB perf counters around a fill (a6xx_rb_perfcounter_select,
++ * a6xx.xml RB_PERFCTR_RB_SEL / RBBM_PERFCTR_RB; RBBM_PERFCTR_CNTL = 1 is in
++ * hw_init) and CP counter 0 (CP_PERFCTR_CP_SEL0 = 0, ALWAYS_COUNT) to show
++ * the counters run at all. Selects written by the CPU with the CP idle, as
++ * KGSL's a6xx perfcounter enable does.
++ */
++#define R_RB_PERFCTR_RB_SEL	0x8e10u		/* [0..7] */
++#define GXR_RBBM_PERFCTR_CP0	0x0400u		/* LO, HI */
++#define GXR_RBBM_PERFCTR_RB0	0x04d6u		/* [i] at + 2i: LO, HI */
++#define DR_NPERF		4u
++
++static const struct {
++	uint32_t sel;
++	const char *name;
++} dr_perf_sel[DR_NPERF] = {
++	{ 23, "2D_ALIVE_CYCLES" },
++	{ 28, "2D_VALID_PIXELS" },
++	{ 40, "2D_OUTPUT_RB_DST_TRANS" },
++	{ 15, "C_WRITE" },
++};
++
++static uint64_t
++dr_ctr(uint32_t lo)
++{
++	uint32_t hi = cp_rd(lo + 1), l = cp_rd(lo), hi2 = cp_rd(lo + 1);
++	if (hi2 != hi) {
++		l = cp_rd(lo);
++	}
++	return ((uint64_t)hi2 << 32) | l;
++}
++
++/* base[0..3] = RB counters, base[4] = CP counter 0 */
++static void
++dr_perf_start(uint64_t base[DR_NPERF + 1])
++{
++	printf("BLUELINE GPU: about to select RB perf counters 0..%u (RB_PERFCTR_RB_SEL %#x):", DR_NPERF - 1,
++	    R_RB_PERFCTR_RB_SEL);
++	for (uint32_t i = 0; i < DR_NPERF; i++) {
++		cp_wr(R_RB_PERFCTR_RB_SEL + i, dr_perf_sel[i].sel);
++		printf(" %s=%u (reads %u)", dr_perf_sel[i].name, dr_perf_sel[i].sel, cp_rd(R_RB_PERFCTR_RB_SEL + i));
++	}
++	printf("\n");
++	for (uint32_t i = 0; i < DR_NPERF; i++) {
++		base[i] = dr_ctr(GXR_RBBM_PERFCTR_RB0 + 2 * i);
++	}
++	base[DR_NPERF] = dr_ctr(GXR_RBBM_PERFCTR_CP0);
++}
++
++static void
++dr_perf_report(const char *what, const uint64_t base[DR_NPERF + 1], uint32_t pixels)
++{
++	uint64_t d[DR_NPERF + 1];
++	uint32_t st = cp_rd(GXR_RBBM_STATUS);
++
++	for (uint32_t i = 0; i < DR_NPERF; i++) {
++		d[i] = dr_ctr(GXR_RBBM_PERFCTR_RB0 + 2 * i) - base[i];
++	}
++	d[DR_NPERF] = dr_ctr(GXR_RBBM_PERFCTR_CP0) - base[DR_NPERF];
++	printf("BLUELINE GPU: %s: rbbm status %#x (A2D_BUSY %u CCU_BUSY %u RB_BUSY %u VBIF_BUSY %u CP_BUSY %u)"
++	    " status1 %#x status2 %#x status3 %#x\n", what, st, (st >> 9) & 1u, (st >> 8) & 1u, (st >> 7) & 1u,
++	    (st >> 4) & 1u, (st >> 2) & 1u, cp_rd(GXR_RBBM_STATUS + 1), cp_rd(GXR_RBBM_STATUS + 2),
++	    cp_rd(GXR_RBBM_STATUS + 3));
++	printf("BLUELINE GPU: %s perf deltas: CP ALWAYS_COUNT %llu", what, (unsigned long long)d[DR_NPERF]);
++	for (uint32_t i = 0; i < DR_NPERF; i++) {
++		printf(", %s %llu", dr_perf_sel[i].name, (unsigned long long)d[i]);
++	}
++	printf(" (%u pixels asked for): %s\n", pixels,
++	    !d[DR_NPERF] ? "COUNTERS NOT RUNNING, no conclusion" :
++	    !d[0] && !d[1] ? "THE 2D ENGINE NEVER RAN" :
++	    d[1] && (d[2] || d[3]) ? "the 2D engine made pixels and the RB wrote them out" :
++	    d[1] ? "the 2D engine made pixels, NO RB OUTPUT COUNTED" : "the 2D engine ran, NO VALID PIXELS");
++}
++
++static uint32_t
++dr_pixels(const struct dr_rect *r, uint32_t n)
++{
++	uint32_t p = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		p += r[i].w * r[i].h;
++	}
++	return p;
++}
++
+ /* Setup: cache invalidates, the a630 init state (bluegpu_draw_init), sysmem CCU, 2D marker. */
+ static bool
+ dr_setup(void)
+@@ -3105,7 +3694,8 @@
+ 	uint64_t a0 = trunc_page_64(a);
+ 
+ 	*size = (vm_size_t)(round_page_64(e) - a0);
+-	*base = ml_io_map((vm_offset_t)a0, *size);
++	/* not ml_io_map: that is a permanent io_submap mapping, which ml_io_unmap (kmem_free on kernel_map) cannot free */
++	*base = ml_io_map_unmappable((vm_offset_t)a0, *size, VM_WIMG_IO);
+ 	return *base ? (volatile uint32_t *)(*base + (a - a0)) : NULL;
+ }
+ 
+@@ -3228,9 +3818,12 @@
+ 		dr_emit_rect(DR_OWN_VA, DR_OWN_STRIDE, &dr_own_rects[i]);
+ 	}
+ 	uint32_t off = dr_emit_tail();
++	uint64_t perf[DR_NPERF + 1];
++	dr_perf_start(perf);
+ 	printf("BLUELINE GPU: about to let the 2D engine fill %u rectangles into GPU VA %#x (pa %#llx)\n", n, DR_OWN_VA,
+ 	    (unsigned long long)dr.pa);
+ 	bool sub = dr_submit("2D fill own buffer", from, off);
++	dr_perf_report("2D fill own buffer", perf, dr_pixels(dr_own_rects, n));
+ 	bool own_ok = dr_own_verify();
+ 	if (!sub || !own_ok) {
+ 		if (sub && !rd(cbn(0, CB_FSR)) && *(volatile uint32_t *)dr.va == DR_OWN_FILL) {
+@@ -3268,7 +3861,9 @@
+ 	(void)dr_fb_check("before", true, border);
+ 	printf("BLUELINE GPU: about to let the 2D engine fill %u rectangles into the scanout buffer at pa %#llx\n", n,
+ 	    (unsigned long long)dr.fb_pa);
++	dr_perf_start(perf);
+ 	sub = dr_submit("2D fill framebuffer", from, off);
++	dr_perf_report("2D fill framebuffer", perf, dr_pixels(dr_fb_rects, n));
+ 	uint32_t pass = dr_fb_check("after fill", false, border);
+ 	if (sub && pass != n) {
+ 		cp_report("after framebuffer fill");
+@@ -3435,8 +4030,12 @@
+ 		cp_dump("CP_WHERE_AM_I");
+ 	}
+ 	if (sub && sh_ok && dr.on) {
+-		printf("BLUELINE GPU: stage 4 %s (step %d); draw stage next\n", res, cp.step);
+-		dr_stage();
++		printf("BLUELINE GPU: stage 4 %s (step %d); zap, then the draw stage\n", res, cp.step);
++		if (zap_stage()) {
++			dr_stage();
++		} else {
++			res = "CP UP, RING STOPPED AFTER THE ZAP";
++		}
+ 	}
+ 
+ out:
+@@ -3851,6 +4450,7 @@
+ 			/* reads only; gx.on and the PDC addresses, then cp.on and the SQE image */
+ 			if (gx_prepare() && level >= 6 && cp_prepare() && level >= 7) {
+ 				(void)dr_prepare();
++				zap_prepare();	/* 0144: on by default at 7, bluegpu_zap=0 turns it off */
+ 			}
+ 		} else if (level >= 5) {
+ 			printf("BLUELINE GPU: stage 3 needs stage 2b's SMMU memory: skipped\n");
+-- 
+2.39.0
