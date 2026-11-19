@@ -41,8 +41,8 @@
 # bluereboot= sends it there; otherwise do it by hand), pulls the log ring,
 # prints the matching lines and sends the phone back to fastboot.
 #
-# Needs: recovery with adb on and no tap (tools/recovery-adb.py, boot_b,
-# slot B active), stock/boot.img, work/DeviceTree.d22ap.im4p, a built kernel.
+# Needs: recovery with adb on and no tap (tools/recovery-adb.py, on boot_b
+# and boot_a, slot B active), stock/boot.img, work/DeviceTree.d22ap.im4p, a built kernel.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 quick=0 name=$(date +%Y%m%d-%H%M%S) grep=BLUELINE wait=
@@ -119,7 +119,7 @@ if adb devices | grep -q 'recovery$'; then
 	adb reboot bootloader
 fi
 # ABL counts each RAM boot as a failed slot-B boot and eventually falls back to
-# slot A (no tap-free adb there); re-marking B active resets its retry count.
+# slot A (tap-free adb there too since 2026-11-19); re-marking B active resets its retry count.
 for _ in $(seq 1 60); do fastboot devices | grep -q fastboot && break; sleep 1; done
 if ! fastboot devices | grep -q fastboot; then	# fastboot would otherwise wait forever, silently
 	say "phone not visible to fastboot after 60 s; if its screen shows fastboot, replug the USB cable (or hold Power + Volume Down)"
