@@ -2,6 +2,8 @@
 # Talk to the phone's userdata from LineageOS recovery (adb root shell).
 #
 #   tools/phone.sh log [OUT.txt]      kernel console log from the last boot
+#   tools/phone.sh snaps PREFIX       screenshots from the last boot (bluesnap=)
+#                                     as PREFIX-snapN.png
 #   tools/phone.sh sync BASE.img      make BASE.img match the phone exactly
 #
 # Get there: phone in fastboot -> `fastboot reboot recovery` -> in the
@@ -10,6 +12,9 @@
 # log:  the iOS kernel keeps its console in a ring in the last 4100 KiB of
 #       userdata (header block "SWEETLOG", then 4 MiB), flushed about once
 #       a second; tools/phonelog.py turns it into text.
+# snaps: the kernel's screenshots (patch 0146) are in the 128 MiB just
+#       below the log area; block 0 says how many blocks are used, only
+#       those are read. tools/snap2png.py makes the PNGs.
 # sync: hashes the phone's first size(BASE) bytes of userdata in 4 MiB
 #       pieces, compares with BASE and copies only the differing pieces
 #       into BASE. Afterwards BASE is a correct OLD for tools/simgdiff.py.
@@ -40,6 +45,25 @@ cmd_log() {
 	adb exec-out "dd if=$PART bs=4096 skip=$skip count=1025 2>/dev/null" > work/phone-log.bin
 	python3 tools/phonelog.py work/phone-log.bin > "$out"
 	echo "$out: $(wc -l < "$out") lines"
+}
+
+cmd_snaps() {
+	local prefix=${1:-work/phone}
+	need_recovery
+	local size skip used
+	size=$(part_size)
+	skip=$((size / 4096 - 1025 - 32768))
+	mkdir -p "$(dirname "$prefix")"
+	adb exec-out "dd if=$PART bs=4096 skip=$skip count=1 2>/dev/null" > "$prefix-snaps.bin"
+	used=$(python3 -c 'import struct,sys
+d = open(sys.argv[1], "rb").read(32)
+print(struct.unpack_from("<I", d, 24)[0] if d[:8] == b"BLUESNPS" else 0)' "$prefix-snaps.bin")
+	if [ "$used" -lt 1 ] || [ "$used" -gt 32768 ]; then
+		echo "no snaps on the phone (area not armed)" >&2
+		return 1
+	fi
+	adb exec-out "dd if=$PART bs=4096 skip=$skip count=$used 2>/dev/null" > "$prefix-snaps.bin"
+	python3 tools/snap2png.py "$prefix-snaps.bin" "$prefix"
 }
 
 cmd_sync() {
@@ -87,6 +111,7 @@ EOF
 
 case ${1:-} in
 log) shift; cmd_log "$@" ;;
+snaps) shift; cmd_snaps "$@" ;;
 sync) [ $# -eq 2 ] || { sed -n '2,6p' "$0"; exit 2; }; cmd_sync "$2" ;;
-*) sed -n '2,16p' "$0"; exit 2 ;;
+*) sed -n '2,23p' "$0"; exit 2 ;;
 esac

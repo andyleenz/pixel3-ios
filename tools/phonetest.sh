@@ -9,6 +9,14 @@
 #   --wait    minutes to wait for recovery (default 5; 30 without bluereboot=)
 #   BOOT-ARGS are added to the usual ones, e.g. bluegpu=3 bluereboot=recovery
 #
+# With bluesnap=, bluesnap_on_reboot=1 or bluetouchscript= in BOOT-ARGS the
+# kernel's screenshots are pulled too, as work/test/NAME-snapN.png (patch
+# 0146), e.g. to look at SpringBoard and swipe up from the bottom edge:
+#   tools/phonetest.sh --name home1 --grep 'BLUELINE (SNAP|SCRIPT|REBOOT)' \
+#     bluesnap=sb+20,sb+40 bluesnap_on_reboot=1 \
+#     'bluetouchscript=sb+25:swipe,540,2150,540,900,300' \
+#     bluereboot=recovery bluereboot_after=springboard bluereboot_delay=50
+#
 # Builds the device tree (with the GMU firmware when work/fw has it), the
 # payload and a shim, gets the phone into fastboot (from recovery over adb
 # if it is there), RAM-boots it, waits for LineageOS recovery (the kernel's
@@ -26,7 +34,7 @@ while [ $# -gt 0 ]; do
 	--name) name=$2; shift 2 ;;
 	--grep) grep=$2; shift 2 ;;
 	--wait) wait=$2; shift 2 ;;
-	-h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+	-h|--help) sed -n '2,29p' "$0"; exit 0 ;;
 	*) break ;;
 	esac
 done
@@ -78,5 +86,11 @@ done
 say "pulling the log"
 tools/phone.sh log "$out/$name.txt" > /dev/null
 grep -a -E "$grep" "$out/$name.txt" || say "no lines match '$grep'"
+case " $extra " in
+*" bluesnap="*|*" bluesnap_on_reboot="*|*" bluetouchscript="*)
+	say "pulling the screenshots"
+	tools/phone.sh snaps "$out/$name" || say "no screenshots"
+	;;
+esac
 adb reboot bootloader
 say "done: $out/$name.txt; phone back to fastboot"
