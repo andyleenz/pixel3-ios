@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 14:30:00 +0100
+Subject: [PATCH] 0155: bluesnap sees flipped frames
+
+While 0145 flips, the display pipes fetch an iOS surface and the panel
+buffer that bluesnap read is stale. blue_dpu_snapinfo() returns the pool
+buffer being fetched and its geometry on the panel (fit or crop), and a
+snap samples it where the panel shows it (nearest, black outside).
+---
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1129,6 +1129,7 @@
+ };
+ 
+ extern int blue_fb_snapinfo(uintptr_t *pixels, uint32_t *w, uint32_t *h, uint32_t *stride);
++extern int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
+ int bluesnap_take(const char *why);
+ 
+ static LCK_MTX_DECLARE(bluesnap_lock, &sweet_ufs_grp);
+@@ -1210,7 +1211,58 @@
+ 	}
+ 	return bytes;
+ }
++
++/*
++ * 0155: the same picture while the display pipes scan out an iOS surface
++ * (0145 flip): each output pixel samples the surface where the panel shows it
++ * (nearest; fit = fit_w columns from fit_x scaled to the panel height, crop =
++ * centred), black outside it. The panel buffer is stale while flipped.
++ */
++static uint32_t
++bluesnap_convert_flipped(uintptr_t px, uint32_t sw, uint32_t sh, uint32_t sbpr, int32_t fit_x, int32_t fit_w,
++    uint32_t w, uint32_t h, uint32_t *ow, uint32_t *oh)
++{
++	uint32_t sc = bs.scale;
++	*ow = w / sc;
++	*oh = h / sc;
++	uint32_t bytes = *ow * *oh * (bs.bpp / 8);
++	uint8_t *out = (uint8_t *)bs.buf;
+ 
++	for (uint32_t oy = 0; oy < *oh; oy++) {
++		int64_t py = (int64_t)oy * sc + sc / 2;
++		for (uint32_t ox = 0; ox < *ow; ox++) {
++			int64_t pxl = (int64_t)ox * sc + sc / 2, sx, sy;
++			if (fit_w > 0) {
++				sx = (pxl - fit_x) * (int64_t)sw / fit_w;
++				sy = py * (int64_t)sh / h;
++			} else {
++				sx = pxl + ((int64_t)sw - w) / 2;
++				sy = py + ((int64_t)sh - h) / 2;
++			}
++			uint8_t b = 0, g = 0, rd = 0;
++			if (sx >= 0 && sy >= 0 && sx < sw && sy < sh) {
++				const uint8_t *p = (const uint8_t *)(px + (uint64_t)sy * sbpr + (uint64_t)sx * 4);
++				b = p[0];
++				g = p[1];
++				rd = p[2];
++			}
++			if (bs.bpp == 16) {
++				uint16_t v = (uint16_t)((rd >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
++				out[0] = (uint8_t)v;
++				out[1] = (uint8_t)(v >> 8);
++				out += 2;
++			} else {
++				out[0] = b;
++				out[1] = g;
++				out[2] = rd;
++				out[3] = 0xff;
++				out += 4;
++			}
++		}
++	}
++	return bytes;
++}
++
+ /* One snap now. Thread context only (it sleeps on locks and UFS commands). */
+ int
+ bluesnap_take(const char *why)
+@@ -1253,7 +1305,12 @@
+ 
+ 	blue_when_now(&ms, &sb_ms);
+ 	uint64_t t = mach_absolute_time();
+-	uint32_t bytes = bluesnap_convert(px, w, h, stride, &ow, &oh);
++	uintptr_t fpx;
++	uint32_t fw, fh, fbpr;
++	int32_t fit_x, fit_w;
++	bool flipped = blue_dpu_snapinfo(&fpx, &fw, &fh, &fbpr, &fit_x, &fit_w) != 0;	/* 0155 */
++	uint32_t bytes = flipped ? bluesnap_convert_flipped(fpx, fw, fh, fbpr, fit_x, fit_w, w, h, &ow, &oh) :
++	    bluesnap_convert(px, w, h, stride, &ow, &oh);
+ 	uint32_t conv_ms = blue_abs_to_ms(mach_absolute_time() - t);
+ 
+ 	uint64_t at = bs.area + bs.used;
+@@ -1292,9 +1349,9 @@
+ 		bs.on = false;
+ 	} else {
+ 		printf("BLUELINE SNAP: #%u %s at %u.%03u s (SpringBoard %d ms): %ux%u, %u bpp, %u KiB "
+-		    "at block 0x%llx; %u ms to read, %u ms to write\n",
++		    "at block 0x%llx; %u ms to read, %u ms to write%s\n",
+ 		    bs.count, why, ms / 1000, ms % 1000, sb_ms, ow, oh, bs.bpp, bytes >> 10, at,
+-		    conv_ms, write_ms);
++		    conv_ms, write_ms, flipped ? "; from the flipped iOS surface" : "");
+ 		bs.count++;
+ 		bs.used += blocks;
+ 	}
+--- a/iokit/Kernel/arm/BlueDPU.cpp
++++ b/iokit/Kernel/arm/BlueDPU.cpp
+@@ -121,6 +121,7 @@
+     uint32_t w, uint32_t h, uint32_t fmt);
+ extern "C" int blue_dpu_unflip(const char *why);
+ extern "C" int blue_dpu_scanout(void);
++extern "C" int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
+ extern "C" int blue_dpu_flip_tick(void);
+ extern "C" void blue_dpu_panic(void);
+ extern "C" void blue_dpu_flip_stop(const char *why);
+@@ -1629,6 +1630,40 @@
+ }
+ 
+ /*
++ * 0155: for screenshots (bluesnap, sweet_ufs.c): the pool buffer the pipes are
++ * fetching while flipped, with the geometry it is shown at on the panel
++ * (fit: fit_w columns from fit_x, all rows; crop: fit_w = 0, centred). 0 when
++ * not flipped (the panel buffer is what is shown).
++ */
++int
++blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w)
++{
++	if (bd_flip_lock == NULL || !bd_flipped) {
++		return 0;
++	}
++	IOLockLock(bd_flip_lock);
++	int ok = 0;
++	for (int i = 0; bd_flipped && i < bd_pool_n; i++) {
++		if (bd_pool[i] != NULL && bd_pool_pa[i] == bd_flip_pa && bd_fplan_stride != 0) {
++			*kva = (uintptr_t)bd_pool[i]->getBytesNoCopy();
++			*w = bd_lw;
++			*h = bd_lh;
++			*bpr = bd_fplan_stride;
++			ok = *kva != 0;
++			break;
++		}
++	}
++	IOLockUnlock(bd_flip_lock);
++	if (ok) {
++		/* as bd_plan_fit: the whole surface height on the panel's, width to scale, centred */
++		uint32_t pw = bd_w, ph = bd_h;
++		*fit_w = bd_fit ? (int32_t)(((uint64_t)*w * ph) / *h) : 0;
++		*fit_x = bd_fit ? ((int32_t)pw - *fit_w) / 2 : 0;
++	}
++	return ok;
++}
++
++/*
+  * About once a second while flipped (vsync timer): a new INTF underrun, a
+  * change of the MDP streams' SMMU fault state, or no frame sent since the
+  * last check turns the flip off. 1 if it did (the caller redraws the panel
