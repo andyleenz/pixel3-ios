@@ -12,7 +12,7 @@
 # com.apple.migration ... (or rerun tools/iosroot-tweaks.py).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-orig=$(find work/orig -path '*System/Library/xpc/launchd.plist' | head -1)
+orig=$(find work/orig/ -path '*System/Library/xpc/launchd.plist' | head -1)
 [ -n "$orig" ] || { echo "no original launchd.plist in work/orig" >&2; exit 1; }
 rm -f work/ios-root-new.img work/diff.simg
 cp -c work/ios-root.img work/ios-root-new.img
