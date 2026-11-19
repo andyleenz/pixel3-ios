@@ -1,0 +1,1126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +0100
+Subject: [PATCH] 0145: blueline: zero-copy present, DPU scans out
+ backboardd's surface (bluedpu_flip=1)
+
+On top of 0140 v2. AppleCLCD::swap only recorded the frame and the vsync
+timer copied (and scaled) it into ABL's panel buffer at sweetfb_hz
+(default 10 Hz); SwapWait is a no-op and no swap-complete is sent.
+
+bluedpu_flip=1 (default 0): a swap of exactly one enabled layer showing a
+whole 1125x2436 BGRA surface at the origin points the staged SSPPs
+(VIG0 -> LM0, VIG1 -> LM1) at that surface:
+- only surfaces from a scanout pool: bluedpu_flip_bufs (default 3, 2..4)
+  contiguous buffers below 4 GiB (SSPP addresses are 32-bit; the MDP
+  streams are untranslated), allocated at AppleCLCD::start and never
+  freed; SweetSurface hands them to backboardd's display-sized BGRA
+  surfaces. Contiguity and the 4 GiB limit are checked again per flip.
+- geometry follows bluefb_fit: QSEED3 fit (default; each LM half scales
+  its source columns, 1125x2436 -> 997x2160 at x 41, bilinear, pixel
+  extension = source size, bars = LM border colour) or the centre crop
+  (bluefb_fit=0, same as the bluedpu=2 test).
+- clean to PoC, write (geometry on the first flip, then only the
+  addresses), CTL_FLUSH of the pipe bits, wait (IOSleep(1), 50 ms bound)
+  until the bits clear = the frame start that took it. SwapEnd returns
+  after that, so the swap is complete when backboardd gets control back.
+- everything else (more layers, other sizes, the console surface,
+  display off, a pending flush) is copied as before; the timer points the
+  pipes back at the panel buffer after copying. Each reason is logged
+  once.
+- display off (0123): the panel buffer is blacked and the pipes go back
+  to it before the fade; no flips while off. Panic (PEInitiatePanic, no
+  locks, no wait) and halt/restart (PEHaltRestart) restore ABL's
+  registers so the panic screen and console are visible.
+- a flush that does not latch, a new INTF underrun, an SMMU fault-state
+  change on the MDP streams' bank or no pp_done for a second (checked
+  every 60 vsync ticks) turns the flip off for the boot.
+
+bluedpu=3: the bluedpu=2 test with the fit geometry (whole test buffer
+framed in magenta), to check QSEED3 before iOS uses it.
+
+bluedpu_stats: every 5 s also flips, unflips, clean and latch time.
+---
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 7a32a23..5364917 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -66,6 +66,19 @@ extern "C" {
+ 
+ #define kShutdownTimeout    30 //in secs
+ 
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(SWEET)
++/*
++ * blueline zero-copy present (iokit/Kernel/arm/BlueDPU.cpp, bluedpu_flip=1):
++ * the display pipes back on the panel buffer, where the panic screen and
++ * the console are drawn.
++ */
++extern "C" void blue_dpu_panic(void);
++extern "C" void blue_dpu_flip_stop(const char *why);
++#endif
++
+ #if defined(XNU_TARGET_OS_OSX)
+ 
+ boolean_t coprocessor_cross_panic_enabled = TRUE;
+@@ -979,6 +992,9 @@ PEInitiatePanic(void)
+ 	flush_mmu_tlb_entry_async(0);
+ 	arm64_sync_tlb(true);
+ #endif // defined(__arm64__)
++#if defined(SWEET)
++	blue_dpu_panic();
++#endif
+ }
+ 
+ int
+@@ -999,6 +1015,9 @@ PEHaltRestartInternal(unsigned int type, uint32_t details)
+ 		if (panic_begin_called) {
+ 			goto skip_to_haltRestart;
+ 		}
++#if defined(SWEET)
++		blue_dpu_flip_stop("halt/restart");
++#endif
+ 
+ 		pmRootDomain = IOService::getPMRootDomain();
+ 		/* Notify IOKit PM clients of shutdown/restart
+diff --git a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+index 0d2a9e3..66dfcb1 100644
+--- a/iokit/Kernel/arm/BlueDPU.cpp
++++ b/iokit/Kernel/arm/BlueDPU.cpp
+@@ -64,6 +64,36 @@
+  *    seen and polled every 250 us for 1 s, plus the wraps of the PP read
+  *    pointer line counter (PP_INT_COUNT_VAL[15:0], reset to init on TE).
+  *
++ * 0145, zero-copy present:
++ *   bluedpu=3  as bluedpu=2, but the whole 1125x2436 test buffer is fitted
++ *              to 997x2160 by the VIG pipes' QSEED3 scalers (bilinear, no
++ *              LUT; each LM half scales its share of the source columns),
++ *              black bars from the layer mixers' border. Tests the geometry
++ *              the flip uses with bluefb_fit=1 before iOS ever sees it.
++ *   bluedpu_flip=1 (default 0)  present without copying: AppleCLCD::swap
++ *              points the staged SSPPs at backboardd's surface when it is
++ *              one full-screen 1125x2436 BGRA layer in physically
++ *              contiguous memory below 4 GiB, cleaned to PoC first (the DPU
++ *              is not IO-coherent). Geometry follows bluefb_fit: fit by
++ *              QSEED3 (default) or the centre crop (bluefb_fit=0, no
++ *              scaler). The first flip writes the geometry, later ones only
++ *              the two source addresses, then CTL_FLUSH; SwapEnd returns
++ *              once the flush latched (CTL_FLUSH bits clear at the next
++ *              frame start, bounded 50 ms; bluedpu_flip_wait=0 returns at
++ *              once), so backboardd never draws into the buffer still being
++ *              fetched. Anything else (several layers, other sizes, the
++ *              console surface, display off) takes the CPU copy into the
++ *              panel buffer and points the pipes back at it. Backboardd's
++ *              display surfaces are made contiguous by a pool of
++ *              bluedpu_flip_bufs (default 3, max 4) buffers allocated
++ *              below 4 GiB when AppleCLCD starts (SweetSurface takes them
++ *              for backboardd's 1125x2436 BGRA surfaces). Panic, halt and
++ *              restart (PEInitiatePanic / PEHaltRestart) and display off
++ *              (0123) point the pipes back at the panel buffer. A stuck
++ *              flush, a new INTF underrun or an SMMU fault on the MDP
++ *              streams (checked every second) turns the flip off for the
++ *              boot. Every reason for not flipping is logged once.
++ *
+  * Register layout: Linux drivers/gpu/drm/msm/disp/dpu1 (catalog
+  * dpu_4_0_sdm845.h, dpu_hw_sspp.c, dpu_hw_ctl.c, dpu_hw_lm.c,
+  * dpu_hw_pingpong.c, dpu_hw_intf.c, dpu_hwio.h; interrupt bits from the
+@@ -85,7 +115,18 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void CleanPoC_DcacheRegion(vm_offset_t va, size_t length);
+ extern "C" void blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride,
+     uintptr_t panel_va, uint32_t lw, uint32_t lh);
++extern "C" int blue_dpu_flip_init(int fit);
+ extern "C" void blue_dpu_stat(int kind, uint64_t dt);
++extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
++    uint32_t w, uint32_t h, uint32_t fmt);
++extern "C" int blue_dpu_unflip(const char *why);
++extern "C" int blue_dpu_scanout(void);
++extern "C" int blue_dpu_flip_tick(void);
++extern "C" void blue_dpu_panic(void);
++extern "C" void blue_dpu_flip_stop(const char *why);
++extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
++    uint32_t planes, uint32_t offset, uint64_t size);
++extern "C" void blue_dpu_pool_put(IOMemoryDescriptor *md);
+ 
+ #define BD_MDSS_PA      0x0ae00000ULL   /* sdm845.dtsi mdss */
+ #define BD_MDSS_SIZE    0x90000         /* MDSS 0x1000 + MDP 0x8f000 */
+@@ -170,6 +211,39 @@ static const char *const bd_intr2_names[32] = {
+ #define SSPP_OUT_SIZE_REC1      0x160
+ #define SSPP_OUT_XY_REC1        0x164
+ #define SSPP_QSEED3             0xa00   /* VIG: dpu_vig_sblk_qseed3_1_3 */
++#define SSPP_PE_C0_LR           0x100   /* SW pixel extension (SRC_OP_MODE bit 31 PE_OVERRIDE) */
++#define SSPP_PE_C0_TB           0x104
++#define SSPP_PE_C0_REQ          0x108
++#define SSPP_PE_C1C2_LR         0x110
++#define SSPP_PE_C1C2_TB         0x114
++#define SSPP_PE_C1C2_REQ        0x118
++#define SSPP_PE_C3_LR           0x120
++#define SSPP_PE_C3_TB           0x124
++#define SSPP_PE_C3_REQ          0x128
++/* QSEED3 (dpu_hw_util.c), at SSPP_QSEED3; version 0x1003 has the 21-bit phase inits */
++#define QS3_HW_VERSION          0x00
++#define QS3_OP_MODE             0x04
++#define QS3_PHASE_STEP_Y_H      0x10
++#define QS3_PHASE_STEP_Y_V      0x14
++#define QS3_PHASE_STEP_UV_H     0x18
++#define QS3_PHASE_STEP_UV_V     0x1c
++#define QS3_PRELOAD             0x20
++#define QS3_SRC_SIZE_Y_RGB_A    0x40
++#define QS3_SRC_SIZE_UV         0x44
++#define QS3_DST_SIZE            0x48
++#define QS3_PHASE_INIT_Y_H      0x90
++#define QS3_PHASE_INIT_Y_V      0x94
++#define QS3_PHASE_INIT_UV_H     0x98
++#define QS3_PHASE_INIT_UV_V     0x9c
++#define QS3_PHASE_SHIFT         21
++/*
++ * dpu_hw_setup_scaler3 for an RGB source with alpha, as _dpu_plane_setup_scaler3:
++ * enable, y/rgb filter DPU_SCALE_BIL (3), alpha filter BIL (1 << 29),
++ * blend_cfg 1 (bit 31), not DX (bit 14), alpha enable (bit 10).
++ */
++#define QS3_OP_RGB_BIL          (1u << 0 | 3u << 16 | 1u << 10 | 1u << 14 | 1u << 29 | 1u << 31)
++#define QS3_PRELOAD_DEFAULT     (4u << 0 | 3u << 8 | 4u << 16 | 3u << 24)      /* H 4, V 3 */
++#define BD_FMT_BGRA             0x42475241u     /* 'BGRA', SweetFramebuffer's pixel format */
+ 
+ /* LM (dpu_hw_lm.c), blend stage 0 at 0x20 */
+ #define LM_OP_MODE              0x00
+@@ -780,12 +854,18 @@ struct bd_rect_plan {
+ 	uint32_t xy_off;        /* SRC_XY(_REC1) */
+ 	uint32_t byte_off;      /* address = buffer + byte_off */
+ 	uint32_t xy;            /* new source x/y */
++	/* fit (0145): new rect geometry and QSEED3 setup, only if fit */
++	bool     fit;
++	uint32_t src_size, out_size, out_xy;    /* h << 16 | w, y << 16 | x */
++	uint32_t step_h, step_v;                /* 21-bit fraction source pixels per output pixel */
+ };
+ 
+ struct bd_plan {
+ 	int      n;
++	bool     fit;
+ 	uint32_t stride;        /* bytes per row of the buffer */
+ 	uint32_t flush;
++	uint32_t fit_x, fit_w;  /* fit: panel columns the picture covers */
+ 	struct bd_rect_plan r[16];
+ };
+ 
+@@ -841,13 +921,124 @@ bd_plan_crop(const struct bd_state *st, uint32_t lw, uint32_t lh, uint32_t strid
+ 			    p->name, r, bad, addr, xy, sz, ys, fmt);
+ 			return why;
+ 		}
+-		pl->r[pl->n++] = (struct bd_rect_plan){
+-			p->base, r, a_off, x_off, row0 * stride + col0 * 4, y << 16 | x,
++		struct bd_rect_plan *rp = &pl->r[pl->n++];
++		bzero(rp, sizeof(*rp));
++		rp->base = p->base;
++		rp->rect = r;
++		rp->addr_off = a_off;
++		rp->xy_off = x_off;
++		rp->byte_off = row0 * stride + col0 * 4;
++		rp->xy = y << 16 | x;
++	}
++	return NULL;
++}
++
++/*
++ * Fit (0145): the whole lw x lh buffer scaled to the panel height and
++ * centred, as AppleCLCD's bluefb_fit=1 copy (fit_w = lw * H / lh = 997 of
++ * 1080 columns for 1125x2436). Each LM drives one half of the panel; its
++ * VIG pipe takes the source columns that land in that half and its QSEED3
++ * scales them (bilinear) to the half's share of the picture. The columns
++ * outside fit_x..fit_x+fit_w show the layer mixer's border colour.
++ */
++static const char *
++bd_plan_fit(const struct bd_state *st, uint32_t lw, uint32_t lh, uint32_t stride, struct bd_plan *pl)
++{
++	static char why[200];
++	bzero(pl, sizeof(*pl));
++	pl->fit = true;
++	pl->stride = stride;
++	pl->flush = st->flush;
++	if (st->ctl < 0 || st->pp < 0 || st->nsrc == 0 || st->intf < 0) {
++		snprintf(why, sizeof(why), "pipeline not as expected (ctl %d pp %d rects %d intf %d)",
++		    st->ctl, st->pp, st->nsrc, st->intf);
++		return why;
++	}
++	if (lh <= bd_h || stride < lw * 4 || (stride & 15) || lw > 4096 || lh > 4096) {
++		snprintf(why, sizeof(why), "buffer %ux%u stride %u: nothing to fit to %ux%u", lw, lh, stride, bd_w, bd_h);
++		return why;
++	}
++	pl->fit_w = (uint32_t)((uint64_t)lw * bd_h / lh);
++	pl->fit_x = pl->fit_w < bd_w ? (bd_w - pl->fit_w) / 2 : 0;
++	if (pl->fit_w > bd_w) {
++		snprintf(why, sizeof(why), "fitted width %u wider than the panel", pl->fit_w);
++		return why;
++	}
++	if (st->nlm < 1 || st->nlm > 2 || st->nsrc != st->nlm) {
++		snprintf(why, sizeof(why), "%d LM / %d rects, want one rect per LM, 1 or 2 LMs", st->nlm, st->nsrc);
++		return why;
++	}
++	for (int s = 0; s < st->nsrc; s++) {
++		const struct bd_src *src = &st->src[s];
++		const struct bd_pipe_desc *p = &bd_pipes[src->pipe];
++		int k = -1;
++		for (int j = 0; j < st->nlm; j++) {
++			k = st->lm[j] == src->lm ? j : k;
++		}
++		uint32_t lmsz = mdp_rd(bd_lms[src->lm].base + LM_OUT_SIZE), lmw = lmsz & 0xffff;
++		uint32_t osz = bd_abl(p->base + SSPP_OUT_SIZE), oxy = bd_abl(p->base + SSPP_OUT_XY);
++		uint32_t fmt = mdp_rd(p->base + SSPP_SRC_FORMAT);
++		const char *bad = NULL;
++		if (!p->vig || src->rect != 0 || mdp_rd(p->base + SSPP_MULTIRECT_OPMODE) != 0) {
++			bad = "not a single-rect VIG pipe (no scaler)";
++		} else if ((mdp_rd(p->base + SSPP_QSEED3 + QS3_HW_VERSION) >> 8) == 0) {
++			bad = "no QSEED3 version";
++		} else if (k < 0 || (lmsz >> 16) != bd_h || lmw * (uint32_t)st->nlm != bd_w) {
++			bad = "layer mixers do not split the panel evenly";
++		} else if (osz != (bd_h << 16 | lmw) || (oxy >> 16) != 0) {
++			bad = "ABL's rect does not fill its LM";
++		} else if (((fmt >> 9) & 3) != 3 || ((fmt >> 30) & 3) != 0 || (fmt & (1u << 22))) {
++			bad = "not a linear 32-bit source";
++		} else if (mdp_rd(p->base + SSPP_ADDR_SW_STATUS) != 0) {
++			bad = "secure fetch";
++		}
++		uint32_t p0 = (uint32_t)k * lmw, p1 = p0 + lmw;
++		uint32_t d0 = p0 > pl->fit_x ? p0 : pl->fit_x;
++		uint32_t d1 = p1 < pl->fit_x + pl->fit_w ? p1 : pl->fit_x + pl->fit_w;
++		if (bad == NULL && d1 <= d0) {
++			bad = "LM half gets none of the picture";
++		}
++		if (bad != NULL) {
++			snprintf(why, sizeof(why), "%s rect %d on %s: %s (out 0x%x at 0x%x, LM out 0x%x, fmt 0x%x)",
++			    p->name, src->rect, bd_lms[src->lm].name, bad, osz, oxy, lmsz, fmt);
++			return why;
++		}
++		uint32_t s0 = (uint32_t)((uint64_t)(d0 - pl->fit_x) * lw / pl->fit_w);
++		uint32_t s1 = (uint32_t)(((uint64_t)(d1 - pl->fit_x) * lw + pl->fit_w - 1) / pl->fit_w);
++		s1 = s1 > lw ? lw : s1;
++		uint32_t sw = s1 - s0, dw = d1 - d0;
++		struct bd_rect_plan *r = &pl->r[pl->n++];
++		*r = (struct bd_rect_plan){
++			.base = p->base, .rect = 0,
++			.addr_off = p->base + SSPP_SRC0_ADDR, .xy_off = p->base + SSPP_SRC_XY,
++			.byte_off = 0, .xy = s0,
++			.fit = true,
++			.src_size = lh << 16 | sw,
++			.out_size = bd_h << 16 | dw,
++			.out_xy = (oxy & 0xffff) + (d0 - p0),       /* ABL's x convention (absolute with source split) */
++			.step_h = (uint32_t)(((uint64_t)sw << QS3_PHASE_SHIFT) / dw),
++			.step_v = (uint32_t)(((uint64_t)lh << QS3_PHASE_SHIFT) / bd_h),
+ 		};
+ 	}
+ 	return NULL;
+ }
+ 
++static void
++bd_plan_log(const char *tag, const struct bd_plan *pl)
++{
++	for (int i = 0; i < pl->n; i++) {
++		const struct bd_rect_plan *r = &pl->r[i];
++		if (r->fit) {
++			IOLog("BLUE DPU: %s: SSPP 0x%x fit: src x %u size %ux%u -> out x %u size %ux%u, step h 0x%x v 0x%x (fit %u+%u, stride %u)\n",
++			    tag, r->base, r->xy & 0xffff, r->src_size & 0xffff, r->src_size >> 16, r->out_xy & 0xffff,
++			    r->out_size & 0xffff, r->out_size >> 16, r->step_h, r->step_v, pl->fit_x, pl->fit_w, pl->stride);
++		} else {
++			IOLog("BLUE DPU: %s: SSPP 0x%x rect %d crop: +0x%x xy 0x%x stride %u\n", tag, r->base, r->rect,
++			    r->byte_off, r->xy, pl->stride);
++		}
++	}
++}
++
+ /* Flush the planned pipes and wait until the CTL took the change (the next frame start). */
+ static int64_t
+ bd_flush(const struct bd_state *st, uint32_t bits, const char *tag, bool sleep, uint32_t max_ms)
+@@ -896,6 +1087,33 @@ bd_plan_write(const struct bd_plan *pl, uint64_t pa, bool all)
+ 		bd_set(r->xy_off, r->xy);
+ 		uint32_t sh = r->rect ? 16 : 0, ys = mdp_rd(r->base + SSPP_SRC_YSTRIDE0);
+ 		bd_set(r->base + SSPP_SRC_YSTRIDE0, (ys & ~(0xffffu << sh)) | (pl->stride << sh));
++		if (!r->fit) {
++			continue;
++		}
++		/* rect geometry, pixel extension (ABL runs PE_OVERRIDE: requested = source size), QSEED3 */
++		uint32_t q = r->base + SSPP_QSEED3;
++		bd_set(r->base + SSPP_SRC_SIZE, r->src_size);
++		bd_set(r->base + SSPP_OUT_SIZE, r->out_size);
++		bd_set(r->base + SSPP_OUT_XY, r->out_xy);
++		static const uint32_t pe_lr[] = { SSPP_PE_C0_LR, SSPP_PE_C1C2_LR, SSPP_PE_C3_LR };
++		for (int c = 0; c < 3; c++) {
++			bd_set(r->base + pe_lr[c], 0);                  /* LR */
++			bd_set(r->base + pe_lr[c] + 4, 0);              /* TB */
++			bd_set(r->base + pe_lr[c] + 8, r->src_size);    /* REQ_PIXELS: h << 16 | w */
++		}
++		bd_set(q + QS3_PHASE_INIT_Y_H, 0);
++		bd_set(q + QS3_PHASE_INIT_Y_V, 0);
++		bd_set(q + QS3_PHASE_INIT_UV_H, 0);
++		bd_set(q + QS3_PHASE_INIT_UV_V, 0);
++		bd_set(q + QS3_PHASE_STEP_Y_H, r->step_h);
++		bd_set(q + QS3_PHASE_STEP_Y_V, r->step_v);
++		bd_set(q + QS3_PHASE_STEP_UV_H, r->step_h);
++		bd_set(q + QS3_PHASE_STEP_UV_V, r->step_v);
++		bd_set(q + QS3_PRELOAD, QS3_PRELOAD_DEFAULT);
++		bd_set(q + QS3_SRC_SIZE_Y_RGB_A, r->src_size);
++		bd_set(q + QS3_SRC_SIZE_UV, r->src_size);
++		bd_set(q + QS3_DST_SIZE, r->out_size);
++		bd_set(q + QS3_OP_MODE, QS3_OP_RGB_BIL);
+ 	}
+ }
+ 
+@@ -1037,11 +1255,12 @@ bd_test(struct bd_state *st)
+ 	struct bd_plan plan;
+ 	struct bd_rate rate;
+ 
+-	const char *bad = bd_plan_crop(st, lw, lh, bstride, &plan);
++	const char *bad = bd_mode == 3 ? bd_plan_fit(st, lw, lh, bstride, &plan) : bd_plan_crop(st, lw, lh, bstride, &plan);
+ 	if (bad != NULL) {
+ 		IOLog("BLUE DPU: test skipped: %s\n", bad);
+ 		return;
+ 	}
++	bd_plan_log(bd_mode == 3 ? "test plan (fit)" : "test plan (crop)", &plan);
+ 	if (bd_target == 2) {
+ 		ram = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000ffffc000ULL);
+@@ -1085,7 +1304,15 @@ bd_test(struct bd_state *st)
+ 		if (in) {
+ 			memcpy(row + offx, (const void *)(bd_panel_va + (uint64_t)(y - offy) * bd_stride), (size_t)bd_w * 4);
+ 		}
+-		/* marker: 12 px magenta frame around the visible part, 160 px checker below the status bar */
++		/* bluedpu=3 (fit): 12 px magenta frame around the whole buffer, all of it is shown */
++		if (bd_mode == 3) {
++			for (uint32_t x = 0; x < lw; x++) {
++				if (y < 12 || y >= lh - 12 || x < 12 || x >= lw - 12) {
++					row[x] = 0xffff00ffu;
++				}
++			}
++		}
++		/* marker: 12 px magenta frame around the panel crop, 160 px checker below the status bar */
+ 		if (in) {
+ 			uint32_t vy = y - offy;
+ 			for (uint32_t x = 0; x < bd_w; x++) {
+@@ -1179,6 +1406,7 @@ out:
+ 	IOLog("BLUE DPU: test done\n");
+ }
+ 
++
+ static void
+ bd_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -1196,11 +1424,367 @@ bd_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/* ---------------- 0145: zero-copy present (bluedpu_flip=1) ---------------- */
++
++#define BD_POOL_MAX     4
++#define BD_FLIP_WAIT_MS 50      /* > 2 frames at 60 Hz; dpu2 latched in 1.9 ms */
++#define BD_ONCE_MAX     24
++
++static IOLock *bd_flip_lock;            /* flip state, plan, pool */
++static bool bd_flip_on;                 /* allowed (turned off for the boot on any trouble) */
++static volatile bool bd_flipped;        /* the SSPPs fetch a pool buffer, not the panel buffer */
++static bool bd_geom;                    /* the plan's geometry is written (only addresses change) */
++static int bd_fit;                      /* AppleCLCD's bluefb_fit */
++static struct bd_plan bd_fplan;
++static uint32_t bd_fplan_stride;        /* stride bd_fplan was made for, 0 none */
++static uint64_t bd_flip_pa;             /* buffer being fetched */
++static IOBufferMemoryDescriptor *bd_pool[BD_POOL_MAX];
++static uint64_t bd_pool_pa[BD_POOL_MAX];
++static bool bd_pool_used[BD_POOL_MAX];
++static int bd_pool_n;
++static uint64_t bd_pool_size;
++static const char *bd_once_seen[BD_ONCE_MAX];
++static uint32_t bd_n_flip, bd_n_unflip, bd_latch_max_us;
++static uint64_t bd_clean_us, bd_latch_us;
++
++/* Log a reason for not flipping the first time it happens (why is a string literal). */
++static void
++bd_once(const char *why, const char *detail)
++{
++	for (int i = 0; i < BD_ONCE_MAX; i++) {
++		if (bd_once_seen[i] == why) {
++			return;
++		}
++		if (bd_once_seen[i] == NULL) {
++			bd_once_seen[i] = why;
++			IOLog("BLUE DPU: flip: copying instead: %s%s%s (logged once)\n", why, detail ? ": " : "",
++			    detail ? detail : "");
++			return;
++		}
++	}
++}
++
++/* Back to the panel buffer (flip lock held). */
++static void
++bd_unflip_locked(const char *why)
++{
++	if (!bd_flipped) {
++		return;
++	}
++	char tag[64];
++	snprintf(tag, sizeof(tag), "unflip (%s)", why);
++	bd_n_unflip++;
++	if (bd_restore(&bd_st, bd_n_unflip <= 8 ? tag : NULL, true, BD_FLIP_WAIT_MS) < 0) {
++		IOLog("BLUE DPU: %s: the panel buffer is not being fetched yet\n", tag);
++	}
++	bd_flipped = false;
++	bd_geom = false;
++	bd_flip_pa = 0;
++}
++
++/* Something is wrong: no more flips this boot (flip lock held). */
++static void
++bd_flip_off(const char *why)
++{
++	if (bd_flip_on) {
++		IOLog("BLUE DPU: flip: turned off for this boot: %s\n", why);
++	}
++	bd_flip_on = false;
++	bd_unflip_locked(why);
++}
++
++static int
++bd_pool_index(IOMemoryDescriptor *md)
++{
++	for (int i = 0; i < bd_pool_n; i++) {
++		if (bd_pool[i] == md) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++/*
++ * Present one full-screen BGRA surface by pointing the pipes at it. 1 when
++ * the DPU took it (the flush latched: the next frame fetched from it), 0
++ * when the caller has to copy.
++ */
++int
++blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr, uint32_t w, uint32_t h,
++    uint32_t fmt)
++{
++	char detail[128];
++	if (!bd_flip_on) {
++		return 0;
++	}
++	if (w != bd_lw || h != bd_lh || fmt != BD_FMT_BGRA || md == NULL || kva == 0) {
++		snprintf(detail, sizeof(detail), "%ux%u fmt 0x%x", w, h, fmt);
++		bd_once("not a full-screen BGRA surface", detail);
++		return 0;
++	}
++	if (offset != 0 || bpr < w * 4 || (bpr & 15)) {
++		snprintf(detail, sizeof(detail), "offset %u bpr %u", offset, bpr);
++		bd_once("surface layout the SSPP cannot fetch", detail);
++		return 0;
++	}
++	uint64_t len = (uint64_t)bpr * h, seg = 0;
++	IOLockLock(bd_flip_lock);
++	int slot = bd_pool_index(md);
++	if (slot < 0) {
++		IOLockUnlock(bd_flip_lock);
++		bd_once("surface not from the scanout pool", NULL);
++		return 0;
++	}
++	uint64_t pa = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++	if (pa == 0 || seg < len || pa != bd_pool_pa[slot]) {
++		IOLockUnlock(bd_flip_lock);
++		snprintf(detail, sizeof(detail), "pa 0x%llx segment %llu of %llu", pa, seg, len);
++		bd_once("surface not physically contiguous", detail);
++		return 0;
++	}
++	if (pa + len > 0x100000000ULL) {
++		IOLockUnlock(bd_flip_lock);
++		snprintf(detail, sizeof(detail), "pa 0x%llx", pa);
++		bd_once("surface above 4 GiB (32-bit SSPP address)", detail);
++		return 0;
++	}
++	if (!bd_flip_on) {
++		IOLockUnlock(bd_flip_lock);
++		return 0;
++	}
++	if (bd_fplan_stride != bpr) {
++		if (bd_flipped) {
++			bd_unflip_locked("new stride");
++		}
++		const char *bad = bd_fit ? bd_plan_fit(&bd_st, bd_lw, bd_lh, bpr, &bd_fplan) :
++		    bd_plan_crop(&bd_st, bd_lw, bd_lh, bpr, &bd_fplan);
++		if (bad != NULL) {
++			bd_fplan_stride = 0;
++			bd_flip_off(bad);
++			IOLockUnlock(bd_flip_lock);
++			return 0;
++		}
++		bd_fplan_stride = bpr;
++		bd_plan_log(bd_fit ? "flip plan (fit)" : "flip plan (crop)", &bd_fplan);
++	}
++	if (mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) {
++		IOLockUnlock(bd_flip_lock);
++		bd_once("a flush is still pending", NULL);
++		return 0;
++	}
++
++	/* The DPU is not IO-coherent: the frame has to be in DRAM before it is fetched. */
++	uint64_t t0 = mach_absolute_time();
++	CleanPoC_DcacheRegion((vm_offset_t)kva, (size_t)len);
++	bd_dsb();
++	uint64_t t1 = mach_absolute_time();
++	if (!bd_geom) {
++		/* entering: forget latches from the copy period */
++		mdp_wr(MDP_INTR_CLEAR, INTR_INTF_UNDERRUN(bd_st.intf) | INTR_PP_DONE(bd_st.pp));
++	}
++	bool first = bd_n_flip == 0;
++	bd_plan_write(&bd_fplan, pa, !bd_geom);
++	bd_geom = true;
++	bd_flipped = true;
++	bd_flip_pa = pa;
++	int64_t lat = bd_flush(&bd_st, bd_fplan.flush, first ? "first flip" : NULL, true, BD_FLIP_WAIT_MS);
++	if (lat < 0) {
++		bd_flip_off("flush did not latch");
++		IOLockUnlock(bd_flip_lock);
++		return 0;
++	}
++	bd_n_flip++;
++	bd_clean_us += bd_us(t1 - t0);
++	bd_latch_us += (uint64_t)lat;
++	bd_latch_max_us = (uint32_t)lat > bd_latch_max_us ? (uint32_t)lat : bd_latch_max_us;
++	if (first) {
++		IOLog("BLUE DPU: first flip: pool buffer %d at 0x%llx, %ux%u bpr %u, clean %llu us, latched after %lld us\n",
++		    slot, pa, w, h, bpr, bd_us(t1 - t0), lat);
++		for (int s = 0; s < bd_st.nsrc; s++) {
++			bd_dump_pipe("flipped", bd_st.src[s].pipe);
++		}
++	}
++	IOLockUnlock(bd_flip_lock);
++	return 1;
++}
++
++/* The pipes back on the panel buffer; 1 if they were flipped. */
++int
++blue_dpu_unflip(const char *why)
++{
++	if (bd_flip_lock == NULL || !bd_flipped) {
++		return 0;
++	}
++	IOLockLock(bd_flip_lock);
++	bool was = bd_flipped;
++	bd_unflip_locked(why);
++	IOLockUnlock(bd_flip_lock);
++	return was;
++}
++
++int
++blue_dpu_scanout(void)
++{
++	return bd_flipped;
++}
++
++/*
++ * About once a second while flipped (vsync timer): a new INTF underrun, a
++ * change of the MDP streams' SMMU fault state, or no frame sent since the
++ * last check turns the flip off. 1 if it did (the caller redraws the panel
++ * buffer).
++ */
++int
++blue_dpu_flip_tick(void)
++{
++	if (bd_flip_lock == NULL || !bd_flipped) {
++		return 0;
++	}
++	IOLockLock(bd_flip_lock);
++	const char *why = bd_flipped ? bd_health(&bd_st, true) : NULL;
++	if (why != NULL) {
++		bd_log_intr("flip health", mdp_rd(MDP_INTR_STATUS), mdp_rd(MDP_INTR2_STATUS));
++		bd_flip_off(why);
++	}
++	IOLockUnlock(bd_flip_lock);
++	return why != NULL;
++}
++
++/* Halt / restart (PEHaltRestart): back to the panel buffer, no more flips. */
++void
++blue_dpu_flip_stop(const char *why)
++{
++	if (bd_flip_lock == NULL) {
++		return;
++	}
++	IOLockLock(bd_flip_lock);
++	bd_flip_off(why);
++	IOLockUnlock(bd_flip_lock);
++}
++
++/*
++ * Panic (PEInitiatePanic, before the panic text is drawn into the panel
++ * buffer): ABL's registers back and one flush, no lock, no waiting.
++ */
++void
++blue_dpu_panic(void)
++{
++	bd_flip_on = false;
++	if (!bd_flipped || bd_mdss == NULL || bd_st.ctl < 0) {
++		return;
++	}
++	for (int i = bd_nregs - 1; i >= 0; i--) {
++		if (bd_regs[i].touched) {
++			mdp_wr(bd_regs[i].off, bd_regs[i].abl);
++		}
++	}
++	bd_dsb();
++	mdp_wr(CTL_BASE(bd_st.ctl) + CTL_FLUSH, bd_st.flush);
++	bd_dsb();
++	bd_flipped = false;
++}
++
++/*
++ * Backing store for backboardd's display surfaces (SweetSurface create):
++ * contiguous, below 4 GiB, allocated once and never freed, so the DPU
++ * never fetches memory that went back to the VM. The buffer being scanned
++ * out is not handed out again. Retained for the caller.
++ */
++IOBufferMemoryDescriptor *
++blue_dpu_pool_take(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt, uint32_t planes, uint32_t offset,
++    uint64_t size)
++{
++	if (!bd_flip_on || bd_flip_lock == NULL || w != bd_lw || h != bd_lh || fmt != BD_FMT_BGRA ||
++	    planes != 0 || offset != 0 || size > bd_pool_size || (uint64_t)bpr * h > bd_pool_size) {
++		return NULL;
++	}
++	IOBufferMemoryDescriptor *md = NULL;
++	IOLockLock(bd_flip_lock);
++	for (int i = 0; i < bd_pool_n && md == NULL; i++) {
++		if (!bd_pool_used[i] && !(bd_flipped && bd_pool_pa[i] == bd_flip_pa)) {
++			bd_pool_used[i] = true;
++			md = bd_pool[i];
++			md->retain();
++			IOLog("BLUE DPU: pool buffer %d (0x%llx) -> %ux%u bpr %u surface\n", i, bd_pool_pa[i], w, h, bpr);
++		}
++	}
++	IOLockUnlock(bd_flip_lock);
++	if (md == NULL) {
++		bd_once("scanout pool empty", NULL);
++	}
++	return md;
++}
++
++void
++blue_dpu_pool_put(IOMemoryDescriptor *md)
++{
++	if (bd_flip_lock == NULL || md == NULL) {
++		return;
++	}
++	IOLockLock(bd_flip_lock);
++	int i = bd_pool_index(md);
++	if (i >= 0) {
++		bd_pool_used[i] = false;
++	}
++	IOLockUnlock(bd_flip_lock);
++}
++
++/* Synchronous setup at AppleCLCD::start. 1: flips allowed. */
++static int
++bd_flip_setup(void)
++{
++	int bufs = 3;
++	struct bd_rate rate;
++	PE_parse_boot_argn("bluedpu_flip_bufs", &bufs, sizeof(bufs));
++	bufs = bufs < 2 ? 2 : (bufs > BD_POOL_MAX ? BD_POOL_MAX : bufs);
++	bd_flip_lock = IOLockAlloc();
++	if (bd_flip_lock == NULL) {
++		return 0;
++	}
++	bd_survey(&bd_st);
++	bd_regs_record(&bd_st);
++	bd_rate_measure(&bd_st, "rate (100 ms)", 100, &rate);
++	bd_done_live = rate.done != 0;
++	uint32_t stride = (bd_lw * 4 + 255) & ~255u;        /* backboardd: 4608 for 1125 */
++	const char *bad = bd_fit ? bd_plan_fit(&bd_st, bd_lw, bd_lh, stride, &bd_fplan) :
++	    bd_plan_crop(&bd_st, bd_lw, bd_lh, stride, &bd_fplan);
++	if (bad != NULL) {
++		IOLog("BLUE DPU: flip: off: %s\n", bad);
++		return 0;
++	}
++	bd_fplan_stride = stride;
++	bd_plan_log(bd_fit ? "flip plan (fit)" : "flip plan (crop)", &bd_fplan);
++	bd_pool_size = round_page((uint64_t)stride * bd_lh);
++	for (int i = 0; i < bufs; i++) {
++		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous |
++		    kIOMemoryHostPhysicallyContiguous, bd_pool_size, 0x00000000ffffc000ULL);
++		uint64_t seg = 0, pa = md != NULL ? md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++		if (md == NULL || pa == 0 || seg < bd_pool_size || pa + bd_pool_size > 0x100000000ULL ||
++		    md->getBytesNoCopy() == NULL) {
++			IOLog("BLUE DPU: flip: pool buffer %d: no contiguous %llu bytes below 4 GiB (pa 0x%llx seg %llu)\n",
++			    i, bd_pool_size, pa, seg);
++			OSSafeReleaseNULL(md);
++			break;
++		}
++		bd_pool[bd_pool_n] = md;
++		bd_pool_pa[bd_pool_n++] = pa;
++		IOLog("BLUE DPU: flip: pool buffer %d at 0x%llx, %llu bytes\n", i, pa, bd_pool_size);
++	}
++	if (bd_pool_n < 2) {
++		IOLog("BLUE DPU: flip: off: %d pool buffers, need 2\n", bd_pool_n);
++		return 0;
++	}
++	bd_health_baseline(&bd_st, "flip baseline");
++	return 1;
++}
++
+ /* ---------------- baseline statistics of the CPU copy ---------------- */
+ 
+ static bool bd_stats_on;
+ static uint32_t bd_n_vsync, bd_n_swap, bd_n_present, bd_present_max_us;
+ static uint64_t bd_present_us, bd_stats_t0;
++static uint32_t bd_last_flip, bd_last_unflip;
+ 
+ /* kind 0: vsync tick (workloop), 1: swap (any thread), 2: panel copy of dt (workloop) */
+ void
+@@ -1230,12 +1814,22 @@ blue_dpu_stat(int kind, uint64_t dt)
+ 		uint32_t swaps = __atomic_exchange_n(&bd_n_swap, 0, __ATOMIC_RELAXED);
+ 		IOLog("BLUE DPU: 5s: %u vsync ticks, %u swaps, %u panel copies, copy avg %llu us max %u us\n",
+ 		    bd_n_vsync, swaps, bd_n_present, bd_n_present ? bd_present_us / bd_n_present : 0, bd_present_max_us);
++		if (bd_flip_lock != NULL) {
++			uint32_t nf = bd_n_flip, nu = bd_n_unflip;
++			IOLog("BLUE DPU: 5s: %u flips (total %u), %u unflips, clean avg %llu us, latch avg %llu us max %u us, %s, %s\n",
++			    nf - bd_last_flip, nf, nu - bd_last_unflip, nf ? bd_clean_us / nf : 0, nf ? bd_latch_us / nf : 0,
++			    bd_latch_max_us, bd_flipped ? "flipped" : "on the panel buffer", bd_flip_on ? "flip on" : "flip off");
++			bd_last_flip = nf;
++			bd_last_unflip = nu;
++		}
+ 		bd_n_vsync = bd_n_present = bd_present_max_us = 0;
+ 		bd_present_us = 0;
+ 		bd_stats_t0 = now;
+ 	}
+ }
+ 
++static int bd_flip_arg;          /* bluedpu_flip */
++
+ void
+ blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride, uintptr_t panel_va,
+     uint32_t lw, uint32_t lh)
+@@ -1243,8 +1837,9 @@ blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride, uintp
+ 	int stats = -1;
+ 	PE_parse_boot_argn("bluedpu", &bd_mode, sizeof(bd_mode));
+ 	PE_parse_boot_argn("bluedpu_stats", &stats, sizeof(stats));
+-	bd_stats_on = stats < 0 ? bd_mode != 0 : stats != 0;
+-	if (bd_mode <= 0) {
++	PE_parse_boot_argn("bluedpu_flip", &bd_flip_arg, sizeof(bd_flip_arg));
++	bd_stats_on = stats < 0 ? (bd_mode != 0 || bd_flip_arg != 0) : stats != 0;
++	if (bd_mode <= 0 && bd_flip_arg == 0) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("bluedpu_delay", &bd_delay, sizeof(bd_delay));
+@@ -1261,16 +1856,27 @@ blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride, uintp
+ 	bd_panel_va = panel_va;
+ 	bd_lw = lw;
+ 	bd_lh = lh;
+-	IOLog("BLUE DPU: mode %d, delay %d s, hold %d ms, keep %d, target %s; panel %ux%u stride %u at 0x%llx, iOS %ux%u\n",
+-	    bd_mode, bd_delay, bd_hold_ms, bd_keep, bd_target == 2 ? "RAM below 4 GiB" : "cont_splash",
+-	    w, h, stride, panel_pa, lw, lh);
++	IOLog("BLUE DPU: mode %d, flip %d, delay %d s, hold %d ms, keep %d, target %s; panel %ux%u stride %u at 0x%llx, iOS %ux%u\n",
++	    bd_mode, bd_flip_arg, bd_delay, bd_hold_ms, bd_keep,
++	    bd_target == 2 ? "RAM below 4 GiB" : "cont_splash", w, h, stride, panel_pa, lw, lh);
+ 	if (w == 0 || h == 0 || stride < w * 4 || panel_va == 0 || lw > 4096 || lh > 4096) {
+ 		IOLog("BLUE DPU: no panel framebuffer\n");
++		bd_flip_arg = 0;
+ 		return;
+ 	}
+ 	bd_mdss = (volatile uint32_t *)ml_io_map(BD_MDSS_PA, BD_MDSS_SIZE);
+ 	if (bd_mdss == NULL) {
+ 		IOLog("BLUE DPU: MDSS mapping failed\n");
++		bd_flip_arg = 0;
++		return;
++	}
++	if (bd_flip_arg) {
++		if (bd_mode >= 2) {
++			IOLog("BLUE DPU: bluedpu=%d tests skipped: bluedpu_flip=1 owns the pipes\n", bd_mode);
++		}
++		return;         /* blue_dpu_flip_init does the survey */
++	}
++	if (bd_mode <= 0) {
+ 		return;
+ 	}
+ 	thread_t thread;
+@@ -1280,4 +1886,17 @@ blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride, uintp
+ 	}
+ 	thread_deallocate(thread);
+ }
++
++/* AppleCLCD::start, after blue_dpu_start; fit is bluefb_fit. 1: swaps may flip. */
++int
++blue_dpu_flip_init(int fit)
++{
++	if (!bd_flip_arg) {
++		return 0;
++	}
++	bd_fit = fit;
++	bd_flip_on = bd_flip_setup() != 0;
++	IOLog("BLUE DPU: flip %s (%s)\n", bd_flip_on ? "ready" : "off, CPU copy", fit ? "fit" : "crop");
++	return bd_flip_on;
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9fd328d..4c4a05c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,14 @@ extern "C" void blue_dpu_stat(int kind, uint64_t dt);
+ #include <sys/proc.h>
+ #include <machine/atomic.h>     /* DSB_SY (blueline display power) */
+ 
++/* blueline zero-copy present (BlueDPU.cpp, bluedpu_flip=1, patch 0145) */
++extern "C" int blue_dpu_flip_init(int fit);
++extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
++    uint32_t w, uint32_t h, uint32_t fmt);
++extern "C" int blue_dpu_unflip(const char *why);
++extern "C" int blue_dpu_scanout(void);
++extern "C" int blue_dpu_flip_tick(void);
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -131,6 +139,14 @@ public:
+ 	volatile uint32_t *fPPPage;   /* 16K page holding PINGPONG_0..3 */
+ 	volatile uint32_t *fPP;       /* the pingpong ABL left on autorefresh */
+ 	uint32_t      fAutoRefresh;   /* its PP_AUTOREFRESH_CONFIG, restored on wake */
++	/*
++	 * blueline zero-copy present (bluedpu_flip=1, 0145): a swap of one
++	 * full-screen surface points the DPU at it instead of being copied.
++	 * fPresentLock orders flips against the vsync timer's copy + unflip
++	 * and the display-off path (lock order: fPresentLock, then fLock).
++	 */
++	bool          fFlip;
++	IOLock       *fPresentLock;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void powerStart(void);
+@@ -141,6 +157,8 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	bool swapFlip(const uint8_t *rec);
++	void consoleOnce(void);
+ 	void present(const uint8_t *rec);
+ 	void presentFit(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+@@ -254,6 +272,11 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
++	fPresentLock = IOLockAlloc();
++	if (fPresentLock != NULL && blue_dpu_flip_init(fFit)) {
++		fFlip = true;   /* before registerService: no swap can come earlier */
++		IOLog("SWEET FB: zero-copy present on (bluedpu_flip=1, %s)\n", fFit ? "QSEED3 fit" : "crop");
++	}
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	int accel = 1;
+@@ -293,6 +316,23 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++		if (fb->fFlip && step <= 1) {
++			/*
++			 * Flipped: the panel buffer holds an old frame. Black first, then
++			 * back to it (no flip happens while fPowerOff, see swapFlip).
++			 */
++			IOLockLock(fb->fPresentLock);
++			if (blue_dpu_scanout()) {
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++					for (uint32_t x = 0; x < fb->fWidth; x++) {
++						row[x] = 0xff000000u;
++					}
++				}
++				blue_dpu_unflip("display off");
++			}
++			IOLockUnlock(fb->fPresentLock);
++		}
+ 		if (step <= 1) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -313,7 +353,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLockLock(fb->fLock);
+ 	}
+ 	blue_dpu_stat(0, 0);
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	/* Flip on: copy only when no flip is in progress (it may sleep up to 50 ms); try next tick. */
++	bool owner_ok = true;
++	if (fb->fFlip) {
++		IOLockUnlock(fb->fLock);
++		owner_ok = IOLockTryLock(fb->fPresentLock);
++		IOLockLock(fb->fLock);
++	}
++	bool flush = owner_ok && fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -328,6 +375,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		blue_dpu_stat(2, mach_absolute_time() - t0);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		if (fb->fFlip) {
++			blue_dpu_unflip("copied frame");        /* the panel buffer has the latest frame now */
++		}
++	}
++	if (fb->fFlip && owner_ok) {
++		if ((count % 60) == 0 && blue_dpu_flip_tick()) {
++			IOLockLock(fb->fLock);
++			fb->fDirty = true;              /* flip turned off: copy the latest frame */
++			IOLockUnlock(fb->fLock);
++		}
++		IOLockUnlock(fb->fPresentLock);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -575,22 +633,28 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	IOLockLock(fLock);
+-	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
+-	IOLockUnlock(fLock);
++	if (!fFlip || !swapFlip(rec)) {
++		IOLockLock(fLock);
++		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = true;
++		IOLockUnlock(fLock);
++	}
+ 	blue_dpu_stat(1, 0);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++/*
++ * bluedpu_flip=1: a swap that is exactly one enabled layer showing a whole
++ * fLogicalW x fLogicalH surface at the origin is handed to the DPU
++ * (BlueDPU.cpp checks format, contiguity, the 4 GiB limit). Returns once
++ * the DPU fetches the new frame, so backboardd's next draw into the other
++ * buffer cannot tear this one. false: copy as before.
++ */
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::consoleOnce(void)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+-
+-
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -600,6 +664,65 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++}
++
++bool
++AppleCLCD::swapFlip(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), id = 0;
++	int n = 0, layer = 0;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
++			n++;
++			layer = (int)l;
++			id = get32(rec, 0x54 + 4 * l);
++		}
++	}
++	if (n != 1) {
++		return false;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer;
++	const uint8_t *b = rec + 0xc4 + 16 * layer;
++	uint32_t bw = get32(b, 8), bh = get32(b, 12);
++	if (get32(a, 0) != 0 || get32(a, 4) != 0 || get32(b, 0) != 0 || get32(b, 4) != 0 ||
++	    !((bw == fLogicalW && bh == fLogicalH) || (bw == 0 && bh == 0))) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s == fSurface || s->memory == NULL || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->bytesPerElement != 4 || s->planeCount != 0 ||
++	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	bool ok = false;
++	IOLockLock(fPresentLock);
++	IOLockLock(fLock);
++	bool off = fPowerOff;
++	IOLockUnlock(fLock);
++	if (!off) {
++		ok = blue_dpu_flip(s->memory, s->kernelAddress(), s->offset, s->bytesPerRow, s->width, s->height,
++		    s->pixelFormat) != 0;
++	}
++	if (ok) {
++		consoleOnce();
++		IOLockLock(fLock);
++		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);  /* the latest frame, for wake / fallback */
++		fDirty = false;
++		IOLockUnlock(fLock);
++	}
++	IOLockUnlock(fPresentLock);
++	s->release();
++	return ok;
++}
++
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++
++
++	consoleOnce();
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 9bee210..59a33ae 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -75,6 +75,15 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/*
++ * blueline zero-copy present (BlueDPU.cpp, bluedpu_flip=1): backboardd's
++ * display-sized surfaces come from a pool of contiguous buffers below
++ * 4 GiB the DPU can fetch. NULL: allocate as usual.
++ */
++extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
++    uint32_t planes, uint32_t offset, uint64_t size);
++extern "C" void blue_dpu_pool_put(IOMemoryDescriptor *md);
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -82,6 +91,7 @@ SweetSurface::free()
+ {
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		blue_dpu_pool_put(memory);      /* back to the scanout pool if it came from there */
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+@@ -674,10 +684,18 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
++		char creator[32];
++		proc_selfname(creator, sizeof(creator));
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			if (strcmp(creator, "backboardd") == 0) {
++				mem = blue_dpu_pool_take(s->width, s->height, s->bytesPerRow, s->pixelFormat,
++				    s->planeCount, s->offset, s->allocSize);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+-- 
+2.54.0 (Apple Git-157)
+

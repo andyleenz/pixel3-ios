@@ -102,7 +102,7 @@ if [ "$quick" = 1 ]; then
 			git -C "$x" apply -R "$work/dxb/patches/${old[i]}" || { echo "could not take out ${old[i]}; tree left as is" >&2; exit 1; }
 			printf '%s\n' "${old[@]:0:i}" > "$work/patch-list.txt"	# the list always matches the tree
 			awk '/^--- \/dev\/null/{n=1;next} n&&/^\+\+\+ b\//{print substr($0,7)} {n=0}' "$work/dxb/patches/${old[i]}" |
-				while read -r f; do [ -f "$x/$f" ] && [ ! -s "$x/$f" ] && rm -f "$x/$f"; done	# git apply -R can leave a created file behind, empty
+				while read -r f; do if [ -f "$x/$f" ] && [ ! -s "$x/$f" ]; then rm -f "$x/$f"; fi; done	# git apply -R can leave a created file behind, empty
 		done
 		for ((i = first; i < ${#new[@]}; i++)); do
 			n=${new[i]}
