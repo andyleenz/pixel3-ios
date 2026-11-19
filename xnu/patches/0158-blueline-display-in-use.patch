@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 16:30:00 +0100
+Subject: [PATCH] 0158: the display holds IOSurface uses (IOSurfaceIsInUse)
+
+backboardd alternated two framebuffers because no surface ever read as in
+use: iOS 16's IOSurfaceIsInUse reads a u64 at +0x18 of the shared state
+page, which stayed 0. The flip path now holds a use on the surface shown
+and on the one it replaced until that flip latches (released from the
+vsync tick), so CoreAnimation takes a third buffer instead of waiting.
+0157's GPU wait applies only to a surface still held.
+---
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -50,6 +50,9 @@
+ 
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
++/* 0158: the display's use of a surface, seen by IOSurfaceIsInUse (u64 at +0x18 of the state page) */
++void sweet_surface_display_use(SweetSurface *s, int delta);
++bool sweet_surface_in_use(SweetSurface *s);
+ 
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -123,6 +123,28 @@
+ sweet_surface_seed(SweetSurface *s)
+ {
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
++}
++
++/*
++ * 0158: IOSurfaceIsInUse (iOS 16 IOSurface.framework) reads a u64 use count at
++ * +0x18 of the shared state page, no call. The display holds a use on the
++ * buffer it shows until the flip replacing it latches, so CoreAnimation does
++ * not draw into a buffer that is still being fetched (it takes another one).
++ * Client use-count traps stay ignored.
++ */
++#define SWEET_SURFACE_STATE_USE         0x18
++
++void
++sweet_surface_display_use(SweetSurface *s, int delta)
++{
++	volatile SInt64 *use = (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE);
++	(void)OSAddAtomic64(delta, use);
++}
++
++bool
++sweet_surface_in_use(SweetSurface *s)
++{
++	return *(volatile int64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) > 0;
+ }
+ 
+ /*
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -79,6 +79,7 @@
+ 
+ /* blueline zero-copy present (BlueDPU.cpp, bluedpu_flip=1, patch 0145) */
+ extern "C" int blue_dpu_flip_init(int fit);
++extern "C" int blue_dpu_latch_pending(void);  /* 0158 */
+ extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
+     uint32_t w, uint32_t h, uint32_t fmt);
+ extern "C" int blue_dpu_unflip(const char *why);
+@@ -176,6 +177,15 @@
+ 	 */
+ 	bool          fFlip;
+ 	IOLock       *fPresentLock;
++	/*
++	 * 0158 (under fPresentLock): the surface the DPU shows and the one it
++	 * replaced until that flip latches, each holding a display use
++	 * (IOSurfaceIsInUse), retained.
++	 */
++	SweetSurface *fShown;
++	SweetSurface *fRetiring;
++	void displayHold(SweetSurface *s);
++	void displayDrop(bool all);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void powerStart(void);
+@@ -367,6 +377,7 @@
+ 				}
+ 				blue_dpu_unflip("display off");
+ 			}
++			fb->displayDrop(true);  /* 0158 */
+ 			IOLockUnlock(fb->fPresentLock);
+ 		}
+ 		if (step <= 1) {
+@@ -414,9 +425,15 @@
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		if (fb->fFlip) {
+ 			blue_dpu_unflip("copied frame");        /* the panel buffer has the latest frame now */
++			if (owner_ok) {
++				fb->displayDrop(true);          /* 0158 */
++			}
+ 		}
+ 	}
+ 	if (fb->fFlip && owner_ok) {
++		if (fb->fRetiring != NULL && !blue_dpu_latch_pending()) {
++			fb->displayDrop(false);                 /* 0158: its replacement is fetched now */
++		}
+ 		if ((count % 60) == 0 && blue_dpu_flip_tick()) {
+ 			IOLockLock(fb->fLock);
+ 			fb->fDirty = true;              /* flip turned off: copy the latest frame */
+@@ -707,6 +724,34 @@
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+ 		}
++	}
++}
++
++/* 0158: s is on screen now (flip done; the flip waited for the latch before it). fPresentLock held. */
++void
++AppleCLCD::displayHold(SweetSurface *s)
++{
++	if (s == fShown) {
++		return;
++	}
++	displayDrop(false);     /* the buffer two flips back: its replacement latched before this flip */
++	fRetiring = fShown;
++	s->retain();
++	sweet_surface_display_use(s, 1);
++	fShown = s;
++}
++
++/* Retiring (latched, or all: flipping stopped). fPresentLock held. */
++void
++AppleCLCD::displayDrop(bool all)
++{
++	if (fRetiring != NULL) {
++		sweet_surface_display_use(fRetiring, -1);
++		OSSafeReleaseNULL(fRetiring);
++	}
++	if (all && fShown != NULL) {
++		sweet_surface_display_use(fShown, -1);
++		OSSafeReleaseNULL(fShown);
+ 	}
+ }
+ 
+@@ -749,6 +794,7 @@
+ 		    s->pixelFormat) != 0;
+ 	}
+ 	if (ok) {
++		displayHold(s);
+ 		consoleOnce();
+ 		IOLockLock(fLock);
+ 		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);  /* the latest frame, for wake / fallback */
+--- a/iokit/Kernel/arm/BlueDPU.cpp
++++ b/iokit/Kernel/arm/BlueDPU.cpp
+@@ -122,6 +122,7 @@
+ extern "C" int blue_dpu_unflip(const char *why);
+ extern "C" int blue_dpu_scanout(void);
+ extern "C" uint32_t blue_dpu_flip_settle(void);
++extern "C" int blue_dpu_latch_pending(void);
+ extern "C" int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
+ extern "C" int blue_dpu_flip_tick(void);
+ extern "C" void blue_dpu_panic(void);
+@@ -1703,7 +1704,21 @@
+ 	return us;
+ }
+ 
++/* 0158: a flip flushed whose latch has not been seen (lock-free; vsync timer) */
+ int
++blue_dpu_latch_pending(void)
++{
++	if (!bd_latch_pending) {
++		return 0;
++	}
++	if ((mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) != 0) {
++		return 1;
++	}
++	bd_latch_pending = false;
++	return 0;
++}
++
++int
+ blue_dpu_scanout(void)
+ {
+ 	return bd_flipped;
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -703,7 +703,9 @@
+ 	}
+ 	/* imports: CPU writes to PoC; a BO the GPU writes is also invalidated (no dirty line lands on it later) */
+ 	for (uint32_t i = 0; i < a->nr_bos; i++) {
+-		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && bg_lookup(c, bos[i].handle)->kind == BG_SURF) {
++		BGBo *wb = bg_lookup(c, bos[i].handle);
++		/* 0158: only a surface the display still holds (2 buffers); 3+ buffers never wait */
++		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && wb->kind == BG_SURF && sweet_surface_in_use(wb->surf)) {
+ 			(void)blue_dpu_flip_settle();   /* 0157: maybe the buffer a pending flip replaces */
+ 			break;
+ 		}
