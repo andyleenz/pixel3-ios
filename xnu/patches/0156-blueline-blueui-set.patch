@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 15:00:00 +0100
+Subject: [PATCH] 0156: blueui=1 boot-arg stands for the GPU UI set
+
+bluegpu=8 bluegpu_mhz=710 bluedpu_flip=1 cs_enforcement_disable=1
+sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib in one
+argument (about 130 bytes of the 607-byte command line back). An argument
+given explicitly still wins.
+---
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -185,7 +185,55 @@
+ 	}
+ 
+ 	return arg_found;
++}
++
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0156: blueui=1 stands for the GPU-rendered UI set (stage 6f), so test and
++ * demo boots stay well inside the 607-byte command line. An argument given
++ * on the command line still wins over its value here.
++ */
++static const struct {
++	const char *name;
++	long long num;
++	const char *str;
++} blue_ui_set[] = {
++	{ "bluegpu", 8, NULL },
++	{ "bluegpu_mhz", 710, NULL },
++	{ "bluedpu_flip", 1, NULL },
++	{ "cs_enforcement_disable", 1, NULL },
++	{ "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib" },
++};
++
++static boolean_t
++blue_ui_default(const char *arg_string, void *arg_ptr, int max_len)
++{
++	int on = 0;
++
++	if (strcmp(arg_string, "blueui") == 0 ||
++	    !PE_parse_boot_argn_internal(PE_boot_args(), "blueui", &on, sizeof(on), FALSE) || on == 0) {
++		return FALSE;
++	}
++	for (size_t i = 0; i < sizeof(blue_ui_set) / sizeof(blue_ui_set[0]); i++) {
++		if (strcmp(arg_string, blue_ui_set[i].name) != 0) {
++			continue;
++		}
++		if (blue_ui_set[i].str != NULL) {
++			if (max_len <= 0) {
++				return FALSE;
++			}
++			strlcpy((char *)arg_ptr, blue_ui_set[i].str, (size_t)max_len);
++		} else {
++			argnumcpy(blue_ui_set[i].num, arg_ptr, (unsigned)max_len);
++		}
++		return TRUE;
++	}
++	return FALSE;
+ }
++#endif
+ 
+ boolean_t
+ PE_parse_boot_argn(
+@@ -193,7 +241,13 @@
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++	boolean_t found = PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!found) {
++		found = blue_ui_default(arg_string, arg_ptr, max_len);
++	}
++#endif
++	return found;
+ }
+ 
+ boolean_t
+@@ -202,7 +256,13 @@
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++	boolean_t found = PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!found) {
++		found = blue_ui_default(arg_string, arg_ptr, strlen);
++	}
++#endif
++	return found;
+ }
+ 
+ #if defined(CONFIG_XNUPOST)
