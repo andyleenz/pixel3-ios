@@ -3,6 +3,7 @@
 #
 #   tools/phonetest.sh [--quick] [--name NAME] [--grep REGEX] [--wait MIN]
 #                      [--push LOCAL:DEVPATH[:MODE[:UID:GID]]]... [--rm DEVPATH]...
+#                      [--mkdir DEVPATH[:MODE[:UID:GID]]]...
 #                      [--run 'DEVPATH[,ARG...]'] [--run-timeout S] [--end recovery|fastboot]
 #                      [BOOT-ARGS...]
 #
@@ -13,7 +14,8 @@
 #   --push    put a file (or a directory) into the iOS root before this boot,
 #             no image round trip (patch 0152; tools/iosfs-push.sh): written
 #             from recovery into userdata's payload area, applied by the kernel
-#             with bluepush=1 before launchd starts. Repeatable. --rm removes.
+#             with bluepush=1 before launchd starts. Repeatable. --rm removes;
+#             --mkdir makes a directory (or sets an existing one's owner).
 #   --run     run that program once SpringBoard is up (tools/bluerun, launchd
 #             job from tools/bluerun/setup.sh, once) with a timeout (default
 #             60 s); its stdout/stderr come out as "BLUERUN: ..." lines in the
@@ -55,6 +57,7 @@ while [ $# -gt 0 ]; do
 	--wait) wait=$2; shift 2 ;;
 	--push) pushes+=("$2"); shift 2 ;;
 	--rm) pushes+=(--rm "$2"); shift 2 ;;
+	--mkdir) pushes+=(--mkdir "$2"); shift 2 ;;
 	--run) run=$2; shift 2 ;;
 	--run-timeout) run_timeout=$2; shift 2 ;;
 	--end) end_in=$2; shift 2 ;;
