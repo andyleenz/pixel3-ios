@@ -1,0 +1,582 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0152: blueline files pushed into the root at boot (bluepush=)
+
+Makes a userland change as quick to test as a kernel change: no image
+round trip, no sudo, no fastboot flash.
+
+tools/iosfs-push.sh (LineageOS recovery, adb) writes a payload of files
+into the 256 MiB of userdata right below the 0146 screenshot area (beyond
+the end of the 16 GiB HFS+ root). With bluepush=1, right after the root is
+mounted and before launchd runs, bsd/dev/blueline_payload.c reads it
+through the root device's strategy routine (read only), checks magic,
+size and CRC-32 of the whole payload, and applies each entry (file,
+directory, remove) through the HFS+ driver: mkdir -p, unlink, vnode_open +
+vn_rdwr, owner and mode, fsync. The driver handles catalog, extents and
+journal. The files are on the root volume, so ad-hoc signed binaries are
+platform binaries there (sweet_amfi.c), and they persist. bluepush=2 only
+lists the entries. The area is used only when the HFS+ volume header says
+the volume ends before it.
+
+The test runner (tools/bluerun, boot-arg bluerun=) is user space and needs
+nothing more from the kernel: it is pushed like any other file, started
+by a launchd job, and writes its child's output to /dev/console, which
+lands in the persistent log (0047).
+
+---
+ bsd/conf/files             |    1 
+ bsd/dev/blueline_payload.c |  475 ++++++++++++++++++++++++++++++++++++++++++++
+ bsd/kern/bsd_init.c        |   10 +
+ bsd/vfs/vfs_syscalls.c     |   25 ++
+ 4 files changed, 511 insertions(+)
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -379,6 +379,7 @@
+ bsd/pthread/sweet_pthread_synch.c	standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
++bsd/dev/blueline_payload.c		standard
+ 
+ bsd/kern/bsd_init.c			standard
+ ./init_sysent.c				standard
+diff --git a/bsd/dev/blueline_payload.c b/bsd/dev/blueline_payload.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/blueline_payload.c
+@@ -0,0 +1,475 @@
++/*
++ * Files pushed into the iOS root from the Mac without an image round trip
++ * (patch 0152, boot-arg bluepush=).
++ *
++ * tools/iosfs-push.sh (in LineageOS recovery, over adb) writes a payload
++ * into the 256 MiB of userdata right below the screenshot area of 0146.
++ * Layout from the end of userdata, in 4 KiB blocks:
++ *
++ *   [... HFS+ root (16 GiB) ... | payload 65536 | snaps 32768 | log 1025 ]
++ *
++ * With bluepush=1 the payload is read once, right after the root volume is
++ * mounted (bsd_init, before launchd exists), checked as a whole (magic,
++ * version, size, CRC-32) and then each entry is applied to the root through
++ * the HFS+ driver itself (mkdir, unlink, vnode_open + vn_rdwr, setattr,
++ * fsync): the driver does the catalog, extents, allocation and journal, so
++ * nothing here knows the HFS+ format. The files are on the MNT_ROOTFS
++ * volume, so sweet_amfi.c makes ad-hoc signed binaries platform binaries
++ * exactly like the system's own, and they stay there on later boots (the
++ * next tools/phone.sh sync picks them up into the Mac's base image).
++ * bluepush=2 only lists the entries.
++ *
++ * Nothing here writes to the device directly: the area is only read, with
++ * I/O buffers through the root device's own strategy routine (sweet_ufs.c),
++ * and only when the HFS+ volume header says the volume ends before it.
++ *
++ * Payload (little endian), area block 0:
++ *   "BLUEPUSH" | u32 version 1 | u32 entry count | u64 entry bytes
++ *   | u64 stamp (Mac time) | u32 CRC-32 of the entry bytes | u32 0
++ *   | char name[32]
++ * then from area byte 4096 the entries, each 8-byte aligned:
++ *   u32 kind (1 file, 2 directory, 3 remove) | u32 mode | u32 uid | u32 gid
++ *   | u32 path bytes (with the NUL) | u32 0 | u64 data bytes
++ *   | path, padded to 8 | data, padded to 8
++ * Paths are absolute, without "." or ".." components, not under /dev.
++ * A file replaces what is there (unlink first, so hard links and
++ * compressed files are left alone); missing parent directories are made
++ * (0755, root:wheel). A failed entry is logged and the next one tried.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/mount.h>
++#include <sys/proc.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <mach/mach_time.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++/* bsd/vfs/vfs_syscalls.c (this patch) */
++int blue_kern_mkdir(const char *path, mode_t mode, vfs_context_t ctx);
++int blue_kern_unlink(const char *path, vfs_context_t ctx);
++void blueline_payload_install(void);
++
++#define BP_BLOCK                4096u
++#define BP_LOG_BLOCKS           1025u           /* sweet_ufs.c SWEET_LOG_BLOCKS */
++#define BP_SNAP_BLOCKS          32768u          /* sweet_ufs.c BLUESNAP_BLOCKS (0146) */
++#define BP_AREA_BLOCKS          65536u          /* 256 MiB */
++#define BP_MAX_BYTES            ((uint64_t)BP_AREA_BLOCKS * BP_BLOCK - BP_BLOCK)
++#define BP_CHUNK                (1u << 20)      /* device reads */
++#define BP_WRITE_CHUNK          (8u << 20)      /* file writes */
++
++enum { BP_FILE = 1, BP_DIR = 2, BP_REMOVE = 3 };
++
++struct bp_header {
++	char magic[8];
++	uint32_t version, count;
++	uint64_t bytes, stamp;
++	uint32_t crc, rsvd;
++	char name[32];
++};
++
++struct bp_entry {
++	uint32_t kind, mode, uid, gid, path_len, rsvd;
++	uint64_t size;
++};
++
++static inline uint32_t
++bp_be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++static uint32_t
++bp_ms_since(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++/* len bytes at byte offset off of the device behind devvp into dst (kernel memory). */
++static int
++bp_dev_read(vnode_t devvp, uint32_t secsize, uint64_t off, void *dst, uint32_t len)
++{
++	if (off % secsize || len % secsize) {
++		return EINVAL;
++	}
++	buf_t bp = buf_alloc(devvp);
++	if (bp == NULL) {
++		return ENOMEM;
++	}
++	int error = buf_setdevice(bp, devvp);
++	if (!error) {
++		buf_setblkno(bp, (daddr64_t)(off / secsize));
++		buf_setlblkno(bp, (daddr64_t)(off / secsize));
++		buf_setcount(bp, len);
++		buf_setsize(bp, len);
++		buf_setdataptr(bp, (uintptr_t)dst);
++		buf_setflags(bp, B_READ | B_NOCACHE);
++		error = VNOP_STRATEGY(bp);
++		if (!error) {
++			error = buf_biowait(bp);
++		}
++		if (!error && buf_resid(bp) != 0) {
++			error = EIO;
++		}
++	}
++	buf_free(bp);
++	return error;
++}
++
++static bool
++bp_path_ok(const char *p, uint32_t len)
++{
++	if (len < 2 || len > MAXPATHLEN || p[len - 1] != '\0' || strlen(p) != len - 1 || p[0] != '/') {
++		return false;
++	}
++	if (strncmp(p, "/dev/", 5) == 0 || strcmp(p, "/dev") == 0) {
++		return false;
++	}
++	for (const char *c = p; *c;) {
++		while (*c == '/') {
++			c++;
++		}
++		const char *e = c;
++		while (*e && *e != '/') {
++			e++;
++		}
++		size_t n = (size_t)(e - c);
++		if ((n == 1 && c[0] == '.') || (n == 2 && c[0] == '.' && c[1] == '.')) {
++			return false;
++		}
++		c = e;
++	}
++	return true;
++}
++
++/* 0 and the vnode type when path exists (no symlinks followed), else an errno. */
++static int
++bp_lookup_type(const char *path, enum vtype *type, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (!error) {
++		*type = vnode_vtype(vp);
++		vnode_put(vp);
++	}
++	return error;
++}
++
++static int
++bp_setattr(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_uid, uid);
++	VATTR_SET(&va, va_gid, gid);
++	VATTR_SET(&va, va_mode, mode & ALLPERMS);
++	error = vnode_setattr(vp, &va, ctx);
++	vnode_put(vp);
++	return error;
++}
++
++/* mkdir -p of every parent of path (the last component is left out). */
++static int
++bp_make_parents(const char *path, vfs_context_t ctx, uint32_t *made)
++{
++	char *buf = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	strlcpy(buf, path, MAXPATHLEN);
++	int error = 0;
++	for (char *s = strchr(buf + 1, '/'); s && !error; s = strchr(s + 1, '/')) {
++		*s = '\0';
++		enum vtype t;
++		error = bp_lookup_type(buf, &t, ctx);
++		if (error == ENOENT) {
++			error = blue_kern_mkdir(buf, 0755, ctx);
++			if (!error) {
++				(void)bp_setattr(buf, 0755, 0, 0, ctx);
++				(*made)++;
++			}
++		} else if (!error && t != VDIR) {
++			error = ENOTDIR;
++		}
++		*s = '/';
++	}
++	kfree_data(buf, MAXPATHLEN);
++	return error;
++}
++
++static int
++bp_write_file(const char *path, const struct bp_entry *e, const uint8_t *data, vfs_context_t ctx)
++{
++	enum vtype t;
++	int error = bp_lookup_type(path, &t, ctx);
++	if (!error) {
++		if (t == VDIR) {
++			return EISDIR;
++		}
++		error = blue_kern_unlink(path, ctx);
++		if (error) {
++			return error;
++		}
++	} else if (error != ENOENT) {
++		return error;
++	}
++
++	vnode_t vp = NULLVP;
++	error = vnode_open(path, O_CREAT | O_EXCL | O_NOFOLLOW | FWRITE, (int)(e->mode & ALLPERMS), 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	for (uint64_t off = 0; !error && off < e->size;) {
++		int n = (int)MIN((uint64_t)BP_WRITE_CHUNK, e->size - off);
++		int resid = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(data + off), n, (off_t)off, UIO_SYSSPACE,
++		    IO_NOCACHE | IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid != 0) {
++			error = EIO;
++		}
++		off += (uint64_t)n;
++	}
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, e->uid);
++		VATTR_SET(&va, va_gid, e->gid);
++		VATTR_SET(&va, va_mode, e->mode & ALLPERMS);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	int cerr = vnode_close(vp, FWRITE, ctx);
++	return error ? error : cerr;
++}
++
++static const char *
++bp_kind_name(uint32_t kind)
++{
++	switch (kind) {
++	case BP_FILE:
++		return "file";
++	case BP_DIR:
++		return "dir";
++	case BP_REMOVE:
++		return "remove";
++	default:
++		return "?";
++	}
++}
++
++/* Walk the entries; apply them unless dry. Returns entries that failed (or -1: malformed). */
++static int
++bp_apply(const uint8_t *buf, uint64_t bytes, uint32_t count, bool dry, vfs_context_t ctx)
++{
++	uint64_t at = 0;
++	int failed = 0;
++
++	for (uint32_t i = 0; i < count; i++) {
++		struct bp_entry e;
++		if (bytes - at < sizeof(e)) {
++			printf("BLUELINE PUSH: entry %u: past the end; stopping\n", i);
++			return -1;
++		}
++		memcpy(&e, buf + at, sizeof(e));
++		uint64_t path_at = at + sizeof(e);
++		uint64_t data_at = path_at + (((uint64_t)e.path_len + 7) & ~7ull);
++		if (e.path_len > MAXPATHLEN || data_at > bytes || e.size > bytes - data_at ||
++		    (e.kind != BP_FILE && e.size != 0)) {
++			printf("BLUELINE PUSH: entry %u: bad sizes (path %u, data %llu); stopping\n",
++			    i, e.path_len, e.size);
++			return -1;
++		}
++		const char *path = (const char *)(buf + path_at);
++		if (!bp_path_ok(path, e.path_len)) {
++			printf("BLUELINE PUSH: entry %u: path refused; stopping\n", i);
++			return -1;
++		}
++		at = data_at + ((e.size + 7) & ~7ull);
++
++		if (dry) {
++			printf("BLUELINE PUSH: [dry] %s %s %llu bytes, mode %o, %u:%u\n",
++			    bp_kind_name(e.kind), path, e.size, e.mode & ALLPERMS, e.uid, e.gid);
++			continue;
++		}
++		uint32_t made = 0;
++		int error = 0;
++		switch (e.kind) {
++		case BP_FILE:
++			error = bp_make_parents(path, ctx, &made);
++			if (!error) {
++				error = bp_write_file(path, &e, buf + data_at, ctx);
++			}
++			break;
++		case BP_DIR: {
++			enum vtype t;
++			error = bp_make_parents(path, ctx, &made);
++			if (!error && bp_lookup_type(path, &t, ctx) == ENOENT) {
++				error = blue_kern_mkdir(path, e.mode & ALLPERMS, ctx);
++			}
++			if (!error) {
++				error = bp_setattr(path, e.mode, e.uid, e.gid, ctx);
++			}
++			break;
++		}
++		case BP_REMOVE:
++			error = blue_kern_unlink(path, ctx);
++			if (error == ENOENT) {
++				error = 0;
++			}
++			break;
++		default:
++			error = EINVAL;
++			break;
++		}
++		if (error) {
++			failed++;
++			printf("BLUELINE PUSH: %s %s FAILED (%d)\n", bp_kind_name(e.kind), path, error);
++		} else {
++			printf("BLUELINE PUSH: %s %s: %llu bytes, mode %o, %u:%u%s\n", bp_kind_name(e.kind), path,
++			    e.size, e.mode & ALLPERMS, e.uid, e.gid, made ? " (made parent directories)" : "");
++		}
++	}
++	return failed;
++}
++
++void
++blueline_payload_install(void)
++{
++	uint32_t mode = 0;
++	if (!PE_parse_boot_argn("bluepush", &mode, sizeof(mode)) || mode == 0) {
++		return;
++	}
++	uint64_t t0 = mach_absolute_time();
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t devvp = rootvp;
++	bool dry = mode == 2;
++
++	if (rootvnode == NULLVP || devvp == NULLVP || vnode_getwithref(devvp) != 0) {
++		printf("BLUELINE PUSH: off: no root device\n");
++		return;
++	}
++	mount_t mp = vnode_mount(rootvnode);
++	if (!dry && (mp == NULL || vfs_isrdonly(mp))) {
++		printf("BLUELINE PUSH: off: the root is read-only (needs rootrw=1)\n");
++		vnode_put(devvp);
++		return;
++	}
++
++	uint32_t secsize = 0;
++	uint64_t nsec = 0;
++	vm_offset_t buf = 0;
++	vm_size_t bufsize = 0;
++	struct bp_header h;
++	uint64_t area = 0;
++	int error = VNOP_IOCTL(devvp, DKIOCGETBLOCKSIZE, (caddr_t)&secsize, 0, ctx);
++	if (!error) {
++		error = VNOP_IOCTL(devvp, DKIOCGETBLOCKCOUNT, (caddr_t)&nsec, 0, ctx);
++	}
++	if (error || secsize == 0 || secsize > BP_BLOCK || (secsize & (secsize - 1))) {
++		printf("BLUELINE PUSH: off: root device size unknown (%d, sector %u)\n", error, secsize);
++		goto out;
++	}
++	uint64_t part_blocks = nsec * secsize / BP_BLOCK;
++	if (part_blocks < 2 * (BP_LOG_BLOCKS + BP_SNAP_BLOCKS + BP_AREA_BLOCKS)) {
++		printf("BLUELINE PUSH: off: partition too small\n");
++		goto out;
++	}
++	area = (part_blocks - BP_LOG_BLOCKS - BP_SNAP_BLOCKS - BP_AREA_BLOCKS) * BP_BLOCK;
++
++	bufsize = BP_CHUNK;
++	if (kmem_alloc(kernel_map, &buf, bufsize, KMA_DATA, VM_KERN_MEMORY_FILE) != KERN_SUCCESS) {
++		buf = 0;
++		printf("BLUELINE PUSH: off: no memory\n");
++		goto out;
++	}
++
++	/* The HFS+ volume header (partition byte 1024) must end before the area. */
++	error = bp_dev_read(devvp, secsize, 0, (void *)buf, BP_BLOCK);
++	const uint8_t *vh = (const uint8_t *)buf + 1024;
++	uint32_t sig = error ? 0 : (uint32_t)vh[0] << 8 | vh[1];
++	uint64_t hfs_end = error ? 0 : (uint64_t)bp_be32(vh + 40) * bp_be32(vh + 44);
++	if (error || (sig != 0x482b && sig != 0x4858) || hfs_end == 0 || hfs_end > area) {
++		printf("BLUELINE PUSH: off: HFS+ volume header %s (error %d, signature 0x%04x, ends at %llu MiB, "
++		    "area at %llu MiB)\n", error ? "unreadable" : "does not clear the area", error, sig,
++		    hfs_end >> 20, area >> 20);
++		goto out;
++	}
++
++	error = bp_dev_read(devvp, secsize, area, (void *)buf, BP_BLOCK);
++	if (error) {
++		printf("BLUELINE PUSH: off: area header unreadable (%d)\n", error);
++		goto out;
++	}
++	memcpy(&h, (const void *)buf, sizeof(h));
++	h.name[sizeof(h.name) - 1] = '\0';
++	if (memcmp(h.magic, "BLUEPUSH", 8) != 0) {
++		printf("BLUELINE PUSH: no payload at userdata +%llu MiB (tools/iosfs-push.sh writes one)\n", area >> 20);
++		goto out;
++	}
++	if (h.version != 1 || h.bytes == 0 || h.bytes > BP_MAX_BYTES || h.count == 0 || h.count > 4096) {
++		printf("BLUELINE PUSH: off: bad header (version %u, %u entries, %llu bytes)\n",
++		    h.version, h.count, h.bytes);
++		goto out;
++	}
++
++	/* The whole payload into memory, checked before the first change. */
++	kmem_free(kernel_map, buf, bufsize);
++	bufsize = round_page((vm_size_t)((h.bytes + BP_BLOCK - 1) & ~(uint64_t)(BP_BLOCK - 1)));
++	if (kmem_alloc(kernel_map, &buf, bufsize, KMA_DATA, VM_KERN_MEMORY_FILE) != KERN_SUCCESS) {
++		buf = 0;
++		printf("BLUELINE PUSH: off: no memory for %llu KiB\n", h.bytes >> 10);
++		goto out;
++	}
++	uint64_t want = (h.bytes + BP_BLOCK - 1) & ~(uint64_t)(BP_BLOCK - 1);
++	for (uint64_t off = 0; !error && off < want; off += BP_CHUNK) {
++		uint32_t n = (uint32_t)MIN((uint64_t)BP_CHUNK, want - off);
++		error = bp_dev_read(devvp, secsize, area + BP_BLOCK + off, (void *)(buf + off), n);
++	}
++	if (error) {
++		printf("BLUELINE PUSH: off: payload read failed (%d)\n", error);
++		goto out;
++	}
++	uint32_t crc = crc32(0, (const void *)buf, (size_t)h.bytes);
++	if (crc != h.crc) {
++		printf("BLUELINE PUSH: off: CRC 0x%08x, header says 0x%08x; nothing changed\n", crc, h.crc);
++		goto out;
++	}
++	printf("BLUELINE PUSH: payload \"%s\" (stamp %llu): %u entries, %llu KiB, CRC ok, read in %u ms\n",
++	    h.name, h.stamp, h.count, h.bytes >> 10, bp_ms_since(t0));
++
++	int failed = bp_apply((const uint8_t *)buf, h.bytes, h.count, dry, ctx);
++	if (!dry && mp != NULL) {
++		(void)VFS_SYNC(mp, MNT_WAIT, ctx);
++	}
++	if (failed < 0) {
++		printf("BLUELINE PUSH: malformed payload; entries before it were applied\n");
++	} else {
++		printf("BLUELINE PUSH: done%s: %u entries, %d failed, %u ms\n", dry ? " (dry run)" : "",
++		    h.count, failed, bp_ms_since(t0));
++	}
++out:
++	if (buf) {
++		kmem_free(kernel_map, buf, bufsize);
++	}
++	vnode_put(devvp);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -950,6 +950,16 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * bluepush=1 (patch 0152, bsd/dev/blueline_payload.c): files pushed by
++	 * tools/iosfs-push.sh into the root, before launchd or anything else runs.
++	 */
++	{
++		extern void blueline_payload_install(void);
++		blueline_payload_install();
++	}
++#endif
+ 
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9899,7 +9899,32 @@
+ 	return mkdir1at(vfs_context_current(), uap->path, &va, uap->fd,
+ 	           UIO_USERSPACE);
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * mkdir and unlink of a kernel-space path in ctx, for files pushed into the
++ * root at boot (patch 0152, bsd/dev/blueline_payload.c).
++ */
++int blue_kern_mkdir(const char *path, mode_t mode, vfs_context_t ctx);
++int blue_kern_unlink(const char *path, vfs_context_t ctx);
+ 
++int
++blue_kern_mkdir(const char *path, mode_t mode, vfs_context_t ctx)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(ctx, CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
++int
++blue_kern_unlink(const char *path, vfs_context_t ctx)
++{
++	return unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++#endif
++
+ static int
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)
+-- 
+2.39.0

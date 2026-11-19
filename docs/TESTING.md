@@ -78,3 +78,36 @@ bootloader and run the next test.
 - The phone is the reviewer: drafts go straight into the loop. An independent review is only asked for
   when a result can't be explained.
 - Every result goes into [LOG.md](LOG.md), with the numbers from the log.
+
+## Userland changes in the same loop (patch 0152)
+
+Before: `phone.sh sync` of the 16 GiB root, `sudo` mount on the Mac, edit, `simgdiff`, `fastboot flash
+userdata`. Now a file goes straight into the root during the test boot:
+
+```
+tools/bluerun/build.sh                 # runner + hello, iphoneos arm64, ad-hoc signed
+tools/phonetest.sh --name hello1 --push tools/bluerun/out/hello:/usr/local/bin/hello \
+  --run /usr/local/bin/hello,one,two --run-timeout 20
+```
+
+- **Push** (`tools/iosfs-push.sh`, `tools/mkpush.py`): in recovery, a payload of files is written with
+  dd into the 256 MiB of userdata below the screenshot area, beyond the end of the HFS+ volume (checked
+  against its volume header first), and read back. With `bluepush=1` the kernel reads it right after
+  mounting the root, before launchd, checks its CRC and writes each file through the HFS+ driver
+  (`BLUELINE PUSH:` lines). Files stay in the root; replacing a system binary or dylib works because
+  nothing runs yet. Not in the payload: anything in the dyld shared cache (a dylib there is loaded from
+  the cache, not from its path).
+- **Signing**: arm64 (not arm64e) Mach-O files for iOS, signed. Ad-hoc is enough (`codesign -s -`):
+  the kernel checks the page hashes, there is no trust cache, and every signed binary on the root
+  volume is a platform binary (sweet_amfi.c). `mkpush.py` refuses x86_64/macOS builds and signs
+  unsigned ones ad-hoc.
+- **Run** (`tools/bluerun`): a launchd job (added once with `tools/bluerun/setup.sh`, a normal diff
+  flash) starts `/usr/local/bin/bluerun` each boot; it reads `bluerun=PATH,ARG,...` from the
+  boot-args, waits for SpringBoard, runs the program with a timeout and writes its stdout/stderr to
+  `/dev/console` as `BLUERUN:` lines, which land in the persistent log.
+
+The runner's launchd job can also be installed without the diff flash: copy
+`System/Library/xpc/launchd.plist` out of the root image, run
+`iosroot-tweaks.py`'s `bluerun_job()` on the copy, and `--push` it to
+`/System/Library/xpc/launchd.plist` (done 2026-11-19; keep the original
+copy for a rollback push).

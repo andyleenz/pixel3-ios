@@ -2,6 +2,7 @@
 """Bring-up changes to the iOS root made by tools/mkiosroot.sh.
 
   sudo tools/iosroot-tweaks.py MOUNTED_ROOT
+  sudo tools/iosroot-tweaks.py --only bluerun MOUNTED_ROOT   (just that change)
 
 Idempotent; run as root (files keep their owners). What each change is for
 (findings from ios-sweet's bring-up on the same iOS build, see their
@@ -21,6 +22,11 @@ NOTES.md; the code here is our own):
   Setup           marked done, mini-buddies off
   activation      mobileactivationd data ark says Activated (the kernel's
                   device tree selects its no-server "Hactivation" path)
+  bluerun         launchd job com.blueline.bluerun: /usr/local/bin/bluerun
+                  once per boot, as root (the test runner of
+                  tools/phonetest.sh --run; the binary itself is pushed
+                  with each test, tools/bluerun/). Without the binary, or
+                  without a bluerun= boot-arg, it does nothing.
 """
 import glob
 import os
@@ -90,6 +96,26 @@ def launchd_jobs(root):
     rewrite(os.path.join(root, 'System/Library/xpc/launchd.plist'), change)
 
 
+BLUERUN_KEY = '/System/Library/LaunchDaemons/com.blueline.bluerun.plist'
+BLUERUN_JOB = {
+    'Label': 'com.blueline.bluerun',
+    'ProgramArguments': ['/usr/local/bin/bluerun'],
+    'RunAtLoad': True,
+    'LaunchOnlyOnce': True,
+    'UserName': 'root',
+    'POSIXSpawnType': 'Interactive',	# no background throttling for GPU tests
+}
+
+
+def bluerun_job(root):
+    def change(plist):
+        jobs = plist['LaunchDaemons']
+        state = 'unchanged' if jobs.get(BLUERUN_KEY) == BLUERUN_JOB else 'replaced' if BLUERUN_KEY in jobs else 'added'
+        jobs[BLUERUN_KEY] = dict(BLUERUN_JOB)
+        print('launchd.plist: job com.blueline.bluerun', state)
+    rewrite(os.path.join(root, 'System/Library/xpc/launchd.plist'), change)
+
+
 def containers(root):
     for sub, owner in (('Bundle', 33), ('Data/System', 0), ('Shared/SystemGroup', 0), ('Temp', 0)):
         d = os.path.join(root, 'private/var/containers', sub)
@@ -149,12 +175,20 @@ def audio_media(root):
 
 
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    only = None
+    if len(args) == 3 and args[0] == '--only' and args[1] in ('bluerun',):
+        only, args = args[1], args[2:]
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
     if os.geteuid() != 0:
         sys.exit('run as root')
-    root = sys.argv[1]
+    root = args[0]
+    if only == 'bluerun':
+        bluerun_job(root)
+        return
     launchd_jobs(root)
+    bluerun_job(root)
     containers(root)
     activation(root)
     audio_media(root)
