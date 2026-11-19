@@ -19,6 +19,9 @@ cp -c work/ios-root.img work/ios-root-new.img
 sudo tools/rootimg.sh mount work/ios-root-new.img
 trap 'sudo tools/rootimg.sh umount' EXIT
 sudo python3 tools/migration-reset.py work/root
+# the current DENY list (e.g. fairplayd, which hangs app installs and Photos without a SEP);
+# mobileassetd, which it also removes, is put back next for the migration
+sudo python3 tools/iosroot-tweaks.py --only launchd work/root
 sudo python3 tools/launchd-restore.py work/root "$orig" com.apple.mobileassetd
 sudo tools/rootimg.sh umount
 trap - EXIT
