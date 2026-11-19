@@ -4,6 +4,7 @@
   mkadt.py OUT.adt [--qemu] [--cpus N] [--ufs] [--iphone DT.im4p]
                    [--gpu-fw a630_gmu.bin [--gpu-sqe auto|vendor|linux|none|PATH]
                     [--gpu-zap auto|none|PATH.mdt]]
+                   [--haptic-fw DIR]
                    [--dump]
 
 The kernel is ios-sweet's SWEET machine config, so this provides what
@@ -32,6 +33,11 @@ Cortex-M3 TCM image), which xnu patch 0126 loads at boot-arg bluegpu=3.
 It is not redistributable here: tools/fetch-gpu-fw.sh downloads the pinned
 copy into work/fw/ (ignored by git) and checks its SHA-256; this checks it
 again. The kernel logs the image's 32-bit word sum, printed here too.
+
+--haptic-fw DIR adds /blueline-haptic with "wmfw" (DIR/cs40l20.wmfw, the
+CS40L20's DSP program) and "wavetable" (DIR/cs40l20.bin), the vendor
+partition's /firmware copies (work/fw/vendor/, ignored by git: debugfs
+from the OTA's vendor.img), loaded by xnu patch 0150 at bluehaptic=2.
 It also adds "sqe-firmware", the CP's SQE microcode (a630_sqe.fw, the
 whole file; the kernel drops dword 0 as Linux does), for xnu 0137 at
 bluegpu=6. --gpu-sqe picks it: auto (default) takes the phone's own
@@ -249,7 +255,17 @@ def d22ap_product(im4p):
     sys.exit('%s: no /product node' % im4p)
 
 
-def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None):
+def haptic_firmware(d):
+    """cs40l20.wmfw + cs40l20.bin from DIR, checked for their magic."""
+    wmfw = open(os.path.join(d, 'cs40l20.wmfw'), 'rb').read()
+    wt = open(os.path.join(d, 'cs40l20.bin'), 'rb').read()
+    if wmfw[:4] != b'WMFW' or len(wmfw) & 3 or wt[:4] != b'WMDR':
+        sys.exit('--haptic-fw %s: cs40l20.wmfw / cs40l20.bin are not WMFW / WMDR files' % d)
+    return wmfw, wt
+
+
+def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None,
+          haptic_fw=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -389,6 +405,10 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
             gpu['zap-elf'] = zap_fw		# 0144, bluegpu=7
         extra.append(node('blueline-gpu', gpu))
 
+    if haptic_fw is not None:
+        # Read by bsd/dev/blueline_haptic.c (0150) at bluehaptic=2.
+        extra.append(node('blueline-haptic', {'wmfw': haptic_fw[0], 'wavetable': haptic_fw[1]}))
+
     root_props.update({'#address-cells': u32(2), '#size-cells': u32(2)})
     return node('device-tree', root_props, [chosen, defaults, cpus_node, arm_io, fbcon] + extra + storage)
 
@@ -406,6 +426,8 @@ if __name__ == '__main__':
                     help='with --gpu-fw: the "sqe-firmware" to add (default auto: vendor/ copy, else linux-firmware)')
     ap.add_argument('--gpu-zap', default='auto', metavar='auto|none|PATH.mdt',
                     help='with --gpu-fw: the "zap-elf" to add (default auto: DIR/vendor/a630_zap.mdt + .bNN)')
+    ap.add_argument('--haptic-fw', metavar='DIR',
+                    help='add /blueline-haptic "wmfw" + "wavetable" from DIR/cs40l20.wmfw, cs40l20.bin')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if not 1 <= a.cpus <= 8 or (a.qemu and a.cpus != 1):
@@ -417,12 +439,17 @@ if __name__ == '__main__':
     gpu_fw = gmu_firmware(a.gpu_fw) if a.gpu_fw else None
     sqe_fw, sqe_why = sqe_firmware(a.gpu_sqe, a.gpu_fw) if a.gpu_fw else (None, None)
     zap_fw, zap_why = zap_firmware(a.gpu_zap, a.gpu_fw) if a.gpu_fw else (None, None)
-    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw)
+    haptic_fw = haptic_firmware(a.haptic_fw) if a.haptic_fw else None
+    root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw,
+                 haptic_fw=haptic_fw)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
         dump(root)
     print('%s: %d bytes' % (a.out, len(blob)), file=sys.stderr)
+    if haptic_fw is not None:
+        print('  /blueline-haptic wmfw %d bytes, wavetable %d bytes' % (len(haptic_fw[0]), len(haptic_fw[1])),
+              file=sys.stderr)
     if gpu_fw is not None:
         print('  /blueline-gpu gmu-firmware: %d bytes, word sum %#x'
               % (len(gpu_fw), sum(struct.unpack('<%dI' % (len(gpu_fw) // 4), gpu_fw)) & 0xffffffff),

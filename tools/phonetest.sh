@@ -54,6 +54,7 @@ if [ "$quick" = 1 ]; then
 fi
 kernel=work/kbuild/out/kernel.development.sweet
 fw=(); [ -f work/fw/a630_gmu.bin ] && fw=(--gpu-fw work/fw/a630_gmu.bin)
+[ -f work/fw/vendor/cs40l20.wmfw ] && [ -f work/fw/vendor/cs40l20.bin ] && fw+=(--haptic-fw work/fw/vendor)	# 0150
 python3 tools/mkadt.py --ufs --cpus 8 --iphone work/DeviceTree.d22ap.im4p "${fw[@]}" "$out/$name.adt" > /dev/null
 python3 tools/mkpayload.py "$kernel" "$out/$name.adt" "$out/$name-payload.bin" --cmdline "$base $extra" > /dev/null
 PATH=/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH p2-shim/build.sh "$out/$name-payload.bin" stock/boot.img > "$out/$name-shim.txt" 2>&1
