@@ -30,7 +30,8 @@ mkdir "$a"
 db=$(echo "$tmp"/x/*/private/var/db)
 find "$db" -name '*:com.apple.*' -delete       # 7-Zip writes xattrs as files
 mv "$db"/diagnostics/* "$db"/uuidtext/* "$a"/
-"$ul" -m log-archive -i "$a" -o /dev/stdout 2>/dev/null | grep -E -- "$1" | python3 -c '
+# (run in $tmp: the parser drops an issues.jsonl of warnings in the current folder)
+(cd "$tmp" && "$ul" -m log-archive -i "$a" -o /dev/stdout 2>/dev/null) | grep -E -- "$1" | python3 -c '
 import sys, json
 for l in sys.stdin:
     try:
