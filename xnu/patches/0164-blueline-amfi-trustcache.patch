@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 20 Nov 2026 08:00:00 +1100
+Subject: [PATCH] 0164: AMFI says every cdhash is in a trust cache
+
+iOS's removable system apps are ad-hoc signed and trusted only through
+the static trust cache. installd checks them with libmis's TrustCacheOnly option, which asks
+an AppleMobileFileIntegrity IOService (selector 6, the cdhash); with no
+such service every system app failed ("Failed to verify code signature
+... 0xe8008001"). Add the service, and answer AMFI's other trust cache
+question (__mac_syscall("AMFI", 0x5f), Security's code requirements).
+Both say yes: every root binary already runs as a platform binary.
+---
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1562,7 +1562,33 @@
+  * Returns:        0                      Success
+  *                !0                      Not success
+  *
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * AMFI op 0x5f, "is this cdhash in a trust cache?" (libmis
++ * amfi_interface_cdhash_in_trustcache; Security's requirement check asks it
++ * for ad-hoc signed code). arg -> {u8 cdhash[20]; u32 pad; u64 result}, and
++ * the answer is yes when the call returns 0 with result != 0. iOS's system
++ * apps (Calculator, Contacts, ...) are ad-hoc signed and trusted only
++ * through the static trust cache, so without an answer installd refuses
++ * every one of them (0xe8008001/0xe8008014, "signer is not trusted"). There
++ * is no trust cache here and every binary on the root volume already runs
++ * as a platform binary, so say yes to every cdhash.
+  */
++#define SWEET_AMFI_CDHASH_IN_TRUSTCACHE 0x5f
++
++static int
++sweet_amfi_cdhash_in_trustcache(user_addr_t arg)
++{
++	uint64_t result = 1;
++
++	if (arg == USER_ADDR_NULL) {
++		return EINVAL;
++	}
++	return copyout(&result, arg + 0x18, sizeof(result));
++}
++#endif
++
+ int
+ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ {
+@@ -1584,6 +1610,12 @@
+ 		return error;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (uap->call == SWEET_AMFI_CDHASH_IN_TRUSTCACHE && strcmp(target, "AMFI") == 0) {
++		return sweet_amfi_cdhash_in_trustcache(uap->arg);
++	}
++#endif
++
+ 	error = ENOPOLICY;
+ 
+ 	for (i = 0; i < mac_policy_list.staticmax; i++) {
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -53,6 +53,11 @@
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleMobileFileIntegrity;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,6 +20,7 @@
+ iokit/Kernel/arm/BlueDPU.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/BlueGPUPresent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/BlueGPUUserClient.cpp                           optional iokitcpp
++iokit/Kernel/arm/BlueAMFI.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/BlueAMFI.cpp
+@@ -0,0 +1,95 @@
++/*
++ * Built-in AppleMobileFileIntegrity IOService for blueline: answers libmis's
++ * trust cache question.
++ *
++ * iOS's removable system apps (/var/staged_system_apps: Calculator,
++ * Contacts, ...) are ad-hoc signed and trusted only through the static
++ * trust cache. installd validates them with kMISValidationOptionTrustCacheOnly;
++ * libmis then opens IOServiceMatching("AppleMobileFileIntegrity") (type 0)
++ * and calls selector 6 with one scalar (1) and the cdhash as the structure
++ * input. 0 means in a trust cache, kIOReturnNotFound means not. Without the
++ * service every system app install failed with 0xe8008001.
++ *
++ * There is no trust cache here and every binary on the root volume already
++ * runs as a platform binary (sweet_amfi.c), so every cdhash is in. Other
++ * selectors are logged and unsupported.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++#define BLUE_AMFI_SEL_TRUSTCACHE        6
++
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	IOLog("BLUE AMFI: AppleMobileFileIntegrity registered (every cdhash trusted)\n");
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch __unused,
++    OSObject *target __unused, void *reference __unused)
++{
++	static uint32_t logged;
++	char name[20];
++
++	if (selector == BLUE_AMFI_SEL_TRUSTCACHE) {
++		uint32_t len = args->structureInputDescriptor != NULL ?
++		    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++		if (len < 20) {
++			return kIOReturnBadArgument;
++		}
++		if (logged < 8) {
++			logged++;
++			proc_selfname(name, sizeof(name));
++			IOLog("BLUE AMFI: %s asks whether a %u-byte cdhash is in a trust cache: yes\n",
++			    name, len);
++		}
++		return kIOReturnSuccess;
++	}
++	proc_selfname(name, sizeof(name));
++	IOLog("BLUE AMFI: %s selector %u (%u scalars in, %u bytes in) unsupported\n",
++	    name, selector, args->scalarInputCount, args->structureInputSize);
++	return kIOReturnUnsupported;
++}
++#endif

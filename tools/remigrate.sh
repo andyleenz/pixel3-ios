@@ -36,6 +36,8 @@ echo "staged apps: $(ls work/root/private/var/staged_system_apps | wc -l)"
 # mobileassetd, which it also removes, is put back next for the migration
 sudo python3 tools/iosroot-tweaks.py --only launchd work/root
 sudo python3 tools/launchd-restore.py work/root "$orig" com.apple.mobileassetd
+# keep the test runner job (tools/bluerun), which migr1-3 lost
+sudo python3 tools/iosroot-tweaks.py --only bluerun work/root
 sudo tools/rootimg.sh umount
 trap - EXIT
 python3 tools/simgdiff.py work/ios-root.img work/ios-root-new.img work/diff.simg

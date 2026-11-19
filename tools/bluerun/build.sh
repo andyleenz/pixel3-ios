@@ -18,7 +18,7 @@ extra=()
 for f in "$@"; do extra+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"); done
 cd "$(dirname "$0")"
 mkdir -p out
-cc=(xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Wno-unused-parameter)
+cc=(xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Wno-unused-parameter -framework CoreFoundation)
 sign() {
 	if [ -n "${ENTITLEMENTS:-}" ]; then
 		codesign -s - -f --entitlements "$ENTITLEMENTS" "$1"
