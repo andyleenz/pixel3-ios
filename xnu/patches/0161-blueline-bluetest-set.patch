@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 20:00:00 +0100
+Subject: [PATCH] 0161: bluetest=1 stands for the test boot's board set
+
+tools/phonetest.sh put about 100 bytes of board arguments (battery,
+LMh, watchdog, framebuffer) on every boot. With blueui, the reboot
+arguments and pushes, only about 200 bytes were left for a
+bluetouchscript. bluetest=1 now stands for that set, the same way
+blueui=1 (0156) stands for the GPU set. An argument given on the
+command line still wins.
+---
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -193,34 +193,42 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /*
+  * 0156: blueui=1 stands for the GPU-rendered UI set (stage 6f), so test and
+- * demo boots stay well inside the 607-byte command line. An argument given
+- * on the command line still wins over its value here.
++ * demo boots stay well inside the 607-byte command line. 0161: bluetest=1
++ * stands for the board set every test boot carries (tools/phonetest.sh). An
++ * argument given on the command line still wins over its value here.
+  */
+ static const struct {
++	const char *set;
+ 	const char *name;
+ 	long long num;
+ 	const char *str;
+ } blue_ui_set[] = {
+-	{ "bluegpu", 8, NULL },
+-	{ "bluegpu_mhz", 710, NULL },
+-	{ "bluedpu_flip", 1, NULL },
+-	{ "cs_enforcement_disable", 1, NULL },
+-	{ "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib" },
++	{ "blueui", "bluegpu", 8, NULL },
++	{ "blueui", "bluegpu_mhz", 710, NULL },
++	{ "blueui", "bluedpu_flip", 1, NULL },
++	{ "blueui", "cs_enforcement_disable", 1, NULL },
++	{ "blueui", "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib" },
++	{ "bluetest", "bluebatt", 1, NULL },
++	{ "bluetest", "bluemax", 2, NULL },
++	{ "bluetest", "bluelmh", 1, NULL },
++	{ "bluetest", "bluewdt", 30, NULL },
++	{ "bluetest", "bluewdt_recovery", 1, NULL },
++	{ "bluetest", "sweetfb_noconsole", 1, NULL },
++	{ "bluetest", "sweetfb_hz", 60, NULL },
+ };
+ 
+ static boolean_t
+ blue_ui_default(const char *arg_string, void *arg_ptr, int max_len)
+ {
+-	int on = 0;
+-
+-	if (strcmp(arg_string, "blueui") == 0 ||
+-	    !PE_parse_boot_argn_internal(PE_boot_args(), "blueui", &on, sizeof(on), FALSE) || on == 0) {
+-		return FALSE;
+-	}
+ 	for (size_t i = 0; i < sizeof(blue_ui_set) / sizeof(blue_ui_set[0]); i++) {
++		int on = 0;
++
+ 		if (strcmp(arg_string, blue_ui_set[i].name) != 0) {
+ 			continue;
+ 		}
++		if (!PE_parse_boot_argn_internal(PE_boot_args(), blue_ui_set[i].set, &on, sizeof(on), FALSE) || on == 0) {
++			continue;
++		}
+ 		if (blue_ui_set[i].str != NULL) {
+ 			if (max_len <= 0) {
+ 				return FALSE;

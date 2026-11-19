@@ -75,9 +75,9 @@ if [ -n "$run" ]; then
 fi
 [ ${#pushes[@]} -gt 0 ] && extra="$extra bluepush=1" && : "${end_in:=recovery}"
 : "${end_in:=fastboot}"
-base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60'
+base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1'
 # real time of day: work/rtc-offset = Mac time minus the raw PM8998 RTC count (see rtc*-rtc.txt)
-base="$base bluebatt=1 bluemax=2 bluelmh=1 bluewdt=30 bluewdt_recovery=1"
+base="$base bluetest=1"	# 0161: bluebatt=1 bluemax=2 bluelmh=1 bluewdt=30 bluewdt_recovery=1 sweetfb_noconsole=1 sweetfb_hz=60
 [ -s work/rtc-offset ] && base="$base bluertc=2 bluertc_offset=$(cat work/rtc-offset)"
 case " $extra " in *" bluereboot="*) : "${wait:=5}" ;; *) : "${wait:=30}" ;; esac
 out=work/test; mkdir -p "$out"
