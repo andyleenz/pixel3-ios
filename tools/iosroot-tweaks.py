@@ -47,7 +47,10 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'purplebuddy', 'restore', 'usb',
         'accessoryd', 'bird', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd',
-        'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # FairPlay needs the Secure Enclave: fairplayd restarts forever, and checkpointd's call
+        # to it never returns, which hangs Photos (and anything else that asks checkpointd).
+        'fairplayd')
 
 
 def read_plist(path):
