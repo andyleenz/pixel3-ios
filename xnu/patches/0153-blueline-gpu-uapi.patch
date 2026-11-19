@@ -967,7 +967,7 @@ new file mode 100644
 index 000000000..a13f02441
 --- /dev/null
 +++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
-@@ -0,0 +1,1779 @@
+@@ -0,0 +1,1783 @@
 +/*
 + * blueline (Pixel 3, SDM845, Adreno 630): the GPU user interface, patch
 + * 0153. The IOService "BlueGPU" and its IOUserClient speak Linux drm/msm
@@ -1633,7 +1633,7 @@ index 000000000..a13f02441
 +	n = 0;
 +	for (uint32_t i = 0; i < a->nr_bos; i++) {
 +		if (bos[i].flags & ~(BLUE_GPU_SUBMIT_BO_READ | BLUE_GPU_SUBMIT_BO_WRITE | BLUE_GPU_SUBMIT_BO_DUMP |
-+		    BLUE_GPU_SUBMIT_BO_NO_IMPLICIT)) {
++		    BLUE_GPU_SUBMIT_BO_NO_IMPLICIT | BLUE_GPU_SUBMIT_BO_NOSYNC)) {
 +			ret = kIOReturnBadArgument;
 +			goto out;
 +		}
@@ -1682,7 +1682,11 @@ index 000000000..a13f02441
 +				b->t_clean = mach_absolute_time();
 +			}
 +		} else if (b->kind == BG_UPTR) {
-+			bg_import_cache(b, true);
++			/* NOSYNC (bluedrm: memory the CPU never touches after its first submit): cleaned once */
++			if (!(bos[i].flags & BLUE_GPU_SUBMIT_BO_NOSYNC) || b->t_clean == 0) {
++				bg_import_cache(b, true);
++				b->t_clean = mach_absolute_time();
++			}
 +		}
 +	}
 +	bg_watch();
@@ -2752,7 +2756,7 @@ new file mode 100644
 index 000000000..506071351
 --- /dev/null
 +++ b/iokit/Kernel/arm/blue_gpu_uapi.h
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,309 @@
 +/*
 + * Kernel copy of mesa-ios/blue_gpu_uapi.h (pixel3-ios-gpu), byte for byte below this comment.
 + * The userland side owns it: change it there and copy it here, never the other way.
@@ -2946,6 +2950,7 @@ index 000000000..506071351
 +#define BLUE_GPU_SUBMIT_BO_WRITE        0x0002
 +#define BLUE_GPU_SUBMIT_BO_DUMP         0x0004
 +#define BLUE_GPU_SUBMIT_BO_NO_IMPLICIT  0x0008
++#define BLUE_GPU_SUBMIT_BO_NOSYNC       0x0100  /* blue: a USERPTR BO the CPU never touches; cleaned at its first submit only */
 +
 +struct blue_gpu_submit_cmd {            /* == struct drm_msm_gem_submit_cmd (32 bytes) */
 +	uint32_t type;                  /* BLUE_GPU_SUBMIT_CMD_*                               */
