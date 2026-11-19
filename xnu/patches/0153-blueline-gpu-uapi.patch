@@ -1,0 +1,3066 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 23:30:00 +1100
+Subject: [PATCH] 0153: blueline GPU: user interface (BlueGPU, msm ABI for
+ mesa-ios/bluedrm)
+
+Stage 6d of pixel3-ios-gpu/gpu-stage6-plan.md, on top of 0147 and 0151.
+Kernel side of the GPU user interface; the ABI is mesa-ios/blue_gpu_uapi.h
+(copied byte for byte to iokit/Kernel/arm/blue_gpu_uapi.h; userland owns
+it): Linux drm/msm, selector = DRM_COMMAND_BASE + DRM_MSM_* (GEM_CLOSE
+0x09, USERPTR 0x7d, IOSURFACE 0x7e as HakiOS), the struct in and back
+through IOConnectCallStructMethod, mmap = IOConnectMapMemory64 with the
+GEM handle as the memory type.
+
+New files (most of the patch):
+ - bsd/dev/blueline_gpu_mem.c: the GPU pool, a physical carve-out below
+   4 GiB that XNU does not manage (default 32 MiB at 0xc0000000, at most 32 MiB (ml_io_map region),
+   bluegpu_pool_mb / bluegpu_pool_base; refused outside 0xa4000000..
+   0xe0000000 or if any page is managed RAM), kernel view write-combined,
+   64 KiB first-fit. GPU VA, one table for everything (per-process tables
+   are stage 2): L1[2] 0x80000000 = the pool, linear, 2M blocks; L1[3]
+   0xc0000000 = imports, 4K PTEs. The pool's first 4 MiB hold the tables.
+ - iokit/Kernel/arm/BlueGPUUserClient.cpp: the IOService "BlueGPU" (on
+   IOResources, published by the bring-up thread once resident) and
+   BlueGPUUserClient: GET/SET_PARAM, GEM_NEW, GEM_INFO, CPU_PREP/FINI,
+   SUBMIT, WAIT_FENCE, GEM_CLOSE, MADVISE, SUBMITQUEUE_*, USERPTR,
+   IOSURFACE. Struct sizes exact, handles per connection, IBs only from
+   the caller's own pool BOs and inside them, no relocs, fences checked
+   against what was issued. Closed BOs wait for their fence and for the
+   last task mapping. IOSurfaces: one handle per surface per connection,
+   clean to PoC at submit (seed or 4 ms), invalidate at CPU_PREP.
+   bluegpu_uapi_test=1: an in-kernel client through the same operations
+   (CP_MEM_WRITE + 2D fill IB, ring wrap, CPU_PREP, busy close, refusals,
+   userptr) logging "BLUEGPU TEST:" lines.
+ - bsd/dev/blueline_gpu_core.h: the C interface between the three.
+
+bsd/dev/blueline_gpu.c, one block marked 0153 before rs_cpu plus four
+small hunks: the ring is shared, so every ring write holds
+blue_gpu_ring_lock and checks space against RPTR (presents too; a present
+is never queued behind user work, it is a CPU copy then); rs_recover
+(0151's, renamed rs_recover_unlocked) runs under the lock and retires
+every user fence; rs_irq wakes user waiters; the bring-up thread calls
+blue_gpu_uapi_start(). User submit: CCU/cache invalidate, WFI,
+CP_ALWAYS_ON, CP_INDIRECT_BUFFER per IB, WFI, CP_ALWAYS_ON, the present
+path's 2D state again, CCU flush TS x2, CACHE_FLUSH_TS, WFI, CP_MEM_WRITE
+seq (target page +0xa00), CACHE_FLUSH_TS | IRQ.
+
+Boot-args: bluegpu=8 (needed), bluegpu_uapi=0 (off), bluegpu_pool_mb,
+bluegpu_pool_base, bluegpu_uapi_hang_ms (1000), bluegpu_uapi_test=1.
+Not tested on the phone yet (draft).
+
+The design follows HakiOS's msm-DRM clone (drivers/gpu/hakios.gpu.cpp,
+APSL 2.0) and ios-flame 0113 (MIT); no code copied.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 49872f4de..b72771b9d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/blueline_scm.c			standard
+ bsd/dev/blueline_wdt.c			standard
+ bsd/dev/blueline_wifi.c			standard
+ bsd/dev/blueline_gpu.c			standard
++bsd/dev/blueline_gpu_mem.c			standard
+ bsd/dev/blueline_haptic.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+diff --git a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+index f3d3803e8..bfe4e3f1d 100644
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -454,6 +454,8 @@
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>	/* CleanPoC_DcacheRegion_Force (0147) */
+ #include <kern/thread.h>		/* kernel_thread_start (0147) */
++#include <kern/locks.h>			/* blue_gpu_ring_lock (0153) */
++#include "blueline_gpu_core.h"		/* 0153: the GPU user interface's view of this file */
+ #include <kern/sched_prim.h>		/* assert_wait_deadline, clear_wait (0151) */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -980,7 +982,11 @@ rscc_idle_check(void)
+ /* arm_smmu_write_context_bank + qcom_adreno_smmu_write_sctlr for a non-coherent AArch64 stage-1 domain */
+ #define CB_CBA2R_VAL		1u						/* VA64 */
+ #define CB_CBAR_VAL		((1u << 16) | (0xfu << 12) | (3u << 8))		/* S1 trans/S2 bypass, WB, NSH */
+-#define CB_TCR2_VAL		((1u << 4) | 1u)				/* AS, PASIZE 36 bits: this SMMU reports OAS 36 */
++/*
++ * 0153: SEP (bits 17:15) = 7, "upstream" (as Linux's ARM_SMMU_TCR2_SEP_UPSTREAM). With SEP 0, VA bit 31
++ * is the sign bit, so every GPU VA from 0x80000000 picked TTBR1 (off, EPD1) and faulted (ATS PAR 0xa03).
++ */
++#define CB_TCR2_VAL		((7u << 15) | (1u << 4) | 1u)			/* SEP upstream, AS, PASIZE 36 bits (OAS 36) */
+ #define CB_TCR_VAL		((1u << 23) | (2u << 12) | 32u)			/* EPD1, SH0 OS, NC walk, 4K, T0SZ 32 */
+ #define CB_MAIR0_VAL		0xf404ff44u	/* io-pgtable-arm: 0 NC, 1 WBRWA, 2 device, 3 inner NC/outer WB */
+ #define CB_SCTLR_VAL		((1u << 12) | (1u << 8) | (1u << 5) | (1u << 2) | (1u << 1) | 1u)
+@@ -4446,6 +4452,7 @@ rs_irq(__unused void *arg)
+ 		}
+ 	}
+ 	thread_wakeup(RS_EVENT);
++	blue_gpu_uapi_fence_signal();	/* 0153: user fences share the interrupt */
+ }
+ 
+ /* GMU "gmu" interrupt (a6xx_gmu_irq): watchdog bite, fence error, host AHB error. */
+@@ -5042,7 +5049,7 @@ fail:
+  * presenting again.
+  */
+ static bool
+-rs_recover(const char *why)
++rs_recover_unlocked(const char *why)	/* 0153: rs_recover (with the ring lock) wraps it */
+ {
+ 	uint64_t t0 = mach_absolute_time(), ns, minute = 60ull * NSEC_PER_SEC;
+ 	const char *bad = NULL;
+@@ -5514,6 +5521,334 @@ rs_stats(void)
+ 	rs.blit_ticks = rs.blit_max = rs.lag_ns = rs.lag_max = 0;
+ }
+ 
++/*
++ * ==== 0153: the GPU user interface's way into the resident core ==========
++ * (bsd/dev/blueline_gpu_core.h; callers: blueline_gpu_mem.c and
++ * iokit/Kernel/arm/BlueGPUUserClient.cpp.) The ring is shared with the
++ * present blit above: every ring write (present or user) holds
++ * blue_gpu_ring_lock and checks the free space against RPTR first (the ring
++ * is a circle since rs_up; CP_RB_CNTL NO_UPDATE, so RPTR is the register).
++ * A present is never queued behind unfinished user work (its 500 ms hang
++ * guard would then time user IBs): it falls back to the CPU copy instead.
++ *
++ * User submit, per batch:
++ *   CCU colour/depth invalidate, CACHE_INVALIDATE, WFI, ALWAYS_ON (start)
++ *   CP_INDIRECT_BUFFER (iova lo, hi, dwords) per IB
++ *   WFI, ALWAYS_ON (end), the present path's 2D state again (Mesa may change
++ *   RB_CCU_CNTL, the marker and the flag buffer), then the fence: CCU flush
++ *   TS x2, CACHE_FLUSH_TS (0151: the interrupt), WFI, CP_MEM_WRITE seq. The
++ *   MEM_WRITE word is the fence the kernel trusts.
++ * With 0151's interrupt on, a second CACHE_FLUSH_TS with the IRQ bit after
++ * the MEM_WRITE (as rs_put_tail): rs_irq wakes the user waiters too.
++ * Target page words (zeroed in blue_gpu_core_uapi_init; the page is filled
++ * with 0x11111111; clear of the draw fences +0x100..0x4ff, 0147/0151's
++ * +0x800..0x83f, the probe +0x900..0x91f and the border +0xc00..0xdff):
++ * +0xa00 MEM_WRITE, +0xa04 CACHE_FLUSH_TS, +0xa08/+0xa0c CCU colour/depth,
++ * +0xa10 the IRQ CACHE_FLUSH_TS; +0xe00..0xfff ALWAYS_ON start/end per seq
++ * (32 x 16 B).
++ * 0151: rs_recover runs under blue_gpu_ring_lock (the wrapper at the end of
++ * this block; the body is 0151's, renamed rs_recover_unlocked) and a
++ * recovery that worked retires every user fence (the ring is empty again).
++ */
++
++#define CP_INDIRECT_BUFFER	0x3fu
++#define UA_TIMES_OFF		(CP_TARGET_OFF + 0xe00u)	/* 32 slots x (start, end) 64-bit */
++#define UA_TIMES_SLOTS		32u
++#define UA_FENCE_OFF		(CP_TARGET_OFF + 0xa00u)	/* +0 MEM_WRITE, +4 CACHE_FLUSH_TS, +8/+12 CCU, +16 IRQ */
++#define UA_PRESENT_ROOM		320u	/* ring dwords a present may need (two passes, two bars, tail, test packet) */
++#define UA_HEAD_DW		11u	/* invalidates 6, WFI 1, stamp 4 */
++#define UA_TAIL_DW		(1u + 4u + 2u + 2u + 4u + 2u + 15u + 1u + 4u + 5u)	/* WFI, stamp, 2D state, fence, IRQ */
++
++static LCK_GRP_DECLARE(blue_gpu_ring_grp, "blueline_gpu_ring");
++static LCK_MTX_DECLARE(blue_gpu_ring_mtx, &blue_gpu_ring_grp);
++static struct {
++	bool init;
++	uint32_t seq;		/* last user seq written to the ring */
++	uint32_t n_retry;	/* WPTR writes the AHB fence dropped */
++} ua;
++
++void
++blue_gpu_ring_lock(void)
++{
++	lck_mtx_lock(&blue_gpu_ring_mtx);
++}
++
++void
++blue_gpu_ring_unlock(void)
++{
++	lck_mtx_unlock(&blue_gpu_ring_mtx);
++}
++
++bool
++blue_gpu_core_ready(void)
++{
++	return __atomic_load_n(&rs.ready, __ATOMIC_ACQUIRE) && cp.wrap && !rs.dead;
++}
++
++/* Free ring dwords: CIRC_SPACE of (RPTR, WPTR index). */
++static uint32_t
++ua_room(void)
++{
++	uint32_t r = cp_rd(GXR_CP_RB_RPTR) & (CP_RING_DWORDS - 1), w = cp.wptr & (CP_RING_DWORDS - 1);
++	return (r - w - 1) & (CP_RING_DWORDS - 1);
++}
++
++uint32_t
++blue_gpu_core_room(void)
++{
++	return blue_gpu_core_ready() ? ua_room() : 0;
++}
++
++uint32_t
++blue_gpu_core_retired(void)
++{
++	return cp.va ? cp_mem(UA_FENCE_OFF)[0] : ua.seq;
++}
++
++/* Present path: user work still on the GPU (a present must not wait behind it). */
++static bool
++ua_busy(void)
++{
++	return ua.init && cp_mem(UA_FENCE_OFF)[0] != ua.seq;
++}
++
++void
++blue_gpu_core_uapi_init(void)
++{
++	blue_gpu_ring_lock();
++	if (!ua.init && blue_gpu_core_ready()) {
++		for (uint32_t i = 0; i < UA_TIMES_SLOTS * 4; i++) {
++			cp_mem(UA_TIMES_OFF)[i] = 0;
++		}
++		for (uint32_t i = 0; i < 8; i++) {
++			cp_mem(UA_FENCE_OFF)[i] = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ua.seq = 0;
++		ua.init = true;
++	}
++	blue_gpu_ring_unlock();
++}
++
++/* 0151, after a reset (ring lock held or not): the user fence word as if everything submitted retired. */
++uint32_t
++blue_gpu_core_fence_force(void)
++{
++	if (cp.va && ua.init) {
++		cp_mem(UA_FENCE_OFF)[0] = ua.seq;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	return ua.seq;
++}
++
++void
++blue_gpu_core_fence_words(uint32_t w[4])
++{
++	for (uint32_t i = 0; i < 4; i++) {
++		w[i] = cp.va ? cp_mem(UA_FENCE_OFF)[i] : 0;
++	}
++}
++
++bool
++blue_gpu_core_times(uint32_t seq, uint64_t *start, uint64_t *end)
++{
++	uint32_t off = UA_TIMES_OFF + (seq & (UA_TIMES_SLOTS - 1)) * 16u;
++	if (!cp.va || (int32_t)(cp_mem(UA_FENCE_OFF)[0] - seq) < 0 || (int32_t)(ua.seq - seq) >= (int32_t)UA_TIMES_SLOTS) {
++		return false;
++	}
++	*start = rs_ao(off);
++	*end = rs_ao(off + 8);
++	return true;
++}
++
++uint64_t
++blue_gpu_core_timestamp(void)
++{
++	if (!blue_gpu_core_ready()) {
++		return 0;
++	}
++	uint32_t hi, lo, hi2;
++	do {
++		hi = cp_rd(GXR_CP_ALWAYS_ON + 1);
++		lo = cp_rd(GXR_CP_ALWAYS_ON);
++		hi2 = cp_rd(GXR_CP_ALWAYS_ON + 1);
++	} while (hi != hi2);
++	return ((uint64_t)hi << 32) | lo;
++}
++
++uint32_t
++blue_gpu_core_submit_dwords(uint32_t n_ibs)
++{
++	return UA_HEAD_DW + 4u * n_ibs + UA_TAIL_DW;
++}
++
++int
++blue_gpu_core_submit(const uint64_t *iova, const uint32_t *dwords, uint32_t n, uint32_t *seq)
++{
++	if (n == 0 || n > BLUE_GPU_CORE_MAX_IBS) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		if (!dwords[i] || dwords[i] > BLUE_GPU_CORE_IB_MAX_DW || (iova[i] & 3) || iova[i] + 4ull * dwords[i] > (1ull << 32)) {
++			return EINVAL;
++		}
++	}
++	blue_gpu_ring_lock();
++	if (!ua.init || !blue_gpu_core_ready()) {
++		blue_gpu_ring_unlock();
++		return ENXIO;
++	}
++	uint32_t need = blue_gpu_core_submit_dwords(n);
++	if (ua_room() < need + UA_PRESENT_ROOM) {
++		blue_gpu_ring_unlock();
++		return EBUSY;
++	}
++	uint32_t from = cp.wptr, s = ua.seq + 1 ? ua.seq + 1 : 1;	/* 0 is "never submitted" */
++	uint32_t t = UA_TIMES_OFF + (s & (UA_TIMES_SLOTS - 1)) * 16u;
++	dr_event(EV_CCU_INV_COLOR);
++	dr_event(EV_CCU_INV_DEPTH);
++	dr_event(EV_CACHE_INVALIDATE);
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	rs_put_ao(t);
++	for (uint32_t i = 0; i < n; i++) {
++		cp_put(pkt7(CP_INDIRECT_BUFFER, 3));
++		cp_put((uint32_t)iova[i]);
++		cp_put((uint32_t)(iova[i] >> 32));
++		cp_put(dwords[i]);
++	}
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	rs_put_ao(t + 8);
++	dr_reg(R_RB_CCU_CNTL, RB_CCU_CNTL_SYSMEM);
++	cp_put(pkt7(CP_SET_MARKER, 1));
++	cp_put(RM6_BLIT2DSCALE);
++	cp_put(pkt4(R_RB_A2D_DEST_FLAG, 3));
++	cp_put(0);
++	cp_put(0);
++	cp_put(0);
++	dr_reg(R_RB_DBG_ECO_CNTL, 0x04100000u);	/* dr_setup's value; dr_eco toggles bit 24 around blits */
++	dr_event_ts(EV_CCU_FLUSH_COLOR_TS, UA_FENCE_OFF + 8, s);
++	dr_event_ts(EV_CCU_FLUSH_DEPTH_TS, UA_FENCE_OFF + 12, s);
++	dr_event_ts(EV_CACHE_FLUSH_TS, UA_FENCE_OFF + 4, s);
++	cp_put(pkt7(CP_WAIT_FOR_IDLE, 0));
++	cp_put(pkt7(CP_MEM_WRITE, 3));
++	cp_put(CP_VA + UA_FENCE_OFF);
++	cp_put(0);
++	cp_put(s);
++	if (rs.irq_on) {
++		dr_event_ts(EV_CACHE_FLUSH_TS | CP_EVENT_IRQ, UA_FENCE_OFF + 16, s);
++	}
++	if (cp.wptr - from > need) {
++		/* a miscount here would have run over unread ring: stop everything */
++		printf("BLUELINE GPU: 0153 submit wrote %u ring dwords, counted %u: BUG, GPU off for users and presents\n",
++		    cp.wptr - from, need);
++		rs.dead = true;
++		blue_gpu_ring_unlock();
++		return ENXIO;
++	}
++	ua.seq = s;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	cp_wr(GXR_CP_RB_WPTR, cp.wptr & (CP_RING_DWORDS - 1));
++	for (int i = 0; i < 3 && (gmu_rd(GMU_AHB_FENCE_STATUS) & AHB_FENCE_DROPPED); i++) {
++		delay(10);
++		cp_wr(GXR_CP_RB_WPTR, cp.wptr & (CP_RING_DWORDS - 1));
++		ua.n_retry++;
++	}
++	blue_gpu_ring_unlock();
++	*seq = s;
++	return 0;
++}
++
++/* L1[2] (pool) and L1[3] (imports) only; set from empty or cleared; cb0 TLB invalidated. */
++bool
++blue_gpu_core_l1(uint32_t index, uint64_t table_pa)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(cp.va + CP_PT_OFF);
++	bool ok;
++
++	if (index < 2 || index > 3 || !blue_gpu_core_ready() || (table_pa & 0xfffull) ||
++	    (table_pa && ((table_pa >> smmu_oas) || l1[index]))) {
++		return false;
++	}
++	blue_gpu_ring_lock();
++	__asm__ volatile ("dsb sy" ::: "memory");
++	l1[index] = table_pa ? (table_pa | LPAE_TABLE) : 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ok = smmu_tlbi_cb(0);
++	blue_gpu_ring_unlock();
++	return ok;
++}
++
++bool
++blue_gpu_core_tlbi(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return blue_gpu_core_ready() && smmu_tlbi_cb(0);
++}
++
++bool
++blue_gpu_core_ats(uint32_t va, uint64_t pa)
++{
++	return !blue_gpu_core_ready() || smmu_ats_cb(0, va, pa);
++}
++
++uint64_t
++blue_gpu_core_pte(uint64_t pa, int kind)
++{
++	switch (kind) {
++	case BLUE_PTE_PAGE_RO:
++		return LPAE_PAGE_RO(pa);
++	case BLUE_PTE_BLOCK:
++		return LPAE_PAGE(pa) & ~2ull;
++	case BLUE_PTE_TABLE:
++		return pa | LPAE_TABLE;
++	default:
++		return LPAE_PAGE(pa);
++	}
++}
++
++uint32_t
++blue_gpu_core_oas(void)
++{
++	return smmu_oas;
++}
++
++uint32_t
++blue_gpu_core_fsr(void)
++{
++	return blue_gpu_core_ready() ? rd(cbn(0, CB_FSR)) : 0;
++}
++
++void
++blue_gpu_core_dump(const char *why)
++{
++	if (!cp.va) {
++		return;
++	}
++	printf("BLUELINE GPU: 0153 %s: user seq %u, MEM_WRITE %#x CACHE_FLUSH_TS %#x CCU %#x/%#x, rptr %u wptr %u"
++	    " (index %u), WPTR retries %u\n", why, ua.seq, cp_mem(UA_FENCE_OFF)[0], cp_mem(UA_FENCE_OFF)[1],
++	    cp_mem(UA_FENCE_OFF)[2], cp_mem(UA_FENCE_OFF)[3], cp_rd(GXR_CP_RB_RPTR), cp_rd(GXR_CP_RB_WPTR),
++	    cp.wptr & (CP_RING_DWORDS - 1), ua.n_retry);
++	cp_smmu_faults(why);
++	cp_dump(why);
++	gx_report(why);
++}
++/* 0151's recovery with the ring to itself; afterwards every user fence counts as retired. */
++static bool
++rs_recover(const char *why)
++{
++	blue_gpu_ring_lock();
++	bool ok = rs_recover_unlocked(why);
++	if (ok) {
++		(void)blue_gpu_core_fence_force();
++	}
++	blue_gpu_ring_unlock();
++	if (ok && ua.init) {
++		blue_gpu_uapi_reset();
++	}
++	return ok;
++}
++/* ==== end 0153 ============================================================ */
++
+ /* CPU copy: the blit in flight first (bounded), so the CPU's pixels land after the GPU's. */
+ static int
+ rs_cpu(int why)
+@@ -5595,6 +5930,11 @@ blue_gpu_present_c(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, v
+ 		}
+ 		rs.test_next = ev ? mach_absolute_time() + ev : 0;
+ 	}
++	blue_gpu_ring_lock();	/* 0153: the ring is shared with user submits */
++	if (ua_busy() || ua_room() < UA_PRESENT_ROOM) {
++		blue_gpu_ring_unlock();
++		return rs_cpu(RSF_OFF);	/* 0153: never queued behind user work (the hang guard would time it) */
++	}
+ 	uint32_t from = cp.wptr;
+ 	rs.seq++;
+ 	if (test) {
+@@ -5602,13 +5942,15 @@ blue_gpu_present_c(const struct blue_gpu_src *s, const struct blue_gpu_dst *d, v
+ 	}
+ 	rs_put_present(s, d, src_va);
+ 	rs_put_tail(rs.seq);
+-	if (cp.wptr - from > RS_RING_MAX) {
++	if (cp.wptr - from > UA_PRESENT_ROOM) {	/* 0153: was RS_RING_MAX; more would overrun user work */
+ 		printf("BLUELINE GPU: present: %u ring dwords (max %u): BUG, GPU presents off\n", cp.wptr - from,
+-		    RS_RING_MAX);
++		    UA_PRESENT_ROOM);
+ 		rs.dead = true;
++		blue_gpu_ring_unlock();
+ 		return rs_cpu(RSF_OFF);
+ 	}
+ 	rs_kick();
++	blue_gpu_ring_unlock();	/* 0153 */
+ 	rs.n_gpu++;
+ 	rs.total_gpu++;
+ 	if (rs.check && !rs.checked) {
+@@ -6276,6 +6618,9 @@ gpu_bringup_thread(void *arg, wait_result_t wr_)
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	printf("BLUELINE GPU: resident bring-up thread done after %llu ms: %s\n", ns / 1000000,
+ 	    rs.up ? "GPU RESIDENT" : "not resident (everything undone as at bluegpu=7)");
++	if (rs.up) {
++		blue_gpu_uapi_start();	/* 0153: the BlueGPU service, its pool and (bluegpu_uapi_test=1) the self-test */
++	}
+ }
+ 
+ void
+diff --git a/bsd/dev/blueline_gpu_core.h b/bsd/dev/blueline_gpu_core.h
+new file mode 100644
+index 000000000..f95dceb23
+--- /dev/null
++++ b/bsd/dev/blueline_gpu_core.h
+@@ -0,0 +1,99 @@
++/*
++ * blueline (Pixel 3, SDM845, Adreno 630): what the GPU user interface (patch
++ * 0153) needs from the resident GPU core and the GPU memory pool, as plain C.
++ *
++ *   bsd/dev/blueline_gpu.c            the core: ring, fences, page-table root
++ *                                     (one block marked "0153", next to the
++ *                                     present blit it shares the ring with)
++ *   bsd/dev/blueline_gpu_mem.c        the pool below 4 GiB and the GPU VA
++ *                                     windows the pool and imports live in
++ *   iokit/Kernel/arm/BlueGPUUserClient.cpp
++ *                                     the IOService "BlueGPU", its msm-shaped
++ *                                     IOUserClient and the bluegpu_uapi_test
++ *                                     in-kernel client
++ *
++ * GPU VA (cb0, one shared table; the SMMU bank is set up by 0137 with T0SZ 32,
++ * so the GPU's address space is 4 GiB and L1 has 4 entries):
++ *   L1[0] 0x00000000..0x3fffffff  kernel: GMEM 0x100000, CP 0x01000000, panel 0x02000000
++ *   L1[1] 0x40000000..0x7fffffff  present surface slots (0147)
++ *   L1[2] 0x80000000..0xbfffffff  the pool, linear: GPU VA = 0x80000000 + (pa - pool base),
++ *                                 4K pages (tables in XNU memory, not in the pool)
++ *   L1[3] 0xc0000000..0xffffffff  imports (IOSurfaces, userptr), 4K pages, 64K-granule VA
++ * GET_PARAM VA_START/VA_SIZE report 0x80000000/0x80000000.
++ */
++#ifndef _BLUELINE_GPU_CORE_H
++#define _BLUELINE_GPU_CORE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ---- core (blueline_gpu.c, the 0153 block) ---------------------------------------------- */
++#define BLUE_GPU_CORE_MAX_IBS   64u             /* CP_INDIRECT_BUFFERs per submit */
++#define BLUE_GPU_CORE_IB_MAX_DW 0xfffffu        /* IB size field (dwords) */
++#define BLUE_PTE_PAGE           0               /* 4K page, read-write, Normal NC (MAIR index 0) */
++#define BLUE_PTE_PAGE_RO        1               /* 4K page, read-only */
++#define BLUE_PTE_BLOCK          2               /* 2M block (L2), read-write */
++#define BLUE_PTE_TABLE          3               /* next-level table */
++
++bool     blue_gpu_core_ready(void);             /* resident, ring a circle, no present hang */
++void     blue_gpu_core_uapi_init(void);         /* zero the user fence words (once, before the first submit) */
++uint32_t blue_gpu_core_room(void);              /* free ring dwords now (no lock: a hint) */
++uint32_t blue_gpu_core_submit_dwords(uint32_t n_ibs);
++/* 0 ok (*seq set), EBUSY ring full, ENXIO not ready, EINVAL bad count/size */
++int      blue_gpu_core_submit(const uint64_t *iova, const uint32_t *dwords, uint32_t n, uint32_t *seq);
++uint32_t blue_gpu_core_fence_force(void);       /* after a recovery: MEM_WRITE word = last user seq; returns it */
++uint32_t blue_gpu_core_retired(void);           /* last user seq the GPU finished (MEM_WRITE after WFI) */
++void     blue_gpu_core_fence_words(uint32_t w[4]); /* MEM_WRITE, CACHE_FLUSH_TS, CCU colour, CCU depth */
++bool     blue_gpu_core_times(uint32_t seq, uint64_t *start, uint64_t *end);    /* CP_ALWAYS_ON stamps */
++uint64_t blue_gpu_core_timestamp(void);         /* CP_ALWAYS_ON_COUNTER, 19.2 MHz */
++bool     blue_gpu_core_l1(uint32_t index, uint64_t table_pa);  /* L1[2] / L1[3]; 0 clears; TLB invalidated */
++bool     blue_gpu_core_tlbi(void);              /* cb0 TLBIASID + sync */
++bool     blue_gpu_core_ats(uint32_t va, uint64_t pa);   /* ATS1PR check (logs); true if no ATS */
++uint64_t blue_gpu_core_pte(uint64_t pa, int kind);
++uint32_t blue_gpu_core_oas(void);               /* SMMU output address bits */
++uint32_t blue_gpu_core_fsr(void);               /* cb0 FSR (0: no fault) */
++void     blue_gpu_core_dump(const char *why);   /* CP, ring, SMMU state into the log */
++void     blue_gpu_ring_lock(void);              /* around every ring write: user submits, presents, 0151 recovery */
++void     blue_gpu_ring_unlock(void);
++
++/* ---- pool + GPU windows (blueline_gpu_mem.c); callers serialise (BlueGPUUserClient.cpp lock) ---- */
++#define BLUE_GMEM_GRANULE       0x10000ull      /* 64 KiB */
++#define BLUE_GMEM_POOL_GVA      0x80000000ull
++#define BLUE_GMEM_IMP_GVA       0xc0000000ull
++#define BLUE_GMEM_IMP_SIZE      0x40000000ull
++#define BLUE_GMEM_VA_START      BLUE_GMEM_POOL_GVA
++#define BLUE_GMEM_VA_SIZE       0x80000000ull
++
++struct blue_gmem_info {
++	uint64_t pool_pa, pool_size, pool_gva;  /* the pool and where the GPU sees it */
++	uintptr_t pool_kva;                     /* write-combined kernel view */
++	uint64_t imp_gva, imp_size;
++	uint32_t granules, free_granules, low_free;     /* pool, in 64 KiB granules */
++	uint32_t imp_granules, imp_free;
++};
++
++bool blue_gmem_init(void);                      /* boot-args, checks, mapping, tables, L1[2..3] */
++bool blue_gmem_alloc(uint64_t size, uint64_t *pa, uint64_t *gva, uintptr_t *kva);     /* zeroed */
++void blue_gmem_free(uint64_t pa, uint64_t size);
++bool blue_gmem_imp_alloc(uint64_t size, uint64_t *gva);
++bool blue_gmem_imp_map(uint64_t gva, uint64_t pa, bool ro);    /* one 4K page */
++void blue_gmem_imp_unmap(uint64_t gva, uint64_t size);         /* PTEs cleared: blue_gmem_sync() next */
++void blue_gmem_imp_free(uint64_t gva, uint64_t size);
++bool blue_gmem_sync(void);                      /* dsb, then the GPU TLB */
++bool blue_gmem_kva_to_pa(uintptr_t kva, uint64_t *pa); /* kernel (managed) VA, 4K resolution */
++void blue_gmem_get_info(struct blue_gmem_info *info);
++
++/* ---- user interface (BlueGPUUserClient.cpp) -------------------------------------------- */
++void blue_gpu_uapi_start(void);                 /* from the bring-up thread once resident */
++void blue_gpu_uapi_fence_signal(void);          /* from 0151's rs_irq: a CACHE_FLUSH_TS interrupt */
++void blue_gpu_uapi_reset(void);                 /* from rs_recover after a 0151 recovery: all user fences retired */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _BLUELINE_GPU_CORE_H */
+diff --git a/bsd/dev/blueline_gpu_mem.c b/bsd/dev/blueline_gpu_mem.c
+new file mode 100644
+index 000000000..a0fa25219
+--- /dev/null
++++ b/bsd/dev/blueline_gpu_mem.c
+@@ -0,0 +1,360 @@
++/*
++ * blueline (Pixel 3, SDM845, Adreno 630): the GPU memory pool and the GPU
++ * VA windows of the user interface (patch 0153). See blueline_gpu_core.h.
++ *
++ * The pool is a physical carve-out below 4 GiB that XNU does not manage:
++ * XNU's RAM starts at 0xf4000000 (tools/mkadt.py DRAM_BASE, /chosen
++ * dram-base), so a range below it has no physmap alias and the CPU may map
++ * it write-combined (Normal NC) without a cacheable alias anywhere. The
++ * default is 32 MiB at 0xc0000000 (bluegpu_pool_mb, bluegpu_pool_base; at most
++ * 32 MiB, because the kernel view comes from the ml_io_map region, 64 MiB in
++ * all with sailfish 0208, and ml_io_map panics when it is full):
++ * inside 0xa4000000..0xe0000000, which the blueline DTB's reserved-memory
++ * and the downstream carve-outs (all below 0xa1c11000; rmtfs at 0xf2700000)
++ * leave free, and clear of the 0xe0000000 slice Wi-Fi claims and the
++ * 0xa2000000 one the sensors want. Each page is also checked against
++ * pmap_valid_address (managed RAM) before it is mapped.
++ *
++ * GPU side: one shared address space (cb0's table, also the kernel's
++ * present mappings); per-process page tables are stage 2. The pool is
++ * mapped linearly at 0x80000000 (L1[2]) with 4K pages, so a pool BO's
++ * GPU VA is 0x80000000 + (pa - base) and needs no map/unmap on alloc/free.
++ * Imports (IOSurfaces, userptr) go through 4K PTEs in L1[3] at 0xc0000000.
++ * The tables (pool L2, import L2, 512 import L3s) live in XNU memory
++ * (kmem_alloc_contig, switched to VM_WIMG_WCOMB like 0147's surface tables),
++ * not in the carve-out: on the phone the SMMU's table walk through tables in
++ * the carve-out faulted (ATS PAR 0xa03) at both 0xa4000000 and 0xc0000000.
++ *
++ * Not thread-safe: BlueGPUUserClient.cpp serialises every call.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "blueline_gpu_core.h"
++
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);	/* osfmk/arm64/machine_routines.c */
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern boolean_t pmap_valid_address(uint64_t);			/* osfmk/arm/pmap/pmap.h */
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);	/* osfmk/vm/pmap.h, kernel-private */
++
++#define GM_WIN_LO		0xa4000000ull	/* the pool must sit inside [GM_WIN_LO, GM_WIN_HI) */
++#define GM_WIN_HI		0xe0000000ull
++#define GM_DEFAULT_BASE		0xc0000000ull
++#define GM_DEFAULT_MB		32u
++#define GM_IO_MAX_MB		32u	/* ml_io_map region: 64 MiB in all (sailfish 0208), shared */
++#define GM_MAX			0x40000000ull	/* L1[2]: 1 GiB */
++#define GM_BLK			0x200000ull
++#define GM_META			0ull		/* the whole pool is GPU-mapped (tables are elsewhere) */
++#define GT_POOL_L2		0x0ull		/* table arena: pool L2 */
++#define GT_IMP_L2		0x1000ull	/* import L2 */
++#define GT_POOL_L3		0x4000ull	/* pool L3s: one per 2 MiB, up to GM_IO_MAX_MB */
++#define GT_L3			(GT_POOL_L3 + (GM_IO_MAX_MB / 2) * 0x1000ull)	/* import L3s: 512 x 4K */
++#define GT_SIZE			(GT_L3 + 512 * 0x1000ull)
++#define GM_POOL_GRANULES	(GM_MAX / BLUE_GMEM_GRANULE)		/* 16384 */
++#define GM_IMP_GRANULES		(BLUE_GMEM_IMP_SIZE / BLUE_GMEM_GRANULE)	/* 16384 */
++
++static struct {
++	bool up, tried;
++	uint64_t pa, size;
++	vm_offset_t kva;
++	vm_offset_t tva;	/* table arena (XNU memory, WCOMB) */
++	uint64_t tpa;
++	uint32_t granules, nfree, imp_free;
++	uint64_t pool_bits[GM_POOL_GRANULES / 64];
++	uint64_t imp_bits[GM_IMP_GRANULES / 64];
++} gm;
++
++static bool
++gm_bit(const uint64_t *b, uint32_t i)
++{
++	return (b[i / 64] >> (i % 64)) & 1;
++}
++
++static void
++gm_set(uint64_t *b, uint32_t i, uint32_t n, bool v)
++{
++	for (uint32_t k = i; k < i + n; k++) {
++		if (v) {
++			b[k / 64] |= 1ull << (k % 64);
++		} else {
++			b[k / 64] &= ~(1ull << (k % 64));
++		}
++	}
++}
++
++/* First fit of n clear bits in [0, total); returns total if none. */
++static uint32_t
++gm_find(const uint64_t *b, uint32_t nbits, uint32_t n)
++{
++	uint32_t run = 0;
++	for (uint32_t i = 0; i < nbits; i++) {
++		if (b[i / 64] == ~0ull && (i % 64) == 0) {
++			run = 0;
++			i += 63;
++			continue;
++		}
++		run = gm_bit(b, i) ? 0 : run + 1;
++		if (run == n) {
++			return i + 1 - n;
++		}
++	}
++	return nbits;
++}
++
++static volatile uint64_t *
++gm_tab(uint64_t off)
++{
++	return (volatile uint64_t *)(gm.tva + off);
++}
++
++bool
++blue_gmem_init(void)
++{
++	uint32_t mb = GM_DEFAULT_MB;
++	uint64_t base = GM_DEFAULT_BASE;
++	const char *why = NULL;
++
++	if (gm.tried) {
++		return gm.up;
++	}
++	gm.tried = true;
++	(void)PE_parse_boot_argn("bluegpu_pool_mb", &mb, sizeof(mb));
++	(void)PE_parse_boot_argn("bluegpu_pool_base", &base, sizeof(base));
++	if (mb == 0) {
++		printf("BLUEGPU UAPI: pool off (bluegpu_pool_mb=0): GEM_NEW fails, imports only\n");
++		return false;
++	}
++	uint64_t size = (uint64_t)mb << 20;
++	if (base & (GM_BLK - 1)) {
++		why = "bluegpu_pool_base not 2 MiB aligned";
++	} else if (size <= GM_META || size > GM_MAX || (size & (GM_BLK - 1))) {
++		why = "bluegpu_pool_mb not a multiple of 2 between 2 and 1024";
++	} else if (mb > GM_IO_MAX_MB) {
++		why = "over 32 MiB (the kernel view comes from the 64 MiB ml_io_map region, which panics when full)";
++	} else if (base < GM_WIN_LO || base + size > GM_WIN_HI) {
++		why = "outside the free window 0xa4000000..0xe0000000";
++	} else if ((base + size - 1) >> blue_gpu_core_oas()) {
++		why = "above the SMMU's output size";
++	}
++	for (uint64_t o = 0; !why && o < size; o += PAGE_SIZE) {
++		if (pmap_valid_address(base + o)) {
++			why = "overlaps RAM XNU manages";
++		}
++	}
++	if (why) {
++		printf("BLUEGPU UAPI: pool %u MiB at %#llx refused: %s; GEM_NEW fails, imports only\n", mb,
++		    (unsigned long long)base, why);
++		return false;
++	}
++	/* The tables first, in XNU memory the SMMU can walk (as 0147's surface tables). */
++	if (kmem_alloc_contig(kernel_map, &gm.tva, (vm_size_t)GT_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		gm.tva = 0;
++		printf("BLUEGPU UAPI: pool: no contiguous memory for the GPU tables (%llu KiB); pool off\n",
++		    (unsigned long long)(GT_SIZE >> 10));
++		return false;
++	}
++	gm.tpa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gm.tva));
++	bool contig = gm.tpa != 0 && ((gm.tpa + GT_SIZE - 1) >> blue_gpu_core_oas()) == 0;
++	for (uint64_t o = 0; o < GT_SIZE; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(gm.tva + o));
++		contig = contig && ptoa_64(pn) == gm.tpa + o;
++		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);	/* Normal NC: the SMMU walks without snooping */
++	}
++	if (!contig) {
++		printf("BLUEGPU UAPI: pool: GPU tables not contiguous or above the SMMU's output size; pool off\n");
++		return false;	/* the arena stays allocated (harmless) */
++	}
++	gm.kva = ml_io_map_wcomb((vm_offset_t)base, (vm_size_t)size);
++	if (!gm.kva) {
++		printf("BLUEGPU UAPI: pool %u MiB at %#llx: no kernel mapping\n", mb, (unsigned long long)base);
++		return false;
++	}
++	gm.pa = base;
++	gm.size = size;
++	gm.granules = (uint32_t)(size / BLUE_GMEM_GRANULE);
++	/*
++	 * pool L2 -> one L3 per 2 MiB -> 4K pages over the whole pool. Not 2 MiB
++	 * block descriptors: with blocks, ATS on cb0 faulted (PAR 0xa03, TF) with
++	 * the tables in the carve-out and in XNU memory alike, while 0147's
++	 * L2 -> L3 -> page tables translate.
++	 */
++	for (uint64_t o = GM_META; o < size; o += GM_BLK) {
++		uint64_t l3 = GT_POOL_L3 + (o / GM_BLK) * 0x1000ull;
++		gm_tab(GT_POOL_L2)[o / GM_BLK] = blue_gpu_core_pte(gm.tpa + l3, BLUE_PTE_TABLE);
++		for (uint64_t p = 0; p < GM_BLK; p += 0x1000) {
++			gm_tab(l3)[p / 0x1000] = blue_gpu_core_pte(base + o + p, BLUE_PTE_PAGE);
++		}
++	}
++	for (uint32_t i = 0; i < 512; i++) {
++		gm_tab(GT_IMP_L2)[i] = blue_gpu_core_pte(gm.tpa + GT_L3 + 0x1000ull * i, BLUE_PTE_TABLE);
++	}
++	bzero(gm.pool_bits, sizeof(gm.pool_bits));
++	bzero(gm.imp_bits, sizeof(gm.imp_bits));
++	gm_set(gm.pool_bits, 0, (uint32_t)(GM_META / BLUE_GMEM_GRANULE), true);
++	gm_set(gm.pool_bits, gm.granules, (uint32_t)GM_POOL_GRANULES - gm.granules, true);
++	gm.nfree = gm.granules - (uint32_t)(GM_META / BLUE_GMEM_GRANULE);
++	gm.imp_free = (uint32_t)GM_IMP_GRANULES;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!blue_gpu_core_l1(2, gm.tpa + GT_POOL_L2) || !blue_gpu_core_l1(3, gm.tpa + GT_IMP_L2)) {
++		(void)blue_gpu_core_l1(2, 0);
++		printf("BLUEGPU UAPI: pool: L1[2]/L1[3] not free or TLB sync timeout: pool off\n");
++		return false;	/* the kernel mapping stays (never unmapped: harmless) */
++	}
++	gm.up = true;
++	printf("BLUEGPU UAPI: GPU tables at pa %#llx (%llu KiB, WCOMB): pool L2[0] %#llx L2[1] %#llx, import L2[0] %#llx\n",
++	    (unsigned long long)gm.tpa, (unsigned long long)(GT_SIZE >> 10), (unsigned long long)gm_tab(GT_POOL_L2)[0],
++	    (unsigned long long)gm_tab(GT_POOL_L2)[1], (unsigned long long)gm_tab(GT_IMP_L2)[0]);
++	bool a = blue_gpu_core_ats((uint32_t)(BLUE_GMEM_POOL_GVA + GM_META), base + GM_META);
++	bool b = blue_gpu_core_ats((uint32_t)(BLUE_GMEM_POOL_GVA + size - 0x1000), base + size - 0x1000);
++	printf("BLUEGPU UAPI: pool %u MiB at pa %#llx..%#llx (unmanaged, CPU write-combined at %p), GPU VA %#llx..%#llx"
++	    " (L1[2], 4K pages), imports at GPU VA %#llx..%#llx (L1[3], 4K); ATS %s\n", mb,
++	    (unsigned long long)base, (unsigned long long)(base + size), (void *)gm.kva,
++	    (unsigned long long)(BLUE_GMEM_POOL_GVA + GM_META), (unsigned long long)(BLUE_GMEM_POOL_GVA + size),
++	    (unsigned long long)BLUE_GMEM_IMP_GVA, (unsigned long long)(BLUE_GMEM_IMP_GVA + BLUE_GMEM_IMP_SIZE),
++	    a && b ? "ok" : "WRONG");
++	return true;
++}
++
++bool
++blue_gmem_alloc(uint64_t size, uint64_t *pa, uint64_t *gva, uintptr_t *kva)
++{
++	if (!gm.up || size == 0 || size > gm.size) {
++		return false;
++	}
++	uint32_t n = (uint32_t)((size + BLUE_GMEM_GRANULE - 1) / BLUE_GMEM_GRANULE);
++	uint32_t i = gm_find(gm.pool_bits, gm.granules, n);
++	if (i >= gm.granules) {
++		return false;
++	}
++	gm_set(gm.pool_bits, i, n, true);
++	gm.nfree -= n;
++	uint64_t off = (uint64_t)i * BLUE_GMEM_GRANULE;
++	bzero((void *)(gm.kva + off), (size_t)n * BLUE_GMEM_GRANULE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*pa = gm.pa + off;
++	*gva = BLUE_GMEM_POOL_GVA + off;
++	*kva = gm.kva + off;
++	return true;
++}
++
++void
++blue_gmem_free(uint64_t pa, uint64_t size)
++{
++	if (!gm.up || pa < gm.pa + GM_META || pa + size > gm.pa + gm.size || ((pa - gm.pa) % BLUE_GMEM_GRANULE)) {
++		printf("BLUEGPU UAPI: pool free of %#llx+%#llx refused (not a pool range)\n", (unsigned long long)pa,
++		    (unsigned long long)size);
++		return;
++	}
++	uint32_t i = (uint32_t)((pa - gm.pa) / BLUE_GMEM_GRANULE);
++	uint32_t n = (uint32_t)((size + BLUE_GMEM_GRANULE - 1) / BLUE_GMEM_GRANULE);
++	gm_set(gm.pool_bits, i, n, false);
++	gm.nfree += n;
++}
++
++bool
++blue_gmem_imp_alloc(uint64_t size, uint64_t *gva)
++{
++	if (!gm.up || size == 0 || size > BLUE_GMEM_IMP_SIZE) {
++		return false;
++	}
++	uint32_t n = (uint32_t)((size + BLUE_GMEM_GRANULE - 1) / BLUE_GMEM_GRANULE);
++	uint32_t i = gm_find(gm.imp_bits, (uint32_t)GM_IMP_GRANULES, n);
++	if (i >= GM_IMP_GRANULES) {
++		return false;
++	}
++	gm_set(gm.imp_bits, i, n, true);
++	gm.imp_free -= n;
++	*gva = BLUE_GMEM_IMP_GVA + (uint64_t)i * BLUE_GMEM_GRANULE;
++	return true;
++}
++
++static volatile uint64_t *
++gm_pte(uint64_t gva)
++{
++	uint64_t idx = (gva - BLUE_GMEM_IMP_GVA) >> 12;	/* 0 .. 2^18 - 1 */
++	return gm_tab(GT_L3) + idx;
++}
++
++bool
++blue_gmem_imp_map(uint64_t gva, uint64_t pa, bool ro)
++{
++	if (!gm.up || gva < BLUE_GMEM_IMP_GVA || gva >= BLUE_GMEM_IMP_GVA + BLUE_GMEM_IMP_SIZE || (gva & 0xfff) ||
++	    (pa & 0xfff) || (pa >> blue_gpu_core_oas())) {
++		return false;
++	}
++	*gm_pte(gva) = blue_gpu_core_pte(pa, ro ? BLUE_PTE_PAGE_RO : BLUE_PTE_PAGE);
++	return true;
++}
++
++void
++blue_gmem_imp_unmap(uint64_t gva, uint64_t size)
++{
++	if (!gm.up || gva < BLUE_GMEM_IMP_GVA || gva + size > BLUE_GMEM_IMP_GVA + BLUE_GMEM_IMP_SIZE) {
++		return;
++	}
++	for (uint64_t o = 0; o < size; o += 0x1000) {
++		*gm_pte(gva + o) = 0;
++	}
++}
++
++void
++blue_gmem_imp_free(uint64_t gva, uint64_t size)
++{
++	if (!gm.up || gva < BLUE_GMEM_IMP_GVA || gva + size > BLUE_GMEM_IMP_GVA + BLUE_GMEM_IMP_SIZE ||
++	    ((gva - BLUE_GMEM_IMP_GVA) % BLUE_GMEM_GRANULE)) {
++		return;
++	}
++	uint32_t i = (uint32_t)((gva - BLUE_GMEM_IMP_GVA) / BLUE_GMEM_GRANULE);
++	uint32_t n = (uint32_t)((size + BLUE_GMEM_GRANULE - 1) / BLUE_GMEM_GRANULE);
++	gm_set(gm.imp_bits, i, n, false);
++	gm.imp_free += n;
++}
++
++bool
++blue_gmem_sync(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return blue_gpu_core_tlbi();
++}
++
++bool
++blue_gmem_kva_to_pa(uintptr_t kva, uint64_t *pa)
++{
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (!pn) {
++		return false;
++	}
++	*pa = ptoa_64(pn) | (kva & PAGE_MASK);
++	return true;
++}
++
++void
++blue_gmem_get_info(struct blue_gmem_info *info)
++{
++	bzero(info, sizeof(*info));
++	info->imp_gva = BLUE_GMEM_IMP_GVA;
++	info->imp_size = BLUE_GMEM_IMP_SIZE;
++	info->imp_granules = (uint32_t)GM_IMP_GRANULES;
++	if (!gm.up) {
++		return;
++	}
++	info->pool_pa = gm.pa;
++	info->pool_size = gm.size;
++	info->pool_gva = BLUE_GMEM_POOL_GVA;
++	info->pool_kva = gm.kva;
++	info->granules = gm.granules;
++	info->free_granules = gm.nfree;
++	info->imp_free = gm.imp_free;
++	uint32_t run = 0, best = 0;
++	for (uint32_t i = 0; i < gm.granules; i++) {
++		run = gm_bit(gm.pool_bits, i) ? 0 : run + 1;
++		best = run > best ? run : best;
++	}
++	info->low_free = best;	/* largest free run */
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/BlueGPUUserClient.cpp b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+new file mode 100644
+index 000000000..a13f02441
+--- /dev/null
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -0,0 +1,1779 @@
++/*
++ * blueline (Pixel 3, SDM845, Adreno 630): the GPU user interface, patch
++ * 0153. The IOService "BlueGPU" and its IOUserClient speak Linux drm/msm
++ * (blue_gpu_uapi.h, a copy of mesa-ios/blue_gpu_uapi.h): selector = the low
++ * byte of the DRM ioctl number, the struct goes in and comes back through
++ * IOConnectCallStructMethod, mmap is IOConnectMapMemory64 with the GEM
++ * handle as the memory type. mesa-ios/bluedrm turns that back into libdrm
++ * for Mesa freedreno's drm/msm backend.
++ *
++ * The shape follows HakiOS's msm-DRM clone (drivers/gpu/hakios.gpu.cpp,
++ * APSL 2.0, like this file): handles per connection, BOs closed while the
++ * GPU still uses them parked until their fence retires, one handle per
++ * imported IOSurface per connection, surface cleans keyed on the surface
++ * seed with a 4 ms re-clean, userptr through withAddressRange + prepare
++ * with a read-only fallback, WAIT_FENCE refusing fences never issued, the
++ * ring space test (CIRC_SPACE on RPTR). No HakiOS code is copied. ios-flame
++ * (MIT) 0113's lesson is kept too: a BO's pages outlive every task mapping.
++ *
++ * Pieces:
++ *   bsd/dev/blueline_gpu.c (0153 block)  ring, fence words, page-table root
++ *   bsd/dev/blueline_gpu_mem.c           the pool and the GPU VA windows
++ *   this file                            service, connections, BOs, waits,
++ *                                        the bluegpu_uapi_test client
++ *
++ * Memory: BOs come from the pool (bluegpu_pool_mb, below 4 GiB, outside
++ * XNU's RAM, CPU write-combined: no cacheable alias anywhere, no cache
++ * maintenance). Imports (IOSurfaces, userptr) are cacheable RAM: cleaned
++ * to PoC before a submit that uses them, invalidated at CPU_PREP after the
++ * GPU wrote them. GPU VA is one space for every connection (stage 2:
++ * per-process tables); the IOMMU therefore does not keep clients apart.
++ *
++ * Security (v1): every struct is size-checked, every handle is looked up in
++ * the caller's own table, IBs must lie inside one of the caller's pool BOs.
++ * There is no CP_PROTECT and no per-process table yet, so a client's IB can
++ * still reach anything the GPU can (other BOs, the panel, GPU registers):
++ * keep the service to trusted clients until stage 2.
++ *
++ * Fences: one sequence for all connections and queues (one ring); a fence
++ * retired when the MEM_WRITE word reached it. Waiters sleep in 200 us
++ * slices and 0151's CACHE_FLUSH_TS interrupt wakes them early
++ * (blue_gpu_uapi_fence_signal). A 0151 recovery (RBBM hang detect, seen by
++ * the vsync thread) empties the ring: every fence then counts as retired
++ * and FAULTS goes up (blue_gpu_uapi_reset). A hang the hardware does not
++ * flag (no fence progress for bluegpu_uapi_hang_ms with work queued) or a
++ * GPU 0147/0151 gave up on: logged once, user access stops (fences count
++ * as retired, FAULTS up, submits fail, the pages of BOs the GPU may still
++ * touch stay allocated: leaked on purpose) until a recovery.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include "SweetSurface.h"
++#include "blue_gpu_uapi.h"
++#include "../../../bsd/dev/blueline_gpu_core.h"
++
++extern "C" {
++extern void CleanPoC_DcacheRegion_Force(vm_offset_t va, size_t length);	/* osfmk/arm/caches_internal.h */
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
++}
++
++#define BG_MAX_BOS              4096u           /* handles per connection */
++#define BG_MAX_QUEUES           64u             /* submit queues per connection (0 = default) */
++#define BG_MAX_SUBMIT_BOS       4096u
++#define BG_MAX_BO               (256ull << 20)
++#define BG_POLL_US              200u
++#define BG_RING_WAIT_MS         50u             /* a full ring: wait this long, then kIOReturnBusy */
++#define BG_SURF_RECLEAN_NS      4000000ull      /* HakiOS: re-clean an unchanged surface after 4 ms */
++#define BG_SURF_SEED            0xc             /* SweetSurface.cpp SWEET_SURFACE_STATE_SEED */
++#define BG_STAT_NS              (5ull * NSEC_PER_SEC)
++#define BG_A630_MAX_FREQ        710000000ull
++
++enum { BG_POOL = 1, BG_SURF, BG_UPTR };
++
++struct BGBo {
++	uint32_t kind, flags, handle;
++	uint64_t size;                  /* bytes of the BO (pool: rounded to 64K) */
++	uint64_t gva, map_len;          /* GPU VA; imports: bytes mapped (4K multiple) */
++	uint64_t pa;                    /* pool */
++	uintptr_t kva;                  /* pool: WC kernel view; surface: cacheable kernel view */
++	IOMemoryDescriptor *md;         /* pool: physical WC (user maps); userptr: the prepared range */
++	SweetSurface *surf;             /* retained */
++	uint32_t surf_id, seed;
++	uint64_t t_clean;
++	uint32_t fence, wfence;         /* last use, last GPU write */
++	bool gpu_wrote, ro;
++	char name[33];
++	BGBo *next;                     /* zombie list */
++};
++
++struct BGQueue {
++	bool used;
++	uint32_t last, faults;
++};
++
++struct BGCtx {
++	task_t task;
++	BGBo **bo;                      /* [BG_MAX_BOS], handle = index + 1 */
++	uint32_t nbo, hint;
++	BGQueue q[BG_MAX_QUEUES];
++	char comm[32];
++	int pid;
++};
++
++static struct {
++	IOLock *lock;
++	bool started, ready, dead;
++	int hang_ms, test;
++	uint32_t faults, last_seq, reset_seq, wake;
++	uint32_t gen;                   /* bumped by every close: handles held across a sleep are rechecked */
++	uint32_t prog_val;
++	uint64_t t_prog;
++	BGBo *zombies;
++	uint32_t nzombie, nconn, nbo_live;
++	/* per 5 s */
++	uint64_t t_stat;
++	uint32_t n_submit, n_ib, n_wait, n_busy, n_ring_full, n_new, n_close;
++	uint64_t wait_ns, gpu_ticks;
++} g;
++
++/* ---------------------------------------------------------------------------------------- */
++
++static uint64_t
++bg_now_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
++	return ns;
++}
++
++static uint64_t
++bg_abs_ns(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns;
++}
++
++/* drm_msm_timespec (absolute, mach_continuous_time ns) -> ns; {0,0} -> 0 (poll). */
++static uint64_t
++bg_deadline(const struct blue_gpu_timespec *t)
++{
++	if (t->tv_sec <= 0 && t->tv_nsec <= 0) {
++		return 0;
++	}
++	if (t->tv_sec < 0 || t->tv_nsec < 0 || t->tv_sec > (int64_t)(UINT64_MAX / NSEC_PER_SEC) - 1) {
++		return UINT64_MAX;
++	}
++	return (uint64_t)t->tv_sec * NSEC_PER_SEC + (uint64_t)t->tv_nsec;
++}
++
++static uint32_t
++bg_retired(void)
++{
++	if (g.dead) {
++		return g.last_seq;
++	}
++	uint32_t r = blue_gpu_core_retired();
++	if ((int32_t)(g.reset_seq - r) > 0) {
++		r = g.reset_seq;
++	}
++	return r;
++}
++
++static bool
++bg_done(uint32_t f)
++{
++	return f == 0 || (int32_t)(bg_retired() - f) >= 0;
++}
++
++/* Lock held. The hang guard: fence progress, or nothing queued. */
++static void
++bg_watch(void)
++{
++	if (g.dead) {
++		return;
++	}
++	uint32_t cur = blue_gpu_core_retired();
++	if (cur != g.prog_val || bg_done(g.last_seq)) {
++		g.prog_val = cur;
++		g.t_prog = mach_absolute_time();
++		return;
++	}
++	if (bg_abs_ns(g.t_prog) < (uint64_t)g.hang_ms * 1000000ull) {
++		return;
++	}
++	uint32_t w[4];
++	blue_gpu_core_fence_words(w);
++	printf("BLUEGPU UAPI: HANG: fence %u not reached after %d ms (retired %u; MEM_WRITE %#x CACHE_FLUSH_TS %#x"
++	    " CCU %#x/%#x; cb0 fsr %#x): user GPU access OFF for this boot, every fence counts as retired, BO pages the"
++	    " GPU may touch are kept\n", g.last_seq, g.hang_ms, cur, w[0], w[1], w[2], w[3], blue_gpu_core_fsr());
++	blue_gpu_core_dump("user hang");
++	g.dead = true;
++	g.faults++;
++	IOLockWakeup(g.lock, &g.wake, false);
++}
++
++/*
++ * Lock held: sleep (lock dropped) until fence f retires or deadline_ns
++ * (continuous-clock ns; 0 = poll). kIOReturnSuccess, or `late` at the
++ * deadline, or kIOReturnAborted on a signal.
++ */
++static IOReturn
++bg_wait_locked(uint32_t f, uint64_t deadline_ns, IOReturn late)
++{
++	uint64_t t0 = mach_absolute_time();
++	bool waited = false;
++	IOReturn ret = kIOReturnSuccess;
++
++	for (;;) {
++		bg_watch();
++		if (bg_done(f)) {
++			break;
++		}
++		uint64_t now = bg_now_ns();
++		if (deadline_ns == 0 || now >= deadline_ns) {
++			ret = late;
++			break;
++		}
++		uint64_t step = MIN(deadline_ns - now, (uint64_t)BG_POLL_US * 1000ull), abs;
++		nanoseconds_to_absolutetime(step, &abs);
++		waited = true;
++		if (IOLockSleepDeadline(g.lock, &g.wake, mach_absolute_time() + abs, THREAD_ABORTSAFE) == THREAD_INTERRUPTED) {
++			ret = kIOReturnAborted;
++			break;
++		}
++	}
++	if (waited) {
++		g.n_wait++;
++		g.wait_ns += bg_abs_ns(t0);
++	}
++	return ret;
++}
++
++/* ---- BOs -------------------------------------------------------------------------------- */
++
++static void
++bg_bo_free(BGBo *b)
++{
++	switch (b->kind) {
++	case BG_POOL:
++		blue_gmem_free(b->pa, b->size);
++		break;
++	case BG_SURF:
++	case BG_UPTR:
++		blue_gmem_imp_unmap(b->gva, b->map_len);
++		(void)blue_gmem_sync();
++		blue_gmem_imp_free(b->gva, b->map_len);
++		if (b->kind == BG_UPTR && b->md != NULL) {
++			b->md->complete();
++		}
++		break;
++	}
++	OSSafeReleaseNULL(b->md);
++	OSSafeReleaseNULL(b->surf);
++	g.nbo_live--;
++	IOFree(b, sizeof(*b));
++}
++
++/* Pages may go once the GPU is done with them and (pool) no task maps them any more. */
++static bool
++bg_bo_idle(BGBo *b)
++{
++	return bg_done(b->fence) && !(b->kind == BG_POOL && b->md != NULL && b->md->getRetainCount() > 1);
++}
++
++static void
++bg_reap(void)
++{
++	if (g.dead) {
++		return;         /* the GPU may still be using anything: keep it */
++	}
++	for (BGBo **pp = &g.zombies; *pp != NULL;) {
++		BGBo *b = *pp;
++		if (bg_bo_idle(b)) {
++			*pp = b->next;
++			g.nzombie--;
++			bg_bo_free(b);
++		} else {
++			pp = &b->next;
++		}
++	}
++}
++
++static void
++bg_bo_release(BGBo *b)
++{
++	if (!g.dead && bg_bo_idle(b)) {
++		bg_bo_free(b);
++		return;
++	}
++	b->next = g.zombies;
++	g.zombies = b;
++	g.nzombie++;
++}
++
++static BGBo *
++bg_lookup(BGCtx *c, uint32_t handle)
++{
++	if (handle == 0 || handle > BG_MAX_BOS) {
++		return NULL;
++	}
++	return c->bo[handle - 1];
++}
++
++static IOReturn
++bg_insert(BGCtx *c, BGBo *b)
++{
++	for (uint32_t k = 0; k < BG_MAX_BOS; k++) {
++		uint32_t i = (c->hint + k) % BG_MAX_BOS;
++		if (c->bo[i] == NULL) {
++			c->bo[i] = b;
++			b->handle = i + 1;
++			c->hint = i + 1;
++			c->nbo++;
++			g.nbo_live++;
++			return kIOReturnSuccess;
++		}
++	}
++	return kIOReturnNoResources;
++}
++
++/* The surface's seed (bumped on every CPU unlock that wrote), in its state page. */
++static uint32_t
++bg_seed(SweetSurface *s)
++{
++	if (s->state == NULL) {
++		return 0;
++	}
++	return *(volatile uint32_t *)((uintptr_t)s->state->getBytesNoCopy() + BG_SURF_SEED);
++}
++
++/* Clean (or clean + invalidate) an import's pages to PoC. */
++static void
++bg_import_cache(BGBo *b, bool inval)
++{
++	if (b->kind == BG_SURF) {
++		if (b->kva == 0) {
++			return;
++		}
++		if (inval) {
++			FlushPoC_DcacheRegion((vm_offset_t)b->kva, (size_t)b->size);
++		} else {
++			CleanPoC_DcacheRegion_Force((vm_offset_t)b->kva, (size_t)b->size);
++		}
++	} else if (b->kind == BG_UPTR && b->md != NULL) {
++		for (uint64_t o = 0; o < b->size;) {
++			IOByteCount len = 0;
++			addr64_t pa = b->md->getPhysicalSegment(o, &len, kIOMemoryMapperNone);
++			if (pa == 0 || len == 0) {
++				break;
++			}
++			len = MIN(len, (IOByteCount)(b->size - o));
++			flush_dcache64(pa, (unsigned)len, TRUE);
++			o += len;
++		}
++	}
++}
++
++/* Map an import's pages (md segments) at a fresh import VA. */
++static IOReturn
++bg_import_map(BGBo *b, IOMemoryDescriptor *md, uint64_t len, bool ro)
++{
++	b->map_len = (len + 0xfffull) & ~0xfffull;
++	if (!blue_gmem_imp_alloc(b->map_len, &b->gva)) {
++		return kIOReturnNoMemory;
++	}
++	for (uint64_t o = 0; o < b->map_len; o += 0x1000) {
++		IOByteCount seg = 0;
++		uint64_t at = MIN(o, len - 1);
++		addr64_t pa = md->getPhysicalSegment(at, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || ((pa - (at - o)) & 0xfff) || !blue_gmem_imp_map(b->gva + o, pa - (at - o), ro)) {
++			blue_gmem_imp_unmap(b->gva, o);
++			(void)blue_gmem_sync();
++			blue_gmem_imp_free(b->gva, b->map_len);
++			return kIOReturnNotAligned;
++		}
++	}
++	if (!blue_gmem_sync()) {
++		blue_gmem_imp_unmap(b->gva, b->map_len);
++		blue_gmem_imp_free(b->gva, b->map_len);
++		return kIOReturnNotReady;
++	}
++	return kIOReturnSuccess;
++}
++
++/* ---- the operations (kernel arguments; the user client copies in and out) ---------------- */
++
++static void bg_stats(void);
++
++static BGCtx *
++bg_ctx_create(task_t task)
++{
++	BGCtx *c = (BGCtx *)IOMallocZero(sizeof(BGCtx));
++	if (c == NULL) {
++		return NULL;
++	}
++	c->bo = (BGBo **)IOMallocZero(sizeof(BGBo *) * BG_MAX_BOS);
++	if (c->bo == NULL) {
++		IOFree(c, sizeof(BGCtx));
++		return NULL;
++	}
++	c->task = task;
++	c->q[0].used = true;
++	c->pid = proc_selfpid();
++	proc_selfname(c->comm, sizeof(c->comm));
++	IOLockLock(g.lock);
++	g.nconn++;
++	IOLockUnlock(g.lock);
++	return c;
++}
++
++static void
++bg_ctx_destroy(BGCtx *c)
++{
++	uint32_t n = 0;
++	IOLockLock(g.lock);
++	g.gen++;
++	for (uint32_t i = 0; i < BG_MAX_BOS; i++) {
++		if (c->bo[i] != NULL) {
++			bg_bo_release(c->bo[i]);
++			c->bo[i] = NULL;
++			n++;
++		}
++	}
++	bg_reap();
++	g.nconn--;
++	uint32_t z = g.nzombie;
++	IOLockUnlock(g.lock);
++	printf("BLUEGPU UAPI: %s[%d] closed: %u BO(s) released, %u parked until idle/unmapped\n", c->comm, c->pid, n, z);
++	IOFree(c->bo, sizeof(BGBo *) * BG_MAX_BOS);
++	IOFree(c, sizeof(BGCtx));
++}
++
++static IOReturn
++bg_get_param(BGCtx *c, struct blue_gpu_param *p)
++{
++	(void)c;
++	if (p->pipe != BLUE_GPU_PIPE_3D0) {
++		return kIOReturnBadArgument;
++	}
++	switch (p->param) {
++	case BLUE_GPU_PARAM_GPU_ID:           p->value = BLUE_GPU_A630_GPU_ID; break;
++	case BLUE_GPU_PARAM_GMEM_SIZE:        p->value = BLUE_GPU_A630_GMEM_SIZE; break;
++	case BLUE_GPU_PARAM_CHIP_ID:          p->value = BLUE_GPU_A630_CHIP_ID; break;
++	case BLUE_GPU_PARAM_MAX_FREQ:         p->value = BG_A630_MAX_FREQ; break;
++	case BLUE_GPU_PARAM_TIMESTAMP:        p->value = blue_gpu_core_timestamp(); break;
++	case BLUE_GPU_PARAM_GMEM_BASE:        p->value = BLUE_GPU_A630_GMEM_BASE; break;
++	case BLUE_GPU_PARAM_PRIORITIES:       p->value = 1; break;
++	case BLUE_GPU_PARAM_PP_PGTABLE:       p->value = 0; break;
++	case BLUE_GPU_PARAM_FAULTS:           p->value = g.faults; break;
++	case BLUE_GPU_PARAM_SUSPENDS:         p->value = 0; break;
++	case BLUE_GPU_PARAM_VA_START:         p->value = BLUE_GMEM_VA_START; break;
++	case BLUE_GPU_PARAM_VA_SIZE:          p->value = BLUE_GMEM_VA_SIZE; break;
++	case BLUE_GPU_PARAM_HIGHEST_BANK_BIT: p->value = BLUE_GPU_A630_HIGHEST_BANK_BIT; break;
++	case BLUE_GPU_PARAM_RAYTRACING:       p->value = 0; break;
++	case BLUE_GPU_PARAM_MACROTILE_MODE:   p->value = 0; break;
++	case BLUE_GPU_PARAM_HAS_PRR:          p->value = 0; break;
++	default:
++		return kIOReturnBadArgument;    /* SYSPROF/COMM/CMDLINE are write-only; UBWC_SWIZZLE, UCHE_TRAP_BASE */
++	}
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++bg_gem_new(BGCtx *c, struct blue_gpu_gem_new *a)
++{
++	uint32_t cache = a->flags & BLUE_GPU_BO_CACHE_MASK;
++	if ((a->flags & ~(BLUE_GPU_BO_SCANOUT | BLUE_GPU_BO_GPU_READONLY | BLUE_GPU_BO_NO_SHARE | BLUE_GPU_BO_CACHE_MASK)) ||
++	    (cache != 0 && cache != BLUE_GPU_BO_WC && cache != BLUE_GPU_BO_UNCACHED) || a->size == 0 || a->size > BG_MAX_BO) {
++		return kIOReturnBadArgument;    /* CACHED and CACHED_COHERENT: the pool is WC only */
++	}
++	BGBo *b = (BGBo *)IOMallocZero(sizeof(BGBo));
++	if (b == NULL) {
++		return kIOReturnNoMemory;
++	}
++	b->kind = BG_POOL;
++	b->flags = a->flags;
++	b->size = (a->size + BLUE_GMEM_GRANULE - 1) & ~(BLUE_GMEM_GRANULE - 1);
++	IOLockLock(g.lock);
++	bool ok = blue_gmem_alloc(b->size, &b->pa, &b->gva, &b->kva);
++	if (!ok && g.nzombie) {
++		bg_reap();
++		ok = blue_gmem_alloc(b->size, &b->pa, &b->gva, &b->kva);
++	}
++	IOReturn ret = kIOReturnNoMemory;
++	if (ok) {
++		/* physical, its cache mode in _flags: a default-cache user map comes out write-combined too */
++		b->md = IOMemoryDescriptor::withAddressRange(b->pa, b->size,
++		    kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
++		ret = b->md != NULL ? bg_insert(c, b) : kIOReturnNoMemory;
++		if (ret == kIOReturnSuccess) {
++			a->handle = b->handle;
++			g.n_new++;
++		} else {
++			blue_gmem_free(b->pa, b->size);
++		}
++	}
++	IOLockUnlock(g.lock);
++	if (ret != kIOReturnSuccess) {
++		OSSafeReleaseNULL(b->md);
++		IOFree(b, sizeof(*b));
++	}
++	return ret;
++}
++
++static IOReturn
++bg_gem_close(BGCtx *c, uint32_t handle)
++{
++	IOLockLock(g.lock);
++	BGBo *b = bg_lookup(c, handle);
++	if (b != NULL) {
++		c->bo[handle - 1] = NULL;
++		c->nbo--;
++		g.gen++;
++		bg_bo_release(b);
++		bg_reap();
++		g.n_close++;
++	}
++	IOLockUnlock(g.lock);
++	return b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++/* GEM_INFO; SET_NAME / GET_NAME use name (kernel copy, 33 bytes) - the user client moves it. */
++static IOReturn
++bg_gem_info(BGCtx *c, struct blue_gpu_gem_info *a, char *name)
++{
++	IOReturn ret = kIOReturnSuccess;
++	IOLockLock(g.lock);
++	BGBo *b = bg_lookup(c, a->handle);
++	if (b == NULL) {
++		IOLockUnlock(g.lock);
++		return kIOReturnNotFound;
++	}
++	switch (a->info) {
++	case BLUE_GPU_INFO_GET_OFFSET:
++		if (b->kind == BG_UPTR) {
++			ret = kIOReturnUnsupported;     /* the caller has the pages already */
++		} else {
++			a->value = b->handle;           /* the IOConnectMapMemory64 memory type */
++		}
++		break;
++	case BLUE_GPU_INFO_GET_IOVA:
++		a->value = b->gva;
++		break;
++	case BLUE_GPU_INFO_SET_IOVA:
++		ret = a->value == b->gva ? kIOReturnSuccess : kIOReturnBadArgument;     /* one shared space: kernel-chosen */
++		break;
++	case BLUE_GPU_INFO_GET_FLAGS:
++		a->value = b->flags;
++		break;
++	case BLUE_GPU_INFO_SET_NAME:
++		if (name == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			strlcpy(b->name, name, sizeof(b->name));
++		}
++		break;
++	case BLUE_GPU_INFO_GET_NAME:
++		if (name == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			strlcpy(name, b->name, sizeof(b->name));
++		}
++		break;
++	default:
++		ret = kIOReturnBadArgument;     /* SET/GET_METADATA: not in v1 */
++		break;
++	}
++	IOLockUnlock(g.lock);
++	return ret;
++}
++
++static IOReturn
++bg_cpu_prep(BGCtx *c, struct blue_gpu_gem_cpu_prep *a)
++{
++	if (a->op & ~(BLUE_GPU_PREP_READ | BLUE_GPU_PREP_WRITE | BLUE_GPU_PREP_NOSYNC | BLUE_GPU_PREP_BOOST)) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t deadline = bg_deadline(&a->timeout);
++	IOLockLock(g.lock);
++	BGBo *b = bg_lookup(c, a->handle);
++	if (b == NULL) {
++		IOLockUnlock(g.lock);
++		return kIOReturnNotFound;
++	}
++	/* READ: the GPU's last write; WRITE (or neither): its last use */
++	uint32_t f = (a->op & (BLUE_GPU_PREP_READ | BLUE_GPU_PREP_WRITE)) == BLUE_GPU_PREP_READ ? b->wfence : b->fence;
++	IOReturn ret = (a->op & BLUE_GPU_PREP_NOSYNC) ? bg_wait_locked(f, 0, kIOReturnBusy) :
++	    bg_wait_locked(f, deadline, deadline ? kIOReturnTimeout : kIOReturnBusy);
++	/* the BO may have been closed by another thread while we slept */
++	if (ret == kIOReturnSuccess && bg_lookup(c, a->handle) == b && b->gpu_wrote && bg_done(b->wfence)) {
++		bg_import_cache(b, true);
++		b->gpu_wrote = false;
++	}
++	IOLockUnlock(g.lock);
++	return ret;
++}
++
++static IOReturn
++bg_wait_fence(BGCtx *c, struct blue_gpu_wait_fence *a)
++{
++	if (a->queueid >= BG_MAX_QUEUES) {
++		return kIOReturnNotFound;
++	}
++	uint64_t deadline = bg_deadline(&a->timeout);
++	IOLockLock(g.lock);
++	IOReturn ret;
++	if (!c->q[a->queueid].used) {
++		ret = kIOReturnNotFound;
++	} else if ((int32_t)(a->fence - c->q[a->queueid].last) > 0) {
++		ret = kIOReturnBadArgument;     /* never issued on this queue (Linux msm_wait_fence) */
++	} else {
++		ret = bg_wait_locked(a->fence, deadline, kIOReturnTimeout);
++	}
++	IOLockUnlock(g.lock);
++	return ret;
++}
++
++/*
++ * SUBMIT with the bos / cmds arrays already in the kernel. IBs: CMD_BUF and
++ * CTX_RESTORE_BUF, each inside one of this connection's pool BOs.
++ */
++static IOReturn
++bg_submit(BGCtx *c, struct blue_gpu_submit *a, const struct blue_gpu_submit_bo *bos,
++    const struct blue_gpu_submit_cmd *cmds)
++{
++	uint64_t iova[BLUE_GPU_CORE_MAX_IBS];
++	uint32_t dw[BLUE_GPU_CORE_MAX_IBS], n = 0, seq = 0, gen;
++	uint32_t allowed = 0xffffu | BLUE_GPU_SUBMIT_NO_IMPLICIT;
++
++	if ((a->flags & ~allowed) || (a->flags & 0xffffu) != BLUE_GPU_PIPE_3D0 || a->nr_cmds == 0 ||
++	    a->nr_cmds > BLUE_GPU_CORE_MAX_IBS || a->nr_bos > BG_MAX_SUBMIT_BOS || a->queueid >= BG_MAX_QUEUES ||
++	    a->nr_in_syncobjs || a->nr_out_syncobjs) {
++		return kIOReturnBadArgument;    /* FENCE_FD_*, SUDO, SYNCOBJ_*, FENCE_SN_IN, other pipes */
++	}
++	IOLockLock(g.lock);
++	IOReturn ret = kIOReturnSuccess;
++	if (!c->q[a->queueid].used) {
++		ret = kIOReturnNotFound;
++		goto out;
++	}
++	if (g.dead || !g.ready) {
++		ret = kIOReturnNotReady;
++		goto out;
++	}
++again:
++	gen = g.gen;
++	n = 0;
++	for (uint32_t i = 0; i < a->nr_bos; i++) {
++		if (bos[i].flags & ~(BLUE_GPU_SUBMIT_BO_READ | BLUE_GPU_SUBMIT_BO_WRITE | BLUE_GPU_SUBMIT_BO_DUMP |
++		    BLUE_GPU_SUBMIT_BO_NO_IMPLICIT)) {
++			ret = kIOReturnBadArgument;
++			goto out;
++		}
++		if (bg_lookup(c, bos[i].handle) == NULL) {
++			ret = kIOReturnNotFound;
++			goto out;
++		}
++	}
++	for (uint32_t i = 0; i < a->nr_cmds; i++) {
++		const struct blue_gpu_submit_cmd *k = &cmds[i];
++		if (k->type != BLUE_GPU_SUBMIT_CMD_BUF && k->type != BLUE_GPU_SUBMIT_CMD_IB_TARGET_BUF &&
++		    k->type != BLUE_GPU_SUBMIT_CMD_CTX_RESTORE_BUF) {
++			ret = kIOReturnBadArgument;
++			goto out;
++		}
++		if (k->nr_relocs != 0 || k->submit_idx >= a->nr_bos) {
++			ret = kIOReturnBadArgument;
++			goto out;
++		}
++		BGBo *b = bg_lookup(c, bos[k->submit_idx].handle);
++		if (b->kind != BG_POOL || k->size == 0 || (k->size & 3) || (k->submit_offset & 3) ||
++		    (uint64_t)k->submit_offset + k->size > b->size || k->size / 4 > BLUE_GPU_CORE_IB_MAX_DW) {
++			ret = kIOReturnBadArgument;     /* IBs only from the caller's own pool BOs, inside them */
++			goto out;
++		}
++		if (k->type == BLUE_GPU_SUBMIT_CMD_IB_TARGET_BUF) {
++			continue;                       /* reached from another IB */
++		}
++		iova[n] = b->gva + k->submit_offset;
++		dw[n] = k->size / 4;
++		n++;
++	}
++	if (n == 0) {
++		a->fence = c->q[a->queueid].last;
++		goto out;
++	}
++	/* imports: CPU writes to PoC; a BO the GPU writes is also invalidated (no dirty line lands on it later) */
++	for (uint32_t i = 0; i < a->nr_bos; i++) {
++		BGBo *b = bg_lookup(c, bos[i].handle);
++		bool w = bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE;
++		if (b->kind == BG_SURF) {
++			uint32_t seed = bg_seed(b->surf);
++			if (w || seed != b->seed || bg_abs_ns(b->t_clean) >= BG_SURF_RECLEAN_NS) {
++				bg_import_cache(b, w);
++				b->seed = seed;
++				b->t_clean = mach_absolute_time();
++			}
++		} else if (b->kind == BG_UPTR) {
++			bg_import_cache(b, true);
++		}
++	}
++	bg_watch();
++	if (bg_done(g.last_seq)) {
++		g.t_prog = mach_absolute_time();        /* idle until now: the guard starts here */
++	}
++	for (uint64_t t0 = mach_absolute_time();;) {
++		int e = blue_gpu_core_submit(iova, dw, n, &seq);
++		if (e == 0) {
++			break;
++		}
++		if (e != EBUSY) {
++			ret = e == EINVAL ? kIOReturnBadArgument : kIOReturnNotReady;
++			goto out;
++		}
++		g.n_ring_full++;
++		bg_watch();
++		if (g.dead || bg_abs_ns(t0) > BG_RING_WAIT_MS * 1000000ull) {
++			g.n_busy++;
++			ret = g.dead ? kIOReturnNotReady : kIOReturnBusy;
++			goto out;
++		}
++		uint64_t abs;
++		nanoseconds_to_absolutetime((uint64_t)BG_POLL_US * 1000ull, &abs);
++		(void)IOLockSleepDeadline(g.lock, &g.wake, mach_absolute_time() + abs, THREAD_UNINT);
++		if (g.gen != gen) {
++			goto again;     /* the lock was dropped and something was closed: validate again */
++		}
++	}
++	g.last_seq = seq;
++	c->q[a->queueid].last = seq;
++	for (uint32_t i = 0; i < a->nr_bos; i++) {
++		BGBo *b = bg_lookup(c, bos[i].handle);
++		b->fence = seq;
++		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE) {
++			b->wfence = seq;
++			b->gpu_wrote = b->kind != BG_POOL;
++		}
++	}
++	a->fence = seq;
++	g.n_submit++;
++	g.n_ib += n;
++out:
++	IOLockUnlock(g.lock);
++	bg_stats();
++	return ret;
++}
++
++static IOReturn
++bg_madvise(BGCtx *c, struct blue_gpu_gem_madvise *a)
++{
++	if (a->madv > 1) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(g.lock);
++	BGBo *b = bg_lookup(c, a->handle);
++	IOLockUnlock(g.lock);
++	if (b == NULL) {
++		return kIOReturnNotFound;
++	}
++	a->retained = 1;        /* never purged */
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++bg_queue_new(BGCtx *c, struct blue_gpu_submitqueue *a)
++{
++	if (a->flags & ~1u) {
++		return kIOReturnBadArgument;    /* ALLOW_PREEMPT only; VM_BIND queues not in v1 */
++	}
++	IOReturn ret = kIOReturnNoResources;
++	IOLockLock(g.lock);
++	for (uint32_t i = 1; i < BG_MAX_QUEUES; i++) {
++		if (!c->q[i].used) {
++			c->q[i].used = true;
++			c->q[i].last = 0;
++			c->q[i].faults = 0;
++			a->id = i;
++			ret = kIOReturnSuccess;
++			break;
++		}
++	}
++	IOLockUnlock(g.lock);
++	return ret;
++}
++
++static IOReturn
++bg_queue_close(BGCtx *c, uint32_t id)
++{
++	IOReturn ret = kIOReturnNotFound;
++	IOLockLock(g.lock);
++	if (id > 0 && id < BG_MAX_QUEUES && c->q[id].used) {
++		c->q[id].used = false;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(g.lock);
++	return ret;
++}
++
++/* SUBMITQUEUE_QUERY FAULTS: *faults gets the value; the user client copies it out. */
++static IOReturn
++bg_queue_query(BGCtx *c, struct blue_gpu_submitqueue_query *a, uint32_t *faults)
++{
++	if (a->param != 0) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn ret = kIOReturnNotFound;
++	IOLockLock(g.lock);
++	if (a->id < BG_MAX_QUEUES && c->q[a->id].used) {
++		*faults = c->q[a->id].faults + (g.dead ? 1 : 0);
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(g.lock);
++	return ret;
++}
++
++static IOReturn
++bg_iosurface(BGCtx *c, struct blue_gpu_iosurface *a)
++{
++	SweetSurface *s = sweet_surface_copy(a->surface);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	uint64_t len = s->memory->getLength();
++	a->size = len;
++	a->offset = s->offset;
++	a->row_bytes = s->bytesPerRow;
++	a->width = s->width;
++	a->height = s->height;
++	a->pixel_format = s->pixelFormat;
++	a->planes = s->planeCount;
++	if (a->handle == BLUE_GPU_IOSURFACE_DESCRIBE) {
++		s->release();
++		return kIOReturnSuccess;
++	}
++	if (len == 0 || len > BLUE_GMEM_IMP_SIZE) {
++		s->release();
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(g.lock);
++	for (uint32_t i = 0; i < BG_MAX_BOS; i++) {
++		BGBo *o = c->bo[i];
++		if (o != NULL && o->kind == BG_SURF && o->surf == s) {
++			a->handle = o->handle;  /* one handle per surface per connection */
++			IOLockUnlock(g.lock);
++			s->release();
++			return kIOReturnSuccess;
++		}
++	}
++	IOLockUnlock(g.lock);
++	uintptr_t kva = s->kernelAddress();     /* may map (takes the surface lock): outside ours */
++	BGBo *b = (BGBo *)IOMallocZero(sizeof(BGBo));
++	if (b == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	b->kind = BG_SURF;
++	b->size = len;
++	b->surf = s;
++	b->surf_id = a->surface;
++	b->kva = kva;
++	IOLockLock(g.lock);
++	IOReturn ret = bg_import_map(b, s->memory, len, false);
++	if (ret == kIOReturnSuccess) {
++		ret = bg_insert(c, b);
++		if (ret != kIOReturnSuccess) {
++			blue_gmem_imp_unmap(b->gva, b->map_len);
++			(void)blue_gmem_sync();
++			blue_gmem_imp_free(b->gva, b->map_len);
++		}
++	}
++	if (ret == kIOReturnSuccess) {
++		bg_import_cache(b, true);
++		b->seed = bg_seed(s);
++		b->t_clean = mach_absolute_time();
++		a->handle = b->handle;
++	}
++	IOLockUnlock(g.lock);
++	if (ret != kIOReturnSuccess) {
++		s->release();
++		IOFree(b, sizeof(*b));
++	}
++	return ret;
++}
++
++static IOReturn
++bg_userptr(BGCtx *c, struct blue_gpu_userptr *a)
++{
++	if (a->flags != 0 || a->size == 0 || a->size > BG_MAX_BO || (a->address & PAGE_MASK) || (a->size & PAGE_MASK)) {
++		return kIOReturnBadArgument;
++	}
++	bool ro = false;
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(a->address, a->size, kIODirectionOutIn, c->task);
++	if (md != NULL && md->prepare() != kIOReturnSuccess) {
++		OSSafeReleaseNULL(md);
++	}
++	if (md == NULL) {       /* read-only memory: the GPU may only read it */
++		md = IOMemoryDescriptor::withAddressRange(a->address, a->size, kIODirectionOut, c->task);
++		if (md != NULL && md->prepare() != kIOReturnSuccess) {
++			OSSafeReleaseNULL(md);
++		}
++		ro = true;
++	}
++	if (md == NULL) {
++		return kIOReturnBadArgument;
++	}
++	BGBo *b = (BGBo *)IOMallocZero(sizeof(BGBo));
++	if (b == NULL) {
++		md->complete();
++		md->release();
++		return kIOReturnNoMemory;
++	}
++	b->kind = BG_UPTR;
++	b->size = a->size;
++	b->md = md;
++	b->ro = ro;
++	b->flags = ro ? BLUE_GPU_BO_GPU_READONLY : 0;
++	IOLockLock(g.lock);
++	IOReturn ret = bg_import_map(b, md, a->size, ro);
++	if (ret == kIOReturnSuccess) {
++		ret = bg_insert(c, b);
++		if (ret != kIOReturnSuccess) {
++			blue_gmem_imp_unmap(b->gva, b->map_len);
++			(void)blue_gmem_sync();
++			blue_gmem_imp_free(b->gva, b->map_len);
++		}
++	}
++	if (ret == kIOReturnSuccess) {
++		a->handle = b->handle;
++	}
++	IOLockUnlock(g.lock);
++	if (ret != kIOReturnSuccess) {
++		md->complete();
++		md->release();
++		IOFree(b, sizeof(*b));
++	}
++	return ret;
++}
++
++/* clientMemoryForType: the pages behind a handle, retained for the caller. */
++static IOMemoryDescriptor *
++bg_memory(BGCtx *c, uint32_t handle)
++{
++	IOMemoryDescriptor *md = NULL;
++	IOLockLock(g.lock);
++	BGBo *b = bg_lookup(c, handle);
++	if (b != NULL && b->kind == BG_POOL) {
++		md = b->md;
++	} else if (b != NULL && b->kind == BG_SURF) {
++		md = b->surf->memory;
++	}
++	if (md != NULL) {
++		md->retain();
++	}
++	IOLockUnlock(g.lock);
++	return md;
++}
++
++static void
++bg_stats(void)
++{
++	IOLockLock(g.lock);
++	if (bg_abs_ns(g.t_stat) < BG_STAT_NS) {
++		IOLockUnlock(g.lock);
++		return;
++	}
++	bg_reap();
++	struct blue_gmem_info mi;
++	blue_gmem_get_info(&mi);
++	printf("BLUEGPU UAPI 5s: %u submits (%u IBs), %u waits (%llu us), %u ring-full retries, %u EBUSY, %u new %u closed;"
++	    " %u connection(s), %u BO(s), %u parked; pool %llu of %llu MiB free (largest %llu); fence %u retired %u%s\n",
++	    g.n_submit, g.n_ib, g.n_wait, g.wait_ns / 1000, g.n_ring_full, g.n_busy, g.n_new, g.n_close, g.nconn,
++	    g.nbo_live, g.nzombie, (uint64_t)mi.free_granules * BLUE_GMEM_GRANULE >> 20, mi.pool_size >> 20,
++	    (uint64_t)mi.low_free * BLUE_GMEM_GRANULE >> 20, g.last_seq, bg_retired(), g.dead ? "; DEAD (hang)" : "");
++	g.t_stat = mach_absolute_time();
++	g.n_submit = g.n_ib = g.n_wait = g.n_busy = g.n_ring_full = g.n_new = g.n_close = 0;
++	g.wait_ns = 0;
++	IOLockUnlock(g.lock);
++}
++
++/* ---- the service and its user client ---------------------------------------------------- */
++
++class BlueGPU : public IOService {
++	OSDeclareDefaultStructors(BlueGPU);
++};
++
++OSDefineMetaClassAndStructors(BlueGPU, IOService);
++
++class BlueGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(BlueGPUUserClient);
++
++	BGCtx *fCtx;
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(BlueGPUUserClient, IOUserClient);
++
++bool
++BlueGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (type != BLUE_GPU_UC_TYPE || !g.ready || !IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fCtx = bg_ctx_create(owningTask);
++	if (fCtx != NULL) {
++		printf("BLUEGPU UAPI: %s[%d] opened BlueGPU\n", fCtx->comm, fCtx->pid);
++	}
++	return fCtx != NULL;
++}
++
++IOReturn
++BlueGPUUserClient::clientClose(void)
++{
++	if (fCtx != NULL) {
++		bg_ctx_destroy(fCtx);
++		fCtx = NULL;
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++BlueGPUUserClient::free()
++{
++	if (fCtx != NULL) {
++		bg_ctx_destroy(fCtx);
++		fCtx = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++BlueGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOMemoryDescriptor *md = fCtx != NULL ? bg_memory(fCtx, type) : NULL;
++	if (md == NULL) {
++		return kIOReturnBadArgument;
++	}
++	*options = 0;           /* user's cache bits replace these anyway: the pool's WC sits in the descriptor */
++	*memory = md;           /* released by IOUserClient once mapped */
++	return kIOReturnSuccess;
++}
++
++static size_t
++bg_struct_size(uint32_t sel)
++{
++	switch (sel) {
++	case BLUE_GPU_SEL_GEM_CLOSE:            return sizeof(struct blue_gpu_gem_close);
++	case BLUE_GPU_SEL_GET_PARAM:
++	case BLUE_GPU_SEL_SET_PARAM:            return sizeof(struct blue_gpu_param);
++	case BLUE_GPU_SEL_GEM_NEW:              return sizeof(struct blue_gpu_gem_new);
++	case BLUE_GPU_SEL_GEM_INFO:             return sizeof(struct blue_gpu_gem_info);
++	case BLUE_GPU_SEL_GEM_CPU_PREP:         return sizeof(struct blue_gpu_gem_cpu_prep);
++	case BLUE_GPU_SEL_GEM_CPU_FINI:         return sizeof(struct blue_gpu_gem_cpu_fini);
++	case BLUE_GPU_SEL_GEM_SUBMIT:           return sizeof(struct blue_gpu_submit);
++	case BLUE_GPU_SEL_WAIT_FENCE:           return sizeof(struct blue_gpu_wait_fence);
++	case BLUE_GPU_SEL_GEM_MADVISE:          return sizeof(struct blue_gpu_gem_madvise);
++	case BLUE_GPU_SEL_SUBMITQUEUE_NEW:      return sizeof(struct blue_gpu_submitqueue);
++	case BLUE_GPU_SEL_SUBMITQUEUE_CLOSE:    return sizeof(uint32_t);
++	case BLUE_GPU_SEL_SUBMITQUEUE_QUERY:    return sizeof(struct blue_gpu_submitqueue_query);
++	case BLUE_GPU_SEL_USERPTR:              return sizeof(struct blue_gpu_userptr);
++	case BLUE_GPU_SEL_IOSURFACE:            return sizeof(struct blue_gpu_iosurface);
++	default:                                return 0;
++	}
++}
++
++/* SUBMIT from user space: copy the arrays in, run it, the struct goes back with the fence. */
++static IOReturn
++bg_submit_user(BGCtx *c, struct blue_gpu_submit *a)
++{
++	if (a->nr_cmds == 0 || a->nr_cmds > BLUE_GPU_CORE_MAX_IBS || a->nr_bos > BG_MAX_SUBMIT_BOS) {
++		return kIOReturnBadArgument;
++	}
++	size_t bl = sizeof(struct blue_gpu_submit_bo) * a->nr_bos, cl = sizeof(struct blue_gpu_submit_cmd) * a->nr_cmds;
++	struct blue_gpu_submit_bo *bos = bl ? (struct blue_gpu_submit_bo *)IOMallocData(bl) : NULL;
++	struct blue_gpu_submit_cmd *cmds = (struct blue_gpu_submit_cmd *)IOMallocData(cl);
++	IOReturn ret = kIOReturnNoMemory;
++	if ((bl == 0 || bos != NULL) && cmds != NULL) {
++		if ((bl && copyin((user_addr_t)a->bos, bos, bl)) || copyin((user_addr_t)a->cmds, cmds, cl)) {
++			ret = kIOReturnBadArgument;
++		} else {
++			ret = bg_submit(c, a, bos, cmds);
++		}
++	}
++	if (bos != NULL) {
++		IOFreeData(bos, bl);
++	}
++	if (cmds != NULL) {
++		IOFreeData(cmds, cl);
++	}
++	return ret;
++}
++
++IOReturn
++BlueGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	union {
++		struct blue_gpu_param param;
++		struct blue_gpu_gem_new gem_new;
++		struct blue_gpu_gem_close gem_close;
++		struct blue_gpu_gem_info gem_info;
++		struct blue_gpu_gem_cpu_prep cpu_prep;
++		struct blue_gpu_gem_cpu_fini cpu_fini;
++		struct blue_gpu_submit submit;
++		struct blue_gpu_wait_fence wait;
++		struct blue_gpu_gem_madvise madvise;
++		struct blue_gpu_submitqueue queue;
++		uint32_t queue_id;
++		struct blue_gpu_submitqueue_query query;
++		struct blue_gpu_userptr userptr;
++		struct blue_gpu_iosurface surface;
++	} u;
++	size_t sz = bg_struct_size(selector);
++
++	if (fCtx == NULL) {
++		return kIOReturnNotAttached;
++	}
++	if (sz == 0) {
++		return kIOReturnUnsupported;    /* 0x49 SVM_NEW, 0x4d VM_BIND, 0x4e PERFCNTR_CONFIG, the rest */
++	}
++	if (args->scalarInputCount != 0 || args->structureInputDescriptor != NULL ||
++	    args->structureOutputDescriptor != NULL || args->structureInput == NULL || args->structureInputSize != sz ||
++	    args->structureOutput == NULL || args->structureOutputSize != sz) {
++		return kIOReturnBadArgument;
++	}
++	bcopy(args->structureInput, &u, sz);
++
++	IOReturn ret;
++	switch (selector) {
++	case BLUE_GPU_SEL_GET_PARAM:
++		ret = bg_get_param(fCtx, &u.param);
++		break;
++	case BLUE_GPU_SEL_SET_PARAM:
++		ret = u.param.pipe == BLUE_GPU_PIPE_3D0 ? kIOReturnSuccess : kIOReturnBadArgument;  /* accept, ignore */
++		break;
++	case BLUE_GPU_SEL_GEM_NEW:
++		ret = bg_gem_new(fCtx, &u.gem_new);
++		break;
++	case BLUE_GPU_SEL_GEM_CLOSE:
++		ret = bg_gem_close(fCtx, u.gem_close.handle);
++		break;
++	case BLUE_GPU_SEL_GEM_INFO: {
++		char name[33] = { 0 };
++		if (u.gem_info.info == BLUE_GPU_INFO_SET_NAME) {
++			size_t n = MIN((size_t)u.gem_info.len, sizeof(name) - 1);
++			if (n && copyin((user_addr_t)u.gem_info.value, name, n)) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++			name[n] = 0;
++		}
++		ret = bg_gem_info(fCtx, &u.gem_info, name);
++		if (ret == kIOReturnSuccess && u.gem_info.info == BLUE_GPU_INFO_GET_NAME) {
++			size_t need = strlen(name) + 1;
++			if (u.gem_info.len == 0) {
++				u.gem_info.len = (uint32_t)need;        /* the size Linux reports for len 0 */
++			} else if (copyout(name, (user_addr_t)u.gem_info.value, MIN(need, (size_t)u.gem_info.len))) {
++				ret = kIOReturnBadArgument;
++			}
++		}
++		break;
++	}
++	case BLUE_GPU_SEL_GEM_CPU_PREP:
++		ret = bg_cpu_prep(fCtx, &u.cpu_prep);
++		break;
++	case BLUE_GPU_SEL_GEM_CPU_FINI: {
++		IOLockLock(g.lock);
++		ret = bg_lookup(fCtx, u.cpu_fini.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		IOLockUnlock(g.lock);
++		break;
++	}
++	case BLUE_GPU_SEL_GEM_SUBMIT:
++		ret = bg_submit_user(fCtx, &u.submit);
++		break;
++	case BLUE_GPU_SEL_WAIT_FENCE:
++		ret = bg_wait_fence(fCtx, &u.wait);
++		break;
++	case BLUE_GPU_SEL_GEM_MADVISE:
++		ret = bg_madvise(fCtx, &u.madvise);
++		break;
++	case BLUE_GPU_SEL_SUBMITQUEUE_NEW:
++		ret = bg_queue_new(fCtx, &u.queue);
++		break;
++	case BLUE_GPU_SEL_SUBMITQUEUE_CLOSE:
++		ret = bg_queue_close(fCtx, u.queue_id);
++		break;
++	case BLUE_GPU_SEL_SUBMITQUEUE_QUERY: {
++		uint32_t faults = 0;
++		ret = bg_queue_query(fCtx, &u.query, &faults);
++		if (ret == kIOReturnSuccess) {
++			if (u.query.len == 0) {
++				u.query.len = sizeof(faults);
++			} else if (copyout(&faults, (user_addr_t)u.query.data, MIN((size_t)u.query.len, sizeof(faults)))) {
++				ret = kIOReturnBadArgument;
++			} else {
++				u.query.len = (uint32_t)MIN((size_t)u.query.len, sizeof(faults));
++			}
++		}
++		break;
++	}
++	case BLUE_GPU_SEL_USERPTR:
++		ret = bg_userptr(fCtx, &u.userptr);
++		break;
++	case BLUE_GPU_SEL_IOSURFACE:
++		ret = bg_iosurface(fCtx, &u.surface);
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	bcopy(&u, args->structureOutput, sz);
++	args->structureOutputSize = (uint32_t)sz;
++	return ret;
++}
++
++/* ---- bluegpu_uapi_test=1: an in-kernel client through the same operations ---------------- */
++
++#define T_CP_NOP                0x10u
++#define T_CP_WAIT_FOR_IDLE      0x26u
++#define T_CP_REG_RMW            0x21u
++#define T_CP_BLIT               0x2cu
++#define T_CP_MEM_WRITE          0x3du
++#define T_CP_EVENT_WRITE        0x46u
++#define T_EV_DEBUG_LABEL        0x3fu
++#define T_BLIT_OP_SCALE         3u
++#define T_R_GRAS_A2D_BLT_CNTL   0x8400u
++#define T_R_GRAS_A2D_DEST_TL    0x8405u
++#define T_R_RB_A2D_BLT_CNTL     0x8c00u
++#define T_R_RB_A2D_DEST_INFO    0x8c17u
++#define T_R_RB_A2D_CLEAR_COLOR  0x8c2cu
++#define T_R_RB_DBG_ECO_CNTL     0x8e04u
++#define T_R_SP_A2D_OUTPUT_INFO  0xacc0u
++#define T_FMT6_8888_UNORM       0x30u
++#define T_A2D_BLT_CNTL_FILL     ((1u << 7) | (T_FMT6_8888_UNORM << 8) | (0xfu << 20))
++#define T_A2D_OUTPUT_INFO_VAL   ((T_FMT6_8888_UNORM << 3) | (0xfu << 12))
++#define T_A2D_DEST_INFO_VAL     (T_FMT6_8888_UNORM | (1u << 10))        /* SWAP_WXYZ */
++#define T_ECO_BLIT_BIT          (1u << 24)
++#define T_FILL_W                64u
++#define T_FILL_H                16u
++#define T_FILL_PITCH            512u	/* wider than the 64-pixel fill, so px[T_FILL_W] is outside it */
++#define T_FILL_OFF              0x1000u
++#define T_FILL_ARGB             0xff336699u
++#define T_RING_OFF              0x2000u
++#define T_RING_N                64u
++
++static uint32_t
++t_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^
++	       (v >> 28)))) & 1u;
++}
++
++static uint32_t
++t_pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (t_parity(cnt) << 15) | ((op & 0x7fu) << 16) | (t_parity(op) << 23);
++}
++
++static uint32_t
++t_pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | (t_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (t_parity(reg) << 27);
++}
++
++struct t_ib {
++	volatile uint32_t *p;
++	uint32_t n;
++};
++
++static void
++t_put(struct t_ib *ib, uint32_t v)
++{
++	ib->p[ib->n++] = v;
++}
++
++static void
++t_eco(struct t_ib *ib, bool blit)
++{
++	t_put(ib, t_pkt7(T_CP_WAIT_FOR_IDLE, 0));
++	t_put(ib, t_pkt7(T_CP_REG_RMW, 3));
++	t_put(ib, T_R_RB_DBG_ECO_CNTL);
++	t_put(ib, ~T_ECO_BLIT_BIT);
++	t_put(ib, blit ? T_ECO_BLIT_BIT : 0);
++}
++
++/* blueline_gpu.c dr_emit_rect for a 64-byte aligned pitch: one solid 2D fill */
++static void
++t_fill(struct t_ib *ib, uint64_t base, uint32_t pitch, uint32_t w, uint32_t h, uint32_t argb)
++{
++	t_put(ib, t_pkt4(T_R_RB_A2D_CLEAR_COLOR, 4));
++	t_put(ib, (argb >> 16) & 0xffu);
++	t_put(ib, (argb >> 8) & 0xffu);
++	t_put(ib, argb & 0xffu);
++	t_put(ib, argb >> 24);
++	t_put(ib, t_pkt4(T_R_RB_A2D_BLT_CNTL, 2));
++	t_put(ib, T_A2D_BLT_CNTL_FILL);
++	t_put(ib, 0);
++	t_put(ib, t_pkt4(T_R_GRAS_A2D_BLT_CNTL, 1));
++	t_put(ib, T_A2D_BLT_CNTL_FILL);
++	t_put(ib, t_pkt4(T_R_SP_A2D_OUTPUT_INFO, 1));
++	t_put(ib, T_A2D_OUTPUT_INFO_VAL);
++	t_put(ib, t_pkt4(T_R_GRAS_A2D_DEST_TL, 2));
++	t_put(ib, 0);
++	t_put(ib, ((w - 1) & 0x3fffu) | (((h - 1) & 0x3fffu) << 16));
++	t_put(ib, t_pkt4(T_R_RB_A2D_DEST_INFO, 4));
++	t_put(ib, T_A2D_DEST_INFO_VAL);
++	t_put(ib, (uint32_t)base);
++	t_put(ib, (uint32_t)(base >> 32));
++	t_put(ib, pitch >> 6);
++	t_put(ib, t_pkt7(T_CP_EVENT_WRITE, 1));
++	t_put(ib, T_EV_DEBUG_LABEL);
++	t_eco(ib, true);
++	t_put(ib, t_pkt7(T_CP_BLIT, 1));
++	t_put(ib, T_BLIT_OP_SCALE);
++	t_eco(ib, false);
++}
++
++static void
++t_mem_write(struct t_ib *ib, uint64_t gva, const uint32_t *v, uint32_t n)
++{
++	t_put(ib, t_pkt7(T_CP_MEM_WRITE, 2 + n));
++	t_put(ib, (uint32_t)gva);
++	t_put(ib, (uint32_t)(gva >> 32));
++	for (uint32_t i = 0; i < n; i++) {
++		t_put(ib, v[i]);
++	}
++}
++
++static uint32_t t_pass, t_fail;
++
++static void
++t_check(bool ok, const char *what, uint64_t got, uint64_t want)
++{
++	if (ok) {
++		t_pass++;
++		printf("BLUEGPU TEST: %s: PASS\n", what);
++	} else {
++		t_fail++;
++		printf("BLUEGPU TEST: %s: FAIL (got %#llx, want %#llx)\n", what, (unsigned long long)got,
++		    (unsigned long long)want);
++	}
++}
++
++static BGBo *
++t_bo(BGCtx *c, uint32_t h)
++{
++	IOLockLock(g.lock);
++	BGBo *b = bg_lookup(c, h);
++	IOLockUnlock(g.lock);
++	return b;
++}
++
++static IOReturn
++t_submit1(BGCtx *c, uint32_t ib_h, uint32_t ib_off, uint32_t ib_dw, uint32_t dst_h, uint32_t *fence, uint32_t relocs)
++{
++	struct blue_gpu_submit_bo bos[2] = {
++		{ BLUE_GPU_SUBMIT_BO_READ, ib_h, 0 },
++		{ BLUE_GPU_SUBMIT_BO_WRITE, dst_h, 0 },
++	};
++	struct blue_gpu_submit_cmd cmd = { BLUE_GPU_SUBMIT_CMD_BUF, 0, ib_off, ib_dw * 4, 0, relocs, 0 };
++	struct blue_gpu_submit s;
++	bzero(&s, sizeof(s));
++	s.flags = BLUE_GPU_PIPE_3D0 | BLUE_GPU_SUBMIT_NO_IMPLICIT;
++	s.nr_bos = 2;
++	s.nr_cmds = 1;
++	s.fence_fd = -1;
++	IOReturn r = bg_submit(c, &s, bos, &cmd);
++	*fence = s.fence;
++	return r;
++}
++
++static IOReturn
++t_wait(BGCtx *c, uint32_t fence, uint64_t ms)
++{
++	struct blue_gpu_wait_fence w;
++	bzero(&w, sizeof(w));
++	uint64_t d = bg_now_ns() + ms * 1000000ull;
++	w.fence = fence;
++	w.timeout.tv_sec = (int64_t)(d / NSEC_PER_SEC);
++	w.timeout.tv_nsec = (int64_t)(d % NSEC_PER_SEC);
++	return bg_wait_fence(c, &w);
++}
++
++static void
++bg_selftest(void)
++{
++	struct blue_gmem_info m0, m1;
++	struct blue_gpu_param p;
++	struct blue_gpu_gem_new n;
++	uint32_t dst = 0, ib = 0, tmp = 0, f = 0;
++	IOReturn r;
++	uint64_t t0 = mach_absolute_time();
++
++	t_pass = t_fail = 0;
++	blue_gmem_get_info(&m0);
++	printf("BLUEGPU TEST: start (pool %llu MiB, %u of %u granules free)\n", m0.pool_size >> 20, m0.free_granules,
++	    m0.granules);
++	BGCtx *c = bg_ctx_create(kernel_task);
++	if (c == NULL || m0.pool_size == 0) {
++		printf("BLUEGPU TEST: FAIL (%s)\n", c == NULL ? "no context" : "no pool");
++		if (c != NULL) {
++			bg_ctx_destroy(c);
++		}
++		return;
++	}
++
++	/* 1. GET_PARAM */
++	static const struct {
++		uint32_t param;
++		uint64_t want;
++		const char *name;
++	} pv[] = {
++		{ BLUE_GPU_PARAM_GPU_ID, BLUE_GPU_A630_GPU_ID, "GET_PARAM GPU_ID" },
++		{ BLUE_GPU_PARAM_CHIP_ID, BLUE_GPU_A630_CHIP_ID, "GET_PARAM CHIP_ID" },
++		{ BLUE_GPU_PARAM_GMEM_SIZE, BLUE_GPU_A630_GMEM_SIZE, "GET_PARAM GMEM_SIZE" },
++		{ BLUE_GPU_PARAM_VA_START, BLUE_GMEM_VA_START, "GET_PARAM VA_START" },
++		{ BLUE_GPU_PARAM_VA_SIZE, BLUE_GMEM_VA_SIZE, "GET_PARAM VA_SIZE" },
++	};
++	for (uint32_t i = 0; i < sizeof(pv) / sizeof(pv[0]); i++) {
++		bzero(&p, sizeof(p));
++		p.pipe = BLUE_GPU_PIPE_3D0;
++		p.param = pv[i].param;
++		r = bg_get_param(c, &p);
++		t_check(r == kIOReturnSuccess && p.value == pv[i].want, pv[i].name, p.value, pv[i].want);
++	}
++	bzero(&p, sizeof(p));
++	p.pipe = BLUE_GPU_PIPE_3D0;
++	p.param = BLUE_GPU_PARAM_TIMESTAMP;
++	(void)bg_get_param(c, &p);
++	uint64_t ts0 = p.value;
++	IODelay(100);
++	(void)bg_get_param(c, &p);
++	t_check(ts0 != 0 && p.value > ts0, "GET_PARAM TIMESTAMP advances", p.value, ts0);
++	p.param = BLUE_GPU_PARAM_UCHE_TRAP_BASE;
++	t_check(bg_get_param(c, &p) == kIOReturnBadArgument, "GET_PARAM UCHE_TRAP_BASE -> EINVAL", 0, 0);
++
++	/* 2. GEM_NEW */
++	bzero(&n, sizeof(n));
++	n.size = 0x10000;
++	n.flags = BLUE_GPU_BO_WC;
++	r = bg_gem_new(c, &n);
++	dst = n.handle;
++	n.handle = 0;
++	n.size = 0x8000;        /* rounds to 64K */
++	IOReturn r2 = bg_gem_new(c, &n);
++	ib = n.handle;
++	t_check(r == kIOReturnSuccess && r2 == kIOReturnSuccess && dst && ib && dst != ib, "GEM_NEW x2", r | r2, 0);
++	if (r != kIOReturnSuccess || r2 != kIOReturnSuccess) {
++		goto done;
++	}
++	n.flags = BLUE_GPU_BO_CACHED_COHERENT;
++	n.handle = 0;
++	t_check(bg_gem_new(c, &n) == kIOReturnBadArgument, "GEM_NEW CACHED_COHERENT -> EINVAL", 0, 0);
++	{
++		BGBo *d = t_bo(c, dst), *b = t_bo(c, ib);
++		volatile uint32_t *dp = (volatile uint32_t *)d->kva;
++		bool zero = true;
++		for (uint32_t i = 0; i < 0x10000 / 4; i++) {
++			zero = zero && dp[i] == 0;
++		}
++		t_check(zero && b->size == 0x10000, "GEM_NEW zero-filled, 64K granule", b->size, 0x10000);
++		printf("BLUEGPU TEST: dst handle %u iova %#llx pa %#llx, ib handle %u iova %#llx\n", dst,
++		    (unsigned long long)d->gva, (unsigned long long)d->pa, ib, (unsigned long long)b->gva);
++
++		struct blue_gpu_gem_info gi;
++		bzero(&gi, sizeof(gi));
++		gi.handle = dst;
++		gi.info = BLUE_GPU_INFO_GET_IOVA;
++		r = bg_gem_info(c, &gi, NULL);
++		t_check(r == kIOReturnSuccess && gi.value == d->gva && gi.value >= BLUE_GMEM_VA_START &&
++		    gi.value < BLUE_GMEM_VA_START + BLUE_GMEM_VA_SIZE, "GEM_INFO GET_IOVA", gi.value, d->gva);
++		gi.info = BLUE_GPU_INFO_GET_OFFSET;
++		r = bg_gem_info(c, &gi, NULL);
++		t_check(r == kIOReturnSuccess && gi.value == dst, "GEM_INFO GET_OFFSET = handle", gi.value, dst);
++
++		/* 3. one IB: CP_MEM_WRITE of 16 words, then a 64x16 2D fill */
++		uint32_t pat[16];
++		for (uint32_t i = 0; i < 16; i++) {
++			pat[i] = 0xb1e60000u | i;
++		}
++		struct t_ib t = { (volatile uint32_t *)b->kva, 0 };
++		t_mem_write(&t, d->gva, pat, 16);
++		t_fill(&t, d->gva + T_FILL_OFF, T_FILL_PITCH, T_FILL_W, T_FILL_H, T_FILL_ARGB);
++		t_put(&t, t_pkt7(T_CP_NOP, 0));
++		uint64_t ts = mach_absolute_time();
++		r = t_submit1(c, ib, 0, t.n, dst, &f, 0);
++		t_check(r == kIOReturnSuccess && f != 0, "SUBMIT (MEM_WRITE + 2D fill IB)", r, 0);
++		r = t_wait(c, f, 1000);
++		t_check(r == kIOReturnSuccess, "WAIT_FENCE", r, 0);
++		printf("BLUEGPU TEST: IB of %u dwords, fence %u retired after %llu us\n", t.n, f, bg_abs_ns(ts) / 1000);
++		bool okw = true;
++		for (uint32_t i = 0; i < 16; i++) {
++			okw = okw && dp[i] == pat[i];
++		}
++		t_check(okw, "CP_MEM_WRITE words", dp[0], pat[0]);
++		uint32_t bad = 0, first = 0;
++		volatile uint32_t *px = (volatile uint32_t *)(d->kva + T_FILL_OFF);
++		for (uint32_t y = 0; y < T_FILL_H; y++) {
++			for (uint32_t x = 0; x < T_FILL_W; x++) {
++				uint32_t v = px[y * (T_FILL_PITCH / 4) + x];
++				if (v != T_FILL_ARGB && bad++ == 0) {
++					first = v;
++				}
++			}
++		}
++		t_check(bad == 0, "2D fill 64x16 pixels", first, T_FILL_ARGB);
++		uint32_t outside = px[T_FILL_W] | px[T_FILL_H * (T_FILL_PITCH / 4)] | dp[16];
++		t_check(outside == 0, "2D fill / MEM_WRITE stay inside", outside, 0);
++
++		/* 4. the user-map path: the descriptor clientMemoryForType returns, mapped (default cache) */
++		IOMemoryDescriptor *md = bg_memory(c, dst);
++		IOMemoryMap *map = md != NULL ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : NULL;
++		int rc = md != NULL ? md->getRetainCount() : 0;
++		uint32_t mv = map != NULL ? ((volatile uint32_t *)map->getVirtualAddress())[1] : 0;
++		uint32_t mp = map != NULL ? ((volatile uint32_t *)(map->getVirtualAddress() + T_FILL_OFF))[0] : 0;
++		t_check(map != NULL && mv == pat[1] && mp == T_FILL_ARGB, "map of the BO descriptor reads the GPU's data",
++		    mv, pat[1]);
++		IOLockLock(g.lock);
++		bool parked = !bg_bo_idle(d);
++		IOLockUnlock(g.lock);
++		t_check(parked, "a mapped BO counts as busy (retain count)", (uint64_t)rc, 3);
++		OSSafeReleaseNULL(map);
++		OSSafeReleaseNULL(md);
++
++		/* 5. 64 submits back to back: ring wrap and the room wait */
++		uint32_t base = 0x2000 / 4, ok_n = 0, last = 0, busy = 0;
++		for (uint32_t i = 0; i < T_RING_N; i++) {
++			struct t_ib q = { (volatile uint32_t *)(b->kva + 0x4000 + i * 64), 0 };
++			uint32_t v = 0x5e000000u | i;
++			t_mem_write(&q, d->gva + T_RING_OFF + 4 * i, &v, 1);
++			do {
++				r = t_submit1(c, ib, 0x4000 + i * 64, q.n, dst, &last, 0);
++			} while (r == kIOReturnBusy && ++busy < 100);
++			ok_n += r == kIOReturnSuccess;
++		}
++		r = t_wait(c, last, 2000);
++		uint32_t good = 0;
++		for (uint32_t i = 0; i < T_RING_N; i++) {
++			good += dp[base + i] == (0x5e000000u | i);
++		}
++		t_check(ok_n == T_RING_N && r == kIOReturnSuccess && good == T_RING_N, "64 submits (ring wrap) all landed",
++		    good, T_RING_N);
++		printf("BLUEGPU TEST: 64 submits: %u EBUSY retries, %u ring-full waits so far, last fence %u\n", busy,
++		    g.n_ring_full, last);
++
++		/* 6. CPU_PREP: NOSYNC on a busy BO, then a blocking one */
++		struct blue_gpu_gem_cpu_prep cp;
++		bzero(&cp, sizeof(cp));
++		struct t_ib q = { (volatile uint32_t *)(b->kva + 0x8000), 0 };
++		for (uint32_t k = 0; k < 8; k++) {
++			t_fill(&q, d->gva + T_FILL_OFF, T_FILL_PITCH, T_FILL_W, T_FILL_H, T_FILL_ARGB ^ k);
++		}
++		r = t_submit1(c, ib, 0x8000, q.n, dst, &f, 0);
++		cp.handle = dst;
++		cp.op = BLUE_GPU_PREP_READ | BLUE_GPU_PREP_NOSYNC;
++		IOReturn rn = bg_cpu_prep(c, &cp);
++		printf("BLUEGPU TEST: CPU_PREP NOSYNC right after a submit: %s\n", rn == kIOReturnBusy ? "EBUSY" :
++		    rn == kIOReturnSuccess ? "already idle (fast GPU; not counted)" : "other");
++		t_check(r == kIOReturnSuccess && (rn == kIOReturnBusy || rn == kIOReturnSuccess), "CPU_PREP NOSYNC", rn,
++		    kIOReturnBusy);
++		uint64_t dl = bg_now_ns() + 1000000000ull;
++		cp.op = BLUE_GPU_PREP_READ;
++		cp.timeout.tv_sec = (int64_t)(dl / NSEC_PER_SEC);
++		cp.timeout.tv_nsec = (int64_t)(dl % NSEC_PER_SEC);
++		r = bg_cpu_prep(c, &cp);
++		t_check(r == kIOReturnSuccess && px[0] == (T_FILL_ARGB ^ 7), "CPU_PREP READ waits for the GPU write", px[0],
++		    T_FILL_ARGB ^ 7);
++
++		/* 7. GEM_CLOSE while the GPU still uses the BO: parked, then reaped */
++		bzero(&n, sizeof(n));
++		n.size = 0x10000;
++		n.flags = BLUE_GPU_BO_WC;
++		r = bg_gem_new(c, &n);
++		tmp = n.handle;
++		if (r == kIOReturnSuccess) {
++			BGBo *tb = t_bo(c, tmp);
++			q.n = 0;
++			q.p = (volatile uint32_t *)(b->kva + 0xc000);
++			for (uint32_t k = 0; k < 8; k++) {
++				t_fill(&q, tb->gva, T_FILL_PITCH, T_FILL_W, 64, 0xff000000u | k);
++			}
++			r = t_submit1(c, ib, 0xc000, q.n, tmp, &f, 0);
++			r2 = bg_gem_close(c, tmp);
++			IOLockLock(g.lock);
++			uint32_t z = g.nzombie;
++			IOLockUnlock(g.lock);
++			(void)t_wait(c, f, 1000);
++			IOLockLock(g.lock);
++			bg_reap();
++			uint32_t z2 = g.nzombie;
++			IOLockUnlock(g.lock);
++			printf("BLUEGPU TEST: GEM_CLOSE while busy: %u parked right after, %u after the fence\n", z, z2);
++			t_check(r == kIOReturnSuccess && r2 == kIOReturnSuccess && z2 == 0, "GEM_CLOSE busy BO parked, then freed",
++			    z2, 0);
++			t_check(t_bo(c, tmp) == NULL, "closed handle gone", 0, 0);
++		}
++
++		/* 8. what must be refused */
++		uint32_t fx = 0;
++		t_check(t_submit1(c, ib, 0x10000 - 8, 4, dst, &fx, 0) == kIOReturnBadArgument, "IB past the end of its BO -> EINVAL",
++		    0, 0);
++		t_check(t_submit1(c, ib, 2, 4, dst, &fx, 0) == kIOReturnBadArgument, "unaligned IB -> EINVAL", 0, 0);
++		t_check(t_submit1(c, ib, 0, 4, dst, &fx, 1) == kIOReturnBadArgument, "relocs -> EINVAL", 0, 0);
++		t_check(t_submit1(c, ib, 0, 4, 0xfff, &fx, 0) == kIOReturnNotFound, "bad handle -> ENOENT", 0, 0);
++		t_check(t_wait(c, g.last_seq + 5, 1) == kIOReturnBadArgument, "WAIT_FENCE beyond the last -> EINVAL", 0, 0);
++		struct blue_gpu_gem_cpu_prep bp;
++		bzero(&bp, sizeof(bp));
++		bp.handle = 4000;
++		t_check(bg_cpu_prep(c, &bp) == kIOReturnNotFound, "CPU_PREP bad handle -> ENOENT", 0, 0);
++	}
++
++	/* 9. userptr: a kernel buffer as a BO, written by the GPU */
++	{
++		void *buf = IOMallocAligned(PAGE_SIZE, PAGE_SIZE);
++		struct blue_gpu_userptr up;
++		bzero(&up, sizeof(up));
++		up.address = (uint64_t)(uintptr_t)buf;
++		up.size = PAGE_SIZE;
++		if (buf != NULL) {
++			bzero(buf, PAGE_SIZE);
++			r = bg_userptr(c, &up);
++			BGBo *ub = r == kIOReturnSuccess ? t_bo(c, up.handle) : NULL;
++			BGBo *b = t_bo(c, ib);
++			if (ub != NULL) {
++				uint32_t v[2] = { 0xa5e70001u, 0xa5e70002u };
++				struct t_ib q = { (volatile uint32_t *)(b->kva + 0xe000), 0 };
++				t_mem_write(&q, ub->gva + 0x100, v, 2);
++				r = t_submit1(c, ib, 0xe000, q.n, up.handle, &f, 0);
++				struct blue_gpu_gem_cpu_prep cp;
++				bzero(&cp, sizeof(cp));
++				uint64_t dl = bg_now_ns() + 1000000000ull;
++				cp.handle = up.handle;
++				cp.op = BLUE_GPU_PREP_READ;
++				cp.timeout.tv_sec = (int64_t)(dl / NSEC_PER_SEC);
++				cp.timeout.tv_nsec = (int64_t)(dl % NSEC_PER_SEC);
++				IOReturn rp = bg_cpu_prep(c, &cp);
++				uint32_t got = ((volatile uint32_t *)buf)[0x40] ^ ((volatile uint32_t *)buf)[0x41];
++				t_check(r == kIOReturnSuccess && rp == kIOReturnSuccess && got == (v[0] ^ v[1]),
++				    "USERPTR BO written by the GPU (cache invalidated at CPU_PREP)", ((volatile uint32_t *)buf)[0x40],
++				    v[0]);
++				(void)bg_gem_close(c, up.handle);
++			} else {
++				t_check(false, "USERPTR import", r, 0);
++			}
++			if (ub == NULL || t_wait(c, f, 1000) == kIOReturnSuccess) {
++				IOFreeAligned(buf, PAGE_SIZE);  /* closed, fence retired: unmapped already */
++			}                                       /* else: the GPU may still write it: leaked */
++		}
++	}
++
++done:
++	if (dst) {
++		(void)bg_gem_close(c, dst);
++	}
++	if (ib) {
++		(void)bg_gem_close(c, ib);
++	}
++	bg_ctx_destroy(c);
++	IOLockLock(g.lock);
++	bg_reap();
++	IOLockUnlock(g.lock);
++	blue_gmem_get_info(&m1);
++	t_check(m1.free_granules == m0.free_granules && m1.imp_free == m0.imp_free, "pool and import VA all given back",
++	    m1.free_granules, m0.free_granules);
++	printf("BLUEGPU TEST: %s: %u passed, %u failed, %llu ms; FAULTS %u, cb0 fsr %#x\n", t_fail ? "FAIL" : "PASS",
++	    t_pass, t_fail, bg_abs_ns(t0) / 1000000, g.faults, blue_gpu_core_fsr());
++}
++
++/* ---- start, and the 0151 hooks ---------------------------------------------------------- */
++
++extern "C" void
++blue_gpu_uapi_start(void)
++{
++	int on = 1;
++
++	if (g.started) {
++		return;
++	}
++	g.started = true;
++	(void)PE_parse_boot_argn("bluegpu_uapi", &on, sizeof(on));
++	g.hang_ms = 1000;
++	(void)PE_parse_boot_argn("bluegpu_uapi_hang_ms", &g.hang_ms, sizeof(g.hang_ms));
++	if (g.hang_ms < 100 || g.hang_ms > 10000) {
++		g.hang_ms = 1000;
++	}
++	(void)PE_parse_boot_argn("bluegpu_uapi_test", &g.test, sizeof(g.test));
++	if (!on || !blue_gpu_core_ready()) {
++		printf("BLUEGPU UAPI: %s: no BlueGPU service\n", on ? "GPU not resident" : "off (bluegpu_uapi=0)");
++		return;
++	}
++	g.lock = IOLockAlloc();
++	if (g.lock == NULL) {
++		return;
++	}
++	blue_gpu_core_uapi_init();
++	bool pool = blue_gmem_init();
++	g.t_stat = g.t_prog = mach_absolute_time();
++	g.ready = true;
++
++	IOService *provider = NULL;
++	for (int i = 0; i < 1000 && (provider = IOService::getResourceService()) == NULL; i++) {
++		IOSleep(10);
++	}
++	BlueGPU *svc = provider != NULL ? OSTypeAlloc(BlueGPU) : NULL;
++	bool ok = svc != NULL && svc->init() && svc->attach(provider);
++	if (ok && !svc->start(provider)) {
++		svc->detach(provider);
++		ok = false;
++	}
++	if (ok) {
++		svc->setProperty(kIOUserClientClassKey, "BlueGPUUserClient");
++		struct blue_gmem_info mi;
++		blue_gmem_get_info(&mi);
++		svc->setProperty("BlueGPUPoolMB", mi.pool_size >> 20, 32);
++		svc->setProperty("BlueGPUVAStart", BLUE_GMEM_VA_START, 64);
++		svc->setProperty("BlueGPUVASize", BLUE_GMEM_VA_SIZE, 64);
++		svc->registerService();
++	}
++	OSSafeReleaseNULL(svc);         /* the registry keeps it */
++	printf("BLUEGPU UAPI: BlueGPU %s (msm ABI 1.9 for mesa-ios/bluedrm; pool %s; hang guard %d ms; self-test %s)\n",
++	    ok ? "registered" : "NOT REGISTERED", pool ? "on" : "OFF", g.hang_ms, g.test ? "on" : "off");
++	if (g.test) {
++		bg_selftest();
++	}
++}
++
++/* From 0151's interrupt handler (rs_irq): a CACHE_FLUSH_TS (ours or a present's). */
++extern "C" void
++blue_gpu_uapi_fence_signal(void)
++{
++	if (g.ready) {
++		IOLockWakeup(g.lock, &g.wake, false);
++	}
++}
++
++/* After a 0151 recovery (blueline_gpu.c rs_recover; the ring is empty again): everything submitted retired. */
++extern "C" void
++blue_gpu_uapi_reset(void)
++{
++	if (!g.ready) {
++		return;
++	}
++	IOLockLock(g.lock);
++	g.reset_seq = blue_gpu_core_fence_force();
++	g.faults++;
++	g.dead = false;         /* the GPU works again; BOs kept while dead are reaped as usual now */
++	g.prog_val = g.reset_seq;
++	g.t_prog = mach_absolute_time();
++	IOLockUnlock(g.lock);
++	IOLockWakeup(g.lock, &g.wake, false);
++	printf("BLUEGPU UAPI: GPU reset: fences up to %u retired, FAULTS %u\n", g.reset_seq, g.faults);
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/blue_gpu_uapi.h b/iokit/Kernel/arm/blue_gpu_uapi.h
+new file mode 100644
+index 000000000..506071351
+--- /dev/null
++++ b/iokit/Kernel/arm/blue_gpu_uapi.h
+@@ -0,0 +1,308 @@
++/*
++ * Kernel copy of mesa-ios/blue_gpu_uapi.h (pixel3-ios-gpu), byte for byte below this comment.
++ * The userland side owns it: change it there and copy it here, never the other way.
++ */
++/*
++ * blue_gpu_uapi.h - the BlueGPU kernel user-client ABI (pixel3-ios, Adreno 630 / SDM845).
++ *
++ * This is the contract between:
++ *   - kernel stage 6d: the IOService "BlueGPU" and its IOUserClient in our XNU tree, and
++ *   - userland: mesa-ios/bluedrm (the libdrm stand-in that Mesa freedreno's drm/msm
++ *     backend, and later Turnip's msm backend, are built against).
++ *
++ * Design (same as HakiOS, tools/mesa/hakios-drm, MIT): the ABI *is* Linux drm/msm.
++ *   - selector  = low byte of the Linux ioctl number = DRM_COMMAND_BASE (0x40) + DRM_MSM_*,
++ *                 plus the generic DRM GEM_CLOSE (0x09) and two non-Linux requests (0x7d, 0x7e).
++ *   - transport = IOConnectCallStructMethod(conn, selector, &s, sizeof s, &s, &sizeof s):
++ *                 the struct goes in and comes back (same size) for EVERY selector, including
++ *                 the ones Linux declares write-only (CPU_PREP, WAIT_FENCE, SUBMITQUEUE_CLOSE).
++ *   - structs   = byte-identical to include/drm-uapi/msm_drm.h (Mesa 26.3.1 copy).
++ *                 bluedrm.c static-asserts every size/offset against Mesa's header.
++ *   - errors    = IOReturn; bluedrm maps them to errno (table at the end).
++ *   - pointers  = user VAs of the calling task (u64). The kernel copyin()s them
++ *                 (submit bos/cmds arrays, SET_NAME strings, SUBMITQUEUE_QUERY data).
++ *   - mmap      = IOConnectMapMemory64(conn, memoryType = (uint32_t)GEM_INFO(GET_OFFSET).value,
++ *                 mach_task_self(), &addr, &size, kIOMapAnywhere) -> clientMemoryForType().
++ *                 The kernel returns the *token* in GET_OFFSET (recommended: the GEM handle);
++ *                 userland never interprets it. Unmap: IOConnectUnmapMemory64 with the same type.
++ *   - timeouts  = absolute drm_msm_timespec on Darwin's CLOCK_MONOTONIC_RAW, i.e.
++ *                 mach_continuous_time() converted to ns (mesa-ios patch 0002 changes Mesa's
++ *                 get_abs_timeout() to that clock). {0,0} = "poll, don't wait".
++ *
++ * Kernel stage 6d implements exactly this header. Keep it free of Mesa/IOKit includes so the
++ * kernel can include it as is (only <stdint.h>-style types).
++ *
++ * Copyright (c) 2026 pixel3-ios. MIT licence. Struct layouts are Linux's msm_drm.h (MIT).
++ */
++#ifndef BLUE_GPU_UAPI_H
++#define BLUE_GPU_UAPI_H
++
++#ifdef KERNEL
++#include <stdint.h>
++#else
++#include <stdint.h>
++#endif
++
++#define BLUE_GPU_SERVICE        "BlueGPU"   /* IOServiceMatching() name of the GPU nub */
++#define BLUE_GPU_UC_TYPE        0           /* IOServiceOpen() type */
++
++/* What drmGetVersion() reports (bluedrm, not a selector). Mesa gates features on the minor:
++ *   >=3 GMEM_BASE + submit queues + BO_IOVA, >=4 softpin (kernel-chosen IOVA, no relocs),
++ *   >=5 robustness (FAULTS), >=7 SUSPENDS, >=8 probes MSM_BO_CACHED_COHERENT once (kernel
++ *   answers EINVAL -> Mesa uses WC everywhere), >=9 asks VA_SIZE.  We report 1.9. */
++#define BLUE_GPU_DRM_NAME       "msm"
++#define BLUE_GPU_DRM_MAJOR      1
++#define BLUE_GPU_DRM_MINOR      9
++
++/* ---- selectors -------------------------------------------------------------------------- */
++#define BLUE_GPU_SEL_GEM_CLOSE          0x09    /* DRM_IOCTL_GEM_CLOSE (generic drm.h)      */
++#define BLUE_GPU_SEL_GET_PARAM          0x40    /* DRM_MSM_GET_PARAM                        */
++#define BLUE_GPU_SEL_SET_PARAM          0x41    /* DRM_MSM_SET_PARAM      (accept, ignore)  */
++#define BLUE_GPU_SEL_GEM_NEW            0x42    /* DRM_MSM_GEM_NEW                          */
++#define BLUE_GPU_SEL_GEM_INFO           0x43    /* DRM_MSM_GEM_INFO                         */
++#define BLUE_GPU_SEL_GEM_CPU_PREP       0x44    /* DRM_MSM_GEM_CPU_PREP                     */
++#define BLUE_GPU_SEL_GEM_CPU_FINI       0x45    /* DRM_MSM_GEM_CPU_FINI   (no-op)           */
++#define BLUE_GPU_SEL_GEM_SUBMIT         0x46    /* DRM_MSM_GEM_SUBMIT                       */
++#define BLUE_GPU_SEL_WAIT_FENCE         0x47    /* DRM_MSM_WAIT_FENCE                       */
++#define BLUE_GPU_SEL_GEM_MADVISE        0x48    /* DRM_MSM_GEM_MADVISE    (retained = 1)    */
++/*      0x49 DRM_MSM_GEM_SVM_NEW: never used by Mesa -> kIOReturnUnsupported                  */
++#define BLUE_GPU_SEL_SUBMITQUEUE_NEW    0x4a    /* DRM_MSM_SUBMITQUEUE_NEW                  */
++#define BLUE_GPU_SEL_SUBMITQUEUE_CLOSE  0x4b    /* DRM_MSM_SUBMITQUEUE_CLOSE (struct = u32) */
++#define BLUE_GPU_SEL_SUBMITQUEUE_QUERY  0x4c    /* DRM_MSM_SUBMITQUEUE_QUERY                */
++/*      0x4d VM_BIND, 0x4e PERFCNTR_CONFIG: not implemented -> kIOReturnUnsupported            */
++#define BLUE_GPU_SEL_USERPTR            0x7d    /* HakiOS: whole pages of the caller as a BO */
++#define BLUE_GPU_SEL_IOSURFACE          0x7e    /* HakiOS: BO over an IOSurface (by ID)      */
++#define BLUE_GPU_SEL_MAX                0x7f    /* external-method table size                */
++
++/* ---- 0x40 / 0x41 GET_PARAM / SET_PARAM --------------------------------------------------- */
++struct blue_gpu_param {                 /* == struct drm_msm_param (24 bytes) */
++	uint32_t pipe;                  /* in: BLUE_GPU_PIPE_3D0 (0x10); 2D0 (0x01) may fail   */
++	uint32_t param;                 /* in: BLUE_GPU_PARAM_*                                */
++	uint64_t value;                 /* out (get) / in (set)                                */
++	uint32_t len;                   /* 0 for value params                                   */
++	uint32_t pad;
++};
++#define BLUE_GPU_PIPE_2D0               0x01
++#define BLUE_GPU_PIPE_3D0               0x10
++
++/* param ids (MSM_PARAM_*) and the values the a630 kernel must return */
++#define BLUE_GPU_PARAM_GPU_ID           0x01    /* 630                                          */
++#define BLUE_GPU_PARAM_GMEM_SIZE        0x02    /* 0x100000 (1 MiB; a6xx_catalog.c a630)        */
++#define BLUE_GPU_PARAM_CHIP_ID          0x03    /* 0x06030001 (Linux a6xx_catalog.c a630 ADRENO_CHIP_IDS) */
++#define BLUE_GPU_PARAM_MAX_FREQ         0x04    /* Hz of the top OPP in use (710000000)         */
++#define BLUE_GPU_PARAM_TIMESTAMP        0x05    /* CP_ALWAYS_ON_COUNTER, 19.2 MHz ticks          */
++#define BLUE_GPU_PARAM_GMEM_BASE        0x06    /* 0x100000                                      */
++#define BLUE_GPU_PARAM_PRIORITIES       0x07    /* 1 (one ring) - also MSM_PARAM_NR_RINGS        */
++#define BLUE_GPU_PARAM_PP_PGTABLE       0x08    /* 0                                             */
++#define BLUE_GPU_PARAM_FAULTS           0x09    /* global hang/fault count since boot            */
++#define BLUE_GPU_PARAM_SUSPENDS         0x0a    /* GPU slumber/resume count (0 until 6c)         */
++#define BLUE_GPU_PARAM_SYSPROF          0x0b    /* WO: accept, ignore                            */
++#define BLUE_GPU_PARAM_COMM             0x0c    /* WO: (value = user ptr, len) accept, ignore    */
++#define BLUE_GPU_PARAM_CMDLINE          0x0d    /* WO: accept, ignore                            */
++#define BLUE_GPU_PARAM_VA_START         0x0e    /* start of this connection's GPU VA window      */
++#define BLUE_GPU_PARAM_VA_SIZE          0x0f    /* size of it (4 GiB backboardd, 1 GiB others)   */
++#define BLUE_GPU_PARAM_HIGHEST_BANK_BIT 0x10    /* 15 (sdm845, a6xx_set_ubwc_config)             */
++#define BLUE_GPU_PARAM_RAYTRACING       0x11    /* 0                                             */
++#define BLUE_GPU_PARAM_UBWC_SWIZZLE     0x12    /* EINVAL in v1 (only Turnip asks; default ~0)   */
++
++#define BLUE_GPU_PARAM_MACROTILE_MODE   0x13    /* 0                                             */
++#define BLUE_GPU_PARAM_UCHE_TRAP_BASE   0x14    /* EINVAL ok (Mesa then uses its default)        */
++#define BLUE_GPU_PARAM_HAS_PRR          0x15    /* 0                                             */
++/* unknown param -> kIOReturnBadArgument (EINVAL) */
++
++#define BLUE_GPU_A630_GPU_ID            630
++#define BLUE_GPU_A630_CHIP_ID           0x06030001ull
++#define BLUE_GPU_A630_GMEM_SIZE         0x100000ull
++#define BLUE_GPU_A630_GMEM_BASE         0x100000ull
++#define BLUE_GPU_A630_HIGHEST_BANK_BIT  15
++#define BLUE_GPU_VA_START_DEFAULT       0x1000000000ull /* 0x10_0000_0000 (stage-6 plan 6d) */
++#define BLUE_GPU_VA_SIZE_BACKBOARDD     0x100000000ull  /* 4 GiB */
++#define BLUE_GPU_VA_SIZE_DEFAULT        0x40000000ull   /* 1 GiB */
++
++/* ---- 0x42 GEM_NEW ----------------------------------------------------------------------- */
++struct blue_gpu_gem_new {               /* == struct drm_msm_gem_new (16 bytes) */
++	uint64_t size;                  /* in: bytes; kernel rounds up to its granule (64 KiB) */
++	uint32_t flags;                 /* in: BLUE_GPU_BO_*                                    */
++	uint32_t handle;                /* out: nonzero, per connection                          */
++};
++#define BLUE_GPU_BO_SCANOUT             0x00000001  /* contiguous, below 4 GiB (pool is anyway) */
++#define BLUE_GPU_BO_GPU_READONLY        0x00000002
++#define BLUE_GPU_BO_NO_SHARE            0x00000004
++#define BLUE_GPU_BO_CACHE_MASK          0x000f0000
++#define BLUE_GPU_BO_CACHED              0x00010000  /* -> EINVAL in v1 (pool is WC-only)         */
++#define BLUE_GPU_BO_WC                  0x00020000  /* the only cache mode v1 accepts            */
++#define BLUE_GPU_BO_UNCACHED            0x00040000  /* treat as WC                               */
++#define BLUE_GPU_BO_CACHED_COHERENT     0x00080000  /* -> EINVAL (Mesa probes it once)           */
++/* Memory: zero-filled, from the GPU carve-out (plan 6d), mapped at a kernel-chosen IOVA inside
++ * the connection's VA window immediately (GET_IOVA must work right after GEM_NEW). */
++
++/* ---- 0x09 GEM_CLOSE --------------------------------------------------------------------- */
++struct blue_gpu_gem_close {             /* == struct drm_gem_close (8 bytes) */
++	uint32_t handle;
++	uint32_t pad;
++};
++/* Frees the handle. Pages and IOVA go to the zombie list until the last fence that used the BO
++ * retires, and until no task still maps it (flame 0113). Never fails for a valid handle. */
++
++/* ---- 0x43 GEM_INFO ---------------------------------------------------------------------- */
++struct blue_gpu_gem_info {              /* == struct drm_msm_gem_info (24 bytes) */
++	uint32_t handle;
++	uint32_t info;                  /* BLUE_GPU_INFO_* */
++	uint64_t value;                 /* in or out, or a user pointer (NAME, METADATA)       */
++	uint32_t len;
++	uint32_t pad;
++};
++#define BLUE_GPU_INFO_GET_OFFSET        0x00    /* out: mmap token = memoryType for IOConnectMapMemory64 */
++#define BLUE_GPU_INFO_GET_IOVA          0x01    /* out: GPU VA                                    */
++#define BLUE_GPU_INFO_SET_NAME          0x02    /* in: value = user ptr, len <= 32: keep for logs  */
++#define BLUE_GPU_INFO_GET_NAME          0x03    /* optional                                        */
++#define BLUE_GPU_INFO_SET_IOVA          0x04    /* in: client-chosen VA in the window (Turnip); EINVAL if busy/outside */
++#define BLUE_GPU_INFO_GET_FLAGS         0x05    /* out: the GEM_NEW flags                          */
++#define BLUE_GPU_INFO_SET_METADATA      0x06    /* EINVAL ok in v1 (Mesa logs once)               */
++#define BLUE_GPU_INFO_GET_METADATA      0x07    /* EINVAL ok in v1                                 */
++
++/* ---- 0x44 / 0x45 CPU_PREP / CPU_FINI ---------------------------------------------------- */
++struct blue_gpu_timespec {              /* == struct drm_msm_timespec (16 bytes) */
++	int64_t tv_sec;
++	int64_t tv_nsec;
++};
++struct blue_gpu_gem_cpu_prep {          /* == struct drm_msm_gem_cpu_prep (24 bytes) */
++	uint32_t handle;
++	uint32_t op;                    /* BLUE_GPU_PREP_*                                     */
++	struct blue_gpu_timespec timeout; /* absolute, CLOCK_MONOTONIC_RAW (see top)          */
++};
++#define BLUE_GPU_PREP_READ              0x01    /* wait for the GPU's last WRITE of the BO       */
++#define BLUE_GPU_PREP_WRITE             0x02    /* wait for the GPU's last READ or WRITE          */
++#define BLUE_GPU_PREP_NOSYNC            0x04    /* don't wait: kIOReturnBusy (EBUSY) if not idle   */
++#define BLUE_GPU_PREP_BOOST             0x08    /* ignore                                          */
++/* Result: 0 idle, kIOReturnBusy (EBUSY) with NOSYNC, kIOReturnTimeout (ETIMEDOUT) at the deadline.
++ * For imported cacheable BOs (0x7d/0x7e): invalidate the CPU cache here if the GPU wrote it. */
++struct blue_gpu_gem_cpu_fini {          /* == struct drm_msm_gem_cpu_fini (4 bytes) */
++	uint32_t handle;
++};
++
++/* ---- 0x46 GEM_SUBMIT -------------------------------------------------------------------- */
++struct blue_gpu_submit_bo {             /* == struct drm_msm_gem_submit_bo (16 bytes) */
++	uint32_t flags;                 /* BLUE_GPU_SUBMIT_BO_*                                */
++	uint32_t handle;
++	uint64_t presumed;              /* Mesa sends 0; kernel ignores (softpin)              */
++};
++#define BLUE_GPU_SUBMIT_BO_READ         0x0001
++#define BLUE_GPU_SUBMIT_BO_WRITE        0x0002
++#define BLUE_GPU_SUBMIT_BO_DUMP         0x0004
++#define BLUE_GPU_SUBMIT_BO_NO_IMPLICIT  0x0008
++
++struct blue_gpu_submit_cmd {            /* == struct drm_msm_gem_submit_cmd (32 bytes) */
++	uint32_t type;                  /* BLUE_GPU_SUBMIT_CMD_*                               */
++	uint32_t submit_idx;            /* index into bos[] of the BO holding the IB           */
++	uint32_t submit_offset;         /* byte offset of the IB in that BO                    */
++	uint32_t size;                  /* IB size in BYTES (kernel emits size/4 dwords)       */
++	uint32_t pad;
++	uint32_t nr_relocs;             /* always 0 with softpin: reject nonzero (EINVAL)      */
++	uint64_t relocs_or_iova;        /* relocs ptr (unused) / iova (VM_BIND only, unused)   */
++};
++#define BLUE_GPU_SUBMIT_CMD_BUF             0x0001  /* CP_INDIRECT_BUFFER                     */
++#define BLUE_GPU_SUBMIT_CMD_IB_TARGET_BUF   0x0002  /* referenced from another IB: skip       */
++#define BLUE_GPU_SUBMIT_CMD_CTX_RESTORE_BUF 0x0003  /* emit only if context switched (always: one ctx) */
++
++struct blue_gpu_submit_syncobj {        /* == struct drm_msm_syncobj (16 bytes) */
++	uint32_t handle;
++	uint32_t flags;
++	uint64_t point;
++};
++
++struct blue_gpu_submit {                /* == struct drm_msm_gem_submit (72 bytes) */
++	uint32_t flags;                 /* BLUE_GPU_PIPE_3D0 | BLUE_GPU_SUBMIT_*              */
++	uint32_t fence;                 /* out: seqno on this queue (monotonic, wraps at 2^32) */
++	uint32_t nr_bos;
++	uint32_t nr_cmds;
++	uint64_t bos;                   /* user ptr: struct blue_gpu_submit_bo[nr_bos]         */
++	uint64_t cmds;                  /* user ptr: struct blue_gpu_submit_cmd[nr_cmds]       */
++	int32_t  fence_fd;              /* -1; FENCE_FD_IN/OUT -> EINVAL                       */
++	uint32_t queueid;               /* from SUBMITQUEUE_NEW (0 = default queue)           */
++	uint64_t in_syncobjs;           /* never reaches the kernel: bluedrm strips SYNCOBJ_* */
++	uint64_t out_syncobjs;
++	uint32_t nr_in_syncobjs;
++	uint32_t nr_out_syncobjs;
++	uint32_t syncobj_stride;
++	uint32_t pad;
++};
++#define BLUE_GPU_SUBMIT_NO_IMPLICIT     0x80000000u /* gallium freedreno sets it; ignore       */
++#define BLUE_GPU_SUBMIT_FENCE_FD_IN     0x40000000u /* EINVAL (no sync files on Darwin)        */
++#define BLUE_GPU_SUBMIT_FENCE_FD_OUT    0x20000000u /* EINVAL (Mesa only asks when exporting)  */
++#define BLUE_GPU_SUBMIT_SUDO            0x10000000u /* EINVAL                                  */
++#define BLUE_GPU_SUBMIT_SYNCOBJ_IN      0x08000000u /* handled in bluedrm, stripped            */
++#define BLUE_GPU_SUBMIT_SYNCOBJ_OUT     0x04000000u /* handled in bluedrm, stripped            */
++#define BLUE_GPU_SUBMIT_FENCE_SN_IN     0x02000000u /* EINVAL                                  */
++/* Kernel duty per submit (as Linux a6xx_submit): validate handles + IB ranges inside their BO,
++ * CCU colour/depth invalidate + CACHE_INVALIDATE before, one CP_INDIRECT_BUFFER per CMD_BUF /
++ * CTX_RESTORE_BUF, then CACHE_FLUSH_TS writing the fence seqno, then CP_ALWAYS_ON stamps for
++ * stats. Clean cacheable imported BOs to PoC. Record the fence on every BO (for CPU_PREP and
++ * deferred free). Ring full -> kIOReturnBusy (EBUSY; Mesa retries). nr_cmds == 0 never reaches
++ * the kernel (bluedrm answers with the last fence). */
++
++/* ---- 0x47 WAIT_FENCE -------------------------------------------------------------------- */
++struct blue_gpu_wait_fence {            /* == struct drm_msm_wait_fence (32 bytes) */
++	uint32_t fence;
++	uint32_t flags;                 /* BOOST: ignore                                       */
++	struct blue_gpu_timespec timeout; /* absolute CLOCK_MONOTONIC_RAW; {0,0} = poll        */
++	uint32_t queueid;
++	uint32_t pad_;                  /* (implicit tail padding of the Linux struct)         */
++};
++/* 0 = retired; kIOReturnTimeout (ETIMEDOUT) = not yet. A fence newer than the last submitted one
++ * on that queue -> kIOReturnBadArgument (EINVAL), like Linux. After a GPU reset (6c) every
++ * submitted fence counts as retired and FAULTS goes up. */
++
++/* ---- 0x48 MADVISE ----------------------------------------------------------------------- */
++struct blue_gpu_gem_madvise {           /* == struct drm_msm_gem_madvise (12 bytes) */
++	uint32_t handle;
++	uint32_t madv;                  /* 0 WILLNEED, 1 DONTNEED                               */
++	uint32_t retained;              /* out: always 1 (we never purge)                       */
++};
++
++/* ---- 0x4a..0x4c SUBMITQUEUE ------------------------------------------------------------- */
++struct blue_gpu_submitqueue {           /* == struct drm_msm_submitqueue (12 bytes) */
++	uint32_t flags;                 /* ALLOW_PREEMPT ok; VM_BIND (0x2) -> EINVAL            */
++	uint32_t prio;                  /* 0..PRIORITIES-1: ignored                             */
++	uint32_t id;                    /* out: nonzero queue id (all share the one ring)       */
++};
++/* SUBMITQUEUE_CLOSE: the struct is a bare uint32_t id (4 bytes). */
++struct blue_gpu_submitqueue_query {     /* == struct drm_msm_submitqueue_query (24 bytes) */
++	uint64_t data;                  /* user ptr (len bytes) for the answer                  */
++	uint32_t id;
++	uint32_t param;                 /* 0 = FAULTS: u32 count of hangs caused by this queue  */
++	uint32_t len;                   /* in/out: 0 in -> kernel writes needed size            */
++	uint32_t pad;
++};
++
++/* ---- 0x7d USERPTR (HakiOS number; not used by gallium freedreno) ------------------------ */
++struct blue_gpu_userptr {               /* 24 bytes (layout as hakios-drm) */
++	uint64_t address;               /* page aligned, in the caller                          */
++	uint64_t size;                  /* multiple of 16 KiB                                   */
++	uint32_t handle;                /* out                                                  */
++	uint32_t flags;                 /* 0                                                    */
++};
++
++/* ---- 0x7e IOSURFACE (HakiOS number) ----------------------------------------------------- */
++struct blue_gpu_iosurface {             /* 40 bytes (layout as hakios-drm struct hakios_drm_surface) */
++	uint32_t surface;               /* in: IOSurfaceID                                     */
++	uint32_t handle;                /* in: BLUE_GPU_IOSURFACE_DESCRIBE = only describe;     */
++	                                /* otherwise ignored on input; out: new/existing handle */
++	uint64_t size;                  /* out: bytes of the BO                                */
++	uint32_t offset;                /* out: first pixel's offset inside the BO              */
++	uint32_t row_bytes;             /* out: bytesPerRow (must be %64 == 0 to render to it)  */
++	uint32_t width, height;         /* out                                                  */
++	uint32_t pixel_format;          /* out: e.g. 'BGRA' 0x42475241                           */
++	uint32_t planes;                /* out: 0 for non-planar                                */
++};
++#define BLUE_GPU_IOSURFACE_DESCRIBE     0xffffffffu
++/* Same surface imported twice in one connection returns the same handle (freedreno looks it up
++ * under its table lock). Pages: SweetSurface's IOBufferMemoryDescriptor, 16 KiB, wired,
++ * cacheable: kernel cleans to PoC at submit when the CPU wrote, invalidates at CPU_PREP. */
++
++/* ---- IOReturn -> errno (bluedrm) -------------------------------------------------------- */
++/*   kIOReturnSuccess 0 | kIOReturnNoMemory ENOMEM | kIOReturnBadArgument EINVAL |
++ *   kIOReturnTimeout ETIMEDOUT | kIOReturnBusy EBUSY | kIOReturnNotFound ENOENT (bad handle) |
++ *   kIOReturnUnsupported ENOSYS | kIOReturnNotPrivileged EPERM | anything else EIO           */
++
++#endif /* BLUE_GPU_UAPI_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 2478394ab..a916f629a 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/BlueBattery.cpp                                 optional iokitc
+ iokit/Kernel/arm/BlueBacklight.cpp                               optional iokitcpp
+ iokit/Kernel/arm/BlueDPU.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/BlueGPUPresent.cpp                              optional iokitcpp
++iokit/Kernel/arm/BlueGPUUserClient.cpp                           optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
