@@ -74,11 +74,14 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 
 **Later**
 - Wi-Fi, audio, display power-off on lock, USB networking.
+- iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
+  a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).
 
 **Why iOS 16:** every iOS for newer iPhones is built for arm64e, which uses ARMv8.3 pointer authentication.
-The Pixel 3's cores are ARMv8.2 and have none, so iOS 16 for the iPhone X (plain arm64) is the newest iOS that
-can run natively here.
+The Pixel 3's cores are ARMv8.2 and have none, so iOS 16 for the iPhone X (plain arm64) is the newest *iPhone*
+iOS that can run natively here. iPadOS 18 for the iPad 7 (A10, also plain arm64) is newer and could run too
+(see Roadmap).
 
 ## How it boots
 
