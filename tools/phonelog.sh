@@ -22,7 +22,9 @@ ul=${UNIFIEDLOG:-$(command -v unifiedlog_iterator || true)}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/phonelog.XXXXXX")
 trap 'rm -rf "${tmp:?}"' EXIT
-7zz x -o"$tmp/x" "$img" '*/private/var/db/diagnostics/*' '*/private/var/db/uuidtext/*' -r >/dev/null
+# a file still being written when the phone went down can be unreadable; skip it
+7zz x -o"$tmp/x" "$img" '*/private/var/db/diagnostics/*' '*/private/var/db/uuidtext/*' -r >/dev/null 2>&1 ||
+	echo "phonelog: some log files could not be read (skipped)" >&2
 a=$tmp/phone.logarchive
 mkdir "$a"
 db=$(echo "$tmp"/x/*/private/var/db)
