@@ -18,8 +18,9 @@ New files (most of the patch):
    bluegpu_pool_mb / bluegpu_pool_base; refused outside 0xa4000000..
    0xe0000000 or if any page is managed RAM), kernel view write-combined,
    64 KiB first-fit. GPU VA, one table for everything (per-process tables
-   are stage 2): L1[2] 0x80000000 = the pool, linear, 2M blocks; L1[3]
-   0xc0000000 = imports, 4K PTEs. The pool's first 4 MiB hold the tables.
+   are stage 2): L1[2] 0x80000000 = the pool, linear, 4K PTEs; L1[3]
+   0xc0000000 = imports, 4K PTEs. The tables live in XNU memory
+   (kmem_alloc_contig, WCOMB), not in the pool.
  - iokit/Kernel/arm/BlueGPUUserClient.cpp: the IOService "BlueGPU" (on
    IOResources, published by the bring-up thread once resident) and
    BlueGPUUserClient: GET/SET_PARAM, GEM_NEW, GEM_INFO, CPU_PREP/FINI,
@@ -47,7 +48,15 @@ seq (target page +0xa00), CACHE_FLUSH_TS | IRQ.
 
 Boot-args: bluegpu=8 (needed), bluegpu_uapi=0 (off), bluegpu_pool_mb,
 bluegpu_pool_base, bluegpu_uapi_hang_ms (1000), bluegpu_uapi_test=1.
-Not tested on the phone yet (draft).
+Also sets cb0/cb1 TCR2.SEP to "upstream" (7): with SEP 0, VA bit 31 was the
+sign bit, so every GPU VA from 0x80000000 picked TTBR1 (off) and faulted
+(ATS PAR 0xa03). 0147's slots at 0x40000000 never hit it.
+
+Tested on the phone: bluegpu_uapi_test=1 -> 32 passed, 0 failed, 15 ms,
+FAULTS 0 (params, GEM_NEW, CP_MEM_WRITE + 2D fill IB fenced in 313 us, BO
+map, 64 submits with ring wrap, CPU_PREP, parked close, refusals, USERPTR).
+A normal bluegpu=8 boot still presents (lock screen at sb+45). 256 MiB
+panicked in ml_io_map (64 MiB region, sailfish 0208): default and cap 32 MiB.
 
 The design follows HakiOS's msm-DRM clone (drivers/gpu/hakios.gpu.cpp,
 APSL 2.0) and ios-flame 0113 (MIT); no code copied.
