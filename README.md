@@ -1,5 +1,29 @@
 # pixel3-ios
 
+> **Independently maintained.** This project started as a fork of
+> **[erikkunz/pixel3-ios](https://github.com/erikkunz/pixel3-ios)** by Erik Kunz
+> ([@erikkunz](https://github.com/erikkunz)), who did the original port to the Pixel 3 and wrote most of the
+> README below. It is now developed here on its own. The main additions are the Adreno 630 GPU, a GPU-drawn
+> iOS UI, zero-copy display flips and more board support. Thanks to Erik for the foundation, and to
+> [ios-sweet](https://github.com/dipa-studio/ios-sweet) and HakiOS (the EAGL shim in `gpu/eagl-ios`, MIT).
+> Please report problems [here](https://github.com/andyleenz/pixel3-ios/issues).
+
+<p>
+<img src="docs/screenshots/2026-11-19-gpu-home.png" width="180" alt="Home screen">
+<img src="docs/screenshots/2026-11-19-gpu-settings.png" width="180" alt="Settings">
+<img src="docs/screenshots/2026-11-19-gpu-settings-scrolled.png" width="180" alt="Settings, scrolled">
+<img src="docs/screenshots/2026-11-19-gpu-safari.png" width="180" alt="Safari">
+</p>
+
+**New since the fork (2026-11):**
+- The UI is drawn by the Adreno 630 at about 60 fps (`blueui=1`). CoreAnimation runs over Mesa freedreno
+  ([`gpu/`](gpu/README.md)).
+- The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
+- Brightness, haptics, battery gauge, RTC, CPU clocks and thermal limits, watchdog, modem boot.
+- A hands-off test loop with scripted touches and screenshots ([docs/TESTING.md](docs/TESTING.md)). The
+  engineering log is on the [`linux-host`](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md)
+  branch.
+
 **Apple's iOS 16 running on a Google Pixel 3.**
 
 A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) to the Pixel 3 (`blueline`, Qualcomm
