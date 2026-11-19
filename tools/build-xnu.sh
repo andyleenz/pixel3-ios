@@ -87,6 +87,14 @@ if [ "$quick" = 1 ]; then
 	for f in "$repo"/xnu/patches/*.patch; do
 		n=$(basename "$f"); printf '%s\n' "${old[@]}" | grep -qx "$n" || new+=("$n")
 	done
+	# the pinned sailfish patches always belong at the end, even if an earlier failure dropped them from the list
+	i=200
+	for s in $SAILFISH_PATCHES; do
+		n=$(cd "$work/dxb/patches" && ls 0${i}-sf-$s-*.patch 2>/dev/null | head -1)
+		[ -n "$n" ] || { echo "sailfish patch $s missing from dxb/patches; run without --quick" >&2; exit 1; }
+		printf '%s\n' "${new[@]}" | grep -qx "$n" || new+=("$n")
+		i=$((i + 1))
+	done
 	mapfile -t new < <(printf '%s\n' "${new[@]}" | LC_ALL=C sort)
 	first=-1	# first position where the stack differs
 	for ((i = 0; i < ${#old[@]} || i < ${#new[@]}; i++)); do
