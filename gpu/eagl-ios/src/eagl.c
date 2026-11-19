@@ -1057,7 +1057,7 @@ show_texture(struct eagl *e, struct image *image)
  * While the drawing thread is held (thread_suspend) nothing here allocates or takes a lock: it may hold malloc's.
  */
 #define PROF_SLOTS      8192
-#define PROF_DUMP       4000
+#define PROF_DUMP       1000
 #define PROF_SHOWN      30
 #define PROF_DEPTH      9                       /* the program counter, the link register, seven callers from the frame chain */
 static unsigned prof_us;                        /* 0: no profile */

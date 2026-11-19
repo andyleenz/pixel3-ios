@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 22:00:00 +0100
+Subject: [PATCH] 0162: clean an imported surface's cache only when the CPU
+ may have written it (bluegpu_lazyclean=1)
+
+At every submit the kernel cleaned and invalidated each surface the GPU
+draws into (the 11 MB display buffers), and cleaned every other surface
+again every 4 ms, changed or not. The drawing thread's profile has the
+submit call at 12-14% of its time. With bluegpu_lazyclean=1 a surface is
+cleaned when its seed says the CPU wrote it, and only a wrapped one (a
+program's own memory, 0154, written without a lock) on the timer. The
+5 s GPU stats line now says how many cleans there were, how many MiB and
+how long they took.
+---
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -121,6 +121,7 @@
+ 	IOLock *lock;
+ 	bool started, ready, dead;
+ 	int hang_ms, test;
++	int lazy_clean;                 /* 0162: bluegpu_lazyclean=1 */
+ 	uint32_t faults, last_seq, reset_seq, wake;
+ 	uint32_t gen;                   /* bumped by every close: handles held across a sleep are rechecked */
+ 	uint32_t prog_val;
+@@ -131,6 +132,8 @@
+ 	uint64_t t_stat;
+ 	uint32_t n_submit, n_ib, n_wait, n_busy, n_ring_full, n_new, n_close;
+ 	uint64_t wait_ns, gpu_ticks;
++	uint64_t clean_ns, clean_bytes;  /* 0162: CPU cache maintenance of imports at submit */
++	uint32_t n_clean;
+ } g;
+ 
+ /* ---------------------------------------------------------------------------------------- */
+@@ -731,8 +734,24 @@
+ 		bool w = bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE;
+ 		if (b->kind == BG_SURF) {
+ 			uint32_t seed = bg_seed(b->surf);
+-			if (w || seed != b->seed || bg_abs_ns(b->t_clean) >= BG_SURF_RECLEAN_NS) {
++			/*
++			 * 0162 (bluegpu_lazyclean=1): the CPU's caches need cleaning only for what the CPU
++			 * wrote. A surface it locks bumps the seed when it unlocks after writing. Only a
++			 * wrapped surface (a program's own memory, 0154) is written without a lock, so only
++			 * it is cleaned again on a timer. Before, every surface the GPU drew into (the 11 MB
++			 * display buffers) was cleaned and invalidated at every submit, and every other one
++			 * every 4 ms, changed or not.
++			 */
++			bool stale = g.lazy_clean ?
++			    seed != b->seed || b->t_clean == 0 ||
++			    (b->surf->wrapped && bg_abs_ns(b->t_clean) >= BG_SURF_RECLEAN_NS) :
++			    w || seed != b->seed || bg_abs_ns(b->t_clean) >= BG_SURF_RECLEAN_NS;
++			if (stale) {
++				uint64_t t0 = mach_absolute_time();
+ 				bg_import_cache(b, w);
++				g.clean_ns += bg_abs_ns(t0);
++				g.clean_bytes += b->size;
++				g.n_clean++;
+ 				b->seed = seed;
+ 				b->t_clean = mach_absolute_time();
+ 			}
+@@ -1018,14 +1037,16 @@
+ 	bg_reap();
+ 	struct blue_gmem_info mi;
+ 	blue_gmem_get_info(&mi);
+-	printf("BLUEGPU UAPI 5s: %u submits (%u IBs), %u waits (%llu us), %u ring-full retries, %u EBUSY, %u new %u closed;"
++	printf("BLUEGPU UAPI 5s: %u submits (%u IBs), %u waits (%llu us), %u cache cleans (%llu MiB, %llu us), %u ring-full retries, %u EBUSY, %u new %u closed;"
+ 	    " %u connection(s), %u BO(s), %u parked; pool %llu of %llu MiB free (largest %llu); fence %u retired %u%s\n",
+-	    g.n_submit, g.n_ib, g.n_wait, g.wait_ns / 1000, g.n_ring_full, g.n_busy, g.n_new, g.n_close, g.nconn,
++	    g.n_submit, g.n_ib, g.n_wait, g.wait_ns / 1000, g.n_clean, g.clean_bytes >> 20, g.clean_ns / 1000, g.n_ring_full, g.n_busy, g.n_new, g.n_close, g.nconn,
+ 	    g.nbo_live, g.nzombie, (uint64_t)mi.free_granules * BLUE_GMEM_GRANULE >> 20, mi.pool_size >> 20,
+ 	    (uint64_t)mi.low_free * BLUE_GMEM_GRANULE >> 20, g.last_seq, bg_retired(), g.dead ? "; DEAD (hang)" : "");
+ 	g.t_stat = mach_absolute_time();
+ 	g.n_submit = g.n_ib = g.n_wait = g.n_busy = g.n_ring_full = g.n_new = g.n_close = 0;
+ 	g.wait_ns = 0;
++	g.n_clean = 0;
++	g.clean_ns = g.clean_bytes = 0;
+ 	IOLockUnlock(g.lock);
+ }
+ 
+@@ -1745,6 +1766,7 @@
+ 		g.hang_ms = 1000;
+ 	}
+ 	(void)PE_parse_boot_argn("bluegpu_uapi_test", &g.test, sizeof(g.test));
++	(void)PE_parse_boot_argn("bluegpu_lazyclean", &g.lazy_clean, sizeof(g.lazy_clean));
+ 	if (!on || !blue_gpu_core_ready()) {
+ 		printf("BLUEGPU UAPI: %s: no BlueGPU service\n", on ? "GPU not resident" : "off (bluegpu_uapi=0)");
+ 		return;
