@@ -1,6 +1,6 @@
-build/
-out/
-dl/
-src/mesa-*/
-venv/
+build
+out
+dl
+src/mesa-*
+venv
 *.out

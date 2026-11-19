@@ -491,6 +491,10 @@ blueeagl_init(void)
 		/* Mesa's needs on this kernel (no UBWC, sysmem rendering) unless glenv= says otherwise:
 		 * saves 34 bytes of the 607-byte boot command line. */
 		setenv("FD_MESA_DEBUG", "noubwc,sysmem", 0);
+		/* Mesa's disk shader cache (built with -Dshader-cache=enabled): a shader is compiled
+		 * once per phone instead of at its first use in every boot, which is what made the
+		 * 100-150 ms frames when an app or effect appeared for the first time. */
+		setenv("MESA_SHADER_CACHE_DIR", "/private/var/mobile/Library/Caches/bluegl", 0);
 		say("CAEnableDeepFramebuffer = NO for %s\n", name);
 		ca_environment();
 		compile_shaders_said = strstr(blog_bootargs(), "glcompile=1") != NULL;

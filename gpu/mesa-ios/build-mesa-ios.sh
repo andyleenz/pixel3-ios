@@ -114,18 +114,28 @@ build_for() {
 	} > "$B/cross-$T.ini.new"
 	cmp -s "$B/cross-$T.ini.new" "$B/cross-$T.ini" || { mv "$B/cross-$T.ini.new" "$B/cross-$T.ini"; rm -rf "$BO"; }
 	rm -f "$B/cross-$T.ini.new"
+	# -Dshader-cache=enabled (with zlib, which it needs): compiled shaders are kept on disk
+	# (MESA_SHADER_CACHE_DIR, set by blueeagl), so a shader is compiled once per phone, not
+	# once per boot. Changed options reconfigure in place.
+	local OPTS=(--buildtype=release -Db_ndebug=true -Ddefault_library=static
+		-Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled
+		-Dgallium-drivers=freedreno -Dvulkan-drivers= -Dfreedreno-kmds=msm
+		-Dllvm=disabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true
+		-Dzstd=disabled -Dzlib=enabled -Dexpat=disabled -Dxmlconfig=disabled
+		-Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled
+		-Dbuild-tests=false -Dshader-cache=enabled -Dperfetto=false
+		-Dgallium-va=disabled -Dgallium-rusticl=false -Dtools=
+		-Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false)
 	if [ ! -f "$BO/build.ninja" ]; then
 		log "[$T] meson setup"
 		meson setup "$BO" "$M" --cross-file "$B/cross-$T.ini" --wrap-mode=nofallback \
-			--buildtype=release -Db_ndebug=true -Ddefault_library=static \
-			-Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled \
-			-Dgallium-drivers=freedreno -Dvulkan-drivers= -Dfreedreno-kmds=msm \
-			-Dllvm=disabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
-			-Dzstd=disabled -Dzlib=disabled -Dexpat=disabled -Dxmlconfig=disabled \
-			-Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
-			-Dbuild-tests=false -Dshader-cache=disabled -Dperfetto=false \
-			-Dgallium-va=disabled -Dgallium-rusticl=false -Dtools= \
-			-Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false > "$B/meson-setup-$T.log"
+			"${OPTS[@]}" > "$B/meson-setup-$T.log"
+		echo "${OPTS[*]}" > "$BO/.bluegl-opts"
+	elif [ "$(cat "$BO/.bluegl-opts" 2>/dev/null)" != "${OPTS[*]}" ]; then
+		log "[$T] meson reconfigure (options changed)"
+		meson setup --reconfigure "$BO" "$M" --cross-file "$B/cross-$T.ini" --wrap-mode=nofallback \
+			"${OPTS[@]}" > "$B/meson-setup-$T.log"
+		echo "${OPTS[*]}" > "$BO/.bluegl-opts"
 	fi
 	log "[$T] ninja (${#LIBS[@]} static libraries)"
 	ninja -C "$BO" "${LIBS[@]}" > "$B/ninja-$T.log" || { tail -40 "$B/ninja-$T.log"; exit 1; }
