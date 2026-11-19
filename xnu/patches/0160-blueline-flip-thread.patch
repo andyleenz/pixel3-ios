@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 18:00:00 +0100
+Subject: [PATCH] 0160: flips on a kernel thread after the GPU; HakiosWaitsForGPU
+
+backboardd's GL renderer (blueeagl) ended every frame with glFinish, so
+CoreAnimation's CPU work and the GPU's drawing ran one after the other.
+SwapEnd now queues the swap and returns; a kernel thread waits for the
+last GPU submit that wrote each of its surfaces (gpuWriteFence, set at
+submit), then flips or records it for the copy. A newer swap replaces
+one still queued. SwapWait (0159) keeps the swap pending until its flip
+latches, so CoreAnimation draws only into free buffers. The display
+publishes HakiosWaitsForGPU, on which blueeagl stops calling glFinish.
+sweetfb_flipthread=0 keeps the old synchronous path.
+---
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -37,6 +37,7 @@
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
++	uint32_t                  gpuWriteFence;        /* 0160: last GPU submit that wrote it (BlueGPUUserClient) */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	bool                      wrapped;      /* 0154: memory is a client's own range (prepared; completed in free) */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -195,6 +195,18 @@
+ 	uint32_t      fSwapPendingID;         /* flipped, latch not seen yet */
+ 	bool          fSwapPending;
+ 	uint32_t      fSwapLatchedID;         /* latest swap whose flip latched (shown) */
++	/*
++	 * 0160 (under fLock): SwapEnd queues the swap and returns; fFlipThread
++	 * waits for the GPU's writes to its surfaces, then flips (or records it
++	 * for the copy). A newer swap replaces one still queued. Published as
++	 * HakiosWaitsForGPU: blueeagl then ends a frame without glFinish.
++	 */
++	uint8_t       fQueued[SWEET_FB_SWAP_REC_SIZE];
++	bool          fHasQueued;
++	bool          fFlipThreadOn;
++	uint32_t      fQueuedDropped, fGPUWaitLate;
++	static void flipThread(void *arg, wait_result_t wr);
++	void showSwap(const uint8_t *rec);
+ 	IOReturn swapWait(uint32_t id, uint32_t flags);
+ 	void displayHold(SweetSurface *s);
+ 	void displayDrop(bool all);
+@@ -334,6 +346,15 @@
+ 	if (fPresentLock != NULL && blue_dpu_flip_init(fFit)) {
+ 		fFlip = true;   /* before registerService: no swap can come earlier */
+ 		IOLog("SWEET FB: zero-copy present on (bluedpu_flip=1, %s)\n", fFit ? "QSEED3 fit" : "crop");
++		int threaded = 1;
++		thread_t th;
++		PE_parse_boot_argn("sweetfb_flipthread", &threaded, sizeof(threaded));
++		if (threaded && kernel_thread_start(&AppleCLCD::flipThread, this, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++			fFlipThreadOn = true;   /* 0160 */
++			setProperty("HakiosWaitsForGPU", kOSBooleanTrue);
++			IOLog("SWEET FB: flips on a thread of their own, after the GPU (HakiosWaitsForGPU)\n");
++		}
+ 	}
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+@@ -703,8 +724,60 @@
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++extern "C" bool blue_gpu_surface_wait(SweetSurface *s, uint32_t max_ms);   /* 0160, BlueGPUUserClient.cpp */
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
++{
++	if (fFlipThreadOn) {
++		IOLockLock(fLock);
++		fQueuedDropped += fHasQueued;
++		memcpy(fQueued, rec, SWEET_FB_SWAP_REC_SIZE);
++		fHasQueued = true;
++		IOLockWakeup(fLock, &fHasQueued, true);
++		IOLockUnlock(fLock);
++	} else {
++		showSwap(rec);
++	}
++	blue_dpu_stat(1, 0);
++	if ((++sweet_fb_swap_count % 1000) == 0) {
++		IOLog("SWEET FB: %llu swaps; SwapWait answered complete %u, pending %u; flip thread: %u replaced while queued, %u GPU waits late\n",
++		    sweet_fb_swap_count, sweet_fb_swapwait_n[0], sweet_fb_swapwait_n[1], fQueuedDropped, fGPUWaitLate);
++	}
++}
++
++/* 0160: a queued swap, on fFlipThread: its surfaces drawn, then shown */
++void
++AppleCLCD::flipThread(void *arg, __unused wait_result_t wr)
++{
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	for (;;) {
++		IOLockLock(fb->fLock);
++		while (!fb->fHasQueued) {
++			IOLockSleep(fb->fLock, &fb->fHasQueued, THREAD_UNINT);
++		}
++		memcpy(rec, fb->fQueued, sizeof(rec));
++		fb->fHasQueued = false;
++		IOLockUnlock(fb->fLock);
++		uint32_t mask = get32(rec, 0x104);
++		for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++			uint32_t id = get32(rec, 0x54 + 4 * l);
++			if (!(mask & (1u << l)) || id == 0) {
++				continue;
++			}
++			SweetSurface *s = sweet_surface_copy(id);
++			if (s != NULL && !blue_gpu_surface_wait(s, 100)) {
++				fb->fGPUWaitLate++;
++			}
++			OSSafeReleaseNULL(s);
++		}
++		fb->showSwap(rec);
++	}
++}
++
++void
++AppleCLCD::showSwap(const uint8_t *rec)
+ {
+ 	if (!fFlip || !swapFlip(rec)) {
+ 		IOLockLock(fLock);
+@@ -713,11 +786,6 @@
+ 		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 		fDirty = true;
+ 		IOLockUnlock(fLock);
+-	}
+-	blue_dpu_stat(1, 0);
+-	if ((++sweet_fb_swap_count % 1000) == 0) {
+-		IOLog("SWEET FB: %llu swaps; SwapWait answered complete %u, pending %u\n", sweet_fb_swap_count,
+-		    sweet_fb_swapwait_n[0], sweet_fb_swapwait_n[1]);
+ 	}
+ }
+ 
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -245,6 +245,22 @@
+ 		g.wait_ns += bg_abs_ns(t0);
+ 	}
+ 	return ret;
++}
++
++/*
++ * 0160: the display's flip thread (SweetFramebuffer.cpp) waits here for the GPU's
++ * last write to a surface before it is shown. true when done (or no GPU here).
++ */
++extern "C" bool
++blue_gpu_surface_wait(SweetSurface *s, uint32_t max_ms)
++{
++	if (g.lock == NULL || s == NULL) {
++		return true;
++	}
++	IOLockLock(g.lock);
++	IOReturn r = bg_wait_locked(s->gpuWriteFence, bg_now_ns() + (uint64_t)max_ms * 1000000ull, kIOReturnTimeout);
++	IOLockUnlock(g.lock);
++	return r == kIOReturnSuccess;
+ }
+ 
+ /* ---- BOs -------------------------------------------------------------------------------- */
+@@ -767,6 +783,12 @@
+ 	}
+ 	a->fence = seq;
+ 	g.n_submit++;
++	for (uint32_t i = 0; i < a->nr_bos; i++) {
++		BGBo *b = bg_lookup(c, bos[i].handle);
++		if (b->kind == BG_SURF && (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE)) {
++			b->surf->gpuWriteFence = seq;   /* 0160: the display waits for it before a flip */
++		}
++	}
+ 	g.n_ib += n;
+ out:
+ 	IOLockUnlock(g.lock);
