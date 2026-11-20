@@ -89,7 +89,7 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Widgets ("Waiting..."), GPU clock scaling (DCVS).
 
 **Later**
-- Audio, display power-off on lock.
+- Audio (speaker amps and the ADSP are up; the DSP link and playback are next, see LOG), display power-off on lock.
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).
