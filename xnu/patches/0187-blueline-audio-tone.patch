@@ -1,0 +1,2514 @@
+0187: blueline speaker stage 3: GLINK to the ADSP, APR, a test tone (bluesnd=3)
+
+bluesnd=3 boots the ADSP (0186), opens GLINK on the lpass edge and the
+apr_audio_svc channel, then: AVCS ready, the amps booted and configured
+(0x40 TDM slot 1, 0x41 slot 0), QUAT TDM pins and port started, amps
+powered, an ASM stream through an ADM COPP to QUAT_TDM_RX_0, and 1 kHz for
+bluesnd_secs (3) at bluesnd_amp (1000/32767). The PCM buffer is 64 KiB at
+0xe1000000 behind an identity SMMU bank for stream 0x1821.
+
+Also: blueline_bbi2c buses are shared by pins and serialized (the gauge and
+the amps use GPIO 49/50); blueline_wifi.c exports its SMMU identity-bank
+setup as blueline_smmu_identity().
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@
+ bsd/dev/blueline_gpu_mem.c			standard
+ bsd/dev/blueline_haptic.c		standard
+ bsd/dev/blueline_audio.c		standard
++bsd/dev/blueline_audio_apr.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
+--- a/bsd/dev/blueline_audio.c
++++ b/bsd/dev/blueline_audio.c
+@@ -25,6 +25,10 @@
+  *   bluesnd=2   boot the ADSP (patch 0186): firmware from the ADT
+  *               (/blueline-adsp, tools/mkadt.py --adsp-fw), TrustZone PAS
+  *               (id 1), wait for its SMP2P "ready"
++ *   bluesnd=3   then a test tone (0187): GLINK on the lpass edge, APR
++ *               (blueline_audio_apr.c) to start QUAT TDM and an ASM stream,
++ *               the amps set up and powered, 1 kHz for bluesnd_secs (3 s)
++ *               at bluesnd_amp (1000 of 32767, about -30 dBFS)
+  * Log prefix "BLUE SOUND:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -41,7 +45,10 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <kern/locks.h>
++#include <libkern/OSAtomic.h>
+ #include "blueline_scm.h"
++#include "blueline_audio_apr.h"
+ 
+ extern void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);	/* blueline_touch.c */
+ extern int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
+@@ -54,6 +61,7 @@
+ extern bool blueline_smem_lock(void);		/* blueline_wifi.c (0186) */
+ extern void blueline_smem_unlock(void);
+ extern int blueline_qmp_send(const char *msg);
++extern bool blueline_smmu_identity(uint32_t sid, uint32_t mask, const char *who);	/* blueline_wifi.c (0187) */
+ void blueline_audio_start(void);
+ 
+ #define TLMM_NORTH_PA	0x03900000u	/* GPIO 49, 50, 112, 115 */
+@@ -76,11 +84,13 @@
+ 	uint32_t rst_tile, irq_tile;
+ 	int rst, irq;
+ 	vm_offset_t rst_va, irq_va;
++	uint32_t rev;
++	uint8_t l37;
+ };
+ 
+ static struct amp amps[2] = {
+-	{ "bottom", 0x40, TLMM_NORTH_PA, TLMM_NORTH_PA, 112, 115, 0, 0 },
+-	{ "top",    0x41, TLMM_EAST_PA,  TLMM_SOUTH_PA, 75,  40,  0, 0 },
++	{ "bottom", 0x40, TLMM_NORTH_PA, TLMM_NORTH_PA, 112, 115, 0, 0, 0, 0 },	/* stock "R AMP", TDM slot 1 */
++	{ "top",    0x41, TLMM_EAST_PA,  TLMM_SOUTH_PA, 75,  40,  0, 0, 0, 0 },	/* stock "AMP", TDM slot 0 */
+ };
+ 
+ static int snd_mode;
+@@ -126,7 +136,632 @@
+ 	return err;
+ }
+ 
++static int
++amp_wr(const struct amp *a, uint32_t reg, uint32_t val)
++{
++	uint8_t b[8] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg,
++		(uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val };
++	return blueline_bbi2c_xfer(snd_bus, a->addr, b, 8, NULL, 0);
++}
++
++/* Read-modify-write; skips the write when nothing changes. */
++static int
++amp_upd(const struct amp *a, uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t v;
++	int e = amp_rd(a, reg, &v);
++	if (e) {
++		return e;
++	}
++	uint32_t n = (v & ~mask) | (val & mask);
++	return n == v ? 0 : amp_wr(a, reg, n);
++}
++
++/* ---- CS35L36 sequence (0187) ---- */
++/*
++ * CS35L36 bring-up sequence for blueline_audio.c (drop-in functions).
++ *
++ * Written from scratch. Two GPL drivers were used only as a description of
++ * the chip (register addresses, field positions, values, order, delays):
++ *   [PX] the Pixel 3's own production driver, the one that ran on these two
++ *        amps: AOSP kernel/msm-extra, branch android-msm-crosshatch-4.9-
++ *        android12, asoc/codecs/cs35l36.c, cs35l36.h, cs35l36-tables.c,
++ *        include/sound/cs35l36.h (Cirrus Logic, 2017-2018);
++ *   [ML] mainline Linux sound/soc/codecs/cs35l36.c / cs35l36.h (Cirrus, 2018);
++ *   [MC] the Pixel 3 machine driver, msm-extra asoc/sdm845.c (DAI format,
++ *        clocks, which amp carries the "R" control prefix);
++ *   [DT] Documentation/devicetree/bindings/sound/cs35l36.txt.
++ * The CS35L36 datasheet is not public (searched; [PX] quotes its section
++ * "7.11.3 BST_IPK_CTL" once). Where [PX] and [ML] differ, [PX] wins: it is
++ * what made sound on this phone.
++ *
++ * Which amp is which ([MC] spk_codec_right_ch_conf: dev "cs35l36.4-0040",
++ * name_prefix "R"):
++ *   0x41, top speaker ("portrait left" in the DT):     "AMP ...",   "Channel Mux" = RX1   -> TDM slot 0
++ *   0x40, bottom speaker ("portrait right" in the DT): "R AMP ...", "R Channel Mux" = RX2 -> TDM slot 1
++ * (mixer_paths_tavil_b1.xml defaults. Its "speaker-mono" path, bottom only,
++ * enables "R AMP" alone; "handset", which uses the top speaker as the
++ * earpiece, enables "AMP" alone. Both paths agree with this.)
++ *
++ * Sequence (the caller releases reset first):
++ *   amp_boot     DEVID, revision, 10 V/12 V part, revision errata (A0 or B0)
++ *   amp_config   boost, DT options, IRQ pin, TDM slave port, slot, PLL on SCLK,
++ *                48 kHz, gain, volume. Clocks need not run yet (as on stock).
++ *   [SoC: start QUAT TDM, SCLK 12.288 MHz + 48 kHz frame sync running]
++ *   amp_power(a, 1)  the stock DAPM power-up, ends unmuted
++ *   amp_power(a, 0)  mute, power down; then the SoC may stop the clocks
++ *   amp_dump     status read-back; amp_recover releases a protection latch
++ *
++ * Add to struct amp:  uint32_t rev; uint8_t l37;
++ * Needs amp_rd / amp_wr / amp_upd (32-bit big-endian, 0 = OK), IOSleep, printf.
++ *
++ * Registers used ([PX]/[ML] names; bit fields from their header):
++ *   0x00000000 SW_RESET     reads the device ID, 0x035A36
++ *   0x00000004 SW_REV       log only; no driver uses it (reads 0x06 on this phone)
++ *   0x00000008 HW_REV       log only
++ *   0x00000020 TESTKEY_CTRL 0x5555, 0xAAAA unlock; 0xCCCC, 0x3333 lock
++ *   0x00000478 OTP_MEM30    bits 23:16 == 0xCC: CS35L37 (12 V) else CS35L36 (10 V)
++ *   0x00000500/504 OTP_CTRL1/2   A0 errata (reruns the OTP boot, ECC off then on)
++ *   0x00000C00 PAC_CTL1     bit 0 PAC enable (0 = reset)      } B0 one-word
++ *   0x00000C08 PAC_CTL3     bit 0 PAC memory access           } PAC patch
++ *   0x00E02800 PAC_PMEM_WORD0 <- 0x00DD0102                  }
++ *   0x00002004 DEVICE_ID    log only;  0x0000200C REV_ID: >> 8 = 0xA0 or 0xB0
++ *   0x00002014 PWR_CTRL1    bit 0 GLOBAL_EN
++ *   0x00002018 PWR_CTRL2    bit 0 AMP_EN; bits 5:4 BST_EN (2 boost on, 1 bypass: VBST = VP)
++ *   0x0000201C PWR_CTRL3    bit 4 class H
++ *   0x00002020 CTRL_OVRRIDE bit 1 SYNC_GLOBAL_OVR, must be 0 (A0 and B0)
++ *   0x00002024 AMP_OUT_MUTE bit 4 AMP_MUTE ("AMP Enable Switch" = 1 means bit 4 = 0)
++ *   0x00002034 PROTECT_REL_ERR  bits 1-6: protection release pulses
++ *   0x00002400 PAD_INTERFACE bit 0 INT out enable, 1 INT/GPIO pin select,
++ *              2 polarity (0 = active low), 3 IRQ source select (A0 only), 5 drive (0 = open drain)
++ *   0x00002C04 PLL_CLK_CTRL bits 2:0 source (0 = SCLK), 4 REFCLK_EN, 10:5 REFCLK_FREQ, 11 OPENLOOP
++ *   0x00002C0C GLOBAL_CLK_CTRL bits 4:0 GLOBAL_FS (0x03 = 48 kHz)
++ *   0x00002D10 TST_FS_MON0  sample-rate monitor windows (see AMP_SET_FS_MON)
++ *   0x00003008 PLL_LOOP_PARAMS, 0x00003010 DCO_CTRL, 0x00003014 MISC_CTRL: A0 PLL fixes
++ *   0x00003800 BSTCVRT_VCTRL1 bits 7:0 boost target (0x96 = 10 V)
++ *   0x00003804 BSTCVRT_VCTRL2 bits 1:0 target source (1 = class-H tracking), bit 2 limit to VCTRL1
++ *   0x00003808 BSTCVRT_PEAK_CUR bits 6:0 (0x10 = 1.60 A, +50 mA per step)
++ *   0x00003810 BSTCVRT_COEFF K1 bits 7:0, K2 bits 15:8
++ *   0x00003814 BSTCVRT_SLOPE_LBST slope bits 15:8, inductor bits 1:0 (0 = 1 uH)
++ *   0x00003818 BSTCVRT_SW_FREQ bits 3:0 CCM frequency
++ *   0x00003830 BSTCVRT_OVERVOLT_CTRL bits 5:0 OVP threshold (0x10 = 11 V)
++ *   0x0000394C BST_ANA2_TEST bits 18:15 OVP trim (0x0C = 11 V; test key)
++ *   0x00004220 DTEMP_WARN_THLD bits 1:0 (1 = 115 C)
++ *   0x00004300 DTEMP_STATUS, 0x0000640C VPBR_STATUS, 0x00006410 VBBR_STATUS: dump only
++ *   0x00004800 ASP_TX_PIN_CTRL bit 6 SCLK master, 7 SCLK force, 8 SCLK invert, 21 TX Hi-Z
++ *   0x00004804 ASP_RATE_CTRL bit 0 LRCLK master, 1 force, 2 invert
++ *   0x00004808 ASP_FORMAT  bits 2:0 (0 = DSP mode A / TDM, 2 = I2S)
++ *   0x00004818 ASP_FRAME_CTRL RX width bits 23:16, TX width bits 7:0 (0x20 = 32)
++ *   0x0000482C ASP_RX1_SLOT bits 5:0
++ *   0x0000483C ASP_RX_TX_EN bit 16 RX1 enable (bits 0-5: TX1-6, feedback, left off)
++ *   0x00004C00 ASP_RX1_SEL  bits 6:0 DAC source (0x08 = ASP RX1, 0 = zeros)
++ *   0x00006000 AMP_DIG_VOL_CTRL bits 13:3 volume (signed, 0.125 dB steps, 0 = 0 dB),
++ *              2:0 soft ramp, 14 invert
++ *   0x00006808 NG_CFG      bits 13:8 NG_AMP_EN (ldm-mode-select)
++ *   0x00006C04 AMP_GAIN_CTRL bits 9:5 PCM gain ("AMP PCM Gain"), bit 10 zero-cross
++ *   0x00007400 DAC_MSM_CFG bit 0 PDM mode, 3 LDM enter ramp, 4 LDM exit ramp
++ *   0x00D00000-0C INT1-4_STATUS (write 1 to clear), 0x00D00020-2C raw, 0x00D00040/48 masks
++ *   0x00D00218 PAC_INT_FLUSH_CTRL, 0x00D00220-3C PAC_INT0-7_CTRL (A0 errata)
++ *   errata-only, undocumented: A0 0x2088 0x6E08 0x6454 0x7064 0x7E14 0x7E34 0x7410
++ *   0x7418 0x410C; B0 0x7064 0x7848-0x7868 0x3854 0x7418 0x394C.
++ */
++
++#define R_SW_RESET		0x00000000u	/* reads DEVID */
++#define R_SW_REV		0x00000004u
++#define R_HW_REV		0x00000008u
++#define R_TESTKEY		0x00000020u
++#define R_OTP_MEM30		0x00000478u
++#define R_OTP_CTRL1		0x00000500u
++#define R_OTP_CTRL2		0x00000504u
++#define R_PAC_CTL1		0x00000c00u
++#define R_PAC_CTL3		0x00000c08u
++#define R_DEVICE_ID		0x00002004u
++#define R_REV_ID		0x0000200cu
++#define R_PWR_CTRL1		0x00002014u
++#define R_PWR_CTRL2		0x00002018u
++#define R_PWR_CTRL3		0x0000201cu
++#define R_CTRL_OVRRIDE		0x00002020u
++#define R_AMP_OUT_MUTE		0x00002024u
++#define R_PROTECT_REL_ERR	0x00002034u
++#define R_PAD_INTERFACE		0x00002400u
++#define R_PLL_CLK_CTRL		0x00002c04u
++#define R_GLOBAL_CLK_CTRL	0x00002c0cu
++#define R_TST_FS_MON0		0x00002d10u
++#define R_PLL_LOOP_PARAMS	0x00003008u
++#define R_DCO_CTRL		0x00003010u
++#define R_MISC_CTRL		0x00003014u
++#define R_BST_VCTRL1		0x00003800u
++#define R_BST_VCTRL2		0x00003804u
++#define R_BST_PEAK_CUR		0x00003808u
++#define R_BST_COEFF		0x00003810u
++#define R_BST_SLOPE_LBST	0x00003814u
++#define R_BST_SW_FREQ		0x00003818u
++#define R_BST_OVERVOLT		0x00003830u
++#define R_BST_ANA2_TEST		0x0000394cu
++#define R_DTEMP_WARN_THLD	0x00004220u
++#define R_DTEMP_STATUS		0x00004300u
++#define R_ASP_TX_PIN_CTRL	0x00004800u
++#define R_ASP_RATE_CTRL		0x00004804u
++#define R_ASP_FORMAT		0x00004808u
++#define R_ASP_FRAME_CTRL	0x00004818u
++#define R_ASP_RX1_SLOT		0x0000482cu
++#define R_ASP_RX_TX_EN		0x0000483cu
++#define R_ASP_RX1_SEL		0x00004c00u
++#define R_AMP_DIG_VOL		0x00006000u
++#define R_VPBR_STATUS		0x0000640cu
++#define R_VBBR_STATUS		0x00006410u
++#define R_NG_CFG		0x00006808u
++#define R_AMP_GAIN_CTRL		0x00006c04u
++#define R_DAC_MSM_CFG		0x00007400u
++#define R_INT1_STATUS		0x00d00000u	/* INT2..4 follow at +4 */
++#define R_INT1_RAW		0x00d00020u
++#define R_INT1_MASK		0x00d00040u
++#define R_INT3_MASK		0x00d00048u
++#define R_INT4_STATUS		0x00d0000cu
++#define R_INT4_RAW		0x00d0002cu
++#define R_PAC_INT_FLUSH		0x00d00218u
++#define R_PAC_INT0_CTRL		0x00d00220u	/* INT1..7 follow at +4 */
++#define R_PAC_PMEM0		0x00e02800u
++
++#define REV_A0			0xa0u
++#define REV_B0			0xb0u
++
++/* INT1 (+0) and INT3 (+8) error bits, the ones the IRQ handler acts on */
++#define INT1_BST_OVP		(1u << 16)
++#define INT1_BST_DCM_UVP	(1u << 17)
++#define INT1_BST_SHORT		(1u << 18)
++#define INT1_TEMP_WARN		(1u << 25)
++#define INT1_TEMP_ERR		(1u << 26)
++#define INT3_AMP_SHORT		(1u << 12)
++#define INT4_PLL_UNLOCK		(1u << 13)	/* read from INT4 RAW after GLOBAL_EN */
++#define INT4_MCU_CONFIG_CLR	(1u << 16)	/* B0 PAC patch done */
++
++/*
++ * TST_FS_MON0. Both drivers mean to set the sample-rate monitor windows to
++ * FS1 = 16, FS2 = 36 for an SCLK above 6 MHz (under the test key). On the
++ * Pixel 3 that write never reached the chip: [PX]'s register map does not list
++ * 0x2D10 as readable, so its read-modify-write failed silently. Stock sound
++ * worked with the chip's own windows, so this stays off (the same applies to
++ * the A0 PLL gain update of 0x3008 below, which failed the same way). Set it
++ * to 1 to do what [ML] does.
++ */
++#define AMP_SET_FS_MON		0
++
++static int
++amp_testkey(const struct amp *a, int unlock)
++{
++	return unlock ? (amp_wr(a, R_TESTKEY, 0x5555) || amp_wr(a, R_TESTKEY, 0xaaaa)) :
++	       (amp_wr(a, R_TESTKEY, 0xcccc) || amp_wr(a, R_TESTKEY, 0x3333));
++}
++
++static int
++amp_seq(const struct amp *a, const uint32_t (*s)[2], unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		if (amp_wr(a, s[i][0], s[i][1])) {
++			printf("BLUE SOUND: %s amp: write 0x%08x failed\n", a->name, s[i][0]);
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++/* Revision A0 fixes: [PX] cs35l36_reva0_errata_patch, then cs35l36_pac_int_patch. */
++static const uint32_t amp_a0_fix[][2] = {
++	{ R_OTP_CTRL1, 0x00002060 }, { R_OTP_CTRL2, 1 },	/* OTP boot again, ECC off */
++	{ R_OTP_CTRL1, 0x00002460 }, { R_OTP_CTRL2, 1 },	/* and with ECC on */
++	{ 0x2088, 0x012a1838 }, { R_MISC_CTRL, 0x0100ee0e }, { R_PLL_LOOP_PARAMS, 0x0008184a },
++	{ 0x7418, 0x509001c8 }, { 0x7064, 0x0929a800 }, { R_TST_FS_MON0, 0x0002c01c },
++	{ 0x410c, 0x00000a11 }, { 0x6e08, 0x8b19140c }, { 0x6454, 0x0300000a },
++	{ 0x7e14, 0x000020ef }, { 0x7e34, 0x0000000e }, { 0x410c, 0x00000a11 },
++	{ 0x7410, 0x20514b00 },
++	/* PAC interrupt set-up */
++	{ R_CTRL_OVRRIDE, 0 },
++	{ R_PAC_INT0_CTRL + 0x00, 0x00860001 }, { R_PAC_INT0_CTRL + 0x04, 0x00860001 },
++	{ R_PAC_INT0_CTRL + 0x08, 0x00860001 }, { R_PAC_INT0_CTRL + 0x0c, 0x00860001 },
++	{ R_PAC_INT0_CTRL + 0x10, 0x00860001 }, { R_PAC_INT0_CTRL + 0x14, 0x00860001 },
++	{ R_PAC_INT0_CTRL + 0x18, 0x00860001 }, { R_PAC_INT0_CTRL + 0x1c, 0x00860001 },
++	{ R_PAC_INT_FLUSH, 0x000000ff },
++};
++
++/* Revision B0 fixes: [PX] cs35l36_revb0_errata_patch (after the PAC patch). */
++static const uint32_t amp_b0_fix[][2] = {
++	{ 0x7064, 0x0929a800 },
++	{ 0x7850, 0x00002fa9 }, { 0x7854, 0x0003f1d5 }, { 0x7858, 0x0003f5e3 },
++	{ 0x785c, 0x00001137 }, { 0x7860, 0x0001a7a5 }, { 0x7864, 0x0002f16a },
++	{ 0x7868, 0x00003e21 }, { 0x7848, 0x00000001 },
++	{ 0x3854, 0x05180240 }, { 0x7418, 0x509001c8 }, { R_BST_ANA2_TEST, 0x028764bd },
++};
++
++/*
++ * B0 only, before its errata ([PX] cs35l36_pac): with the test key open, hold
++ * the internal PAC (a small patch processor) in reset, write its one-word
++ * program, start it, and wait up to ~20 ms for "MCU config cleared" in INT4.
++ */
++static int
++amp_b0_pac(const struct amp *a)
++{
++	uint32_t v = 0;
++	int i;
++	if (amp_testkey(a, 1)) {
++		return EIO;
++	}
++	IOSleep(10);
++	if (amp_wr(a, R_PAC_CTL1, 0) || amp_wr(a, R_PAC_CTL3, 1) ||
++	    amp_wr(a, R_PAC_PMEM0, 0x00dd0102) || amp_wr(a, R_PAC_CTL3, 0) ||
++	    amp_wr(a, R_PAC_CTL1, 1)) {
++		return EIO;
++	}
++	IOSleep(10);
++	for (i = 0; i < 20; i++) {
++		if (amp_rd(a, R_INT4_STATUS, &v) == 0 && (v & INT4_MCU_CONFIG_CLR)) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (!(v & INT4_MCU_CONFIG_CLR)) {
++		printf("BLUE SOUND: %s amp: B0 PAC patch did not finish (INT4 0x%x)\n", a->name, v);
++		amp_testkey(a, 0);
++		return ETIMEDOUT;
++	}
++	int err = amp_wr(a, R_INT4_STATUS, INT4_MCU_CONFIG_CLR) || amp_upd(a, R_PAC_CTL1, 1, 0);
++	return amp_testkey(a, 0) || err ? EIO : 0;
++}
++
++/*
++ * After reset release. Both drivers wait 2 ms and read the ID once; neither
++ * polls an "OTP boot done" bit (the header names one, 0x02000000, but not its
++ * register), so this polls the ID for up to 20 ms instead.
++ *
++ * The revision is REV_ID (0x200C) >> 8: 0xA0 or 0xB0. Register 0x4 (SW_REV,
++ * 0x06 on this phone) is not a silicon revision and no driver reads it. Any
++ * other REV_ID gets no errata and a warning, as in both drivers (their switch
++ * has no default case).
++ */
++static int
++amp_boot(struct amp *a)
++{
++	uint32_t devid = 0, devid2 = 0, revid = 0, swrev = 0, hwrev = 0, otp30 = 0;
++	int i, err;
++	for (i = 0; i < 10; i++) {
++		IOSleep(2);
++		if (amp_rd(a, R_SW_RESET, &devid) == 0 && devid == DEVID_L36) {
++			break;
++		}
++	}
++	if (devid != DEVID_L36) {
++		printf("BLUE SOUND: %s amp: DEVID 0x%x after %d ms, not a CS35L36\n", a->name, devid, 2 * i);
++		return ENODEV;
++	}
++	if (amp_rd(a, R_REV_ID, &revid) || amp_rd(a, R_OTP_MEM30, &otp30)) {
++		return EIO;
++	}
++	amp_rd(a, R_DEVICE_ID, &devid2);
++	amp_rd(a, R_SW_REV, &swrev);
++	amp_rd(a, R_HW_REV, &hwrev);
++	a->rev = revid >> 8;
++	a->l37 = (otp30 & 0x00ff0000u) == 0x00cc0000u;
++	printf("BLUE SOUND: %s amp: CS35L%d (%d V boost max), REV_ID 0x%x -> rev 0x%x (%s), "
++	    "DEVICE_ID 0x%x, SW_REV 0x%x, HW_REV 0x%x, OTP_MEM30 0x%x, ID after %d ms\n",
++	    a->name, a->l37 ? 37 : 36, a->l37 ? 12 : 10, revid, a->rev,
++	    a->rev == REV_A0 ? "A0" : a->rev == REV_B0 ? "B0" : "UNKNOWN: no errata applied",
++	    devid2, swrev, hwrev, otp30, 2 * (i + 1));
++
++	switch (a->rev) {
++	case REV_A0:
++		err = amp_testkey(a, 1) || amp_seq(a, amp_a0_fix, sizeof(amp_a0_fix) / sizeof(amp_a0_fix[0])) ||
++		    amp_testkey(a, 0);
++		break;
++	case REV_B0:
++		err = amp_b0_pac(a);
++		if (!err) {
++			err = amp_testkey(a, 1) || amp_seq(a, amp_b0_fix, sizeof(amp_b0_fix) / sizeof(amp_b0_fix[0])) ||
++			    amp_testkey(a, 0);
++		}
++		break;
++	default:
++		err = 0;
++		break;
++	}
++	if (err) {
++		printf("BLUE SOUND: %s amp: rev 0x%x errata FAILED (%d)\n", a->name, a->rev, err);
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * Everything except power, in the order [PX] applies it (codec probe, the
++ * IRQ pin set-up, then the TDM startup's set_fmt / set_sysclk / hw_params).
++ * slot: 0 for the top amp (0x41, left), 1 for the bottom amp (0x40, right).
++ */
++static int
++amp_config(const struct amp *a, uint32_t slot)
++{
++	int err;
++
++	/*
++	 * INT pin ([PX] i2c probe, DT irq-config): output on, the INT pin (not
++	 * GPIO), active low, IRQ source 1 (written on A0 only, as [PX] does),
++	 * open drain. Then [PX]'s default masks: INT3 unmasks amp short; INT1
++	 * unmasks boost OVP, boost short, temperature warning and error, plus
++	 * bits 15 and 22, which no source names. Boost UVP (bit 17) stays masked
++	 * but still latches in the status register, where amp_dump reads it.
++	 */
++	err = amp_upd(a, R_PAD_INTERFACE, 0x27u, 0x01u) ||
++	    (a->rev == REV_A0 && amp_upd(a, R_PAD_INTERFACE, 0x08u, 0x08u)) ||
++	    amp_wr(a, R_INT1_MASK, 0xf9ba7fffu) ||
++	    amp_wr(a, R_INT3_MASK, 0xffffefffu);
++	if (err) {
++		return EIO;
++	}
++
++	/*
++	 * [PX] codec probe, DT options in its order: amp-gain-zc, ldm-mode-select
++	 * (all NG_AMP_EN bits), multi-amp-mode (TX pin Hi-Z when not sending),
++	 * pdm-ldm-enter and -exit ramps. Boost: target 10000 mV =
++	 * ((10000 - 2550) / 100 + 1) << 1 = 0x96; boost-ctl-select 1 = follow the
++	 * class-H tracking target; peak 3700 mA = (3700 - 1600) / 50 + 16 = 58 =
++	 * 0x3A ([PX], citing the datasheet: 16 = 1.60 A; [ML] leaves out the +16,
++	 * which would give 2.65 A); 1.0 uH: K1 = K2 = 0x3C, CCM frequency 0, slope
++	 * 0x75, LBST 0. Temperature warning at 115 C.
++	 */
++	err = amp_upd(a, R_AMP_GAIN_CTRL, 1u << 10, 1u << 10) ||
++	    amp_upd(a, R_NG_CFG, 0x3f00u, 0x3f00u) ||
++	    amp_upd(a, R_ASP_TX_PIN_CTRL, 1u << 21, 1u << 21) ||
++	    amp_upd(a, R_DAC_MSM_CFG, 0x18u, 0x18u) ||
++	    amp_upd(a, R_BST_VCTRL1, 0xffu, 0x96u) ||
++	    amp_upd(a, R_BST_VCTRL2, 0x3u, 0x1u) ||
++	    amp_upd(a, R_BST_PEAK_CUR, 0x7fu, 0x3au) ||
++	    amp_upd(a, R_BST_COEFF, 0xffffu, 0x3c3cu) ||
++	    amp_upd(a, R_BST_SW_FREQ, 0xfu, 0) ||
++	    amp_upd(a, R_BST_SLOPE_LBST, 0xff03u, 0x7500u) ||
++	    amp_upd(a, R_DTEMP_WARN_THLD, 0x3u, 0x1u);
++	/*
++	 * The DT's weak-fet-delay = 4 and weak-fet-thld = 1 are read by neither
++	 * driver ([DT] names them classh-wk-fet-delay / classh-weak-fet-thld-
++	 * millivolt), so the chip's defaults stood on stock; 4 (100 ms) is the
++	 * documented default anyway. Nothing to write.
++	 */
++	if (err) {
++		return EIO;
++	}
++
++	/*
++	 * A CS35L36 is the 10 V part: [PX] clamps it for safety whatever the DT
++	 * says. OVP threshold 11 V; with the test key, OVP trim 0x0C, limit the
++	 * class-H target to VCTRL1, and VCTRL1 = 0x96 (10 V).
++	 */
++	if (!a->l37) {
++		err = amp_upd(a, R_BST_OVERVOLT, 0x3fu, 0x10u) || amp_testkey(a, 1) ||
++		    amp_upd(a, R_BST_ANA2_TEST, 0xfu << 15, 0xcu << 15) ||
++		    amp_upd(a, R_BST_VCTRL2, 1u << 2, 1u << 2) ||
++		    amp_upd(a, R_BST_VCTRL1, 0xffu, 0x96u) || amp_testkey(a, 0);
++		if (err) {
++			return EIO;
++		}
++	}
++
++	/* A0 and B0 both need SYNC_GLOBAL_OVR off while GLOBAL_EN is 0. */
++	if (amp_upd(a, R_CTRL_OVRRIDE, 1u << 1, 0)) {
++		return EIO;
++	}
++
++	/*
++	 * Serial port ([MC] sdm845_tdm_snd_startup: DSP_A | CBS_CFS | IB_NF):
++	 * slave for both clocks, not forced, bit clock inverted, frame sync not
++	 * inverted, DSP mode A (data one bit clock after the frame pulse). Data 32
++	 * bits per slot each way (S32_LE, hw_params); this amp's input slot; DAC
++	 * fed zeros until power-up.
++	 */
++	err = amp_upd(a, R_ASP_TX_PIN_CTRL, 0x1c0u, 0x100u) ||
++	    amp_upd(a, R_ASP_RATE_CTRL, 0x7u, 0) ||
++	    amp_upd(a, R_ASP_FORMAT, 0x7u, 0) ||
++	    amp_upd(a, R_ASP_FRAME_CTRL, 0x00ff00ffu, 0x00200020u) ||
++	    amp_upd(a, R_ASP_RX1_SLOT, 0x3fu, slot) ||
++	    amp_upd(a, R_ASP_RX1_SEL, 0x7fu, 0);
++	if (err) {
++		return EIO;
++	}
++
++	/*
++	 * Clocks ([PX] codec set_sysclk, clock 0 = SCLK, 12.288 MHz): PLL open
++	 * loop, reference 12.288 MHz (code 0x33), reference off, source SCLK, loop
++	 * closed, reference on. PCM mode (not PDM). 48 kHz is GLOBAL_FS 0x03
++	 * (hw_params). This only arms the PLL; it locks after GLOBAL_EN, and
++	 * only with SCLK running.
++	 */
++	err = amp_upd(a, R_PLL_CLK_CTRL, 1u << 11, 1u << 11) ||
++	    amp_upd(a, R_PLL_CLK_CTRL, 0x3fu << 5, 0x33u << 5) ||
++	    amp_upd(a, R_PLL_CLK_CTRL, 1u << 4, 0) ||
++	    amp_upd(a, R_PLL_CLK_CTRL, 0x7u, 0) ||
++	    amp_upd(a, R_PLL_CLK_CTRL, 1u << 11, 0) ||
++	    amp_upd(a, R_PLL_CLK_CTRL, 1u << 4, 1u << 4) ||
++	    amp_upd(a, R_DAC_MSM_CFG, 0x1u, 0) ||
++	    amp_upd(a, R_GLOBAL_CLK_CTRL, 0x1fu, 0x03u);
++	if (err) {
++		return EIO;
++	}
++	/*
++	 * A0 only: DCO and misc PLL values. [PX] also updates 0x3008's gains
++	 * (bits 9:4 = 4, bits 3:0 = 0x0A for 12.288 MHz), but that update failed
++	 * on stock (see AMP_SET_FS_MON), so the errata value 0x0008184A stands.
++	 */
++	if (a->rev == REV_A0) {
++		err = amp_testkey(a, 1) || amp_wr(a, R_DCO_CTRL, 0x00036da8) ||
++		    amp_wr(a, R_MISC_CTRL, 0x0100ee0e) || amp_testkey(a, 0);
++		if (err) {
++			return EIO;
++		}
++	}
++#if AMP_SET_FS_MON
++	/* [ML]: SCLK > 6 MHz: FS1 = 16 (bits 10:0), FS2 = 36 (<< 12, inside mask 0x00FFF800). */
++	err = amp_testkey(a, 1) || amp_upd(a, R_TST_FS_MON0, 0x00ffffffu, 16u | (36u << 12)) || amp_testkey(a, 0);
++	if (err) {
++		return EIO;
++	}
++#endif
++
++	/*
++	 * Levels. "AMP PCM Gain" / "R AMP PCM Gain" = 17 is AMP_GAIN_CTRL bits 9:5
++	 * ([PX] SOC_SINGLE_TLV("AMP PCM Gain", 0x6C04, shift 5, max 0x13); the
++	 * reset value is 0x13, the maximum). The dB size of a step is not public:
++	 * the sibling CS35L41 uses the same field as 0.5 dB + 1 dB/step, which
++	 * would make 17 about 17.5 dB. Digital volume 0 dB (bits 13:3 = 0; also
++	 * the reset value; [PX] range -102 dB (0x4D0) to +12 dB in 0.125 dB steps).
++	 */
++	err = amp_upd(a, R_AMP_GAIN_CTRL, 0x1fu << 5, 17u << 5) ||
++	    amp_upd(a, R_AMP_DIG_VOL, 0x7ffu << 3, 0);
++	if (err) {
++		return EIO;
++	}
++	printf("BLUE SOUND: %s amp: configured, TDM slot %u, rev 0x%x\n", a->name, slot, a->rev);
++	return 0;
++}
++
++/*
++ * Power, as [PX]'s DAPM runs it for "AMP Playback" (widget order: SDIN, BOOST
++ * Mux, CLASS H, Main AMP, then the "AMP Enable" switch); the codec's
++ * mute_stream op only talks to the ADSP's speaker protection, so the mute here
++ * is the DAPM one.
++ *
++ * Up needs the TDM clocks already running. On stock, the AFE port (and so
++ * SCLK and frame sync) starts in the CPU DAI's prepare, before the DAPM
++ * stream event that sets GLOBAL_EN. [PX] waits 2 ms and checks PLL unlock
++ * once, then unmutes anyway; this polls up to 20 ms, also unmutes anyway (a
++ * late clock may still lock), and returns ETIMEDOUT so the caller knows.
++ *
++ * Down: DAC source to zeros, mute, amp off, GLOBAL_EN off, 2 ms; class H off,
++ * boost to bypass, 2 ms; serial port input off. Stop the TDM clocks after.
++ */
++static int
++amp_power(const struct amp *a, int on)
++{
++	uint32_t raw = 0;
++	int i, err;
++	if (on) {
++		err = amp_upd(a, R_ASP_RX_TX_EN, 1u << 16, 1u << 16) ||	/* SDIN: ASP RX1 on */
++		    amp_upd(a, R_PWR_CTRL2, 0x3u << 4, 0x2u << 4) ||		/* BOOST Mux: boost on */
++		    amp_upd(a, R_PWR_CTRL3, 1u << 4, 1u << 4) ||		/* CLASS H */
++		    amp_upd(a, R_PWR_CTRL2, 1u, 1u) ||				/* Main AMP: AMP_EN */
++		    amp_upd(a, R_PWR_CTRL1, 1u, 1u);				/* GLOBAL_EN */
++		if (err) {
++			return EIO;
++		}
++		for (i = 0; i < 10; i++) {
++			IOSleep(2);
++			if (amp_rd(a, R_INT4_RAW, &raw) == 0 && !(raw & INT4_PLL_UNLOCK)) {
++				break;
++			}
++		}
++		/* DAC from ASP RX1, then unmute ("AMP Enable Switch" = 1). */
++		err = amp_upd(a, R_ASP_RX1_SEL, 0x7fu, 0x08u) ||
++		    amp_upd(a, R_AMP_OUT_MUTE, 1u << 4, 0);
++		printf("BLUE SOUND: %s amp: on, PLL %s after %d ms (INT4 raw 0x%x)%s\n", a->name,
++		    (raw & INT4_PLL_UNLOCK) ? "NOT LOCKED" : "locked", 2 * (i < 10 ? i + 1 : 10), raw,
++		    err ? ", unmute FAILED" : "");
++		if (err) {
++			return EIO;
++		}
++		return (raw & INT4_PLL_UNLOCK) ? ETIMEDOUT : 0;
++	}
++	/* Every step is tried even if one fails (one statement each keeps the order). */
++	err = 0;
++	err += amp_upd(a, R_ASP_RX1_SEL, 0x7fu, 0) != 0;
++	err += amp_upd(a, R_AMP_OUT_MUTE, 1u << 4, 1u << 4) != 0;
++	err += amp_upd(a, R_PWR_CTRL2, 1u, 0) != 0;
++	err += amp_upd(a, R_PWR_CTRL1, 1u, 0) != 0;
++	IOSleep(2);
++	err += amp_upd(a, R_PWR_CTRL3, 1u << 4, 0) != 0;
++	err += amp_upd(a, R_PWR_CTRL2, 0x3u << 4, 0x1u << 4) != 0;
++	IOSleep(2);
++	err += amp_upd(a, R_ASP_RX_TX_EN, 1u << 16, 0) != 0;
++	printf("BLUE SOUND: %s amp: off%s\n", a->name, err ? " (a write FAILED)" : "");
++	return err ? EIO : 0;
++}
++
++/*
++ * For when it stays silent. Prints the power, clock, port and level registers
++ * and the four interrupt status words (latched, then live), and decodes the
++ * error bits [PX]'s IRQ handler acts on. Returns the latched INT1 error bits,
++ * with the amp-short bit from INT3 folded in as bit 0.
++ */
++static uint32_t
++amp_dump(const struct amp *a)
++{
++	static const struct {
++		uint32_t reg;
++		const char *name;
++	} r[] = {
++		{ R_PWR_CTRL1, "PWR1 (b0 GLOBAL_EN)" }, { R_PWR_CTRL2, "PWR2 (b0 AMP, b5:4 BST)" },
++		{ R_PWR_CTRL3, "PWR3 (b4 classH)" }, { R_AMP_OUT_MUTE, "MUTE (b4)" },
++		{ R_PLL_CLK_CTRL, "PLL_CLK" }, { R_GLOBAL_CLK_CTRL, "GLOBAL_FS" },
++		{ R_ASP_TX_PIN_CTRL, "ASP_PIN" }, { R_ASP_RATE_CTRL, "ASP_RATE" },
++		{ R_ASP_FORMAT, "ASP_FMT" }, { R_ASP_FRAME_CTRL, "ASP_FRAME" },
++		{ R_ASP_RX1_SLOT, "RX1_SLOT" }, { R_ASP_RX_TX_EN, "RX_TX_EN (b16 RX1)" },
++		{ R_ASP_RX1_SEL, "DAC_SRC (8=ASP)" }, { R_AMP_DIG_VOL, "DIG_VOL" },
++		{ R_AMP_GAIN_CTRL, "GAIN (b9:5)" }, { R_BST_VCTRL1, "BST_V1" },
++		{ R_BST_VCTRL2, "BST_V2" }, { R_BST_PEAK_CUR, "BST_IPK" },
++		{ R_DTEMP_STATUS, "DTEMP" }, { R_VPBR_STATUS, "VPBR" }, { R_VBBR_STATUS, "VBBR" },
++		{ R_PAD_INTERFACE, "PAD" }, { R_INT1_MASK, "INT1_MASK" }, { R_INT3_MASK, "INT3_MASK" },
++	};
++	uint32_t v, st[4] = { 0 }, raw[4] = { 0 };
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		int e = amp_rd(a, r[i].reg, &v);
++		printf("BLUE SOUND: %s amp: 0x%08x %-24s %s0x%08x\n", a->name, r[i].reg, r[i].name, e ? "NACK " : "", v);
++	}
++	for (int i = 0; i < 4; i++) {
++		amp_rd(a, R_INT1_STATUS + 4u * i, &st[i]);
++		amp_rd(a, R_INT1_RAW + 4u * i, &raw[i]);
++	}
++	printf("BLUE SOUND: %s amp: INT1-4 latched 0x%x 0x%x 0x%x 0x%x, live 0x%x 0x%x 0x%x 0x%x\n", a->name,
++	    st[0], st[1], st[2], st[3], raw[0], raw[1], raw[2], raw[3]);
++	printf("BLUE SOUND: %s amp:%s%s%s%s%s%s%s\n", a->name,
++	    (raw[3] & INT4_PLL_UNLOCK) ? " PLL-UNLOCKED(no SCLK?)" : " pll-locked",
++	    (st[0] & INT1_BST_OVP) ? " BOOST-OVERVOLTAGE" : "",
++	    (st[0] & INT1_BST_DCM_UVP) ? " BOOST-UNDERVOLTAGE" : "",
++	    (st[0] & INT1_BST_SHORT) ? " BOOST-INDUCTOR-SHORT" : "",
++	    (st[0] & INT1_TEMP_WARN) ? " TEMP-WARNING" : "",
++	    (st[0] & INT1_TEMP_ERR) ? " TEMP-ERROR" : "",
++	    (st[2] & INT3_AMP_SHORT) ? " AMP-OUTPUT-SHORT" : "");
++	return (st[0] & (INT1_BST_OVP | INT1_BST_DCM_UVP | INT1_BST_SHORT | INT1_TEMP_WARN | INT1_TEMP_ERR)) |
++	       ((st[2] & INT3_AMP_SHORT) ? 1u : 0);
++}
++
++/*
++ * The protection errors latch the amp into a safe mode until released ([PX]
++ * cs35l36_irq): pulse the matching PROTECT_REL_ERR bit 0, 1, 0, then clear the
++ * status bit (write 1). Release bits: 1 amp short, 2 boost short, 3 boost OVP,
++ * 4 boost UVP, 5 temp warning, 6 temp error. ([PX] pulses bit 6, not 3, for
++ * boost OVP; that looks like a copy slip, so both are pulsed here.)
++ * errs is amp_dump's return value.
++ */
+ static void
++amp_recover(const struct amp *a, uint32_t errs)
++{
++	uint32_t rel = 0;
++	rel |= (errs & 1u) ? 1u << 1 : 0;
++	rel |= (errs & INT1_BST_SHORT) ? 1u << 2 : 0;
++	rel |= (errs & INT1_BST_OVP) ? (1u << 3) | (1u << 6) : 0;
++	rel |= (errs & INT1_BST_DCM_UVP) ? 1u << 4 : 0;
++	rel |= (errs & INT1_TEMP_WARN) ? 1u << 5 : 0;
++	rel |= (errs & INT1_TEMP_ERR) ? 1u << 6 : 0;
++	if (!rel) {
++		return;
++	}
++	amp_upd(a, R_PROTECT_REL_ERR, rel, 0);
++	amp_upd(a, R_PROTECT_REL_ERR, rel, rel);
++	amp_upd(a, R_PROTECT_REL_ERR, rel, 0);
++	if (errs & ~1u) {
++		amp_wr(a, R_INT1_STATUS, errs & ~1u);
++	}
++	if (errs & 1u) {
++		amp_wr(a, R_INT1_STATUS + 8u, INT3_AMP_SHORT);
++	}
++	printf("BLUE SOUND: %s amp: released protection 0x%x (errors 0x%x)\n", a->name, rel, errs);
++}
++
++static void
+ amp_probe(struct amp *a)
+ {
+ 	a->rst_va = pin_map(a->rst_tile, a->rst);
+@@ -599,11 +1234,575 @@
+ 	return true;
+ }
+ 
++/*
++ * ---- Stage 3 (bluesnd=3): GLINK to the ADSP, APR, a tone ----
++ *
++ * GLINK as blueline_wifi.c's for the modem (Linux qcom_glink_smem.c / qcom_glink_native.c), here on
++ * the lpass edge: SMEM items 478 (indexes), 479 (our FIFO, 16 KiB), 480 (the ADSP's) in the apps-ADSP
++ * partition, doorbell APCS IPC bit 8 (sdm845.dtsi glink-edge "lpass"). The ADSP opens its channels;
++ * we answer "apr_audio_svc" (APR: blueline_audio_apr.c) and log the others. A thread polls the FIFO.
++ */
++#define IPC_ADSP_GLINK		8u
++#define LG_DESC_ITEM		478u
++#define LG_TX_ITEM		479u
++#define LG_RX_ITEM		480u
++#define LG_TX_SIZE		16384u
++#define LG_LCID			1u
++#define LG_INTENTS		8u
++#define LG_INTENT_SIZE		4096u
++#define LG_FEAT_REUSE		1u
++#define SND_SID			0x1821u		/* q6asm / msm-audio-ion: iommus <&apps_smmu 0x1821 0x0> */
++#define SND_SHM_PA		0xe1000000ull	/* in the gap blueline_wifi.c's radio pool uses (0xe0000000 + 16 MiB) */
++#define SND_SHM_SIZE		0x10000u
++
++enum { LG_VERSION = 0, LG_VERSION_ACK, LG_OPEN, LG_CLOSE, LG_OPEN_ACK, LG_INTENT, LG_RX_DONE, LG_INTENT_REQ,
++       LG_INTENT_REQ_ACK, LG_TX_DATA, LG_CLOSE_ACK = 11, LG_TX_DATA_CONT, LG_READ_NOTIF, LG_RX_DONE_REUSE, LG_SIGNALS };
++
++static LCK_GRP_DECLARE(lg_grp, "blueline_audio_glink");
++static LCK_MTX_DECLARE(lg_lock, &lg_grp);
++
++static struct {
++	vm_offset_t desc, tx, rx;
++	uint32_t tx_len, rx_len, rcid, rxoff, next_iid, unknown;
++	bool open_tx, open_acked, remote_open, version_done, req_acked, stop;
++	struct { uint32_t size, iid; bool busy; } ri[32];
++	int nri;
++} lg;
++static uint8_t lg_rxbuf[16384];
++static uint8_t lg_txbuf[16 + 4096 + 16];
++
++#define LG_TX_TAIL	(lg.desc + 0)
++#define LG_TX_HEAD	(lg.desc + 4)
++#define LG_RX_TAIL	(lg.desc + 8)
++#define LG_RX_HEAD	(lg.desc + 12)
++
++uint64_t bsnd_shm_pa;
++uint8_t *bsnd_shm_va;
++uint32_t bsnd_shm_size;
++
++static bool
++lg_init(void)
++{
++	uint32_t sz = 0, off;
++
++	if (!(off = smem_alloc(LG_DESC_ITEM, 32))) {
++		return false;
++	}
++	lg.desc = dsp.smem + off;
++	if (!(off = smem_alloc(LG_TX_ITEM, LG_TX_SIZE)) || !smem_find(dsp.pa_off, dsp.pa_size, dsp.pa_cl, LG_TX_ITEM, &sz)) {
++		return false;
++	}
++	lg.tx = dsp.smem + off;
++	lg.tx_len = sz & ~7u;
++	if (!(off = smem_find(dsp.pa_off, dsp.pa_size, dsp.pa_cl, LG_RX_ITEM, &sz))) {
++		printf("BLUE SOUND: glink: the ADSP has no FIFO (smem item 480)\n");
++		return false;
++	}
++	lg.rx = dsp.smem + off;
++	lg.rx_len = sz & ~7u;
++	wr(LG_RX_TAIL, 0);
++	wr(LG_TX_HEAD, 0);
++	lg.next_iid = 100;
++	printf("BLUE SOUND: glink: fifos tx %u rx %u bytes\n", lg.tx_len, lg.rx_len);
++	return true;
++}
++
++/* Caller holds lg_lock. Non-zero if our FIFO is full. */
++static int
++lg_send(uint16_t cmd, uint16_t p1, uint32_t p2, const void *data, uint32_t len)
++{
++	uint32_t n = 8 + len, padded = (n + 7) & ~7u;
++
++	if (padded > sizeof(lg_txbuf)) {
++		return -1;
++	}
++	bzero(lg_txbuf, padded);
++	memcpy(lg_txbuf, &cmd, 2);
++	memcpy(lg_txbuf + 2, &p1, 2);
++	memcpy(lg_txbuf + 4, &p2, 4);
++	if (len) {
++		memcpy(lg_txbuf + 8, data, len);
++	}
++	uint32_t head = rd(LG_TX_HEAD), tail = rd(LG_TX_TAIL);
++	if (head >= lg.tx_len || tail >= lg.tx_len) {
++		return -1;
++	}
++	uint32_t avail = tail <= head ? lg.tx_len - head + tail : tail - head;
++	if (avail < padded + 16) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < padded; i += 4) {
++		uint32_t w;
++		memcpy(&w, lg_txbuf + i, 4);
++		wr(lg.tx + head, w);
++		head += 4;
++		if (head >= lg.tx_len) {
++			head -= lg.tx_len;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(LG_TX_HEAD, head);
++	kick(IPC_ADSP_GLINK);
++	return 0;
++}
++
++static uint32_t
++lg_rx_avail(void)
++{
++	uint32_t head = rd(LG_RX_HEAD), tail = rd(LG_RX_TAIL);
++	if (head >= lg.rx_len || tail >= lg.rx_len) {
++		return 0;
++	}
++	return head < tail ? lg.rx_len - tail + head : head - tail;
++}
++
+ static void
++lg_rx_peek(void *buf, uint32_t off, uint32_t len)
++{
++	uint32_t t = rd(LG_RX_TAIL) + off;
++	uint8_t *b = buf;
++
++	while (t >= lg.rx_len) {
++		t -= lg.rx_len;
++	}
++	for (uint32_t i = 0; i < len; i++) {
++		b[i] = (uint8_t)(rd(lg.rx + (t & ~3u)) >> (8 * (t & 3u)));
++		if (++t >= lg.rx_len) {
++			t = 0;
++		}
++	}
++}
++
++static void
++lg_rx_advance(uint32_t len)
++{
++	uint32_t t = rd(LG_RX_TAIL) + len;
++	while (t >= lg.rx_len) {
++		t -= lg.rx_len;
++	}
++	wr(LG_RX_TAIL, t);
++}
++
++/* One command from the ADSP's FIFO (lg_lock held); *pkt_len set when a whole APR packet is in lg_rxbuf. */
++static bool
++lg_rx_one(uint32_t *pkt_len)
++{
++	uint32_t avail = lg_rx_avail(), adv = 8, p2;
++	uint16_t cmd, p1;
++	uint8_t h[16];
++
++	if (avail < 8) {
++		return false;
++	}
++	lg_rx_peek(h, 0, 8);
++	memcpy(&cmd, h, 2);
++	memcpy(&p1, h + 2, 2);
++	memcpy(&p2, h + 4, 4);
++	switch (cmd) {
++	case LG_VERSION:
++		printf("BLUE SOUND: glink: < VERSION %u features %#x\n", p1, p2);
++		(void)lg_send(LG_VERSION_ACK, 1, p2 & LG_FEAT_REUSE, NULL, 0);
++		if (!lg.version_done) {
++			(void)lg_send(LG_VERSION, 1, LG_FEAT_REUSE, NULL, 0);
++		}
++		break;
++	case LG_VERSION_ACK:
++		printf("BLUE SOUND: glink: < VERSION_ACK %u features %#x\n", p1, p2);
++		lg.version_done = true;
++		break;
++	case LG_OPEN: {
++		uint32_t nl = (p2 + 7) & ~7u;
++		char name[33] = { 0 };
++		if (avail < 8 + nl) {
++			return false;
++		}
++		lg_rx_peek(name, 8, MIN(p2, 32u));
++		adv += nl;
++		printf("BLUE SOUND: glink: < OPEN rcid %u \"%s\"\n", p1, name);
++		(void)lg_send(LG_OPEN_ACK, p1, 0, NULL, 0);
++		if (strcmp(name, "apr_audio_svc") == 0) {
++			lg.rcid = p1;
++			lg.remote_open = true;
++			if (!lg.open_tx) {
++				static const char ch[] = "apr_audio_svc";
++				(void)lg_send(LG_OPEN, LG_LCID, sizeof(ch), ch, sizeof(ch));
++				lg.open_tx = true;
++			}
++		}
++		break;
++	}
++	case LG_OPEN_ACK:
++		printf("BLUE SOUND: glink: < OPEN_ACK lcid %u\n", p1);
++		if (p1 == LG_LCID && !lg.open_acked) {
++			uint32_t p[LG_INTENTS * 2];
++			lg.open_acked = true;
++			for (uint32_t i = 0; i < LG_INTENTS; i++) {
++				p[2 * i] = LG_INTENT_SIZE;
++				p[2 * i + 1] = i + 1;
++			}
++			(void)lg_send(LG_INTENT, LG_LCID, LG_INTENTS, p, sizeof(p));
++		}
++		break;
++	case LG_CLOSE:
++		printf("BLUE SOUND: glink: < CLOSE rcid %u\n", p1);
++		(void)lg_send(LG_CLOSE_ACK, p1, 0, NULL, 0);
++		break;
++	case LG_CLOSE_ACK:
++		break;
++	case LG_INTENT: {
++		uint32_t len = 8 + p2 * 8;
++		if (p2 > 64) {
++			adv = avail;
++			break;
++		}
++		if (avail < len) {
++			return false;
++		}
++		for (uint32_t i = 0; i < p2; i++) {
++			uint32_t pr[2];
++			lg_rx_peek(pr, 8 + i * 8, 8);
++			if (p1 == lg.rcid && lg.remote_open && lg.nri < (int)(sizeof(lg.ri) / sizeof(lg.ri[0]))) {
++				lg.ri[lg.nri].size = pr[0];
++				lg.ri[lg.nri].iid = pr[1];
++				lg.ri[lg.nri].busy = false;
++				lg.nri++;
++			}
++		}
++		adv = (len + 7) & ~7u;
++		break;
++	}
++	case LG_RX_DONE:
++	case LG_RX_DONE_REUSE:
++		if (p1 == lg.rcid) {
++			for (int i = 0; i < lg.nri; i++) {
++				if (lg.ri[i].iid == p2) {
++					if (cmd == LG_RX_DONE) {
++						lg.ri[i] = lg.ri[--lg.nri];
++					} else {
++						lg.ri[i].busy = false;
++					}
++					break;
++				}
++			}
++		}
++		break;
++	case LG_INTENT_REQ:
++		if (p1 == lg.rcid) {
++			uint32_t p[2] = { MAX(p2, LG_INTENT_SIZE), lg.next_iid++ };
++			(void)lg_send(LG_INTENT, LG_LCID, 1, p, sizeof(p));
++			(void)lg_send(LG_INTENT_REQ_ACK, LG_LCID, 1, NULL, 0);
++		} else {
++			(void)lg_send(LG_INTENT_REQ_ACK, 0, 0, NULL, 0);
++		}
++		break;
++	case LG_INTENT_REQ_ACK:
++		lg.req_acked = true;
++		break;
++	case LG_TX_DATA:
++	case LG_TX_DATA_CONT: {
++		uint32_t chunk, left;
++		if (avail < 16) {
++			return false;
++		}
++		lg_rx_peek(h, 0, 16);
++		memcpy(&chunk, h + 8, 4);
++		memcpy(&left, h + 12, 4);
++		if (chunk > lg.rx_len) {
++			adv = avail;
++			break;
++		}
++		if (avail < 16 + chunk) {
++			return false;
++		}
++		if (lg.rxoff + chunk <= sizeof(lg_rxbuf)) {
++			lg_rx_peek(lg_rxbuf + lg.rxoff, 16, chunk);
++		}
++		lg.rxoff += chunk;
++		adv = (16 + chunk + 7) & ~7u;
++		if (p1 != lg.rcid) {
++			lg.rxoff = 0;
++			break;
++		}
++		if (!left) {
++			*pkt_len = MIN(lg.rxoff, (uint32_t)sizeof(lg_rxbuf));
++			lg.rxoff = 0;
++			(void)lg_send(LG_RX_DONE_REUSE, LG_LCID, p2, NULL, 0);
++		}
++		break;
++	}
++	case LG_READ_NOTIF:
++		kick(IPC_ADSP_GLINK);
++		break;
++	case LG_SIGNALS:
++		printf("BLUE SOUND: glink: < SIGNALS %#x\n", p2);
++		break;
++	default:
++		if (lg.unknown++ < 4) {
++			printf("BLUE SOUND: glink: < unknown command %u (%u %#x): dropping the FIFO\n", cmd, p1, p2);
++		}
++		adv = avail;
++		break;
++	}
++	lg_rx_advance(adv);
++	return true;
++}
++
++static void
++lg_thread(void *arg __unused, wait_result_t w __unused)
++{
++	static uint8_t pkt[sizeof(lg_rxbuf)];
++
++	while (!lg.stop) {
++		bool any = false;
++		for (int n = 0; n < 64; n++) {
++			uint32_t len = 0;
++			lck_mtx_lock(&lg_lock);
++			bool got = lg_rx_one(&len);
++			if (len) {
++				memcpy(pkt, lg_rxbuf, len);
++			}
++			lck_mtx_unlock(&lg_lock);
++			if (!got) {
++				break;
++			}
++			any = true;
++			if (len) {
++				bsnd_apr_rx(pkt, len);
++			}
++		}
++		if (!any) {
++			IOSleep(1);
++		}
++	}
++}
++
++/* The APR transport (blueline_audio_apr.h): one packet into one of the ADSP's intents. */
++int
++apr_tx(const void *pkt, uint32_t len)
++{
++	uint64_t end = mach_absolute_time() + ms_abs(1000);
++	bool asked = false;
++
++	if (len > LG_INTENT_SIZE) {
++		return -1;
++	}
++	lck_mtx_lock(&lg_lock);
++	for (;;) {
++		int best = -1;
++		for (int i = 0; i < lg.nri; i++) {
++			if (!lg.ri[i].busy && lg.ri[i].size >= len && (best < 0 || lg.ri[i].size < lg.ri[best].size)) {
++				best = i;
++			}
++		}
++		if (best >= 0) {
++			static uint8_t b[8 + LG_INTENT_SIZE];	/* under lg_lock */
++			uint32_t hdr[2] = { len, 0 };
++			memcpy(b, hdr, 8);
++			memcpy(b + 8, pkt, len);
++			if (lg_send(LG_TX_DATA, LG_LCID, lg.ri[best].iid, b, 8 + len) == 0) {
++				lg.ri[best].busy = true;
++				lck_mtx_unlock(&lg_lock);
++				return 0;
++			}
++		} else if (!asked || lg.req_acked) {
++			lg.req_acked = false;
++			(void)lg_send(LG_INTENT_REQ, LG_LCID, len, NULL, 0);
++			asked = true;
++		}
++		lck_mtx_unlock(&lg_lock);
++		if (mach_absolute_time() > end) {
++			printf("BLUE SOUND: glink: cannot send %u bytes (%d intents)\n", len, lg.nri);
++			return -1;
++		}
++		IOSleep(1);
++		lck_mtx_lock(&lg_lock);
++	}
++}
++
++static bool
++lg_up(void)
++{
++	if (!lg_init()) {
++		return false;
++	}
++	lck_mtx_lock(&lg_lock);
++	(void)lg_send(LG_VERSION, 1, LG_FEAT_REUSE, NULL, 0);
++	lck_mtx_unlock(&lg_lock);
++	thread_t th;
++	if (kernel_thread_start(lg_thread, NULL, &th) != KERN_SUCCESS) {
++		return false;
++	}
++	thread_deallocate(th);
++	uint64_t t0 = mach_absolute_time(), end = t0 + ms_abs(5000);
++	while (mach_absolute_time() < end && !(lg.open_acked && lg.remote_open && lg.nri > 0)) {
++		IOSleep(5);
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUE SOUND: glink: apr_audio_svc %s after %llu ms (version %d, remote open %d, ack %d, %d intents)\n",
++	    (lg.open_acked && lg.remote_open) ? "open" : "NOT open", ns / NSEC_PER_MSEC, lg.version_done, lg.remote_open,
++	    lg.open_acked, lg.nri);
++	return lg.open_acked && lg.remote_open;
++}
++
++/* QUAT TDM pins: 58 bit clock, 59 frame sync (8 mA), 60 data in, 61 data out (2 mA); function 1, no pull. */
++static void
++tdm_pins(void)
++{
++	static const struct { int pin; uint32_t ma; } p[] = { { 58, 8 }, { 59, 8 }, { 60, 2 }, { 61, 2 } };
++	for (unsigned i = 0; i < 4; i++) {
++		vm_offset_t v = pin_map(TLMM_NORTH_PA, p[i].pin);
++		if (v) {
++			wr32(v, (1u << 2) | ((p[i].ma / 2 - 1) << 6));
++		}
++	}
++}
++
++/* Out of reset (the probe's pulse, then left high). */
++static bool
++amp_reset(struct amp *a)
++{
++	a->rst_va = pin_map(a->rst_tile, a->rst);
++	a->irq_va = pin_map(a->irq_tile, a->irq);
++	if (!a->rst_va || !a->irq_va) {
++		return false;
++	}
++	pin_out(a->rst_va, 0);
++	IOSleep(3);
++	pin_out(a->rst_va, 1);
++	IOSleep(10);
++	return true;
++}
++
++static volatile uint32_t tone_free;	/* bit n: region n is back from the DSP */
++
++static void
++tone_done(uint32_t off, uint32_t len __unused, uint32_t status)
++{
++	static unsigned bad;
++	if (status && bad++ < 4) {
++		printf("BLUE SOUND: write at %#x came back with status %u\n", off, status);
++	}
++	OSBitOrAtomic(1u << (off / 4096u), &tone_free);
++}
++
++/* 1 kHz at 48 kHz: 48 frames a cycle; each region holds 960 frames (20 cycles, 3840 bytes), 16 regions. */
++static void
++tone_fill(int amp)
++{
++	static const int16_t sine48[48] = {
++		0, 4277, 8481, 12539, 16384, 19947, 23170, 25996, 28378, 30273, 31651, 32487, 32767, 32487, 31651,
++		30273, 28378, 25996, 23170, 19947, 16384, 12539, 8481, 4277, 0, -4277, -8481, -12539, -16384, -19947,
++		-23170, -25996, -28378, -30273, -31651, -32487, -32767, -32487, -31651, -30273, -28378, -25996, -23170,
++		-19947, -16384, -12539, -8481, -4277,
++	};
++	for (uint32_t r = 0; r < 16; r++) {
++		volatile int16_t *d = (volatile int16_t *)(bsnd_shm_va + r * 4096u);
++		for (uint32_t f = 0; f < 960; f++) {
++			int16_t v = (int16_t)((int32_t)sine48[f % 48] * amp / 32767);
++			d[2 * f] = v;
++			d[2 * f + 1] = v;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++snd_tone(void)
++{
++	int secs = 3, amp = 1000, sid = 1;
++	PE_parse_boot_argn("bluesnd_secs", &secs, sizeof(secs));
++	PE_parse_boot_argn("bluesnd_amp", &amp, sizeof(amp));
++	PE_parse_boot_argn("bluesnd_sid", &sid, sizeof(sid));
++	amp = MAX(0, MIN(amp, 8000));
++
++	if (!lg_up()) {
++		return;
++	}
++	int r = bsnd_apr_core_ready(5000);
++	printf("BLUE SOUND: apr core ready -> %d\n", r);
++	if (r) {
++		return;
++	}
++
++	/* The PCM buffer: identity SMMU bank for the ADSP's stream, the stream id's low bits above bit 32. */
++	bool smmu = blueline_smmu_identity(SND_SID, 0, "audio");
++	bsnd_shm_va = (uint8_t *)ml_io_map_unmappable((vm_offset_t)SND_SHM_PA, SND_SHM_SIZE, VM_WIMG_WCOMB);
++	bsnd_shm_size = SND_SHM_SIZE;
++	bsnd_shm_pa = SND_SHM_PA | (sid ? (uint64_t)(SND_SID & 0xfu) << 32 : 0);
++	printf("BLUE SOUND: shm %#llx (smmu %s)\n", bsnd_shm_pa, smmu ? "ok" : "NOT set");
++	if (!bsnd_shm_va) {
++		return;
++	}
++	tone_fill(amp);
++
++	/* Amps first (I2C only), then the clocks, then power (the amps' PLL locks to the bit clock). */
++	snd_bus = blueline_bbi2c_open(TLMM_NORTH_PA, AMP_SDA, AMP_SCL);
++	bool amps_ok = snd_bus != NULL;
++	for (int i = 0; i < 2 && amps_ok; i++) {
++		amps_ok = amp_reset(&amps[i]) && amp_boot(&amps[i]) == 0 && amp_config(&amps[i], i == 0 ? 1u : 0u) == 0;
++	}
++	printf("BLUE SOUND: amps %s\n", amps_ok ? "configured" : "NOT configured");
++	tdm_pins();
++	r = bsnd_apr_tdm_start();
++	printf("BLUE SOUND: tdm start -> %d\n", r);
++	if (r) {
++		return;
++	}
++	if (amps_ok) {
++		for (int i = 0; i < 2; i++) {
++			int e = amp_power(&amps[i], 1);
++			uint32_t errs = amp_dump(&amps[i]);
++			printf("BLUE SOUND: %s amp power -> %d, errors %#x\n", amps[i].name, e, errs);
++		}
++	}
++	bsnd_apr_set_write_done(tone_done);
++	r = bsnd_apr_stream_open();
++	printf("BLUE SOUND: stream open -> %d\n", r);
++	if (r == 0) {
++		uint64_t end = mach_absolute_time() + ms_abs((uint32_t)secs * 1000u);
++		uint32_t writes = 0, fails = 0;
++		tone_free = 0xffff;
++		while (mach_absolute_time() < end) {
++			uint32_t f = tone_free;
++			for (uint32_t n = 0; n < 16; n++) {
++				if ((f & (1u << n)) && bsnd_apr_writes_in_flight() < 8) {
++					OSBitAndAtomic(~(1u << n), &tone_free);
++					if (bsnd_apr_write(n * 4096u, 3840) == 0) {
++						writes++;
++					} else {
++						OSBitOrAtomic(1u << n, &tone_free);
++						fails++;
++					}
++				}
++			}
++			IOSleep(5);
++		}
++		printf("BLUE SOUND: tone: %u writes (%u ms of audio), %u refused\n", writes, writes * 20, fails);
++		if (amps_ok) {
++			for (int i = 0; i < 2; i++) {
++				printf("BLUE SOUND: %s amp after: errors %#x\n", amps[i].name, amp_dump(&amps[i]));
++			}
++		}
++		printf("BLUE SOUND: stream close -> %d\n", bsnd_apr_stream_close());
++	}
++	if (amps_ok) {
++		for (int i = 0; i < 2; i++) {
++			(void)amp_power(&amps[i], 0);
++		}
++	}
++	printf("BLUE SOUND: tdm stop -> %d\n", bsnd_apr_tdm_stop());
++}
++
++static void
+ snd_thread(void *arg __unused, wait_result_t w __unused)
+ {
+ 	if (snd_mode >= 2) {
+-		printf("BLUE SOUND: adsp %s\n", adsp_boot() ? "up" : "NOT up");
++		bool up = adsp_boot();
++		printf("BLUE SOUND: adsp %s\n", up ? "up" : "NOT up");
++		if (up && snd_mode >= 3) {
++			snd_tone();
++		}
+ 		return;
+ 	}
+ 	snd_bus = blueline_bbi2c_open(TLMM_NORTH_PA, AMP_SDA, AMP_SCL);
+diff -ruN a/bsd/dev/blueline_audio_apr.c b/bsd/dev/blueline_audio_apr.c
+--- a/bsd/dev/blueline_audio_apr.c
++++ b/bsd/dev/blueline_audio_apr.c
+@@ -0,0 +1,958 @@
++/*
++ * Pixel 3 (blueline) speaker: PCM to the two CS35L36 amps on QUAT TDM through
++ * the stock ADSP firmware's Elite audio services (Android 9-12 era, APR
++ * transport; not AudioReach/GPR).
++ *
++ *   bsnd_shm -> ASM session 1 (PCM decoder) -> ADM Audio Rx matrix
++ *            -> COPP (NULL topology) -> AFE port QUAT_TDM_RX_0 -> TDM pins
++ *
++ * Written from the protocol as described by, not copied from: the downstream
++ * audio driver (LineageOS android_kernel_google_msm-4.9, lineage-19.1,
++ * techpack/audio: ipc/apr.h, ipc/apr.c, include/dsp/apr_audio-v2.h,
++ * include/dsp/q6core.h, dsp/q6core.c, q6afe.c, q6adm.c, q6asm.c,
++ * msm_audio_ion.c, asoc/msm-dai-q6-v2.c, msm-pcm-routing-v2.c, sdm845.c) and
++ * mainline Linux sound/soc/qcom/qdsp6/ (q6core.c, q6afe.c, q6adm.c, q6asm.c,
++ * q6asm-dai.c, q6routing.c) plus sound/soc/qcom/sdm845.c. Board values: the
++ * stock DT node qcom,msm-dai-tdm-quat-rx with its dtbo 8 overrides, and
++ * mixer_paths_tavil_b1.xml (path "speaker": QUAT_TDM_RX_0, two channels, S32_LE).
++ *
++ * Every packet is an APR SEQ_CMD: 20-byte header, src APPS 5 -> dest ADSP 4,
++ * the same service id at both ends (CORE 3, AFE 4, ASM 7, ADM 8). Each command
++ * waits for the reply carrying its token, APR_BASIC_RSP_RESULT 0x000110E8
++ * {opcode, status} unless another reply is named. Ports: QUAT_TDM_RX_0 0x9030,
++ * its group 0x9130; ASM session 1 stream 1 = 0x0101.
++ *
++ * bsnd_apr_core_ready
++ *   1  CORE AVCS_CMD_ADSP_EVENT_GET_STATE 0x0001290C, repeated until
++ *           AVCS_CMDRSP_ADSP_EVENT_GET_STATE 0x0001290D says 1
++ *   2  CORE AVCS_CMD_GET_FWK_VERSION 0x0001292C -> AVCS_CMDRSP_GET_FWK_VERSION 0x0001292D
++ * bsnd_apr_tdm_start
++ *   3  AFE  AFE_SVC_CMD_SET_PARAM 0x000100F3: AFE_MODULE_CLOCK_SET 0x0001028F,
++ *           AFE_PARAM_ID_CLOCK_SET 0x00010290: Q6AFE_LPASS_CLK_ID_QUAD_TDM_IBIT 0x206,
++ *           12288000 Hz, Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO 4, enable 1
++ *  (3a) AFE AFE_SVC_CMD_SET_PARAM: AFE_MODULE_GROUP_DEVICE 0x00010254,
++ *           AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG 0x0001029E: group 0x9130 = {0x9030}
++ *  (3b) AFE AFE_SVC_CMD_SET_PARAM: AFE_MODULE_GROUP_DEVICE,
++ *           AFE_PARAM_ID_GROUP_DEVICE_ENABLE 0x00010256 {0x9130, 1}
++ *           (3a/3b only with bsnd_tdm_group; stock skips them for a one-port group)
++ *   4  AFE  AFE_PORT_CMD_SET_PARAM_V2 0x000100EF, port 0x9030: AFE_MODULE_AUDIO_DEV_INTERFACE
++ *           0x0001020C, AFE_PARAM_ID_TDM_CONFIG 0x0001029D: 2 of 8 x 32-bit slots (mask 0x3),
++ *           48 kHz, short sync, internal sync, one-bit data delay
++ *   5  AFE  AFE_PORT_CMD_SET_PARAM_V2, port 0x9030: AFE_MODULE_TDM 0x0001028A,
++ *           AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG 0x00010297: byte offsets {0, 4}
++ *   6  AFE  AFE_PORT_CMD_DEVICE_START 0x000100E5 {0x9030}
++ * bsnd_apr_stream_open
++ *   7  ASM  ASM_CMD_SHARED_MEM_MAP_REGIONS 0x00010D92, ADSP_MEMORY_MAP_SHMEM8_4K_POOL 3
++ *           -> ASM_CMDRSP_SHARED_MEM_MAP_REGIONS 0x00010D93 {mem_map_handle}
++ *   8  ASM  ASM_STREAM_CMD_OPEN_WRITE_V3 0x00010DB3 to 0x0101: ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2
++ *           0x00010DA5, ASM_STREAM_POSTPROCOPO_ID_NONE 0x00010C68, sink = matrix
++ *   9  ADM  ADM_CMD_DEVICE_OPEN_V5 0x00010326 to 0x9030: RX path, endpoint 0x9030,
++ *           NULL_COPP_TOPOLOGY 0x00010312, 2 ch, 16 bit, 48 kHz
++ *           -> ADM_CMDRSP_DEVICE_OPEN_V5 0x00010329 {status, copp_id}
++ *  10  ADM  ADM_CMD_MATRIX_MAP_ROUTINGS_V5 0x00010325: ADM_MATRIX_ID_AUDIO_RX 0, session 1 -> copp_id
++ *  11  ASM  ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 0x00010D98 to 0x0101: 2 ch, 16 bit, 48 kHz, FL/FR
++ *  12  ASM  ASM_SESSION_CMD_RUN_V2 0x00010DAA to 0x0101: run immediately
++ * bsnd_apr_write (does not wait)
++ *      ASM  ASM_DATA_CMD_WRITE_V2 0x00010DAB to 0x0101 -> ASM_DATA_EVENT_WRITE_DONE_V2 0x00010D99
++ *           {addr, handle, status}; ASM_SESSION_EVENT_RX_UNDERFLOW 0x00010C17 when the queue runs dry
++ * bsnd_apr_stream_close
++ *  13  ASM  ASM_STREAM_CMD_CLOSE 0x00010BCD to 0x0101
++ *  14  ADM  ADM_CMD_DEVICE_CLOSE_V5 0x00010327 to copp_id, from port 0x9030
++ *  15  ASM  ASM_CMD_SHARED_MEM_UNMAP_REGIONS 0x00010D94 {mem_map_handle}
++ * bsnd_apr_tdm_stop
++ *  16  AFE  AFE_PORT_CMD_DEVICE_STOP 0x000100E6 {0x9030}, then 3b with 0 if used, then 3 with enable 0
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <libkern/libkern.h>
++#include "blueline_audio_apr.h"
++
++extern void IOSleep(unsigned int milliseconds);
++
++/* APR transport, ipc/apr.h */
++#define APR_HDR_SIZE			20u		/* sizeof(struct apr_hdr) */
++#define APR_HDR_FIELD_SEQ_CMD		0x0250u		/* APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD 2, APR_HDR_LEN 5 words, APR_PKT_VER 0) */
++#define APR_DOMAIN_ADSP			4
++#define APR_DOMAIN_APPS			5
++#define APR_SVC_ADSP_CORE		3
++#define APR_SVC_AFE			4
++#define APR_SVC_ASM			7
++#define APR_SVC_ADM			8
++#define APR_BASIC_RSP_RESULT		0x000110E8u
++#define APR_RSP_ACCEPTED		0x000100BEu
++
++/* Status codes, apr_audio-v2.h ADSP_E* */
++#define ADSP_EOK			0x0u
++#define ADSP_EFAILED			0x1u
++#define ADSP_EUNSUPPORTED		0x3u
++#define ADSP_EABORTED			0xDu
++
++/* Core, include/dsp/q6core.h */
++#define AVCS_CMD_ADSP_EVENT_GET_STATE		0x0001290Cu
++#define AVCS_CMDRSP_ADSP_EVENT_GET_STATE	0x0001290Du
++#define AVCS_CMD_GET_FWK_VERSION		0x0001292Cu
++#define AVCS_CMDRSP_GET_FWK_VERSION		0x0001292Du
++
++/* AFE, apr_audio-v2.h (each param's minor version is 1, as q6afe.c and msm-dai-q6-v2.c send) */
++#define AFE_SVC_CMD_SET_PARAM			0x000100F3u
++#define AFE_PORT_CMD_SET_PARAM_V2		0x000100EFu
++#define AFE_PORT_CMD_DEVICE_START		0x000100E5u
++#define AFE_PORT_CMD_DEVICE_STOP		0x000100E6u
++#define AFE_MODULE_CLOCK_SET			0x0001028Fu
++#define AFE_PARAM_ID_CLOCK_SET			0x00010290u
++#define Q6AFE_LPASS_CLK_ID_QUAD_TDM_IBIT	0x206u	/* internal (DT clk-internal <1>); _EBIT 0x207 is for a slave */
++#define Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO 0x4u	/* msm_dai_tdm_q6_probe default, no DT override; mainline
++							 * q6afe-dai.c q6afe_mi2s_set_sysclk for TDM clocks */
++#define AFE_MODULE_AUDIO_DEV_INTERFACE		0x0001020Cu
++#define AFE_PARAM_ID_TDM_CONFIG			0x0001029Du
++#define AFE_MODULE_TDM				0x0001028Au
++#define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG	0x00010297u
++#define AFE_MODULE_GROUP_DEVICE			0x00010254u
++#define AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG	0x0001029Eu
++#define AFE_PARAM_ID_GROUP_DEVICE_ENABLE	0x00010256u
++#define AFE_PORT_INVALID			0xFFFFu	/* also AFE_SLOT_MAPPING_OFFSET_INVALID */
++
++/* AFE_PORT_ID_TDM_PORT_RANGE_START 0x9000 + 0x30, group = port + 0x100; the stock DT agrees. */
++#define QUAT_TDM_RX_0		0x9030u		/* AFE_PORT_ID_QUATERNARY_TDM_RX */
++#define QUAT_TDM_RX_GROUP	0x9130u		/* AFE_GROUP_DEVICE_ID_QUATERNARY_TDM_RX */
++
++/* sdm845.c sdm845_tdm_snd_hw_params: 8 x 32-bit slots, mask 0xFFFF >> (16 - ch), channel n at byte 4n. */
++#define TDM_RATE		48000u
++#define TDM_CHANNELS		2u
++#define TDM_SLOTS		8u
++#define TDM_SLOT_BITS		32u
++#define TDM_SLOT_MASK		0x3u
++#define TDM_BCLK_HZ		(TDM_RATE * TDM_SLOTS * TDM_SLOT_BITS)	/* 12288000 = DT clk-rate */
++
++/* ADM, apr_audio-v2.h and q6adm.c */
++#define ADM_CMD_DEVICE_OPEN_V5		0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5	0x00010329u
++#define ADM_CMD_DEVICE_CLOSE_V5		0x00010327u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5	0x00010325u
++#define ADM_MATRIX_ID_AUDIO_RX		0
++#define ADM_CMD_COPP_OPEN_MODE_OF_OPERATION_RX_PATH_COPP 1
++#define ADM_CMD_COPP_OPEN_END_POINT_ID_2_IGNORE	0xFFFFu
++#define NULL_COPP_TOPOLOGY		0x00010312u
++#define INVALID_COPP_ID			0xFFu
++#define PCM_CHANNEL_FL			1
++#define PCM_CHANNEL_FR			2
++
++/*
++ * COPP width. Stock takes it from the app type (16-bit playback 69936 gives 16)
++ * or else the back end (S32_LE gives 32): msm-pcm-routing-v2.c
++ * msm_routing_get_bit_width. The AFE widens to 32-bit slots either way.
++ */
++#define BSND_ADM_BITS			16u
++
++/* ASM, apr_audio-v2.h */
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS		0x00010D92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00010D93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS	0x00010D94u
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL		3	/* what every q6 driver maps with, not EBI 0 */
++#define ASM_STREAM_CMD_OPEN_WRITE_V3		0x00010DB3u
++#define ASM_STREAM_POSTPROCOPO_ID_NONE		0x00010C68u	/* mainline q6asm.c ASM_NULL_POPP_TOPOLOGY */
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2	0x00010DA5u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2	0x00010D98u
++#define ASM_SESSION_CMD_RUN_V2			0x00010DAAu
++#define ASM_DATA_CMD_WRITE_V2			0x00010DABu
++#define ASM_DATA_EVENT_WRITE_DONE_V2		0x00010D99u
++#define ASM_SESSION_EVENT_RX_UNDERFLOW		0x00010C17u
++#define ASM_STREAM_CMD_CLOSE			0x00010BCDu
++
++/* Session 1 (of ASM_MAX_SESSION_ID 15), stream 1; APR port = session << 8 | stream (q6asm.c __q6asm_add_hdr). */
++#define ASM_SESSION		1u
++#define ASM_PORT		((ASM_SESSION << 8) | 1u)
++#define BSND_FRAME_BYTES	4u		/* 2 channels x 16 bits */
++
++#define BSND_TIMEOUT_MS		1000u		/* q6afe.c / q6adm.c TIMEOUT_MS */
++#define BSND_MAX_PAYLOAD	96u
++#define BSND_TOK_WRITE		0x80000000u	/* data-write tokens: this bit + slot index */
++#define BSND_WR_SLOTS		16u
++#define BSND_NO_COPP		0xFFFFu
++
++/*
++ * Steps 3a/3b. msm_dai_q6_tdm_prepare sends them only for a group of more than
++ * one port; QUAT RX has one (DT tdm-group-num-ports <1>), and mainline never
++ * sends them. Set this if DEVICE_START is refused.
++ */
++static bool bsnd_tdm_group = false;
++
++/* ---- Wire formats: little-endian, packed, named after the apr.h / apr_audio-v2.h structs ---- */
++
++struct bsnd_apr_hdr {			/* apr_hdr */
++	uint16_t hdr_field, pkt_size;	/* pkt_size: header + payload */
++	uint8_t src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;		/* the token comes back in the reply */
++} __attribute__((packed));
++
++/*
++ * afe_svc_cmd_set_param, afe_port_cmd_set_param_v2 (address and handle 0:
++ * the data follows in-band), afe_port_param_data_v2, and the {id, value}
++ * of afe_group_device_enable and afe_port_cmd_device_start / _stop.
++ */
++struct bsnd_afe_svc_cmd { uint32_t payload_size, addr_lsw, addr_msw, mem_map_handle; } __attribute__((packed));
++struct bsnd_afe_port_cmd {
++	uint16_t port_id, payload_size;
++	uint32_t addr_lsw, addr_msw, mem_map_handle;
++} __attribute__((packed));
++struct bsnd_param_hdr { uint32_t module_id, param_id; uint16_t param_size, reserved; } __attribute__((packed));
++struct bsnd_pair16 { uint16_t id, value; } __attribute__((packed));
++
++struct bsnd_clk_set {			/* afe_clk_set */
++	uint32_t minor_version, clk_id, clk_freq_in_hz;
++	uint16_t clk_attri, clk_root;
++	uint32_t enable;
++} __attribute__((packed));
++
++struct bsnd_tdm_cfg {			/* afe_param_id_tdm_cfg */
++	uint32_t minor_version, num_channels, sample_rate, bit_width;
++	uint16_t data_format, sync_mode, sync_src, nslots_per_frame;
++	uint16_t ctrl_data_out_enable, ctrl_invert_sync_pulse, ctrl_sync_data_delay, slot_width;
++	uint32_t slot_mask;
++} __attribute__((packed));
++
++struct bsnd_slot_map {			/* afe_param_id_slot_mapping_cfg */
++	uint32_t minor_version;
++	uint16_t num_channel, bitwidth;
++	uint32_t data_align_type;
++	uint16_t offset[8];		/* byte offset of each channel within the frame */
++} __attribute__((packed));
++
++struct bsnd_group_tdm_cfg {		/* afe_param_id_group_device_tdm_cfg */
++	uint32_t minor_version;
++	uint16_t group_id, reserved;
++	uint16_t port_id[8];
++	uint32_t num_channels, sample_rate, bit_width;
++	uint16_t nslots_per_frame, slot_width;
++	uint32_t slot_mask;
++} __attribute__((packed));
++
++struct bsnd_adm_open {			/* adm_cmd_device_open_v5 */
++	uint16_t flags, mode_of_operation, endpoint_id_1, endpoint_id_2;
++	uint32_t topology_id;
++	uint16_t dev_num_channel, bit_width;
++	uint32_t sample_rate;
++	uint8_t dev_channel_mapping[8];
++} __attribute__((packed));
++
++struct bsnd_adm_map {			/* adm_cmd_matrix_map_routings_v5 + one adm_session_map_node_v5 */
++	uint32_t matrix_id, num_sessions;
++	uint16_t session_id, num_copps, copp_id, pad;	/* one COPP, padded to 32 bits */
++} __attribute__((packed));
++
++struct bsnd_mem_map {			/* avs_cmd_shared_mem_map_regions + one avs_shared_map_region_payload */
++	uint16_t mem_pool_id, num_regions;
++	uint32_t property_flag;		/* 0: the address is physical, as the DSP sees it */
++	uint32_t shm_addr_lsw, shm_addr_msw, mem_size_bytes;
++} __attribute__((packed));
++
++struct bsnd_open_write {		/* asm_stream_cmd_open_write_v3 */
++	uint32_t mode_flags;
++	uint16_t sink_endpointype, bits_per_sample;
++	uint32_t postprocopo_id, dec_fmt_id;
++} __attribute__((packed));
++
++struct bsnd_media_fmt {			/* asm_data_cmd_media_fmt_update_v2 + asm_multi_channel_pcm_fmt_blk_v2 */
++	uint32_t fmt_blk_size;		/* bytes after this field */
++	uint16_t num_channels, bits_per_sample;
++	uint32_t sample_rate;
++	uint16_t is_signed, reserved;
++	uint8_t channel_mapping[8];
++} __attribute__((packed));
++
++struct bsnd_write {			/* asm_data_cmd_write_v2 */
++	uint32_t buf_addr_lsw, buf_addr_msw, mem_map_handle, buf_size;
++	uint32_t seq_id, timestamp_lsw, timestamp_msw, flags;
++} __attribute__((packed));
++
++_Static_assert(sizeof(struct bsnd_apr_hdr) == APR_HDR_SIZE && sizeof(struct bsnd_afe_svc_cmd) == 16 &&
++    sizeof(struct bsnd_afe_port_cmd) == 16 && sizeof(struct bsnd_param_hdr) == 12, "apr/afe headers");
++_Static_assert(sizeof(struct bsnd_clk_set) == 20 && sizeof(struct bsnd_tdm_cfg) == 36 &&
++    sizeof(struct bsnd_slot_map) == 28 && sizeof(struct bsnd_group_tdm_cfg) == 44, "afe params");
++_Static_assert(sizeof(struct bsnd_adm_open) == 28 && sizeof(struct bsnd_adm_map) == 16 &&
++    sizeof(struct bsnd_mem_map) == 20 && sizeof(struct bsnd_open_write) == 16 &&
++    sizeof(struct bsnd_media_fmt) == 24 && sizeof(struct bsnd_write) == 32, "adm/asm payloads");
++
++/* ---- State ---- */
++
++/* The awaited reply. bsnd_apr_rx claims the token (-> 0) before filling the rest: taken whole or not at all. */
++static struct {
++	uint32_t token, done;
++	uint32_t opcode, status, len;	/* reply opcode, ADSP status, payload bytes */
++	uint32_t pl[32];		/* the first 128 payload bytes */
++} bsnd_rsp;
++
++static uint32_t bsnd_seq;		/* control tokens, 1..0x7fffffff */
++
++/* Writes the DSP holds; slot index = token & ~BSND_TOK_WRITE. */
++static struct {
++	uint32_t busy, off, len;
++} bsnd_wr[BSND_WR_SLOTS];
++static uint32_t bsnd_wr_inflight;
++static bsnd_write_done_fn bsnd_wr_cb;
++
++static struct {
++	bool tdm_up, group_up;		/* port started; steps 3a/3b done */
++	bool stream_open, running;	/* ASM session open; RUN sent, writes allowed */
++	uint16_t copp_id;		/* BSND_NO_COPP when none */
++	uint32_t mem_handle;		/* 0 when unmapped */
++	uint32_t underflows;
++} bsnd = { .copp_id = BSND_NO_COPP };
++
++/* ---- Helpers ---- */
++
++static uint64_t
++ms_abs(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++static const char *
++adsp_err(uint32_t s)
++{
++	static const char *const names[] = {
++		"EOK", "EFAILED", "EBADPARAM", "EUNSUPPORTED", "EVERSION", "EUNEXPECTED",
++		"EPANIC", "ENORESOURCE", "EHANDLE", "EALREADY", "ENOTREADY", "EPENDING",
++		"EBUSY", "EABORTED", "EPREEMPTED", "ECONTINUE", "EIMMEDIATE", "ENOTIMPL",
++		"ENEEDMORE", "?", "ENOMEMORY", "ENOTEXIST",
++	};
++	if (s < sizeof(names) / sizeof(names[0])) {
++		return names[s];
++	}
++	return s == 0x11174u ? "ETERMINATED" : "?";
++}
++
++static void
++apr_hdr(struct bsnd_apr_hdr *h, uint8_t svc, uint16_t src_port, uint16_t dest_port,
++    uint32_t token, uint32_t opcode, uint32_t payload_len)
++{
++	h->hdr_field = APR_HDR_FIELD_SEQ_CMD;
++	h->pkt_size = (uint16_t)(APR_HDR_SIZE + payload_len);
++	h->src_svc = h->dest_svc = svc;
++	h->src_domain = APR_DOMAIN_APPS;
++	h->dest_domain = APR_DOMAIN_ADSP;
++	h->src_port = src_port;
++	h->dest_port = dest_port;
++	h->token = token;
++	h->opcode = opcode;
++}
++
++/*
++ * Send one command and wait for the reply with its token: 0, the DSP's status
++ * (> 0), or -errno. The reply stays in bsnd_rsp (COPP id, map handle, versions).
++ */
++static int
++apr_send_wait(const char *what, uint8_t svc, uint16_t src_port, uint16_t dest_port,
++    uint32_t opcode, const void *payload, uint32_t len, uint32_t timeout_ms, bool quiet)
++{
++	uint8_t pkt[APR_HDR_SIZE + BSND_MAX_PAYLOAD] __attribute__((aligned(8)));
++	uint32_t tok, t;
++	uint64_t deadline;
++
++	if (len > BSND_MAX_PAYLOAD) {
++		return -EINVAL;
++	}
++	do {
++		tok = ++bsnd_seq & ~BSND_TOK_WRITE;
++	} while (tok == 0);
++	apr_hdr((struct bsnd_apr_hdr *)pkt, svc, src_port, dest_port, tok, opcode, len);
++	if (len != 0) {
++		memcpy(pkt + APR_HDR_SIZE, payload, len);
++	}
++
++	/* Arm the waiter before sending so a fast reply cannot slip past. */
++	__atomic_store_n(&bsnd_rsp.done, 0, __ATOMIC_RELAXED);
++	__atomic_store_n(&bsnd_rsp.token, tok, __ATOMIC_RELEASE);
++	if (apr_tx(pkt, APR_HDR_SIZE + len) != 0) {
++		__atomic_store_n(&bsnd_rsp.token, 0, __ATOMIC_RELEASE);
++		printf("BLUE SOUND: %s (op %#x): apr_tx failed\n", what, opcode);
++		return -EIO;
++	}
++
++	deadline = mach_absolute_time() + ms_abs(timeout_ms);
++	while (!__atomic_load_n(&bsnd_rsp.done, __ATOMIC_ACQUIRE)) {
++		if (mach_absolute_time() > deadline) {
++			/* Withdraw the token. If bsnd_apr_rx already claimed it, the reply is landing: keep waiting. */
++			t = tok;
++			if (__atomic_compare_exchange_n(&bsnd_rsp.token, &t, 0, false,
++			    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++				if (!quiet) {
++					printf("BLUE SOUND: %s (op %#x): no reply in %u ms\n", what, opcode, timeout_ms);
++				}
++				return -ETIMEDOUT;
++			}
++		}
++		IOSleep(1);
++	}
++
++	if (bsnd_rsp.opcode == APR_BASIC_RSP_RESULT && bsnd_rsp.pl[0] != opcode) {
++		printf("BLUE SOUND: %s: reply names op %#x, sent %#x\n", what, bsnd_rsp.pl[0], opcode);
++	}
++	if (bsnd_rsp.status != ADSP_EOK) {
++		if (!quiet) {
++			printf("BLUE SOUND: %s (op %#x): ADSP %s (%#x)\n", what, opcode,
++			    adsp_err(bsnd_rsp.status), bsnd_rsp.status);
++		}
++		return (int)bsnd_rsp.status;
++	}
++	return 0;
++}
++
++static int
++apr_cmd(const char *what, uint8_t svc, uint16_t src_port, uint16_t dest_port,
++    uint32_t opcode, const void *payload, uint32_t len)
++{
++	return apr_send_wait(what, svc, src_port, dest_port, opcode, payload, len, BSND_TIMEOUT_MS, false);
++}
++
++/*
++ * Set one AFE parameter in-band: service-wide for port 0 (clocks, groups),
++ * else on that port. param_size is the exact struct size; for the TDM config
++ * stock sends the size of its union of all port configs (q6afe.c
++ * afe_tdm_port_start), which only adds unused trailing bytes.
++ */
++static int
++afe_set(const char *what, uint16_t port, uint32_t module_id, uint32_t param_id,
++    const void *data, uint16_t size)
++{
++	uint8_t pl[16 + sizeof(struct bsnd_param_hdr) + sizeof(struct bsnd_group_tdm_cfg)];
++	struct bsnd_param_hdr ph = { .module_id = module_id, .param_id = param_id, .param_size = size };
++	struct bsnd_afe_svc_cmd sc = { .payload_size = sizeof(ph) + size };
++	struct bsnd_afe_port_cmd pc = { .port_id = port, .payload_size = (uint16_t)(sizeof(ph) + size) };
++
++	if (size > sizeof(struct bsnd_group_tdm_cfg)) {
++		return -EINVAL;
++	}
++	if (port != 0) {
++		memcpy(pl, &pc, sizeof(pc));
++	} else {
++		memcpy(pl, &sc, sizeof(sc));
++	}
++	memcpy(pl + 16, &ph, sizeof(ph));
++	memcpy(pl + 16 + sizeof(ph), data, size);
++	return apr_cmd(what, APR_SVC_AFE, 0, 0, port != 0 ? AFE_PORT_CMD_SET_PARAM_V2 : AFE_SVC_CMD_SET_PARAM,
++	    pl, 16 + sizeof(ph) + size);
++}
++
++/* ---- 1. Core ---- */
++
++/* Ask AVCS for the framework version and log it, with each service's API version (ids as in apr.h). */
++static int
++avcs_version(bool quiet)
++{
++	uint32_t n, i, words;
++	int rc;
++
++	rc = apr_send_wait("AVCS version", APR_SVC_ADSP_CORE, 0, 0, AVCS_CMD_GET_FWK_VERSION, NULL, 0, 200, quiet);
++	if (rc != 0) {
++		return rc;
++	}
++	if (bsnd_rsp.opcode != AVCS_CMDRSP_GET_FWK_VERSION || bsnd_rsp.len < 20) {
++		return -EPROTO;
++	}
++	n = bsnd_rsp.pl[4];
++	words = bsnd_rsp.len / 4 < 32 ? bsnd_rsp.len / 4 : 32;
++	printf("BLUE SOUND: AVS %u.%u.%u.%u, %u services\n", bsnd_rsp.pl[0], bsnd_rsp.pl[1],
++	    bsnd_rsp.pl[2], bsnd_rsp.pl[3], n);
++	for (i = 0; i < n && 7 + 3 * i < words; i++) {
++		printf("BLUE SOUND:   service %#x api %u branch %u\n", bsnd_rsp.pl[5 + 3 * i],
++		    bsnd_rsp.pl[6 + 3 * i], bsnd_rsp.pl[7 + 3 * i]);
++	}
++	return 0;
++}
++
++/*
++ * The core answers AVCS_CMD_ADSP_EVENT_GET_STATE with 1 once every audio
++ * service has registered (q6core.c q6core_is_adsp_ready). Firmware without
++ * that query answers EUNSUPPORTED, and mainline then assumes the DSP is up
++ * (q6core.c __q6core_is_adsp_ready); we take an answered version query as proof.
++ */
++int
++bsnd_apr_core_ready(unsigned timeout_ms)
++{
++	uint64_t deadline = mach_absolute_time() + ms_abs(timeout_ms);
++	int rc;
++
++	for (;;) {
++		rc = apr_send_wait("AVCS state", APR_SVC_ADSP_CORE, 0, 0, AVCS_CMD_ADSP_EVENT_GET_STATE,
++		    NULL, 0, 100, true);
++		if (rc == 0 && bsnd_rsp.opcode == AVCS_CMDRSP_ADSP_EVENT_GET_STATE && bsnd_rsp.pl[0] != 0) {
++			printf("BLUE SOUND: ADSP audio services ready\n");
++			avcs_version(false);
++			return 0;
++		}
++		if (rc == (int)ADSP_EUNSUPPORTED && avcs_version(true) == 0) {
++			printf("BLUE SOUND: ADSP audio services ready (no state query on this firmware)\n");
++			return 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("BLUE SOUND: ADSP audio services not ready after %u ms (last %d)\n", timeout_ms, rc);
++			return -ETIMEDOUT;
++		}
++		IOSleep(50);
++	}
++}
++
++/* ---- 2. QUAT TDM ---- */
++
++/* Bit clock on or off (msm-dai-q6-v2.c msm_dai_q6_tdm_set_clk); clk_root 0 = default. */
++static int
++tdm_clock(bool on)
++{
++	struct bsnd_clk_set clk = {
++		.minor_version = 1, .clk_id = Q6AFE_LPASS_CLK_ID_QUAD_TDM_IBIT, .clk_freq_in_hz = TDM_BCLK_HZ,
++		.clk_attri = Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO, .clk_root = 0, .enable = on,
++	};
++
++	return afe_set(on ? "QUAD_TDM_IBIT on" : "QUAD_TDM_IBIT off", 0,
++	    AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clk, sizeof(clk));
++}
++
++/* Steps 3a/3b; disabling needs only the enable word. num_channels = active slots (apr_audio-v2.h). */
++static int
++tdm_group(bool on)
++{
++	struct bsnd_group_tdm_cfg cfg = {
++		.minor_version = 1, .group_id = QUAT_TDM_RX_GROUP,
++		.port_id = { QUAT_TDM_RX_0, AFE_PORT_INVALID, AFE_PORT_INVALID, AFE_PORT_INVALID,
++		    AFE_PORT_INVALID, AFE_PORT_INVALID, AFE_PORT_INVALID, AFE_PORT_INVALID },
++		.num_channels = TDM_CHANNELS, .sample_rate = TDM_RATE, .bit_width = TDM_SLOT_BITS,
++		.nslots_per_frame = TDM_SLOTS, .slot_width = TDM_SLOT_BITS, .slot_mask = TDM_SLOT_MASK,
++	};
++	struct bsnd_pair16 en = { .id = QUAT_TDM_RX_GROUP, .value = on };
++	int rc;
++
++	if (on) {
++		rc = afe_set("TDM group config", 0, AFE_MODULE_GROUP_DEVICE,
++		    AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG, &cfg, sizeof(cfg));
++		if (rc != 0) {
++			return rc;
++		}
++	}
++	rc = afe_set(on ? "TDM group enable" : "TDM group disable", 0, AFE_MODULE_GROUP_DEVICE,
++	    AFE_PARAM_ID_GROUP_DEVICE_ENABLE, &en, sizeof(en));
++	bsnd.group_up = on && rc == 0;
++	return rc;
++}
++
++int
++bsnd_apr_tdm_start(void)
++{
++	/* Values from the stock DT; (dtbo) marks the dtbo 8 overrides of the base node. */
++	struct bsnd_tdm_cfg tdm = {
++		.minor_version = 1,
++		.num_channels = TDM_CHANNELS, .sample_rate = TDM_RATE,
++		.bit_width = TDM_SLOT_BITS,		/* S32_LE (mixer_paths "QUAT_TDM_RX_0 Format") */
++		.data_format = 0,			/* AFE_LINEAR_PCM_DATA */
++		.sync_mode = 0,				/* AFE_PORT_TDM_SHORT_SYNC_BIT_MODE: sync-mode 0 (dtbo) */
++		.sync_src = 1,				/* AFE_PORT_TDM_SYNC_SRC_INTERNAL: sync-src 1 */
++		.nslots_per_frame = TDM_SLOTS,
++		.ctrl_data_out_enable = 0,		/* AFE_PORT_TDM_CTRL_DATA_OE_DISABLE: data-out 0 */
++		.ctrl_invert_sync_pulse = 0,		/* AFE_PORT_TDM_SYNC_NORMAL: invert-sync 0 (dtbo) */
++		.ctrl_sync_data_delay = 1,		/* AFE_PORT_TDM_DATA_DELAY_1_BCLK_CYCLE: data-delay 1 */
++		.slot_width = TDM_SLOT_BITS, .slot_mask = TDM_SLOT_MASK,
++	};
++	struct bsnd_slot_map map = {
++		.minor_version = 1, .num_channel = TDM_CHANNELS, .bitwidth = TDM_SLOT_BITS,
++		.data_align_type = 0,			/* AFE_SLOT_MAPPING_DATA_ALIGN_MSB: data-align 0 */
++		.offset = { 0, 4, AFE_PORT_INVALID, AFE_PORT_INVALID, AFE_PORT_INVALID,
++		    AFE_PORT_INVALID, AFE_PORT_INVALID, AFE_PORT_INVALID },
++	};
++	struct bsnd_pair16 start = { .id = QUAT_TDM_RX_0 };
++	int rc;
++
++	if (bsnd.tdm_up) {
++		return 0;
++	}
++
++	/* 1. LPASS makes the 12.288 MHz bit clock for QUAT; the SoC is clock and frame master. */
++	rc = tdm_clock(true);
++	if (rc != 0) {
++		return rc;
++	}
++
++	/* 2. Optionally, the group around the port (off by default, as stock). */
++	if (bsnd_tdm_group && (rc = tdm_group(true)) != 0) {
++		goto clock_off;
++	}
++
++	/* 3. The port's frame: 8 slots of 32 bits, our two channels in slots 0 and 1. No custom TDM header. */
++	rc = afe_set("TDM port config", QUAT_TDM_RX_0, AFE_MODULE_AUDIO_DEV_INTERFACE,
++	    AFE_PARAM_ID_TDM_CONFIG, &tdm, sizeof(tdm));
++	if (rc != 0) {
++		goto group_off;
++	}
++
++	/* 4. Where in the frame each channel goes (byte offsets). */
++	rc = afe_set("TDM slot map", QUAT_TDM_RX_0, AFE_MODULE_TDM,
++	    AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG, &map, sizeof(map));
++	if (rc != 0) {
++		goto group_off;
++	}
++
++	/* 5. Start the port: clocks and frame sync run, the slots carry zeros until a stream feeds them. */
++	rc = apr_cmd("AFE start QUAT_TDM_RX_0", APR_SVC_AFE, 0, 0, AFE_PORT_CMD_DEVICE_START,
++	    &start, sizeof(start));
++	if (rc != 0) {
++		goto group_off;
++	}
++	bsnd.tdm_up = true;
++	printf("BLUE SOUND: QUAT_TDM_RX_0 up: %u Hz, %u of %u x %u-bit slots, bit clock %u Hz\n",
++	    TDM_RATE, TDM_CHANNELS, TDM_SLOTS, TDM_SLOT_BITS, TDM_BCLK_HZ);
++	return 0;
++
++group_off:
++	if (bsnd.group_up) {
++		tdm_group(false);
++	}
++clock_off:
++	tdm_clock(false);
++	return rc;
++}
++
++int
++bsnd_apr_tdm_stop(void)
++{
++	struct bsnd_pair16 stop = { .id = QUAT_TDM_RX_0 };
++	int rc;
++
++	if (!bsnd.tdm_up) {
++		return 0;
++	}
++	/* Port, then group, then clock (msm-dai-q6-v2.c msm_dai_q6_tdm_shutdown order). */
++	rc = apr_cmd("AFE stop QUAT_TDM_RX_0", APR_SVC_AFE, 0, 0, AFE_PORT_CMD_DEVICE_STOP, &stop, sizeof(stop));
++	if (bsnd.group_up) {
++		tdm_group(false);
++	}
++	tdm_clock(false);
++	bsnd.tdm_up = false;
++	return rc;
++}
++
++/* ---- 3. Stream ---- */
++
++int
++bsnd_apr_stream_open(void)
++{
++	struct bsnd_mem_map mm = {
++		.mem_pool_id = ADSP_MEMORY_MAP_SHMEM8_4K_POOL, .num_regions = 1, .property_flag = 0,
++		.shm_addr_lsw = (uint32_t)bsnd_shm_pa, .shm_addr_msw = (uint32_t)(bsnd_shm_pa >> 32),
++		.mem_size_bytes = bsnd_shm_size,
++	};
++	struct bsnd_open_write ow = {
++		.mode_flags = 0,			/* ASM_LEGACY_STREAM_SESSION */
++		.sink_endpointype = 0,			/* ASM_END_POINT_DEVICE_MATRIX */
++		.bits_per_sample = 16,
++		.postprocopo_id = ASM_STREAM_POSTPROCOPO_ID_NONE, .dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2,
++	};
++	struct bsnd_adm_open ao = {
++		.flags = 0,				/* ADM_LEGACY_DEVICE_SESSION */
++		.mode_of_operation = ADM_CMD_COPP_OPEN_MODE_OF_OPERATION_RX_PATH_COPP,
++		.endpoint_id_1 = QUAT_TDM_RX_0, .endpoint_id_2 = ADM_CMD_COPP_OPEN_END_POINT_ID_2_IGNORE,
++		.topology_id = NULL_COPP_TOPOLOGY,
++		.dev_num_channel = TDM_CHANNELS, .bit_width = BSND_ADM_BITS, .sample_rate = TDM_RATE,
++		.dev_channel_mapping = { PCM_CHANNEL_FL, PCM_CHANNEL_FR },
++	};
++	struct bsnd_adm_map map = {
++		.matrix_id = ADM_MATRIX_ID_AUDIO_RX, .num_sessions = 1, .session_id = ASM_SESSION, .num_copps = 1,
++	};
++	struct bsnd_media_fmt fmt = {
++		.fmt_blk_size = sizeof(struct bsnd_media_fmt) - 4,
++		.num_channels = 2, .bits_per_sample = 16, .sample_rate = TDM_RATE, .is_signed = 1,
++		.channel_mapping = { PCM_CHANNEL_FL, PCM_CHANNEL_FR },
++	};
++	uint32_t run[3] = { 0, 0, 0 };	/* asm_session_cmd_run_v2: ASM_SESSION_CMD_RUN_STARTIME_RUN_IMMEDIATE, time 0 */
++	int rc;
++
++	if (bsnd.stream_open || bsnd.mem_handle != 0) {
++		return -EBUSY;
++	}
++	if (!bsnd.tdm_up) {
++		printf("BLUE SOUND: stream open before the TDM port is up\n");
++		return -ENXIO;
++	}
++	if ((bsnd_shm_pa & 0xFFFu) != 0 || bsnd_shm_size == 0 || (bsnd_shm_size & 0xFFFu) != 0) {
++		printf("BLUE SOUND: shm %#llx+%#x must be 4 KiB aligned and sized\n",
++		    (unsigned long long)bsnd_shm_pa, bsnd_shm_size);
++		return -EINVAL;
++	}
++
++	/* 1. Map the PCM buffer into the DSP; writes then name regions of it by handle and address. */
++	rc = apr_cmd("ASM map shm", APR_SVC_ASM, 0, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &mm, sizeof(mm));
++	if (rc == 0 && (bsnd_rsp.opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || bsnd_rsp.pl[0] == 0)) {
++		printf("BLUE SOUND: ASM map shm: reply op %#x, handle %#x\n", bsnd_rsp.opcode, bsnd_rsp.pl[0]);
++		rc = -EPROTO;
++	}
++	if (rc != 0) {
++		return rc;
++	}
++	bsnd.mem_handle = bsnd_rsp.pl[0];
++
++	/* 2. ASM session 1: a PCM "decoder" feeding the ADM matrix. No post-processing, so no calibration. */
++	rc = apr_cmd("ASM open write", APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, &ow, sizeof(ow));
++	if (rc != 0) {
++		goto fail;
++	}
++	bsnd.stream_open = true;
++
++	/*
++	 * 3. A COPP on QUAT_TDM_RX_0 with NULL_COPP_TOPOLOGY, a built-in pass-through:
++	 * stock opens it when ACDB has no topology for the device (msm-pcm-routing-v2.c
++	 * msm_routing_get_adm_topology); mainline q6routing.c always does.
++	 */
++	rc = apr_cmd("ADM open", APR_SVC_ADM, QUAT_TDM_RX_0, QUAT_TDM_RX_0, ADM_CMD_DEVICE_OPEN_V5, &ao, sizeof(ao));
++	if (rc == 0 && (bsnd_rsp.opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || bsnd_rsp.len < 8 ||
++	    (bsnd_rsp.pl[1] & 0xFFFFu) >= INVALID_COPP_ID)) {
++		printf("BLUE SOUND: ADM open: reply op %#x, copp %#x\n", bsnd_rsp.opcode, bsnd_rsp.pl[1] & 0xFFFFu);
++		rc = -EPROTO;
++	}
++	if (rc != 0) {
++		goto fail;
++	}
++	bsnd.copp_id = (uint16_t)(bsnd_rsp.pl[1] & 0xFFFFu);
++
++	/* 4. Route session 1 into that COPP through the Audio Rx matrix. */
++	map.copp_id = bsnd.copp_id;
++	rc = apr_cmd("ADM matrix map", APR_SVC_ADM, 0, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &map, sizeof(map));
++	if (rc != 0) {
++		goto fail;
++	}
++
++	/* 5. What the buffers hold: interleaved signed 16-bit L/R at 48 kHz. */
++	rc = apr_cmd("ASM media format", APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2,
++	    &fmt, sizeof(fmt));
++	if (rc != 0) {
++		goto fail;
++	}
++
++	/* 6. Run now. Until the first write the session renders silence and reports underflows. */
++	bsnd.underflows = 0;
++	rc = apr_cmd("ASM run", APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run));
++	if (rc != 0) {
++		goto fail;
++	}
++	bsnd.running = true;
++	printf("BLUE SOUND: stream running: ASM session %u -> COPP %u -> QUAT_TDM_RX_0, shm handle %#x\n",
++	    ASM_SESSION, bsnd.copp_id, bsnd.mem_handle);
++	return 0;
++
++fail:
++	bsnd_apr_stream_close();
++	return rc;
++}
++
++int
++bsnd_apr_stream_close(void)
++{
++	uint32_t handle, i, busy;
++	uint64_t deadline;
++	int rc = 0, r;
++
++	/* Refuse new writes, then let the queued ones play out. */
++	if (bsnd.running) {
++		bsnd.running = false;
++		deadline = mach_absolute_time() + ms_abs(500);
++		while (bsnd_apr_writes_in_flight() != 0 && mach_absolute_time() < deadline) {
++			IOSleep(5);
++		}
++	}
++
++	/* Session, then the COPP it fed, then the memory (stock order). Closing hands back unplayed writes. */
++	if (bsnd.stream_open) {
++		r = apr_cmd("ASM close", APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0);
++		rc = rc ? rc : r;
++		bsnd.stream_open = false;
++	}
++	if (bsnd.copp_id != BSND_NO_COPP) {
++		r = apr_cmd("ADM close", APR_SVC_ADM, QUAT_TDM_RX_0, bsnd.copp_id, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0);
++		rc = rc ? rc : r;
++		bsnd.copp_id = BSND_NO_COPP;
++	}
++	if (bsnd.mem_handle != 0) {
++		handle = bsnd.mem_handle;
++		r = apr_cmd("ASM unmap shm", APR_SVC_ASM, 0, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle, sizeof(handle));
++		rc = rc ? rc : r;
++		bsnd.mem_handle = 0;
++	}
++
++	/* Forget writes that never came back; whoever wins a slot's claim drops the count. */
++	for (i = 0; i < BSND_WR_SLOTS; i++) {
++		busy = 1;
++		if (__atomic_compare_exchange_n(&bsnd_wr[i].busy, &busy, 0, false,
++		    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++			__atomic_fetch_sub(&bsnd_wr_inflight, 1, __ATOMIC_RELEASE);
++		}
++	}
++	if (bsnd.underflows != 0) {
++		printf("BLUE SOUND: stream closed after %u underflows\n", bsnd.underflows);
++	}
++	return rc;
++}
++
++/* ---- 4. Data ---- */
++
++void
++bsnd_apr_set_write_done(bsnd_write_done_fn fn)
++{
++	__atomic_store_n(&bsnd_wr_cb, fn, __ATOMIC_RELEASE);
++}
++
++uint32_t
++bsnd_apr_writes_in_flight(void)
++{
++	return __atomic_load_n(&bsnd_wr_inflight, __ATOMIC_ACQUIRE);
++}
++
++int
++bsnd_apr_write(uint32_t off, uint32_t len)
++{
++	struct {
++		struct bsnd_apr_hdr h;
++		struct bsnd_write w;
++	} __attribute__((packed)) pkt;
++	uint64_t addr = bsnd_shm_pa + off;
++	uint32_t slot, idle;
++
++	if (!bsnd.running) {
++		return -ENXIO;
++	}
++	if (len == 0 || (len % BSND_FRAME_BYTES) != 0 || off > bsnd_shm_size || len > bsnd_shm_size - off ||
++	    (addr & 31u) != 0) {
++		printf("BLUE SOUND: bad write %#x+%#x (whole frames, 32-byte aligned, inside shm)\n", off, len);
++		return -EINVAL;
++	}
++
++	/* Claim a free slot; its index rides in the token so the write-done finds (off, len) again. */
++	for (slot = 0; slot < BSND_WR_SLOTS; slot++) {
++		idle = 0;
++		if (__atomic_compare_exchange_n(&bsnd_wr[slot].busy, &idle, 1, false,
++		    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++			break;
++		}
++	}
++	if (slot == BSND_WR_SLOTS) {
++		return -EBUSY;
++	}
++	bsnd_wr[slot].off = off;
++	bsnd_wr[slot].len = len;
++	__atomic_fetch_add(&bsnd_wr_inflight, 1, __ATOMIC_RELEASE);
++
++	/* No timestamp (flags 0): the DSP plays it right after the previous buffer. */
++	apr_hdr(&pkt.h, APR_SVC_ASM, ASM_PORT, ASM_PORT, BSND_TOK_WRITE | slot, ASM_DATA_CMD_WRITE_V2, sizeof(pkt.w));
++	pkt.w = (struct bsnd_write){
++		.buf_addr_lsw = (uint32_t)addr, .buf_addr_msw = (uint32_t)(addr >> 32),
++		.mem_map_handle = bsnd.mem_handle, .buf_size = len, .seq_id = slot,
++	};
++	if (apr_tx(&pkt, sizeof(pkt)) != 0) {
++		__atomic_fetch_sub(&bsnd_wr_inflight, 1, __ATOMIC_RELEASE);
++		__atomic_store_n(&bsnd_wr[slot].busy, 0, __ATOMIC_RELEASE);
++		return -EIO;
++	}
++	return 0;
++}
++
++/* A write came back, played or not: free its slot, then hand the region back to the owner. */
++static void
++write_done(uint32_t slot, uint32_t status)
++{
++	bsnd_write_done_fn cb;
++	uint32_t off, len, busy = 1;
++
++	if (slot >= BSND_WR_SLOTS) {
++		return;
++	}
++	off = bsnd_wr[slot].off;
++	len = bsnd_wr[slot].len;
++	if (!__atomic_compare_exchange_n(&bsnd_wr[slot].busy, &busy, 0, false,
++	    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++		return;		/* already returned, or forgotten by stream_close */
++	}
++	__atomic_fetch_sub(&bsnd_wr_inflight, 1, __ATOMIC_RELEASE);
++	if (status != ADSP_EOK) {
++		printf("BLUE SOUND: write %#x+%#x: ADSP %s (%#x)\n", off, len, adsp_err(status), status);
++	}
++	cb = __atomic_load_n(&bsnd_wr_cb, __ATOMIC_ACQUIRE);
++	if (cb != NULL) {
++		cb(off, len, status);
++	}
++}
++
++/* ---- 5. Receive ---- */
++
++void
++bsnd_apr_rx(const void *pkt, uint32_t len)
++{
++	struct bsnd_apr_hdr h;
++	uint32_t pl[32];
++	uint32_t hlen, plen, status, want;
++
++	if (pkt == NULL || len < APR_HDR_SIZE) {
++		return;
++	}
++	memcpy(&h, pkt, sizeof(h));
++	hlen = ((h.hdr_field >> 4) & 0xFu) * 4;		/* header length in words, as apr.c apr_cb_func reads it */
++	if (hlen < APR_HDR_SIZE || h.pkt_size < hlen || h.pkt_size > len) {
++		printf("BLUE SOUND: bad APR packet (field %#x, size %u of %u)\n", h.hdr_field, h.pkt_size, len);
++		return;
++	}
++	plen = h.pkt_size - hlen;
++	memset(pl, 0, sizeof(pl));
++	memcpy(pl, (const uint8_t *)pkt + hlen, plen < sizeof(pl) ? plen : sizeof(pl));
++
++	switch (h.opcode) {
++	case ASM_DATA_EVENT_WRITE_DONE_V2:
++		/* {buf_addr_lsw, buf_addr_msw, mem_map_handle, status} */
++		write_done(h.token & ~BSND_TOK_WRITE, plen >= 16 ? pl[3] : ADSP_EFAILED);
++		return;
++	case ASM_SESSION_EVENT_RX_UNDERFLOW:
++		/* The DSP wanted data and none was queued; log the first and every 256th. */
++		if ((bsnd.underflows++ & 0xFFu) == 0) {
++			printf("BLUE SOUND: ASM underflow (%u so far)\n", bsnd.underflows);
++		}
++		return;
++	case APR_RSP_ACCEPTED:
++		return;
++	case APR_BASIC_RSP_RESULT:
++		/* {opcode, status}. With a write token: a buffer handed back unplayed, on close
++		 * (mainline q6asm.c q6asm_stream_callback) or because the DSP refused it. */
++		status = plen >= 8 ? pl[1] : ADSP_EFAILED;
++		if (h.token & BSND_TOK_WRITE) {
++			write_done(h.token & ~BSND_TOK_WRITE, status != ADSP_EOK ? status : ADSP_EABORTED);
++			return;
++		}
++		break;
++	case ADM_CMDRSP_DEVICE_OPEN_V5:
++		/* {status, copp_id, reserved} */
++		status = plen >= 4 ? pl[0] : ADSP_EFAILED;
++		break;
++	default:
++		/* Replies that carry data (map handle, AVCS state, version) have no status field. */
++		status = ADSP_EOK;
++		break;
++	}
++
++	/* Hand the reply to the waiting command if the token is the one it armed. */
++	want = h.token;
++	if (want == 0 || !__atomic_compare_exchange_n(&bsnd_rsp.token, &want, 0, false,
++	    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++		printf("BLUE SOUND: unclaimed APR op %#x token %#x from svc %u port %#x (status %#x)\n",
++		    h.opcode, h.token, h.src_svc, h.src_port, status);
++		return;
++	}
++	bsnd_rsp.opcode = h.opcode;
++	bsnd_rsp.status = status;
++	bsnd_rsp.len = plen;
++	memcpy(bsnd_rsp.pl, pl, sizeof(pl));
++	__atomic_store_n(&bsnd_rsp.done, 1, __ATOMIC_RELEASE);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/blueline_audio_apr.h b/bsd/dev/blueline_audio_apr.h
+--- a/bsd/dev/blueline_audio_apr.h
++++ b/bsd/dev/blueline_audio_apr.h
+@@ -0,0 +1,90 @@
++/*
++ * Pixel 3 (blueline) speaker: PCM to QUAT_TDM_RX_0 through the stock ADSP's
++ * Elite audio services (AVCS, AFE, ADM, ASM) over APR. See blueline_audio_apr.c
++ * for the command sequence and every id.
++ *
++ * Call order:
++ *   bsnd_apr_core_ready(3000)      ADSP audio framework is up
++ *   bsnd_apr_tdm_start()           bit clock + TDM port running (sends zeros)
++ *   bsnd_apr_set_write_done(fn)    optional, before the first write
++ *   bsnd_apr_stream_open()         ASM session -> ADM COPP -> QUAT_TDM_RX_0, running
++ *   bsnd_apr_write(off, len) ...   queue regions of bsnd_shm; fn() hands each back
++ *   bsnd_apr_stream_close()
++ *   bsnd_apr_tdm_stop()
++ *
++ * Return values: 0 on success, a positive ADSP status (ADSP_EBADPARAM = 2,
++ * ADSP_EUNSUPPORTED = 3, ...) when the DSP refused a command, or a negative
++ * errno (-ETIMEDOUT, -EIO from apr_tx, -EINVAL, -EBUSY, -ENXIO).
++ *
++ * Threads: the control calls (everything but bsnd_apr_write) wait for their
++ * reply and must come from one thread at a time, never from the thread that
++ * calls bsnd_apr_rx(). bsnd_apr_write() does not wait and may run on its own
++ * thread, but must stop before bsnd_apr_stream_close() starts; the write-done
++ * callback runs on the bsnd_apr_rx() thread and must not block.
++ *
++ * Before bsnd_apr_tdm_start() the apps side must mux the QUAT TDM pins (the
++ * ADSP does not touch TLMM): GPIO 58 (bit clock) and 59 (frame sync) to
++ * function 1 "qua_mi2s", 8 mA, no pull; GPIO 61 (data out) and 60 (data in)
++ * to function 1, 2 mA, no pull (stock DT quat_tdm_active, quat_tdm_dout_active,
++ * quat_tdm_din_active).
++ */
++#ifndef _BLUELINE_AUDIO_APR_H_
++#define _BLUELINE_AUDIO_APR_H_
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++/* ---- Provided by the GLINK "apr_audio_svc" transport ---- */
++
++/* Queue one APR packet (header included); 0 = queued. The bytes are copied before it returns. */
++int apr_tx(const void *pkt, uint32_t len);
++
++/*
++ * The PCM buffer: physically contiguous, uncached, 4 KiB aligned, size a
++ * multiple of 4 KiB (ADSP_MEMORY_MAP_SHMEM8_4K_POOL rule). bsnd_shm_pa is the
++ * address as the ADSP sees it. With the stock SMMU setup that is the IOVA in
++ * the apps SMMU context bank of stream 0x1821 with the stream id's low 4 bits
++ * in bits 32-35, i.e. iova | (1ull << 32) (msm_audio_ion.c
++ * msm_audio_ion_get_phys: "Append the SMMU SID information to the IOVA";
++ * mainline q6asm-dai.c: addr | (sid << 32), sid = 0x1821 & 0xf).
++ */
++extern uint64_t bsnd_shm_pa;
++extern uint8_t *bsnd_shm_va;
++extern uint32_t bsnd_shm_size;
++
++/* ---- This file's API ---- */
++
++/* Poll the AVCS core until it reports the audio services up; logs the AVS version. */
++int bsnd_apr_core_ready(unsigned timeout_ms);
++
++/* QUAT TDM bit clock on, port configured and started; and back down. */
++int bsnd_apr_tdm_start(void);
++int bsnd_apr_tdm_stop(void);
++
++/*
++ * Map bsnd_shm, open ASM session 1 (PCM, 48 kHz, 2 ch, 16-bit interleaved
++ * little-endian) and an ADM COPP on QUAT_TDM_RX_0, route one to the other,
++ * and start the session. stream_close waits up to 500 ms for queued writes
++ * to come back, then closes everything stream_open set up.
++ */
++int bsnd_apr_stream_open(void);
++int bsnd_apr_stream_close(void);
++
++/*
++ * Queue bsnd_shm[off, off + len) for playback: len a multiple of 4 (one
++ * stereo 16-bit frame), bsnd_shm_pa + off 32-byte aligned. At most 16 writes
++ * in flight (-EBUSY beyond). The region belongs to the DSP until the
++ * write-done callback returns it with status 0 (ADSP_EOK) or an ADSP error.
++ */
++typedef void (*bsnd_write_done_fn)(uint32_t off, uint32_t len, uint32_t status);
++void bsnd_apr_set_write_done(bsnd_write_done_fn fn);
++int bsnd_apr_write(uint32_t off, uint32_t len);
++uint32_t bsnd_apr_writes_in_flight(void);
++
++/* Called by the transport's polling thread for each received APR packet. */
++void bsnd_apr_rx(const void *pkt, uint32_t len);
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* _BLUELINE_AUDIO_APR_H_ */
+diff -ruN a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+--- a/bsd/dev/blueline_touch.c	2026-11-21 08:21:57
++++ b/bsd/dev/blueline_touch.c	2026-11-21 08:21:57
+@@ -43,6 +43,7 @@
+ #include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -110,6 +111,8 @@
+ struct bbi2c {
+ 	vm_offset_t tlmm;	/* mapped TLMM tile holding both pins */
+ 	int sda, scl;
++	uint32_t tlmm_pa;
++	lck_mtx_t lock;		/* exported buses: one transfer at a time (0187) */
+ };
+ 
+ static struct bbi2c touch_bus;
+@@ -256,9 +259,13 @@
+  * mapping failed). Opening switches both pins to the GPIO function (away
+  * from their QUP function) and sends 9 clocks and a stop with no start, so
+  * no device sees a command. Then: blueline_bbi2c_xfer(), 0 or EIO (NACK) /
+- * EINVAL. Thread context; one caller at a time per bus.
++ * EINVAL. Thread context. Opening the same pins again returns the same bus,
++ * and transfers on a bus are serialized (0187: the MAX1720x gauge and the
++ * CS35L36 speaker amps share GPIO 49/50).
+  */
+-#define BBI2C_MAX_BUSES	4	/* touch-script, MAX1720x (0141), CS40L20 (0150) */
++#define BBI2C_MAX_BUSES	4	/* touch-script, MAX1720x (0141, shared with the CS35L36s), CS40L20 (0150) */
++static LCK_GRP_DECLARE(bbi2c_grp, "blueline_bbi2c");
++static LCK_MTX_DECLARE(bbi2c_open_lock, &bbi2c_grp);
+ void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);
+ int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
+     uint32_t rlen);
+@@ -269,19 +276,34 @@
+ 	static struct bbi2c buses[BBI2C_MAX_BUSES];
+ 	static int nbuses;
+ 	int top = sda > scl ? sda : scl;
++	struct bbi2c *b = NULL;
+ 
+-	if (sda < 0 || scl < 0 || sda == scl || top > 149 || nbuses >= BBI2C_MAX_BUSES) {
++	if (sda < 0 || scl < 0 || sda == scl || top > 149) {
+ 		return NULL;
+ 	}
++	lck_mtx_lock(&bbi2c_open_lock);
++	for (int i = 0; i < nbuses; i++) {
++		if (buses[i].tlmm_pa == tlmm_pa && buses[i].sda == sda && buses[i].scl == scl) {
++			b = &buses[i];
++			goto out;
++		}
++	}
++	if (nbuses >= BBI2C_MAX_BUSES) {
++		goto out;
++	}
+ 	vm_offset_t tlmm = ml_io_map(tlmm_pa, GPIO_CFG(top + 1));
+ 	if (!tlmm) {
+-		return NULL;
++		goto out;
+ 	}
+-	struct bbi2c *b = &buses[nbuses++];
++	b = &buses[nbuses++];
+ 	b->tlmm = tlmm;
++	b->tlmm_pa = tlmm_pa;
+ 	b->sda = sda;
+ 	b->scl = scl;
++	lck_mtx_init(&b->lock, &bbi2c_grp, LCK_ATTR_NULL);
+ 	bb_reset(b);
++out:
++	lck_mtx_unlock(&bbi2c_open_lock);
+ 	return b;
+ }
+ 
+@@ -292,7 +314,11 @@
+ 	if (!bus || addr > 0x7fu || (wlen && !w) || (rlen && !r) || wlen + rlen == 0) {
+ 		return EINVAL;
+ 	}
+-	return bb_xfer((const struct bbi2c *)bus, addr, w, wlen, r, rlen);
++	struct bbi2c *b = bus;
++	lck_mtx_lock(&b->lock);
++	int err = bb_xfer(b, addr, w, wlen, r, rlen);
++	lck_mtx_unlock(&b->lock);
++	return err;
+ }
+ 
+ /* ---- RPMh: LDO19 from the AOP ---- */
+diff -ruN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -2557,10 +2557,33 @@
+ 	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
+ }
+ 
+-/* true: the WLAN stream reaches memory untranslated (kept bypass, or our identity bank) */
++/*
++ * true: stream sid/mask reaches memory untranslated (a bypass entry kept, or an identity context bank).
++ * Exported for the ADSP's audio stream (0187); serialized, since each caller picks a free SMR and bank.
++ */
++static LCK_GRP_DECLARE(smmu_grp, "blueline_smmu");
++static LCK_MTX_DECLARE(smmu_lock, &smmu_grp);
++static bool smmu_identity(uint32_t sid, uint32_t mask, const char *who);
++
++bool blueline_smmu_identity(uint32_t sid, uint32_t mask, const char *who);
++bool
++blueline_smmu_identity(uint32_t sid, uint32_t mask, const char *who)
++{
++	lck_mtx_lock(&smmu_lock);
++	bool ok = smmu_identity(sid, mask, who);
++	lck_mtx_unlock(&smmu_lock);
++	return ok;
++}
++
+ static bool
+ radio_smmu(void)
+ {
++	return blueline_smmu_identity(RADIO_SID, RADIO_SID_MASK, "WLAN");
++}
++
++static bool
++smmu_identity(uint32_t sid, uint32_t mask, const char *who)
++{
+ 	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(RADIO_SMMU_PA, RADIO_SMMU_SIZE);
+ 	if (s == NULL) {
+ 		RLOG("smmu: map failed");
+@@ -2576,9 +2599,9 @@
+ 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+ 		smr = rr32(s, 0x800 + 4 * i);
+ 		s2cr = rr32(s, 0xC00 + 4 * i);
+-		if ((smr >> 31) != 0 && smmu_sid_match(smr, RADIO_SID, RADIO_SID_MASK)) {
+-			RLOG("smmu: SMR%u %08x S2CR %08x (type %u cb %u) matches the WLAN stream", i, smr, s2cr, (s2cr >> 16) & 3,
+-			    s2cr & 0xff);
++		if ((smr >> 31) != 0 && smmu_sid_match(smr, sid, mask)) {
++			RLOG("smmu: SMR%u %08x S2CR %08x (type %u cb %u) matches the %s stream", i, smr, s2cr, (s2cr >> 16) & 3,
++			    s2cr & 0xff, who);
+ 			if (slot == ~0u) {
+ 				slot = i;
+ 			}
+@@ -2590,13 +2613,13 @@
+ 		}
+ 	}
+ 	if (slot != ~0u && ((rr32(s, 0xC00 + 4 * slot) >> 16) & 3) == 1) {
+-		RLOG("smmu: WLAN stream already in bypass: kept");
++		RLOG("smmu: %s stream already in bypass: kept", who);
+ 		return true;
+ 	}
+ 	if (slot == ~0u) {
+ 		slot = freeslot;
+ 		if ((cr0 & (1u << 10)) == 0) {			/* sCR0.USFCFG 0: unmatched streams bypass */
+-			RLOG("smmu: no SMR for the WLAN stream and unmatched streams bypass: left alone");
++			RLOG("smmu: no SMR for the %s stream and unmatched streams bypass: left alone", who);
+ 			return true;
+ 		}
+ 	}
+@@ -2622,7 +2645,7 @@
+ 	rw32(gr1, 0x000 + 4 * cb, RADIO_CB_CBAR);
+ 	rw32(cbp, 0x0, RADIO_CB_SCTLR);			/* SCTLR last */
+ 	rw32(s, 0xC00 + 4 * slot, cb);			/* S2CR: translate, this bank */
+-	rw32(s, 0x800 + 4 * slot, (1u << 31) | (RADIO_SID_MASK << 16) | RADIO_SID);
++	rw32(s, 0x800 + 4 * slot, (1u << 31) | (mask << 16) | sid);
+ 	rw32(s, 0x70, 0);				/* sTLBGSYNC */
+ 	uint32_t n;
+ 	for (n = 0; n < 100000 && (rr32(s, 0x74) & 1) != 0; n++) {
+@@ -2630,9 +2653,9 @@
+ 	}
+ 	smr = rr32(s, 0x800 + 4 * slot);
+ 	s2cr = rr32(s, 0xC00 + 4 * slot);
+-	bool ok = (smr >> 31) != 0 && smmu_sid_match(smr, RADIO_SID, RADIO_SID_MASK) && ((s2cr >> 16) & 3) == 0 &&
++	bool ok = (smr >> 31) != 0 && smmu_sid_match(smr, sid, mask) && ((s2cr >> 16) & 3) == 0 &&
+ 	    (s2cr & 0x3F) == cb;
+-	RLOG("smmu: WLAN identity CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", cb, slot, smr, s2cr, rr32(cbp, 0x0),
++	RLOG("smmu: %s identity CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", who, cb, slot, smr, s2cr, rr32(cbp, 0x0),
+ 	    ok ? "OK" : "NOT as written");
+ 	return ok;
+ }
