@@ -890,3 +890,15 @@ The speaker path is QUAT TDM RX (48 kHz, 8 slots of 32 bits, 12.288 MHz bit cloc
 **Frame timing (lock2, scripted Safari scroll, home-page swipes, Settings scroll).** Animations run at 27-41 fps, slowest gaps 59-89 ms. eagl's per-frame line (every 20th frame, 233 sampled over the boot): frames under 33 ms take a median 10 ms (6.2 ms of it the copy out, 2.8 ms GL calls); the 16 over 33 ms take a median 48 ms, of which 38 ms is GL calls, the copy out is unchanged (6.3 ms), and 9 of them refilled textures from IOSurfaces (up to 6.8 MB, 15 ms before the frame). So the hitches are in Mesa's draw/flush path (shader variants or a GPU wait), not the copy; the copy-free path (gldirect) would take ~6 ms off every frame but not the hitches. Next: `glslow=` per-call timing on the slow frames.
 
 **Screenshots.** Retaken at the full-width canvas with the status bar: lock, home, apps, Settings (scrolled past the Wi-Fi row), Safari on apple.com.
+
+### Cameras: sensor chip IDs (2026-11-21)
+
+**0188 (`bluecam=1|2|3`): read-only probe, cam1.** Each group is powered in the stock order (AVDD switch GPIO, LVS1 1.8 V by RPMh, reset), MCLK at 19.2 MHz from XO, then the Sony model ID (0x0016) is read over a bit-banged CCI and everything is put back as found.
+
+| Sensor | Address | Model |
+|---|---|---|
+| Rear IMX363 | 0x1a | 0x0363 |
+| Front IMX355 (normal) | 0x10 | 0x0355 |
+| Front IMX355 (wide) | 0x1a | 0x0355 |
+
+Before MCLK runs the sensors NACK. The MCLK branches (CBCR) only start with the TITAN_TOP GDSC on, as in the stock order. No CSI PHY, CCI block or capture pipeline yet.
