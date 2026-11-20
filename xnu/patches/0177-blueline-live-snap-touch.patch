@@ -1,0 +1,189 @@
+diff -ru a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+--- a/bsd/dev/blueline_touch.c
++++ b/bsd/dev/blueline_touch.c
+@@ -37,6 +37,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
++#include <sys/sysctl.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+@@ -681,6 +682,8 @@
+  *   volchord               a fake-accelerometer quarter turn, as volume up +
+  *                          down (needs bluefakeaccel=1; BlueFakeMotion.cpp)
+  *   snap                   a screenshot now (bluesnap, sweet_ufs.c)
++ *   wait,MS                nothing for MS (for kern.bluetouch, whose steps
++ *                          all have time 0)
+  *   print,N                a fingerprint of each of the next N frames shown
+  *                          (SweetFramebuffer.cpp: "SWEET FP:" lines), for
+  *                          tools/fpblink.py to find frames that step back
+@@ -776,10 +779,10 @@
+ }
+ 
+ static void
+-touchscript_thread(__unused void *arg, __unused wait_result_t wr)
++touchscript_thread(void *arg, __unused wait_result_t wr)
+ {
+ 	static const char *const keys[] = { "power", "volup", "voldown", "home" };
+-	const char *p = touch_script;
++	const char *p = arg != NULL ? (const char *)arg : touch_script;
+ 	unsigned n = 0;
+ 
+ 	while (*p) {
+@@ -796,7 +799,7 @@
+ 		}
+ 		const char *act = p;
+ 		bool ok = true;
+-		enum { S_TAP, S_HOLD, S_SWIPE, S_KEY, S_CHORD, S_SNAP, S_PRINT } kind;
++		enum { S_TAP, S_HOLD, S_SWIPE, S_KEY, S_CHORD, S_SNAP, S_PRINT, S_WAIT } kind;
+ 		if (script_word(&p, "tap")) {
+ 			kind = S_TAP;
+ 			ok = script_int(&p, &a[0]) && script_int(&p, &a[1]);
+@@ -821,6 +824,9 @@
+ 			kind = S_CHORD;
+ 		} else if (script_word(&p, "snap")) {
+ 			kind = S_SNAP;
++		} else if (script_word(&p, "wait")) {
++			kind = S_WAIT;
++			ok = script_int(&p, &a[0]) && a[0] >= 0 && a[0] <= 60000;
+ 		} else if (script_word(&p, "print")) {
+ 			kind = S_PRINT;
+ 			ok = script_int(&p, &a[0]) && a[0] > 0 && a[0] <= 2000;
+@@ -881,10 +887,61 @@
+ 		case S_PRINT:
+ 			sweet_fb_print_frames((uint32_t)a[0]);
+ 			break;
++		case S_WAIT:
++			blue_sleep_until(mach_absolute_time() + script_ms((uint32_t)a[0]));
++			break;
+ 		}
+ 	}
+ 	printf("BLUELINE SCRIPT: done (%u steps)\n", n);
+ }
++
++/*
++ * kern.bluetouch (write a script, as bluetouchscript=, at most 1023 bytes): run it now, on a thread of its own,
++ * for driving the running phone from the Mac (tools/bluesh.py touch). Steps with time 0 run one after another at
++ * once; "wait,MS" spaces them. Writes while one runs are refused (EBUSY).
++ */
++static volatile uint32_t touch_live_busy;
++static void
++touchscript_live_thread(void *arg, wait_result_t wr)
++{
++	touchscript_thread(arg, wr);
++	kfree_data(arg, 1024);
++	touch_live_busy = 0;
++}
++
++static int
++sysctl_bluetouch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char *script;
++	thread_t thread;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, "", 1);
++	}
++	if (req->newlen == 0 || req->newlen > 1023) {
++		return EINVAL;
++	}
++	if (!os_atomic_cmpxchg(&touch_live_busy, 0, 1, acq_rel)) {
++		return EBUSY;
++	}
++	script = kalloc_data(1024, Z_WAITOK | Z_ZERO);
++	if (script == NULL) {
++		touch_live_busy = 0;
++		return ENOMEM;
++	}
++	error = SYSCTL_IN(req, script, req->newlen);
++	if (error != 0 || kernel_thread_start(touchscript_live_thread, script, &thread) != KERN_SUCCESS) {
++		kfree_data(script, 1024);
++		touch_live_busy = 0;
++		return error != 0 ? error : ENOMEM;
++	}
++	thread_deallocate(thread);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, bluetouch, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_bluetouch,
++    "A", "run a touch script now (bluetouchscript= syntax)");
+ 
+ void
+ blueline_touchscript_start(void)
+diff -ru a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1406,6 +1406,71 @@
+ 	}
+ }
+ 
++/*
++ * kern.bluesnap (read): the screen now, for the Mac over the USB link (tools/bluesh.py snap): a struct
++ * bluesnap_header (index 0, why "live") then the pixels, as one snap in the area. Needs no UFS area: works on
++ * any boot. Scale and bpp as bluesnap_scale= / bluesnap_bpp= (2 and 16 by default).
++ */
++static int
++sysctl_bluesnap SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	uintptr_t px, fpx;
++	uint32_t w, h, stride, ow, oh, fw, fh, fbpr, ms;
++	int32_t sb_ms, fit_x, fit_w;
++	int error;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (!blue_fb_snapinfo(&px, &w, &h, &stride) || w < 4 || h < 4) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&bluesnap_lock);
++	if (bs.scale == 0) {
++		bs.scale = 2;
++		bs.bpp = 16;
++	}
++	uint32_t need_bytes = (w / bs.scale) * (h / bs.scale) * (bs.bpp / 8);
++	if (req->oldptr == USER_ADDR_NULL) {
++		lck_mtx_unlock(&bluesnap_lock);
++		return SYSCTL_OUT(req, NULL, sizeof(struct bluesnap_header) + need_bytes);
++	}
++	vm_size_t want = round_page((vm_size_t)((need_bytes + 63u) & ~63u) + (vm_size_t)bs.scale * w * 4);
++	if (bs.bufsize < want) {
++		if (bs.buf) {
++			kmem_free(kernel_map, bs.buf, bs.bufsize);
++			bs.buf = 0;
++			bs.bufsize = 0;
++		}
++		if (kmem_alloc(kernel_map, &bs.buf, want, KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			bs.buf = 0;
++			lck_mtx_unlock(&bluesnap_lock);
++			return ENOMEM;
++		}
++		bs.bufsize = want;
++	}
++	blue_when_now(&ms, &sb_ms);
++	bool flipped = blue_dpu_snapinfo(&fpx, &fw, &fh, &fbpr, &fit_x, &fit_w) != 0;
++	uint32_t bytes = flipped ? bluesnap_convert_flipped(fpx, fw, fh, fbpr, fit_x, fit_w, w, h, &ow, &oh) :
++	    bluesnap_convert(px, w, h, stride, &ow, &oh);
++	struct bluesnap_header hd = {
++		.magic = { 'B', 'L', 'U', 'E', 'S', 'N', 'A', 'P' },
++		.nonce = 0, .version = 1, .index = 0, .width = ow, .height = oh,
++		.bpp = bs.bpp, .scale = bs.scale, .bytes = bytes, .ms = ms, .sb_ms = sb_ms,
++		.src_w = w, .src_h = h,
++	};
++	strlcpy(hd.why, "live", sizeof(hd.why));
++	error = SYSCTL_OUT(req, &hd, sizeof(hd));
++	if (!error) {
++		error = SYSCTL_OUT(req, (const void *)bs.buf, bytes);
++	}
++	lck_mtx_unlock(&bluesnap_lock);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, bluesnap, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_bluesnap,
++    "S", "the screen now (struct bluesnap_header, then the pixels)");
++
+ static void
+ bluesnap_arm(void)
+ {

@@ -14,7 +14,7 @@
 <img src="docs/screenshots/2026-11-20-home-wallpaper.png" width="180" alt="Home screen with wallpaper and widgets">
 <img src="docs/screenshots/2026-11-20-system-apps.png" width="180" alt="Second home page: the stock apps">
 <img src="docs/screenshots/2026-11-19-gpu-settings.png" width="180" alt="Settings">
-<img src="docs/screenshots/2026-11-19-gpu-safari.png" width="180" alt="Safari">
+<img src="docs/screenshots/2026-11-20-wifi-safari-google.png" width="180" alt="Safari loading google.com over Wi-Fi">
 </p>
 
 **New since the fork (2026-11):**
