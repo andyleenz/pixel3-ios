@@ -52,6 +52,11 @@ Apple80211 layer (0900, from HackiOS) can follow. Logs carry no SSIDs.
 bluewifi_join=N (255: strongest) or bluewifi_joinoui=0xAABBCC tries a join
 with no key after the first scan: auth, association and EAPOL message 1/2
 work against a WPA2 AP; it then fails with EAUTH, as it should.
+Teardown follows mac80211/ath10k: deauth to the AP, PEER_DELETE, then
+VDEV_DOWN and VDEV_STOP (bluewifi_td, default 31). topaz's order (VDEV_DOWN
+first, with the peer mid-handshake) asserts the firmware in _wlan_vdev_down;
+without the deauth a rejoin gets no auth reply. bluewifi_joins=N repeats the
+test join; two joins in one boot both reach the handshake.
 --- a/bsd/dev/blueline_wifi.c
 +++ b/bsd/dev/blueline_wifi.c
 @@ -103,6 +103,7 @@
@@ -125,7 +130,7 @@ work against a WPA2 AP; it then fails with EAUTH, as it should.
  		w_start(WLFW_CAL_REPORT);
  		w_u8(0x01, 0);			/* meta_data[]: none */
  		printf("BLUELINE WIFI: wlfw: cal report -> %d\n", w_request(&r, 5000));
-@@ -2427,644 +2453,3438 @@
+@@ -2427,644 +2453,3476 @@
  	return true;
  }
  
@@ -2822,17 +2827,38 @@ work against a WPA2 AP; it then fails with EAUTH, as it should.
 +}
 +
 +/* ---- the join, step by step from the modem thread */
++/* which teardown steps run (bluewifi_td): 1 VDEV_DOWN, 2 PEER_DELETE, 4 VDEV_STOP, 8 deauth to the AP,
++ * 16 PEER_DELETE before VDEV_DOWN */
++static uint32_t w_td = 31;			/* VDEV_DOWN with the peer still there asserts in the firmware
++						 * (_wlan_vdev_down) and a rejoin without a deauth gets no auth reply */
++
 +static void
 +w_teardown(void)
 +{
 +	if (s_state >= S_START) {
-+		if (s_state >= S_4WAY) {
++		bool down = s_state >= S_4WAY && (w_td & 1), peer = s_state >= S_AUTH && (w_td & 2), stop = (w_td & 4) != 0;
++		bool deauth = s_state >= S_ASSOC && (w_td & 8);
++		bool late = (w_td & 16) != 0;
++		RLOG("teardown from state %u:%s%s%s%s%s", s_state, deauth ? " deauth" : "", down && !late ? " vdev down" : "",
++		    peer ? " peer delete" : "", down && late ? " vdev down" : "", stop ? " vdev stop" : "");
++		if (deauth) {				/* tell the AP, as mac80211 does, so a rejoin starts clean */
++			uint8_t f[26], *r = w_mgmt_hdr(f, FC_DEAUTH);
++			r[0] = 3;			/* reason: leaving */
++			r[1] = 0;
++			(void)w_mgmt_tx(f, sizeof(f));
++		}
++		if (down && !(w_td & 16)) {
 +			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
 +		}
-+		if (s_state >= S_AUTH) {
++		if (peer) {
 +			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
 +		}
-+		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++		if (down && (w_td & 16)) {		/* mac80211/ath10k order: the station goes before the vdev */
++			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		}
++		if (stop) {
++			w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++		}
 +	}
 +	if (s_state == S_UP) {
 +		w_link(false);
@@ -3212,11 +3238,28 @@ work against a WPA2 AP; it then fails with EAUTH, as it should.
 +w_join_test(void)
 +{
 +	static bool done;
++	static uint32_t joins = 1, left, end_seen, end_ms;
 +	uint32_t n = 0;
++	if (done && left > 0 && s_state == S_IDLE && !s_join_asked) {
++		/* again, bluewifi_joins times in all, 3 s after each end: does a rejoin work after a teardown? */
++		if (end_seen != s_join_done) {
++			end_seen = s_join_done;
++			end_ms = W_NOW;
++		} else if (W_NOW > end_ms + 3000) {
++			left--;
++			RLOG("join test: again (%u of %u)", joins - left, joins);
++			s_join_asked = true;
++		}
++		return;
++	}
 +	if (done || scans < 1 || scanning) {
 +		return;
 +	}
 +	done = true;
++	(void)PE_parse_boot_argn("bluewifi_td", &w_td, sizeof(w_td));
++	(void)PE_parse_boot_argn("bluewifi_joins", &joins, sizeof(joins));
++	left = joins > 0 ? joins - 1 : 0;
++	end_seen = s_join_done;
 +	(void)PE_parse_boot_argn("bluewifi_join", &n, sizeof(n));
 +	if (nbss == 0) {
 +		return;
