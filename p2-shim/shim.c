@@ -26,7 +26,7 @@
 #define PAUSE_SECONDS		1
 #define FAIL_SECONDS		2
 #else
-#define PAUSE_SECONDS		3	/* time to photo the screen before XNU */
+#define PAUSE_SECONDS		0	/* boot-arg bluepause=N: N s to photo the screen before XNU */
 #define FAIL_SECONDS		60
 #endif
 
@@ -231,12 +231,23 @@ void entry_main(uintptr_t dtb, uintptr_t load)
 	*p = 0;
 	con_line("CMDLINE", buf);
 
+	unsigned pause = PAUSE_SECONDS;
+	for (int i = 0; i + 10 < BOOT_LINE_LENGTH && pl->cmdline[i]; i++) {
+		const char *c = &pl->cmdline[i];
+		if ((i == 0 || c[-1] == ' ') && c[0] == 'b' && c[1] == 'l' && c[2] == 'u' && c[3] == 'e' && c[4] == 'p' &&
+		    c[5] == 'a' && c[6] == 'u' && c[7] == 's' && c[8] == 'e' && c[9] == '=' && c[10] >= '0' && c[10] <= '9') {
+			pause = 0;
+			for (int j = 10; j < 13 && c[j] >= '0' && c[j] <= '9'; j++)
+				pause = pause * 10 + (unsigned)(c[j] - '0');
+		}
+	}
 	p = fmt_str(buf, "jumping to XNU in ");
-	p = fmt_dec(p, PAUSE_SECONDS);
+	p = fmt_dec(p, pause);
 	fmt_str(p, "s");
 	con_skip();
 	con_line("XNU", buf);
-	delay_s(PAUSE_SECONDS);
+	if (pause)
+		delay_s(pause);
 
 	for (uint32_t i = 0; i < pl->nsegs; i++) {
 		const struct payload_seg *s = &pl->segs[i];
