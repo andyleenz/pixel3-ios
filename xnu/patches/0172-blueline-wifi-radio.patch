@@ -130,7 +130,7 @@ test join; two joins in one boot both reach the handshake.
  		w_start(WLFW_CAL_REPORT);
  		w_u8(0x01, 0);			/* meta_data[]: none */
  		printf("BLUELINE WIFI: wlfw: cal report -> %d\n", w_request(&r, 5000));
-@@ -2427,1045 +2453,3882 @@
+@@ -2427,1016 +2453,3857 @@
  	return true;
  }
  
@@ -1602,38 +1602,6 @@ test join; two joins in one boot both reach the handshake.
 -	printf("BLUELINE WIFI: step 3 done (MBA running, MPSS and MBA owned by the modem)\n");
 -	if (w2.step < 4 || !step4_mpss()) {
 -		return;
--	}
--	if (kernel_thread_start(watch_thread, NULL, &th) == KERN_SUCCESS) {
--		thread_deallocate(th);
--	}
--}
--
--void
--blueline_wifi_probe(void)
--{
--	int level = 0;
--
--	(void)PE_parse_boot_argn("bluewifi", &level, sizeof(level));
--	if (level <= 0) {
--		return;
--	}
--	w2.level = level;
--	if (level >= 3) {
--		printf("BLUELINE WIFI: stage 2 (bluewifi=%d): SCM queries, then the modem boot steps\n", level);
--		scm_probe();
--		stage2();
--		printf("BLUELINE WIFI: stage 2 done\n");
--		return;
--	}
--	printf("BLUELINE WIFI: stage 1 probe (bluewifi=%d): SCM queries%s; no writes, no votes\n",
--	    level, level >= 2 ? " + always-on register and SMEM reads" : "");
--	scm_probe();
--	if (level >= 2) {
--		state_probe();
--	}
--	printf("BLUELINE WIFI: stage 1 done\n");
--}
--#endif /* ARM64_BOARD_CONFIG_SWEET */
 +/* ---------------- WMI (TLV, ath10k wmi-tlv.c) and the passive scan */
 +
 +#define WMI_EV_SERVICE_READY 0x1
@@ -3904,8 +3872,12 @@ test join; two joins in one boot both reach the handshake.
 +	uint32_t last = 0xffffffffu, v, fl, ver;
 +	bool wd = false, crashed = false, link_tried = false;
 +
-+	printf("BLUELINE WIFI: watcher: following the modem for %u s\n", w2.watch_s);
-+	while (ms_since(t0) < w2.watch_s * 1000u) {
++	if (w2.watch_s == 0) {
++		printf("BLUELINE WIFI: watcher: following the modem for good (bluewifi_watch=0)\n");
++	} else {
++		printf("BLUELINE WIFI: watcher: following the modem for %u s\n", w2.watch_s);
++	}
++	while (w2.watch_s == 0 || ms_since(t0) < w2.watch_s * 1000u) {
 +		if (smp2p_in_state(&v, &fl, &ver)) {
 +			smp2p_service(fl, ver);
 +			if (v != last) {
@@ -4898,7 +4870,8 @@ test join; two joins in one boot both reach the handshake.
 +		printf("BLUELINE WIFI: bluewifi_fw=%s: only modem_a or modem_b\n", w2.part);
 +		return;
 +	}
-+	w2.watch_s = MIN(w2.watch_s, 600u);
++	/* bluewifi_watch=0: for good -- the watcher is the radio's poll loop, so iOS's Wi-Fi stops with it */
++	w2.watch_s = MIN(w2.watch_s, 86400u);
 +	printf("BLUELINE WIFI: stage 2 step %d: firmware from %s; MPSS %#x+%#x, MBA %#x+%#x, metadata %#x\n", w2.step,
 +	    w2.part, MPSS_PA, MPSS_SIZE, MBA_PA, MBA_SIZE, MDATA_PA);
 +	if (!step1_reads()) {
@@ -4919,36 +4892,6 @@ test join; two joins in one boot both reach the handshake.
 +	}
 +	if (w2.level >= 6 && topaz_sta_init != NULL) {
 +		topaz_sta_init();			/* en0 + Apple80211 for wifid (0173), on the radio's ready hook */
-+	}
-+	if (kernel_thread_start(watch_thread, NULL, &th) == KERN_SUCCESS) {
-+		thread_deallocate(th);
-+	}
-+}
-+
-+void
-+blueline_wifi_probe(void)
-+{
-+	int level = 0;
-+
-+	(void)PE_parse_boot_argn("bluewifi", &level, sizeof(level));
-+	if (level <= 0) {
-+		return;
-+	}
-+	w2.level = level;
-+	if (level >= 3) {
-+		printf("BLUELINE WIFI: stage 2 (bluewifi=%d): SCM queries, then the modem boot steps\n", level);
-+		scm_probe();
-+		stage2();
-+		printf("BLUELINE WIFI: stage 2 done\n");
-+		return;
-+	}
-+	printf("BLUELINE WIFI: stage 1 probe (bluewifi=%d): SCM queries%s; no writes, no votes\n",
-+	    level, level >= 2 ? " + always-on register and SMEM reads" : "");
-+	scm_probe();
-+	if (level >= 2) {
-+		state_probe();
-+	}
-+	printf("BLUELINE WIFI: stage 1 done\n");
-+}
-+#endif /* ARM64_BOARD_CONFIG_SWEET */
-+// touch
+ 	}
+ 	if (kernel_thread_start(watch_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
