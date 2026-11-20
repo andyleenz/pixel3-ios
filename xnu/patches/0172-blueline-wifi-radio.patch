@@ -41,9 +41,33 @@ listed channels).
 L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 (bluewifi_ch0mv).
 
+
+Station (WIP): the scan list keeps each AP's beacon IEs; HTT in-order RX
+indications go to a native-wifi -> Ethernet bridge and TX completions free
+the HTT data slots. Join state machine, WPA2-PSK 4-way handshake (SHA-1,
+HMAC, PBKDF2, PRF, AES key unwrap, with a self-test) and the C API
+topaz_wlan_join/join_pmk/leave/joined/transmit/scan/heard, ported from
+ios-topaz (APSL 2.0) 0126, 0129 and 0130 under topaz's names so its en0 and
+Apple80211 layer (0900, from HackiOS) can follow. Logs carry no SSIDs.
+bluewifi_join=N (255: strongest) or bluewifi_joinoui=0xAABBCC tries a join
+with no key after the first scan: auth, association and EAPOL message 1/2
+work against a WPA2 AP; it then fails with EAUTH, as it should.
+Teardown follows mac80211/ath10k: deauth to the AP, PEER_DELETE, then
+VDEV_DOWN and VDEV_STOP (bluewifi_td, default 31). topaz's order (VDEV_DOWN
+first, with the peer mid-handshake) asserts the firmware in _wlan_vdev_down;
+without the deauth a rejoin gets no auth reply. bluewifi_joins=N repeats the
+test join; two joins in one boot both reach the handshake.
 --- a/bsd/dev/blueline_wifi.c
 +++ b/bsd/dev/blueline_wifi.c
-@@ -1957,10 +1957,12 @@
+@@ -103,6 +103,7 @@
+ #include <vm/pmap.h>
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
++#include <kern/locks.h>
+ #include <libkern/crypto/sha2.h>
+ #include <pexpert/device_tree.h>
+ #include "blueline_scm.h"
+@@ -1957,10 +1958,12 @@
  #define VMID_WLAN		0x18u
  #define VMID_WLAN_CE		0x19u
  #define QMI_INDICATION		4
@@ -57,7 +81,7 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
  };
  
  static struct {
-@@ -2104,9 +2106,11 @@
+@@ -2104,9 +2107,11 @@
  static bool
  wlan_power(void)
  {
@@ -71,7 +95,7 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
  	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
  		uint32_t a = blueline_cmddb_addr(ldo[i].res);
  		if (!a) {
-@@ -2255,6 +2259,16 @@
+@@ -2255,6 +2260,16 @@
  		return -1;
  	}
  	printf("BLUELINE WIFI: wlfw: [+%u ms] wlan config sent, mission mode on\n", ms_since(wlfw_t0));
@@ -88,11 +112,10 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
  	return 0;
  }
  
-@@ -2349,6 +2363,17 @@
- 		}
+@@ -2350,6 +2365,17 @@
  		if (wlfw_bdf()) {
  			return -1;
-+		}
+ 		}
 +		if (w2.level >= 6) {
 +			/*
 +			 * The WCN3990 has no address of its own (WMI READY says 00:00:00:00:00:00); on the Pixel 3 it
@@ -103,16 +126,19 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			w_tlv(0x10, wlan_mac, 6);
 +			printf("BLUELINE WIFI: wlfw: mac address %02x:%02x:%02x:**:**:** -> %d\n", wlan_mac[0], wlan_mac[1],
 +			    wlan_mac[2], w_request(&r, 5000));
- 		}
++		}
  		w_start(WLFW_CAL_REPORT);
  		w_u8(0x01, 0);			/* meta_data[]: none */
-@@ -2424,10 +2449,1389 @@
- 	    gl.nri);
- 	gl.up = true;
- 	rmtfs_start();
-+	return true;
-+}
-+
+ 		printf("BLUELINE WIFI: wlfw: cal report -> %d\n", w_request(&r, 5000));
+@@ -2427,1016 +2453,3857 @@
+ 	return true;
+ }
+ 
+-static bool
+-wdog_pending(void)
+-{
+-	return w2.gicd && ((rd(w2.gicd + 0x200 + 4 * (MSS_WDOG_INTID / 32)) >> (MSS_WDOG_INTID % 32)) & 1u);
+-}
 +/*
 + * ---- Stage 4 (bluewifi=6): the radio: copy engines, HTC, WMI, a passive scan ----
 + *
@@ -139,26 +165,88 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +#define RADIO_POOL_PA		0xe0000000ull
 +#define RADIO_POOL_SIZE		0x01000000ull
 +#define RADIO_WLAN_PA		0x18800000ull
-+
+ 
+-static void
+-watch_thread(__unused void *arg, __unused wait_result_t wres)
+-{
+-	uint64_t t0 = mach_absolute_time();
+-	uint32_t last = 0xffffffffu, v, fl, ver;
+-	bool wd = false, crashed = false, link_tried = false;
 +#define RLOG(fmt, ...) printf("BLUELINE WIFI: radio: [+%u ms] " fmt "\n", ms_since(wlfw_t0), ##__VA_ARGS__)
-+
+ 
+-	printf("BLUELINE WIFI: watcher: following the modem for %u s\n", w2.watch_s);
+-	while (ms_since(t0) < w2.watch_s * 1000u) {
+-		if (smp2p_in_state(&v, &fl, &ver)) {
+-			smp2p_service(fl, ver);
+-			if (v != last) {
+-				printf("BLUELINE WIFI: [+%u ms] modem state %#x%s%s%s%s\n", ms_since(t0), v,
+-				    v & MODEM_FATAL ? " ERR-FATAL" : "", v & MODEM_READY ? " ready" : "",
+-				    v & MODEM_HANDOVER ? " handover" : "", v & MODEM_STOP_ACK ? " stop-ack" : "");
+-				last = v;
+-			}
+-			if ((v & MODEM_FATAL) && !crashed) {
+-				crashed = true;
+-				crash_reason();
+-			}
+-		}
+-		if (w2.level >= 4 && !gl.up && !crashed && last != 0xffffffffu && (last & MODEM_READY) && !link_tried) {
+-			link_tried = true;
+-			if (w2.level >= 5 && !wf.powered) {
+-				wf.powered = wlan_power();
+-			}
+-			(void)link_up();
+-		}
+-		if (w2.level >= 5 && gl.up && wlfw_srv_seen && !wf.started && !crashed) {
+-			wf.started = true;
+-			wf.node = wlfw_srv_node;
+-			wf.port = wlfw_srv_port;
+-			int e = wlfw_start();
+-			printf("BLUELINE WIFI: wlfw: %s (%d) after %u ms\n", e ? "stopped" : "chip up, mission mode", e,
+-			    ms_since(wlfw_t0));
+-		}
+-		if (gl.up) {
+-			link_poll();
+-		}
+-		if (!wd && wdog_pending()) {
+-			wd = true;
+-			printf("BLUELINE WIFI: [+%u ms] modem watchdog (SPI 266) pending\n", ms_since(t0));
+-			crash_reason();
+-		}
+-		delay(gl.up ? 5000 : 100000);
+-	}
+-	if (gl.up) {
+-		printf("BLUELINE WIFI: glink: %u servers announced, %d modem intents\n", gl.servers, gl.nri);
+-		printf("BLUELINE WIFI: rmtfs: %u reads (%u sectors), %u writes dropped (%u sectors)\n", rf.reads, rf.read_sectors,
+-		    rf.writes, rf.write_sectors);
+-	}
+-	printf("BLUELINE WIFI: watcher done: last state %#x, rmb mba_status %d\n", last, (int32_t)rd(w2.rmb + RMB_MBA_STATUS));
+-}
 +static inline uint32_t rr32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
 +static inline void rw32(volatile uint8_t *b, uint32_t o, uint32_t v) { __asm__ volatile ("dsb sy" ::: "memory"); *(volatile uint32_t *)(b + o) = v; }
 +#define RMB() __asm__ volatile ("dsb sy" ::: "memory")
-+
++#define W_NOW ms_since(wlfw_t0)
+ 
+-/* ---- AOP QMP (qcom_aoss.c) ---- */
 +static uint8_t *rpool;
 +static bool radio_smmu_ok;
 +static uint64_t rpool_used;
-+
+ 
+-static bool
+-qmp_wait(uint32_t reg, uint32_t want, const char *what)
 +static void *
 +pool_alloc(uint64_t size, uint64_t *pa)
-+{
+ {
+-	uint32_t v;
+-	if (poll32(w2.qmp + reg, 0xffffffffu, want, 1000, &v)) {
+-		return true;
 +	if (rpool == NULL) {
 +		rpool = (uint8_t *)ml_io_map_unmappable(RADIO_POOL_PA, RADIO_POOL_SIZE, VM_WIMG_WCOMB);
 +		if (rpool == NULL) {
 +			return NULL;
 +		}
-+	}
+ 	}
+-	printf("BLUELINE WIFI: qmp: %s timed out (%#x)\n", what, v);
+-	return false;
 +	size = (size + 0xfff) & ~0xfffull;
 +	if (rpool_used + size > RADIO_POOL_SIZE) {
 +		return NULL;
@@ -168,30 +256,68 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	rpool_used += size;
 +	bzero(va, (size_t)size);
 +	return va;
-+}
-+
-+static bool
+ }
+ 
+ static bool
+-qmp_open(void)
 +smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
-+{
+ {
+-	printf("BLUELINE WIFI: about to read the AOP QMP descriptor at %#x\n", QMP_PA);
+-	uint32_t magic = rd(w2.qmp), ver = rd(w2.qmp + 4);
+-	w2.qmp_off = rd(w2.qmp + QMP_MCORE_MBOX_OFF);
+-	w2.qmp_size = rd(w2.qmp + QMP_MCORE_MBOX_SIZE);
+-	printf("BLUELINE WIFI: qmp magic %#x version %u mbox %#x+%#x links ucore %#x mcore %#x/%#x ch ucore %#x mcore %#x/%#x\n",
+-	    magic, ver, w2.qmp_off, w2.qmp_size, rd(w2.qmp + QMP_UCORE_LINK), rd(w2.qmp + QMP_MCORE_LINK),
+-	    rd(w2.qmp + QMP_MCORE_LINK_ACK), rd(w2.qmp + QMP_UCORE_CH), rd(w2.qmp + QMP_MCORE_CH), rd(w2.qmp + QMP_MCORE_CH_ACK));
+-	if (magic != QMP_MAGIC || ver != 1 || w2.qmp_size < QMP_MSG_LEN + 4 || w2.qmp_off < 0x40 ||
+-	    w2.qmp_off + QMP_MSG_LEN + 4 > 0x400) {
+-		printf("BLUELINE WIFI: qmp descriptor not usable\n");
+-		return false;
+-	}
+-	return true;
 +	uint32_t id = smr & 0xFFFF, m = (smr >> 16) & 0x7FFF;
 +	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
-+}
-+
+ }
+ 
 +/* true: the WLAN stream reaches memory untranslated (kept bypass, or our identity bank) */
-+static bool
+ static bool
+-qmp_link(void)
 +radio_smmu(void)
-+{
+ {
+-	wr(w2.qmp + QMP_UCORE_LINK_ACK, rd(w2.qmp + QMP_UCORE_LINK));
+-	wr(w2.qmp + QMP_MCORE_LINK, QMP_UP);
+-	printf("BLUELINE WIFI: about to ring APCS IPC bit %u (AOP)\n", IPC_AOP);
+-	kick(IPC_AOP);
+-	if (!qmp_wait(QMP_MCORE_LINK_ACK, QMP_UP, "link ack")) {
 +	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(RADIO_SMMU_PA, RADIO_SMMU_SIZE);
 +	if (s == NULL) {
 +		RLOG("smmu: map failed");
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	wr(w2.qmp + QMP_MCORE_CH, QMP_UP);
+-	kick(IPC_AOP);
+-	if (!qmp_wait(QMP_UCORE_CH, QMP_UP, "ucore channel")) {
+-		return false;
+-	}
+-	wr(w2.qmp + QMP_UCORE_CH_ACK, QMP_UP);
+-	kick(IPC_AOP);
+-	return qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, "channel ack");
+-}
 +	uint32_t cr0 = rr32(s, 0x0), id0 = rr32(s, 0x20), id1 = rr32(s, 0x24);
 +	uint32_t nsmr = id0 & 0xFF, ncb = id1 & 0xFF;
 +	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
 +	uint32_t slot = ~0u, freeslot = ~0u, cb = ~0u, smr, s2cr;
 +	uint64_t used = 0;
-+
+ 
+-static bool
+-qmp_send(const char *msg)
+-{
+-	char buf[QMP_MSG_LEN] = { 0 };
+-	strlcpy(buf, msg, sizeof(buf));
+-	for (uint32_t i = 0; i < QMP_MSG_LEN; i += 4) {
+-		uint32_t x;
+-		memcpy(&x, buf + i, 4);
+-		wr(w2.qmp + w2.qmp_off + 4 + i, x);
 +	RLOG("smmu: sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs, page %x x%u", cr0, id0, id1, nsmr, ncb, psize, npage);
 +	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
 +		smr = rr32(s, 0x800 + 4 * i);
@@ -208,28 +334,73 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +		if ((smr >> 31) != 0 && ((s2cr >> 16) & 3) == 0) {
 +			used |= 1ull << (s2cr & 0x3F);
 +		}
-+	}
+ 	}
+-	wr(w2.qmp + w2.qmp_off, QMP_MSG_LEN);
+-	(void)rd(w2.qmp + w2.qmp_off);
+-	kick(IPC_AOP);
+-	uint32_t v;
+-	bool ok = poll32(w2.qmp + w2.qmp_off, 0xffffffffu, 0, 1000, &v);
+-	if (!ok) {
+-		wr(w2.qmp + w2.qmp_off, 0);
 +	if (slot != ~0u && ((rr32(s, 0xC00 + 4 * slot) >> 16) & 3) == 1) {
 +		RLOG("smmu: WLAN stream already in bypass: kept");
 +		return true;
-+	}
+ 	}
+-	printf("BLUELINE WIFI: qmp \"%s\": %s\n", msg, ok ? "acked" : "NOT acked (cleared)");
+-	return ok;
+-}
+-
+-/* ---- RPMh votes (rpmhpd: ARC level index; clk-rpmh: xo.lvl on = 3) ---- */
+-
+-static int
+-arc_levels(const char *id, uint16_t *lv, int max, uint32_t *addr)
+-{
+-	uint8_t b[64] = { 0 };
+-	*addr = blueline_cmddb_addr(id);
+-	uint32_t len = blueline_cmddb_aux(id, b, sizeof(b));
+-	int n = (int)(MIN(len, (uint32_t)sizeof(b)) / 2);
+-	if (n > max) {
+-		n = max;
 +	if (slot == ~0u) {
 +		slot = freeslot;
 +		if ((cr0 & (1u << 10)) == 0) {			/* sCR0.USFCFG 0: unmatched streams bypass */
 +			RLOG("smmu: no SMR for the WLAN stream and unmatched streams bypass: left alone");
 +			return true;
 +		}
-+	}
+ 	}
+-	for (int i = 0; i < n; i++) {
+-		lv[i] = (uint16_t)(b[2 * i] | b[2 * i + 1] << 8);
 +	for (uint32_t i = 4; i < ncb && i < 64; i++) {	/* clear of the loader's cb0..3 */
 +		if ((used & (1ull << i)) == 0) {
 +			cb = i;
 +			break;
 +		}
-+	}
+ 	}
+-	while (n > 0 && !lv[n - 1]) {
+-		n--;
+-	}
+-	printf("BLUELINE WIFI: cmd-db %s at %#x, %d levels:", id, *addr, n);
+-	for (int i = 0; i < n; i++) {
+-		printf(" %u", lv[i]);
+-	}
+-	printf("\n");
+-	return n;
+-}
+-
+-/* The lowest level index whose voltage level is >= vlvl (downstream rpmh-regulator), else the top one. */
+-static bool
+-arc_vote(const char *id, uint32_t vlvl, bool dry)
+-{
+-	uint16_t lv[32];
+-	uint32_t a;
+-	int n = arc_levels(id, lv, 32, &a), i;
+-	if (!a || n <= 0) {
+-		printf("BLUELINE WIFI: %s not in cmd-db: not voted\n", id);
 +	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > RADIO_SMMU_SIZE) {
 +		RLOG("smmu: no free SMR/CB (slot %u cb %u)", slot, cb);
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	for (i = 0; i < n - 1 && lv[i] < vlvl; i++) {
 +	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
 +	rw32(cbp, 0x58, 0xFFFFFFFF);			/* FSR */
 +	rw32(cbp, 0x20, 0);				/* TTBR0 */
@@ -247,18 +418,63 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	uint32_t n;
 +	for (n = 0; n < 100000 && (rr32(s, 0x74) & 1) != 0; n++) {
 +		delay(1);
-+	}
+ 	}
+-	uint32_t data = (uint32_t)i;
+-	if (dry) {
+-		printf("BLUELINE WIFI: would vote %s = index %u (level %u)\n", id, data, lv[i]);
+-		return true;
+-	}
+-	printf("BLUELINE WIFI: about to RPMh %s (%#x) = index %u (level %u)\n", id, a, data, lv[i]);
+-	int err = blueline_rpmh_write(&a, &data, 1);
+-	printf("BLUELINE WIFI: RPMh %s err=%d\n", id, err);
+-	return err == 0;
+-}
+-
+-/* ---- GCC (gcc-sdm845.c) ---- */
+-
+-static bool
+-branch_on(const char *what, uint32_t cbcr, bool check)
+-{
+-	uint32_t v = rd(w2.gcc + cbcr);
+-	if (!(v & 1u)) {
+-		wr(w2.gcc + cbcr, v | 1u);
+-	}
+-	if (!check) {
+-		printf("BLUELINE WIFI: gcc %s %#x -> %#x (voted, no halt check)\n", what, v, rd(w2.gcc + cbcr));
+-		return true;
+-	}
+-	bool ok = poll32(w2.gcc + cbcr, 1u << 31, 0, 10, &v);
+-	printf("BLUELINE WIFI: gcc %s -> %#x %s\n", what, v, ok ? "on" : "STILL OFF");
 +	smr = rr32(s, 0x800 + 4 * slot);
 +	s2cr = rr32(s, 0xC00 + 4 * slot);
 +	bool ok = (smr >> 31) != 0 && smmu_sid_match(smr, RADIO_SID, RADIO_SID_MASK) && ((s2cr >> 16) & 3) == 0 &&
 +	    (s2cr & 0x3F) == cb;
 +	RLOG("smmu: WLAN identity CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", cb, slot, smr, s2cr, rr32(cbp, 0x0),
 +	    ok ? "OK" : "NOT as written");
-+	return ok;
-+}
-+
+ 	return ok;
+ }
+ 
+-static bool
+-clocks_on(void)
+-{
+-	printf("BLUELINE WIFI: about to write GCC vote %#x |= boot_rom, prng, gpll0_mss\n", GCC_PA + GCC_VOTE);
+-	uint32_t vote = rd(w2.gcc + GCC_VOTE);
+-	wr(w2.gcc + GCC_VOTE, vote | (1u << 10) | (1u << 13) | (1u << 17));
+-	delay(1);
+-	uint32_t v;
+-	bool ok = poll32(w2.gcc + GCC_BOOT_ROM_HALT, 1u << 31, 0, 10, &v);
+-	printf("BLUELINE WIFI: gcc votes %#x -> %#x, boot_rom %#x%s\n", vote, rd(w2.gcc + GCC_VOTE), v, ok ? "" : " STILL OFF");
+-	ok &= poll32(w2.gcc + GCC_PRNG_HALT, 1u << 31, 0, 10, &v);
+-	printf("BLUELINE WIFI: gcc prng %#x\n", v);
+-	ok &= branch_on("mss_cfg_ahb (iface)", GCC_MSS_CFG_AHB, true);
+-	ok &= branch_on("mss_snoc_axi", GCC_MSS_SNOC_AXI, true);
+-	ok &= branch_on("mss_q6_memnoc_axi (bus)", GCC_MSS_Q6_MEMNOC_AXI, false);
+-	ok &= branch_on("mss_mfab_axis (mnoc_axi)", GCC_MSS_MFAB_AXIS, false);
+-	return ok;
+-}
 +/* ---------------- copy engines (ath10k ce.c; WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
-+
+ 
+-/* ---- resets (q6v5_reset_assert/deassert with has_alt_reset; pil_mss_assert/deassert_resets) ---- */
 +#define CE_PA			(RADIO_WLAN_PA + 0x240000)
 +#define CE_COUNT		12
 +#define SHADOW_PA		(RADIO_WLAN_PA + 0x32000)
@@ -286,30 +502,106 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +#define RX_BUF_SIZE		2048
 +#define RX_POST			32
 +#define TX_SLOTS_MAX		64
-+
+ 
+-static void
+-pdc_sync(bool on)
+-{
+-	uint32_t v = rd(w2.pdc + PDC_SYNC_RESET);
+-	wr(w2.pdc + PDC_SYNC_RESET, on ? (v | PDC_MODEM_BIT) : (v & ~PDC_MODEM_BIT));
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	delay(2);
+-}
 +struct ce_desc { uint64_t addr; uint16_t nbytes, flags; uint32_t toeplitz; } __attribute__((packed));
 +struct ce_attr { uint16_t src_n, src_max, dst_n, flags; };
-+
+ 
+-static void
+-mss_reset_pulse(bool alt)
+-{
+-	pdc_sync(true);
+-	delay(200);
+-	if (alt) {
+-		wr(w2.rmb + RMB_MBA_ALT_RESET, 1);
+-		delay(2);
+-	}
+-	wr(w2.aoss, 1);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	delay(200);
+-	wr(w2.aoss, 0);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	delay(200);
+-	if (alt) {
+-		wr(w2.rmb + RMB_MBA_ALT_RESET, 0);
+-		delay(2);
+-	}
+-	pdc_sync(false);
+-}
+-
+-static void
+-halt_port(const char *what, vm_offset_t h)
+-{
+-	uint32_t v;
+-	if (rd(h + AXI_IDLE)) {
+-		printf("BLUELINE WIFI: axi %s already idle\n", what);
+-		return;
+-	}
+-	wr(h + AXI_HALTREQ, 1);
+-	bool ok = poll32(h + AXI_HALTACK, 0xffffffffu, 1, 100, &v) || v;
+-	printf("BLUELINE WIFI: axi %s halt ack %#x%s, idle %#x\n", what, v, ok ? "" : " (timed out)", rd(h + AXI_IDLE));
+-	wr(h + AXI_HALTREQ, 0);
+-}
+-
+-/* q6v5_mba_reclaim / the halt_axi_ports path: stop the Q6, give the memory back if we know its state. */
+-static void
+-fail_stop(const char *why)
+-{
+-	printf("BLUELINE WIFI: FAILED: %s; rmb pbl %#x mba_status %d mss_status %#x\n", why, rd(w2.rmb + RMB_PBL_STATUS),
+-	    (int32_t)rd(w2.rmb + RMB_MBA_STATUS), rd(w2.rmb + RMB_MBA_MSS_STATUS));
+-	if (w2.q6_started) {
+-		printf("BLUELINE WIFI: halting the modem AXI ports and resetting the MSS\n");
+-		halt_port("q6", w2.halt_q6);
+-		halt_port("modem", w2.halt_modem);
+-		halt_port("nc", w2.halt_nc);
+-		mss_reset_pulse(false);
+-		w2.q6_started = false;
+-	}
+-	(void)assign("mpss (reclaim)", MPSS_PA, MPSS_SIZE, &w2.mpss_own, true, false);
+-	(void)assign("mba (reclaim)", MBA_PA, MBA_SIZE, &w2.mba_own, true, false);
+-	(void)assign("metadata (reclaim)", MDATA_PA, MDATA_SIZE, &w2.mdata_own, true, false);
+-	printf("BLUELINE WIFI: ownership now mpss %#x mba %#x metadata %#x (8 = HLOS; RPMh votes and clocks left on)\n",
+-	    w2.mpss_own, w2.mba_own, w2.mdata_own);
+-}
+-
+-/* ---- the firmware: FAT16 in the modem partition (read only) ---- */
+-
+-struct fat {
+-	uint32_t bps, clus;		/* bytes per sector, per cluster */
+-	uint64_t root_off, data_off;
+-	uint32_t root_bytes, nclus;
+-	uint16_t *tab;
+-	uint32_t tab_bytes;
 +/* host_ce_config_wlan (ath10k snoc.c) */
 +static const struct ce_attr ce_attr[CE_COUNT] = {
 +	{ 16, 2048, 0, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 64, 0 }, { 32, 2048, 0, 0 },
 +	{ 2048, 256, 0, ATTR_DIS_INTR }, { 0, 512, 512, 0 }, { 0, 0, 0, 0 }, { 2, 2048, 2, 0 },
 +	{ 0, 2048, 128, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 512, 0 },
-+};
-+
+ };
+ 
+-struct ffile {
+-	uint32_t clus, size;
 +struct ce_state {
 +	volatile struct ce_desc *src, *dst;
 +	uint64_t src_pa, dst_pa, rx_pa, tx_pa;
 +	uint32_t src_n, dst_n, src_wr, dst_wr, dst_sw;
 +	uint8_t *rx_buf, *tx_buf;
 +	uint32_t rx, tx, tx_full;
-+};
+ };
 +static struct ce_state ce[CE_COUNT];
 +static volatile uint8_t *ce_regs, *ce_shadow;
 +static volatile uint32_t *ce_rri;
 +static uint64_t ce_rri_pa;
 +static bool ce_up;
-+
+ 
+-static struct fat fs;
 +static bool ce_host_rx(uint32_t c) { return ce_attr[c].dst_n != 0 && c != 7; }
 +static bool ce_host_tx(uint32_t c) { return c == 0 || c == 3 || c == 4; }
 +static uint32_t ce_tx_slots(uint32_t c) { return MIN(ce[c].src_n, (uint32_t)TX_SLOTS_MAX); }
@@ -317,25 +609,72 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +static uint32_t pow2(uint32_t n) { uint32_t p = 1; while (p < n) { p <<= 1; } return p; }
 +static uint32_t ce_rd(uint32_t c, uint32_t o) { return rr32(ce_regs, c * 0x1000 + o); }
 +static void ce_wr(uint32_t c, uint32_t o, uint32_t v) { rw32(ce_regs, c * 0x1000 + o, v); }
-+
+ 
+-static int
+-part_read(uint64_t off, void *buf, uint32_t len)
 +static void
 +ce_post(uint32_t c)
-+{
+ {
+-	return sweet_ufs_read_part(w2.part, off, buf, len, NULL);
 +	struct ce_state *s = &ce[c];
 +	uint32_t slot = s->dst_wr;
 +	s->dst[slot].addr = s->rx_pa + (uint64_t)(slot % RX_POST) * RX_BUF_SIZE;
 +	s->dst[slot].nbytes = 0;
 +	s->dst_wr = (slot + 1) & (s->dst_n - 1);
-+}
-+
-+static bool
+ }
+ 
+-static uint16_t
+-le16(const uint8_t *p)
+-{
+-	return (uint16_t)(p[0] | p[1] << 8);
+-}
+-
+-static uint32_t
+-le32(const uint8_t *p)
+-{
+-	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+-}
+-
+ static bool
+-fat_open(void)
 +ce_start(void)
-+{
+ {
+-	uint8_t bs[512];
+-	uint64_t pbytes = 0;
+-	printf("BLUELINE WIFI: about to read %s (read only, UFS LUN 0) boot sector\n", w2.part);
+-	int err = sweet_ufs_read_part(w2.part, 0, bs, sizeof(bs), &pbytes);
+-	if (err) {
+-		printf("BLUELINE WIFI: %s: read error %d\n", w2.part, err);
+-		return false;
 +	uint64_t off = 0x1000, pa = 0;			/* RRI in the first page */
 +
 +	if (ce_up) {
 +		return true;
-+	}
+ 	}
+-	uint32_t bps = le16(bs + 11), spc = bs[13], rsvd = le16(bs + 14), nfats = bs[16], rootent = le16(bs + 17);
+-	uint32_t spf = le16(bs + 22), tot = le16(bs + 19) ? le16(bs + 19) : le32(bs + 32);
+-	printf("BLUELINE WIFI: %s %llu MiB: bps %u spc %u reserved %u fats %u root %u spf %u sectors %u sig %02x%02x\n",
+-	    w2.part, pbytes >> 20, bps, spc, rsvd, nfats, rootent, spf, tot, bs[510], bs[511]);
+-	if (bs[510] != 0x55 || bs[511] != 0xaa || bps < 512 || bps > 4096 || (bps & (bps - 1)) || !spc || (spc & (spc - 1)) ||
+-	    !nfats || nfats > 2 || !rootent || !spf || !tot || (uint64_t)tot * bps > pbytes) {
+-		printf("BLUELINE WIFI: %s is not a FAT16 volume we can read\n", w2.part);
+-		return false;
+-	}
+-	fs.bps = bps;
+-	fs.clus = bps * spc;
+-	fs.root_off = (uint64_t)(rsvd + nfats * spf) * bps;
+-	fs.root_bytes = rootent * 32;
+-	fs.data_off = fs.root_off + (fs.root_bytes + bps - 1) / bps * bps;
+-	if (fs.data_off / bps >= tot) {
+-		printf("BLUELINE WIFI: %s: data area past the end of the volume\n", w2.part);
+-		return false;
+-	}
+-	uint64_t data_secs = tot - (fs.data_off / bps);
+-	fs.nclus = (uint32_t)(data_secs / spc);
+-	fs.tab_bytes = spf * bps;
+-	if (fs.nclus < 4085 || fs.nclus >= 65525 || fs.tab_bytes < (fs.nclus + 2) * 2 || fs.tab_bytes > (256u << 10)) {
+-		printf("BLUELINE WIFI: %s: %u clusters, FAT %u bytes: not FAT16\n", w2.part, fs.nclus, fs.tab_bytes);
+-		return false;
 +	ce_regs = (volatile uint8_t *)ml_io_map(CE_PA, (CE_COUNT + 1) * 0x1000);
 +	ce_shadow = (volatile uint8_t *)ml_io_map(SHADOW_PA, 0x1000);
 +	for (uint32_t c = 0; c < CE_COUNT; c++) {
@@ -345,12 +684,44 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +		off += ((uint64_t)ce[c].dst_n * sizeof(struct ce_desc) + 0xfff) & ~0xfffull;
 +		off += ce_host_rx(c) ? RX_POST * RX_BUF_SIZE : 0;
 +		off += ce_host_tx(c) ? ce_tx_slots(c) * ce_tx_sz(c) : 0;
-+	}
+ 	}
+-	fs.tab = kalloc_data(fs.tab_bytes, Z_WAITOK | Z_ZERO);
+-	if (!fs.tab || part_read((uint64_t)rsvd * bps, fs.tab, fs.tab_bytes)) {
+-		printf("BLUELINE WIFI: %s: cannot read the FAT\n", w2.part);
 +	uint8_t *va = (uint8_t *)pool_alloc(off, &pa);
 +	if (ce_regs == NULL || ce_shadow == NULL || va == NULL) {
 +		RLOG("ce: map/alloc failed (%llu bytes)", off);
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	printf("BLUELINE WIFI: %s: FAT16, %u clusters of %u bytes, data at %#llx\n", w2.part, fs.nclus, fs.clus, fs.data_off);
+-	return true;
+-}
+-
+-static uint32_t
+-fat_next(uint32_t c)
+-{
+-	return (c >= 2 && c < fs.nclus + 2) ? fs.tab[c] : 0xffffu;
+-}
+-
+-static bool
+-clus_ok(uint32_t c)
+-{
+-	return c >= 2 && c < fs.nclus + 2;
+-}
+-
+-/* Read len bytes at off of a file (or a directory: size 0 = follow the chain). */
+-static int
+-fat_read(const struct ffile *f, uint32_t off, void *dst, uint32_t len)
+-{
+-	uint8_t *d = dst;
+-	uint32_t c = f->clus, skip = off / fs.clus, steps = 0;
+-	if (f->size && (off > f->size || len > f->size - off)) {
+-		return EINVAL;
+-	}
+-	while (skip--) {
+-		c = fat_next(c);
+-		if (!clus_ok(c) || ++steps > fs.nclus) {
+-			return EIO;
 +	RLOG("ce: host memory %llx + %llx; about to read ce0 CTRL1", pa, off);
 +	RLOG("ce: ce0 CTRL1 %08x SR_WR %x CUR_SRRI %x, ce1 DR_WR %x CUR_DRRI %x", ce_rd(0, CTRL1), ce_rd(0, SR_WR_IDX),
 +	    ce_rd(0, CUR_SRRI), ce_rd(1, DR_WR_IDX), ce_rd(1, CUR_DRRI));
@@ -363,7 +734,7 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			s->src = (volatile struct ce_desc *)(va + off);
 +			s->src_pa = pa + off;
 +			off += ((uint64_t)s->src_n * sizeof(struct ce_desc) + 0xfff) & ~0xfffull;
-+		}
+ 		}
 +		if (s->dst_n != 0) {
 +			s->dst = (volatile struct ce_desc *)(va + off);
 +			s->dst_pa = pa + off;
@@ -379,7 +750,11 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			s->tx_pa = pa + off;
 +			off += ce_tx_slots(c) * ce_tx_sz(c);
 +		}
-+	}
+ 	}
+-	off %= fs.clus;
+-	while (len) {
+-		if (!clus_ok(c)) {
+-			return EIO;
 +	/* the CE writes its read indices to ce_rri[ce] (src [15:0], dst [31:16]) */
 +	rw32(ce_regs, WRAP_RRI_LO, (uint32_t)ce_rri_pa);
 +	rw32(ce_regs, WRAP_RRI_HI, (uint32_t)(ce_rri_pa >> 32) & ADDR_HI_MASK);
@@ -395,7 +770,12 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			ce_wr(c, SR_SIZE, s->src_n);
 +			ce_wr(c, CTRL1, (ce_rd(c, CTRL1) & ~(CTRL1_DMAX | CTRL1_SRC_SWAP)) | ce_attr[c].src_max);
 +			ce_wr(c, SRC_WM, s->src_n);
-+		}
+ 		}
+-		/* a run of consecutive clusters, one read */
+-		uint32_t first = c, n = 1;
+-		while ((uint64_t)n * fs.clus - off < len && fat_next(c) == c + 1 && n < (LOAD_WINDOW / fs.clus)) {
+-			c++;
+-			n++;
 +		if (s->dst_n != 0) {			/* ath10k_ce_init_dest_ring */
 +			s->dst_sw = ce_rd(c, CUR_DRRI) & (s->dst_n - 1);
 +			s->dst_wr = ce_rd(c, DR_WR_IDX) & (s->dst_n - 1);
@@ -404,28 +784,46 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			ce_wr(c, DR_SIZE, s->dst_n);
 +			ce_wr(c, CTRL1, ce_rd(c, CTRL1) & ~CTRL1_DST_SWAP);
 +			ce_wr(c, DST_WM, s->dst_n);
-+		}
+ 		}
+-		uint32_t take = MIN(len, n * fs.clus - off);
+-		int err = part_read(fs.data_off + (uint64_t)(first - 2) * fs.clus + off, d, take);
+-		if (err) {
+-			return err;
 +	}
 +	for (uint32_t c = 0; c < CE_COUNT; c++) {	/* ath10k_snoc_rx_post */
 +		if (!ce_host_rx(c)) {
 +			continue;
-+		}
+ 		}
+-		d += take;
+-		len -= take;
+-		off = 0;
+-		c = fat_next(c);
+-		if (++steps > fs.nclus) {
+-			return EIO;
 +		for (uint32_t i = 0; i < RX_POST; i++) {
 +			ce_post(c);
-+		}
+ 		}
 +		RMB();
 +		ce_wr(c, DR_WR_IDX, ce[c].dst_wr);
-+	}
+ 	}
+-	return 0;
 +	ce_up = true;
 +	RLOG("ce: %u rings programmed, rx posted", CE_COUNT);
 +	return true;
-+}
-+
+ }
+ 
 +static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len);
 +
-+static bool
+ static bool
+-dir_find(const uint8_t *dir, uint32_t bytes, const char name11[11], bool want_dir, struct ffile *f)
 +ce_poll(void)
-+{
+ {
+-	for (uint32_t o = 0; o + 32 <= bytes; o += 32) {
+-		const uint8_t *e = dir + o;
+-		if (e[0] == 0) {
+-			break;
+-		}
+-		if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x08)) {
 +	bool any = false;
 +	if (!ce_up) {
 +		return false;
@@ -433,8 +831,12 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	for (uint32_t c = 0; c < CE_COUNT; c++) {
 +		struct ce_state *s = &ce[c];
 +		if (!ce_host_rx(c)) {
-+			continue;
-+		}
+ 			continue;
+ 		}
+-		if (memcmp(e, name11, 11) == 0 && !!(e[11] & 0x10) == want_dir) {
+-			f->clus = (uint32_t)le16(e + 26) | (uint32_t)le16(e + 20) << 16;
+-			f->size = le32(e + 28);
+-			return true;
 +		for (int k = 0; k < 16; k++) {
 +			uint32_t slot = s->dst_sw, n = s->dst[slot].nbytes;
 +			if (n == 0) {
@@ -449,17 +851,24 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			RMB();
 +			ce_wr(c, DR_WR_IDX, s->dst_wr);
 +			any = true;
-+		}
-+	}
+ 		}
+ 	}
+-	return false;
 +	return any;
-+}
-+
-+static bool
+ }
+ 
+-static uint8_t *image_dir;
+-static uint32_t image_dir_bytes;
+-
+ static bool
+-fw_find(const char name11[11], struct ffile *f)
 +ce_send(uint32_t c, const void *data, uint32_t len, uint32_t transfer_id)
-+{
+ {
+-	if (!dir_find(image_dir, image_dir_bytes, name11, false, f) || !clus_ok(f->clus)) {
+-		printf("BLUELINE WIFI: /IMAGE/%.8s.%.3s not found\n", name11, name11 + 8);
 +	if (!ce_up || c >= CE_COUNT || !ce_host_tx(c) || len > ce_tx_sz(c)) {
-+		return false;
-+	}
+ 		return false;
+ 	}
 +	struct ce_state *s = &ce[c];
 +	uint32_t mask = s->src_n - 1, sw = ce_rri[c] & 0xFFFF;
 +	if (((sw - 1 - s->src_wr) & mask) == 0 || ((s->src_wr - sw) & mask) >= ce_tx_slots(c) - 1) {
@@ -502,20 +911,33 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +static bool htc_ready, htc_setup;
 +
  static bool
+-fw_open(void)
 +htc_send(uint8_t eid, const void *payload, uint32_t len)
-+{
+ {
+-	if (!fat_open()) {
 +	static uint8_t buf[2048];
 +	struct htc_hdr *h = (struct htc_hdr *)buf;
 +	if (eid >= EP_MAX || len + sizeof(*h) > sizeof(buf)) {
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	uint8_t *root = kalloc_data(fs.root_bytes, Z_WAITOK | Z_ZERO);
+-	struct ffile d;
+-	if (!root || part_read(fs.root_off, root, fs.root_bytes) || !dir_find(root, fs.root_bytes, "IMAGE      ", true, &d)) {
+-		printf("BLUELINE WIFI: %s: no /IMAGE directory\n", w2.part);
+-		if (root) {
+-			kfree_data(root, fs.root_bytes);
 +	struct htc_ep *e = &ep[eid];
 +	if (e->credit_flow) {
 +		if (e->credits == 0) {
 +			return false;
-+		}
+ 		}
+-		return false;
 +		e->credits--;
-+	}
+ 	}
+-	kfree_data(root, fs.root_bytes);
+-	image_dir_bytes = MIN(64u << 10, ((64u << 10) / fs.clus) * fs.clus);
+-	image_dir = kalloc_data(image_dir_bytes, Z_WAITOK | Z_ZERO);
+-	if (!image_dir) {
 +	bzero(h, sizeof(*h));
 +	h->eid = eid;
 +	h->len = (uint16_t)len;
@@ -524,54 +946,134 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	memcpy(buf + sizeof(*h), payload, len);
 +	if (!ce_send(e->ul, buf, (uint32_t)sizeof(*h) + len, eid)) {
 +		RLOG("htc: send on ep %u (ce%u) FAILED", eid, e->ul);
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	/* the directory chain, up to 64 KiB */
+-	uint32_t c = d.clus, got = 0;
+-	while (clus_ok(c) && got + fs.clus <= image_dir_bytes) {
+-		if (part_read(fs.data_off + (uint64_t)(c - 2) * fs.clus, image_dir + got, fs.clus)) {
+-			return false;
+-		}
+-		got += fs.clus;
+-		c = fat_next(c);
+-	}
+-	image_dir_bytes = got;
+-	printf("BLUELINE WIFI: /IMAGE: cluster %u, %u bytes of entries\n", d.clus, got);
+-	return got > 0;
 +	return true;
-+}
-+
+ }
+ 
+-static uint8_t *
+-fw_load(const char name11[11], uint32_t max, uint32_t *len)
 +static void
 +htc_connect(uint16_t svc)
-+{
+ {
+-	struct ffile f;
+-	if (!fw_find(name11, &f)) {
+-		return NULL;
+-	}
+-	if (!f.size || f.size > max) {
+-		printf("BLUELINE WIFI: /IMAGE/%.8s.%.3s: %u bytes, want 1..%u\n", name11, name11 + 8, f.size, max);
+-		return NULL;
+-	}
+-	uint8_t *b = kalloc_data(f.size, Z_WAITOK | Z_ZERO);
+-	if (!b || fat_read(&f, 0, b, f.size)) {
+-		printf("BLUELINE WIFI: /IMAGE/%.8s.%.3s: read failed\n", name11, name11 + 8);
+-		return NULL;
+-	}
+-	*len = f.size;
+-	return b;
 +	uint8_t m[8] = {};
 +	uint16_t id = HTC_MSG_CONNECT, flags = svc == SVC_WMI_CONTROL ? (uint16_t)(1u << 8) : HTC_CONN_NO_CREDIT_FLOW;
 +	memcpy(m, &id, 2);
 +	memcpy(m + 2, &svc, 2);
 +	memcpy(m + 4, &flags, 2);
 +	htc_send(0, m, sizeof(m));
-+}
-+
+ }
+ 
+-/* ---- the MDT: program headers (qcom_mdt_read_metadata, q6v5_phdr_valid, q6v5_mpss_load checks) ---- */
 +/* WMI waits here while the endpoint has no credit */
 +#define WMIQ_LEN 6
 +#define WMIQ_MAX 2040
 +static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
 +static uint16_t wmiq_len[WMIQ_LEN];
 +static uint32_t wmiq_head, wmiq_tail;
-+
+ 
+-struct phdr32 {
+-	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
+-};
+-
+-static const struct phdr32 *
+-mdt_phdrs(uint32_t *n)
 +static void
 +wmiq_pump(void)
-+{
+ {
+-	const uint8_t *e = w2.mdt;
+-	if (w2.mdt_len < 52 || memcmp(e, "\177ELF", 4) || e[4] != 1 || le16(e + 18) != 164 /* EM_QDSP6 */) {
+-		printf("BLUELINE WIFI: MODEM.MDT is not a 32-bit Hexagon ELF\n");
+-		return NULL;
 +	while (wmiq_head != wmiq_tail && wmi_eid != 0xFF && ep[wmi_eid].credits != 0) {
 +		uint32_t i = wmiq_head % WMIQ_LEN;
 +		if (!htc_send(wmi_eid, wmiq[i], wmiq_len[i])) {
 +			break;
 +		}
 +		wmiq_head++;
-+	}
-+}
-+
-+static bool
+ 	}
+-	uint32_t phoff = le32(e + 28), phnum = le16(e + 44), phent = le16(e + 42);
+-	if (phent != 32 || phnum < 2 || phnum > PHDR_MAX || phoff > w2.mdt_len || phnum * 32 > w2.mdt_len - phoff || (phoff & 3)) {
+-		printf("BLUELINE WIFI: MODEM.MDT program headers %u x %u at %#x: bad\n", phnum, phent, phoff);
+-		return NULL;
+-	}
+-	*n = phnum;
+-	return (const struct phdr32 *)(const void *)(e + phoff);
+ }
+ 
+ static bool
+-seg_valid(const struct phdr32 *p)
 +htc_wmi_send(const void *data, uint32_t len)
-+{
+ {
+-	return p->type == PT_LOAD_ && (p->flags & MDT_TYPE_MASK) != MDT_TYPE_HASH && p->memsz;
+-}
+-
+-/*
+- * Checks everything stage 2 relies on. *meta_len = header + hash, *hash_at = where the hash is in the
+- * .mdt, *reloc = the address that maps to MPSS_PA, *boot = RMB code start (q6v5_mpss_load).
+- */
+-static bool
+-mdt_check(uint32_t *meta_len, uint32_t *hash_at, uint32_t *reloc, uint32_t *boot, uint64_t *segbytes)
+-{
+-	uint32_t n, hash = 0, minpa = 0xffffffffu, maxpa = 0;
+-	bool relocatable = false;
+-	const struct phdr32 *ph = mdt_phdrs(&n);
+-	if (!ph) {
 +	if (wmi_eid == 0xFF || len > WMIQ_MAX) {
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	if (ph[0].type == PT_LOAD_) {
+-		return false;
 +	if (wmiq_head == wmiq_tail && ep[wmi_eid].credits != 0) {
 +		return htc_send(wmi_eid, data, len);
-+	}
+ 	}
+-	for (uint32_t i = 1; i < n && !hash; i++) {
+-		if ((ph[i].flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
+-			hash = i;
+-		}
+-	}
+-	if (!hash) {
+-		printf("BLUELINE WIFI: MODEM.MDT: no hash segment\n");
 +	if (wmiq_tail - wmiq_head >= WMIQ_LEN) {
 +		RLOG("htc: wmi queue full, message dropped");
-+		return false;
-+	}
+ 		return false;
+ 	}
+-	uint32_t ehdr = ph[0].filesz, hsz = ph[hash].filesz;
+-	/* the split-firmware case: header and hash packed in the .mdt (mdt_loader) */
+-	if (ehdr + hsz == w2.mdt_len) {
+-		*hash_at = ehdr;
+-	} else if (ehdr <= w2.mdt_len && ph[hash].offset <= w2.mdt_len && hsz <= w2.mdt_len - ph[hash].offset) {
+-		*hash_at = ph[hash].offset;
+-	} else {
+-		printf("BLUELINE WIFI: MODEM.MDT: header %#x + hash %#x not in the %u-byte file\n", ehdr, hsz, w2.mdt_len);
+-		return false;
 +	uint32_t i = wmiq_tail++ % WMIQ_LEN;
 +	memcpy(wmiq[i], data, len);
 +	wmiq_len[i] = (uint16_t)len;
@@ -580,6 +1082,10 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +
 +static void wmi_rx(const uint8_t *d, uint32_t len);
 +static void htt_rx(const uint8_t *p, uint32_t len);
++static void w_rx_native(const uint8_t *f, uint32_t len);
++static void htt_tx_compl(const uint8_t *p, uint32_t len);
++static void w_assoc_mgmt_rx(const uint8_t *f, uint32_t len);
++static void w_join_event(uint32_t id, const uint8_t *t, uint32_t len);
 +
 +static void
 +htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
@@ -588,7 +1094,10 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	const uint8_t *p = d + sizeof(*h);
 +	if (len < sizeof(*h)) {
 +		return;
-+	}
+ 	}
+-	if (ehdr + hsz > MDATA_SIZE) {
+-		printf("BLUELINE WIFI: metadata %#x bytes > %#x\n", ehdr + hsz, MDATA_SIZE);
+-		return false;
 +	uint32_t plen = MIN((uint32_t)h->len, len - (uint32_t)sizeof(*h));
 +	{
 +		static unsigned said;
@@ -599,7 +1108,12 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			    c, h->eid, plen, h->flags, h->trailer, id, wmi_eid != 0xFF ? ep[wmi_eid].credits : 0,
 +			    wmiq_tail - wmiq_head);
 +		}
-+	}
+ 	}
+-	*meta_len = ehdr + hsz;
+-	*segbytes = 0;
+-	for (uint32_t i = 0; i < n; i++) {
+-		if (!seg_valid(&ph[i])) {
+-			continue;
 +	if ((h->flags & HTC_FLAG_TRAILER) != 0 && h->trailer <= plen) {
 +		const uint8_t *t = p + plen - h->trailer;   /* records {id, len, data}; id 1 = credits */
 +		for (uint32_t o = 0; o + 2 <= h->trailer && o + 2 + t[o + 1] <= h->trailer; o += 2 + t[o + 1]) {
@@ -610,10 +1124,18 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +					}
 +				}
 +			}
-+		}
+ 		}
+-		relocatable |= (ph[i].flags & MDT_RELOCATABLE) != 0;
+-		minpa = MIN(minpa, ph[i].paddr);
+-		maxpa = MAX(maxpa, ph[i].paddr + ph[i].memsz);
 +		plen -= h->trailer;
 +		wmiq_pump();
-+	}
+ 	}
+-	*reloc = relocatable ? minpa : MPSS_PA;
+-	*boot = relocatable ? MPSS_PA : minpa;
+-	for (uint32_t i = 0; i < n; i++) {
+-		if (!seg_valid(&ph[i])) {
+-			continue;
 +	if (h->eid < EP_MAX) {
 +		ep[h->eid].rx++;
 +	}
@@ -621,7 +1143,19 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +		uint16_t msg = 0;
 +		if (plen >= 2) {
 +			memcpy(&msg, p, 2);
-+		}
+ 		}
+-		uint64_t off = (uint64_t)ph[i].paddr - *reloc;
+-		if (ph[i].paddr < *reloc || off + ph[i].memsz > MPSS_SIZE || ph[i].filesz > ph[i].memsz) {
+-			printf("BLUELINE WIFI: segment %u %#x+%#x/%#x outside the MPSS region\n", i, ph[i].paddr, ph[i].filesz, ph[i].memsz);
+-			return false;
+-		}
+-		if (ph[i].filesz) {
+-			char nm[12];
+-			struct ffile f = { 0, 0 };
+-			snprintf(nm, sizeof(nm), "MODEM   B%02u", i);
+-			if (!fw_find(nm, &f) || f.size != ph[i].filesz) {
+-				printf("BLUELINE WIFI: MODEM.B%02u: %u bytes, the header says %u\n", i, f.size, ph[i].filesz);
+-				return false;
 +		if (msg == HTC_MSG_READY && plen >= 8) {
 +			uint16_t cc, cs;
 +			memcpy(&cc, p + 2, 2);
@@ -641,7 +1175,7 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			RLOG("htc: connect resp svc %x status %u eid %u max_msg %u", svc, status, eid, max);
 +			if (status != 0 || eid >= EP_MAX) {
 +				return;
-+			}
+ 			}
 +			ep[eid].svc = svc;
 +			ep[eid].max_msg = max;
 +			ep[eid].ul = svc == SVC_WMI_CONTROL ? 3 : 4;
@@ -660,15 +1194,414 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +				htc_setup = htc_send(0, m, sizeof(m));
 +				RLOG("htc: SETUP_COMPLETE_EX %s", htc_setup ? "sent" : "FAILED");
 +			}
-+		}
+ 		}
+-		*segbytes += ph[i].filesz;
 +	} else if (h->eid == wmi_eid) {
 +		wmi_rx(p, plen);
 +	} else if (h->eid == htt_eid) {
 +		htt_rx(p, plen);
-+	}
+ 	}
+-	printf("BLUELINE WIFI: MODEM.MDT: %u phdrs, hash in %u, metadata %#x bytes, %s, %#x..%#x, %llu bytes of segments\n",
+-	    n, hash, *meta_len, relocatable ? "relocatable" : "fixed", minpa, maxpa, *segbytes);
+-	return true;
 +	/* HTT (data path) comes later */
-+}
-+
+ }
+ 
+-/* Copy (or zero) [pa, pa + len) of a carve-out through write-combined windows that are unmapped again. */
+-static int
+-fill_region(uint64_t pa, const struct ffile *src, uint32_t filesz, uint32_t memsz, const uint8_t *from_buf)
+-{
+-	for (uint32_t done = 0; done < memsz;) {
+-		uint32_t len = MIN(LOAD_WINDOW, memsz - done);
+-		uint64_t wpa = pa + done, mpa = trunc_page_64(wpa);
+-		vm_size_t moff = (vm_size_t)(wpa - mpa), msz = round_page(moff + len);
+-		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)mpa, msz, VM_WIMG_WCOMB);
+-		if (!va) {
+-			return ENOMEM;
+-		}
+-		uint8_t *w = (uint8_t *)(trunc_page(va) + moff);
+-		uint32_t fpart = done < filesz ? MIN(len, filesz - done) : 0;
+-		int err = 0;
+-		if (fpart) {
+-			if (from_buf) {
+-				memcpy(w, from_buf + done, fpart);
+-			} else {
+-				err = fat_read(src, done, w, fpart);
+-			}
+-		}
+-		/* the rest of the window: zero, byte-exact (bss of the segment) */
+-		uint32_t o = err ? len : fpart;
+-		for (; o < len && (o & 3u); o++) {
+-			*(volatile uint8_t *)(w + o) = 0;
+-		}
+-		for (; o + 4 <= len; o += 4) {
+-			*(volatile uint32_t *)(void *)(w + o) = 0;
+-		}
+-		for (; o < len; o++) {
+-			*(volatile uint8_t *)(w + o) = 0;
+-		}
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		ml_io_unmap(trunc_page(va), msz);
+-		if (err) {
+-			return err;
+-		}
+-		done += len;
+-	}
+-	return 0;
+-}
+-
+-/* ---- the steps ---- */
+-
+-static bool
+-step1_reads(void)
+-{
+-	uint32_t v;
+-
+-	w2.gcc = map_block("GCC", GCC_PA, GCC_SIZE);
+-	w2.qdsp6 = map_block("QDSP6SS", QDSP6_PA, 0x1000);
+-	w2.rmb = map_block("RMB", RMB_PA, 0x1000);
+-	w2.aoss = map_block("AOSS MSS restart", AOSS_MSS_RESTART_PA, 0x1000);
+-	w2.pdc = map_block("PDC sync reset", PDC_RESET_PA, PDC_RESET_SIZE);
+-	w2.halt_q6 = map_block("TCSR halt_q6", TCSR_HALT_Q6_PA, 0x1000);
+-	w2.halt_nc = map_block("TCSR halt_nc", TCSR_HALT_NC_PA, 0x1000);
+-	w2.halt_modem = map_block("TCSR halt_modem", TCSR_HALT_MODEM_PA, 0x1000);
+-	w2.apcs = map_block("APCS IPC", APCS_PA, 0x1000);
+-	w2.qmp = map_block("AOP QMP", QMP_PA, 0x400);
+-	w2.mutex = map_block("TCSR mutex 3", TCSR_MUTEX3_PA, 0x1000);
+-	w2.smem = map_block("SMEM", SMEM_PA, SMEM_SIZE);
+-	w2.gicd = map_block("GICD", GICD_PA, 0x1000);
+-	if (!w2.gcc || !w2.qdsp6 || !w2.rmb || !w2.aoss || !w2.pdc || !w2.halt_q6 || !w2.halt_nc || !w2.halt_modem ||
+-	    !w2.apcs || !w2.qmp || !w2.mutex || !w2.smem || !w2.gicd) {
+-		return false;
+-	}
+-
+-	printf("BLUELINE WIFI: about to read GCC mss_cfg_ahb\n");
+-	uint32_t ahb = rd(w2.gcc + GCC_MSS_CFG_AHB);
+-	printf("BLUELINE WIFI: gcc mss_cfg_ahb %#x (%s) snoc_axi %#x q6_memnoc_axi %#x mfab_axis %#x votes %#x\n", ahb,
+-	    (ahb & 1u) && !(ahb >> 31) ? "on" : "OFF", rd(w2.gcc + GCC_MSS_SNOC_AXI), rd(w2.gcc + GCC_MSS_Q6_MEMNOC_AXI),
+-	    rd(w2.gcc + GCC_MSS_MFAB_AXIS), rd(w2.gcc + GCC_VOTE));
+-
+-	printf("BLUELINE WIFI: about to read PDC sync reset %#x\n", PDC_RESET_PA + PDC_SYNC_RESET);
+-	v = rd(w2.pdc + PDC_SYNC_RESET);
+-	printf("BLUELINE WIFI: pdc sync_reset %#x (modem %u)\n", v, (v >> 9) & 1);
+-
+-	printf("BLUELINE WIFI: about to read AOSS MSS restart %#x\n", AOSS_MSS_RESTART_PA);
+-	printf("BLUELINE WIFI: aoss mss_restart %#x\n", rd(w2.aoss));
+-
+-	if ((ahb & 1u) && !(ahb >> 31)) {
+-		printf("BLUELINE WIFI: about to read RMB %#x\n", RMB_PA);
+-		printf("BLUELINE WIFI: rmb image %#x pbl %#x cmd %#x mba_status %d meta %#x code %#x+%#x mss_status %#x alt_reset %#x\n",
+-		    rd(w2.rmb + RMB_MBA_IMAGE), rd(w2.rmb + RMB_PBL_STATUS), rd(w2.rmb + RMB_MBA_COMMAND),
+-		    (int32_t)rd(w2.rmb + RMB_MBA_STATUS), rd(w2.rmb + RMB_PMI_META_DATA), rd(w2.rmb + RMB_PMI_CODE_START),
+-		    rd(w2.rmb + RMB_PMI_CODE_LENGTH), rd(w2.rmb + RMB_MBA_MSS_STATUS), rd(w2.rmb + RMB_MBA_ALT_RESET));
+-		printf("BLUELINE WIFI: about to read QDSP6SS %#x\n", QDSP6_PA);
+-		printf("BLUELINE WIFI: qdsp6ss sleep %#x boot_core_start %#x boot_cmd %#x\n", rd(w2.qdsp6 + QDSP6SS_SLEEP),
+-		    rd(w2.qdsp6 + QDSP6SS_BOOT_CORE_START), rd(w2.qdsp6 + QDSP6SS_BOOT_CMD));
+-	} else {
+-		printf("BLUELINE WIFI: mss_cfg_ahb off: RMB/QDSP6SS reads wait for step 2\n");
+-	}
+-
+-	printf("BLUELINE WIFI: about to read TCSR halt_q6 %#x\n", TCSR_HALT_Q6_PA);
+-	printf("BLUELINE WIFI: axi q6 req %#x ack %#x idle %#x\n", rd(w2.halt_q6), rd(w2.halt_q6 + 4), rd(w2.halt_q6 + 8));
+-	printf("BLUELINE WIFI: about to read TCSR halt_modem %#x\n", TCSR_HALT_MODEM_PA);
+-	printf("BLUELINE WIFI: axi modem req %#x ack %#x idle %#x\n", rd(w2.halt_modem), rd(w2.halt_modem + 4), rd(w2.halt_modem + 8));
+-	printf("BLUELINE WIFI: about to read TCSR halt_nc %#x\n", TCSR_HALT_NC_PA);
+-	printf("BLUELINE WIFI: axi nc req %#x ack %#x idle %#x\n", rd(w2.halt_nc), rd(w2.halt_nc + 4), rd(w2.halt_nc + 8));
+-
+-	printf("BLUELINE WIFI: about to read TCSR mutex 3\n");
+-	printf("BLUELINE WIFI: tcsr mutex 3 owner %#x\n", rd(w2.mutex));
+-
+-	printf("BLUELINE WIFI: about to read GICD pending for INTID %u\n", MSS_WDOG_INTID);
+-	printf("BLUELINE WIFI: modem wdog pending %u\n", wdog_pending());
+-
+-	if (!qmp_open()) {
+-		return false;
+-	}
+-
+-	smem_parts();
+-	if (!w2.pm_off) {
+-		printf("BLUELINE WIFI: no apps-modem SMEM partition\n");
+-		return false;
+-	}
+-	uint32_t sz = 0;
+-	uint32_t o428 = smem_find(w2.pm_off, w2.pm_size, w2.pm_cl, SMP2P_OUT, &sz);
+-	printf("BLUELINE WIFI: smem 428 (smp2p apps->modem) %s %#x\n", o428 ? "at" : "absent", o428 ? SMEM_PA + o428 : 0);
+-	uint32_t o435 = smem_find(w2.pm_off, w2.pm_size, w2.pm_cl, SMP2P_IN, &sz);
+-	printf("BLUELINE WIFI: smem 435 (smp2p modem->apps) %s %#x\n", o435 ? "at" : "absent", o435 ? SMEM_PA + o435 : 0);
+-	crash_reason();
+-
+-	(void)arc_vote("mx.lvl", 385, true);
+-	(void)arc_vote("cx.lvl", 385, true);
+-	(void)arc_vote("mss.lvl", 385, true);
+-	printf("BLUELINE WIFI: cmd-db xo.lvl at %#x\n", blueline_cmddb_addr("xo.lvl"));
+-
+-	/* The firmware. */
+-	if (!fw_open()) {
+-		return false;
+-	}
+-	w2.mba = fw_load("MBA     MBN", MBA_MAX, &w2.mba_len);
+-	w2.mdt = fw_load("MODEM   MDT", MDT_MAX, &w2.mdt_len);
+-	if (!w2.mba || !w2.mdt) {
+-		return false;
+-	}
+-	sha256_log("MBA.MBN", w2.mba, w2.mba_len);
+-	sha256_log("MODEM.MDT", w2.mdt, w2.mdt_len);
+-	uint32_t meta, hash_at, reloc, boot;
+-	uint64_t segbytes;
+-	return mdt_check(&meta, &hash_at, &reloc, &boot, &segbytes);
+-}
+-
+-static bool
+-step2_power(void)
+-{
+-	printf("BLUELINE WIFI: step 2: AOP load_state, RPMh votes, GCC clocks\n");
+-	if (!qmp_link() || !qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
+-		return false;
+-	}
+-	if (!arc_vote("mx.lvl", 385, false) || !arc_vote("cx.lvl", 385, false) || !arc_vote("mss.lvl", 385, false)) {
+-		return false;
+-	}
+-	uint32_t xo = blueline_cmddb_addr("xo.lvl"), on = 3;
+-	if (xo) {
+-		printf("BLUELINE WIFI: about to RPMh xo.lvl (%#x) = 3\n", xo);
+-		printf("BLUELINE WIFI: RPMh xo.lvl err=%d\n", blueline_rpmh_write(&xo, &on, 1));
+-	}
+-	if (!clocks_on()) {
+-		return false;
+-	}
+-	printf("BLUELINE WIFI: about to read RMB %#x\n", RMB_PA);
+-	printf("BLUELINE WIFI: rmb pbl %#x mba_status %d mss_status %#x; qdsp6ss sleep %#x\n", rd(w2.rmb + RMB_PBL_STATUS),
+-	    (int32_t)rd(w2.rmb + RMB_MBA_STATUS), rd(w2.rmb + RMB_MBA_MSS_STATUS), rd(w2.qdsp6 + QDSP6SS_SLEEP));
+-	return true;
+-}
+-
+-static bool
+-step3_mba(void)
+-{
+-	uint32_t v;
+-	bool to;
+-
+-	printf("BLUELINE WIFI: step 3: SMP2P, MBA, assign, reset, boot FSM\n");
+-	if (blueline_scm_is_call_avail(SVC_MP, MP_ASSIGN) != 1) {
+-		printf("BLUELINE WIFI: MP_ASSIGN not available\n");
+-		return false;
+-	}
+-	if (!smp2p_create()) {
+-		return false;
+-	}
+-	printf("BLUELINE WIFI: about to write the MBA region: MBA.MBN (%u bytes) at %#x\n", w2.mba_len, MBA_PA);
+-	if (fill_region(MBA_PA, NULL, w2.mba_len, w2.mba_len, w2.mba)) {
+-		printf("BLUELINE WIFI: MBA copy failed\n");
+-		return false;
+-	}
+-	/* some MBAs wipe the MPSS region at boot: give the Q6 both (q6v5_mba_load) */
+-	if (assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, false, true) ||
+-	    assign("mba", MBA_PA, MBA_SIZE, &w2.mba_own, false, true)) {
+-		fail_stop("assigning MPSS/MBA to the modem");
+-		return false;
+-	}
+-	printf("BLUELINE WIFI: about to reset the MSS (pdc sync, alt reset, aoss restart pulse)\n");
+-	mss_reset_pulse(true);
+-	printf("BLUELINE WIFI: about to write RMB image %#x and start the QDSP6 boot FSM\n", MBA_PA);
+-	wr(w2.rmb + RMB_MBA_IMAGE, MBA_PA);
+-	wr(w2.rmb + RMB_PMI_CODE_START, 0);
+-	wr(w2.rmb + RMB_PMI_CODE_LENGTH, 0);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	/* q6v5proc_reset, MSS_SDM845 / __pil_q6v65_reset */
+-	wr(w2.qdsp6 + QDSP6SS_SLEEP, rd(w2.qdsp6 + QDSP6SS_SLEEP) | 1u);
+-	if (!poll32(w2.qdsp6 + QDSP6SS_SLEEP, 1u << 31, 0, 1, &v)) {
+-		printf("BLUELINE WIFI: QDSP6SS sleep clock did not come on (%#x)\n", v);
+-		fail_stop("sleep clock");
+-		return false;
+-	}
+-	w2.q6_started = true;
+-	wr(w2.qdsp6 + QDSP6SS_BOOT_CORE_START, 1);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	wr(w2.qdsp6 + QDSP6SS_BOOT_CMD, 1);
+-	uint64_t t0 = mach_absolute_time();
+-	bool fsm = poll32(w2.rmb + RMB_MBA_MSS_STATUS, 1u, 1u, 10, &v);
+-	printf("BLUELINE WIFI: boot FSM %s (mss_status %#x, %u ms)\n", fsm ? "done" : "TIMED OUT", v, ms_since(t0));
+-	if (!fsm) {
+-		fail_stop("boot FSM");
+-		return false;
+-	}
+-	/* q6v5_rmb_pbl_wait: any non-zero status ends it, 1 = success */
+-	uint64_t pend = mach_absolute_time() + ms_abs(1000);
+-	while (!(v = rd(w2.rmb + RMB_PBL_STATUS)) && mach_absolute_time() < pend) {
+-		delay(1000);
+-	}
+-	printf("BLUELINE WIFI: PBL status %#x after %u ms%s\n", v, ms_since(t0), v == 1 ? " (success)" : v ? " (ERROR)" : " (TIMED OUT)");
+-	if (v != 1) {
+-		fail_stop("PBL");
+-		return false;
+-	}
+-	int32_t s = mba_wait(0, 5000, &to);
+-	if (to || (s != MBA_XPU_UNLOCKED && s != MBA_XPU_UNLOCKED_SCRIBBLED)) {
+-		fail_stop("MBA boot");
+-		return false;
+-	}
+-	printf("BLUELINE WIFI: MBA booted (%s)\n", s == MBA_XPU_UNLOCKED ? "XPU unlocked" : "XPU unlocked, scribbled");
+-	return true;
+-}
+-
+-static bool
+-step4_mpss(void)
+-{
+-	uint32_t meta, hash_at, reloc, boot, n, code = 0;
+-	uint64_t segbytes, t0 = mach_absolute_time();
+-	bool to;
+-
+-	printf("BLUELINE WIFI: step 4: MPSS metadata, segments, authentication\n");
+-	if (!mdt_check(&meta, &hash_at, &reloc, &boot, &segbytes)) {
+-		fail_stop("MDT");
+-		return false;
+-	}
+-	const struct phdr32 *ph = mdt_phdrs(&n);
+-	wr(w2.rmb + RMB_PMI_CODE_LENGTH, 0);
+-
+-	/* metadata: ELF header + hash segment, in its own buffer (q6v5_mpss_init_image) */
+-	uint8_t *mbuf = kalloc_data(meta, Z_WAITOK | Z_ZERO);
+-	if (!mbuf || !ph) {
+-		fail_stop("metadata buffer");
+-		return false;
+-	}
+-	memcpy(mbuf, w2.mdt, ph[0].filesz);
+-	memcpy(mbuf + ph[0].filesz, w2.mdt + hash_at, meta - ph[0].filesz);
+-	printf("BLUELINE WIFI: about to write %u bytes of metadata to %#x\n", meta, MDATA_PA);
+-	int err = fill_region(MDATA_PA, NULL, meta, meta, mbuf);
+-	kfree_data(mbuf, meta);
+-	if (err || assign("metadata", MDATA_PA, MDATA_SIZE, &w2.mdata_own, false, true)) {
+-		fail_stop("metadata");
+-		return false;
+-	}
+-	wr(w2.rmb + RMB_PMI_META_DATA, MDATA_PA);
+-	wr(w2.rmb + RMB_MBA_COMMAND, RMB_CMD_META_DATA_READY);
+-	int32_t s = mba_wait(MBA_META_DATA_AUTH_SUCCESS, 1000, &to);
+-	printf("BLUELINE WIFI: MPSS header authentication %s\n", s == MBA_META_DATA_AUTH_SUCCESS ? "ok" : "FAILED");
+-	if (assign("metadata", MDATA_PA, MDATA_SIZE, &w2.mdata_own, true, false) || s != MBA_META_DATA_AUTH_SUCCESS) {
+-		fail_stop("metadata authentication");
+-		return false;
+-	}
+-
+-	/* the modem can give MPSS back only now that the MBA runs; then share it while loading */
+-	if (assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, true, false) ||
+-	    assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, true, true)) {
+-		fail_stop("sharing MPSS");
+-		return false;
+-	}
+-	printf("BLUELINE WIFI: about to load %llu bytes of segments into %#x from %s\n", segbytes, MPSS_PA, w2.part);
+-	for (uint32_t i = 0; i < n; i++) {
+-		if (!seg_valid(&ph[i])) {
+-			continue;
+-		}
+-		struct ffile f = { 0, 0 };
+-		if (ph[i].filesz) {
+-			char nm[12];
+-			snprintf(nm, sizeof(nm), "MODEM   B%02u", i);
+-			if (!fw_find(nm, &f)) {
+-				fail_stop("segment file");
+-				return false;
+-			}
+-		}
+-		uint64_t pa = MPSS_PA + (ph[i].paddr - reloc);
+-		err = fill_region(pa, &f, ph[i].filesz, ph[i].memsz, NULL);
+-		if (err) {
+-			printf("BLUELINE WIFI: segment %u: error %d\n", i, err);
+-			fail_stop("segment load");
+-			return false;
+-		}
+-		if (!rd(w2.rmb + RMB_PMI_CODE_LENGTH)) {
+-			wr(w2.rmb + RMB_PMI_CODE_START, boot);
+-			wr(w2.rmb + RMB_MBA_COMMAND, RMB_CMD_LOAD_READY);
+-		}
+-		code += ph[i].memsz;
+-		wr(w2.rmb + RMB_PMI_CODE_LENGTH, code);
+-		s = (int32_t)rd(w2.rmb + RMB_MBA_STATUS);
+-		printf("BLUELINE WIFI: segment %2u %#llx +%#x/%#x loaded, code length %#x, mba_status %d\n", i, pa,
+-		    ph[i].filesz, ph[i].memsz, code, s);
+-		if (s < 0) {
+-			fail_stop("MPSS segment authentication");
+-			return false;
+-		}
+-	}
+-	printf("BLUELINE WIFI: segments loaded in %u ms\n", ms_since(t0));
+-	if (assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, false, true)) {
+-		fail_stop("giving MPSS to the modem");
+-		return false;
+-	}
+-	s = mba_wait(MBA_AUTH_COMPLETE, 10000, &to);
+-	if (s != MBA_AUTH_COMPLETE) {
+-		fail_stop("MPSS authentication");
+-		return false;
+-	}
+-	printf("BLUELINE WIFI: MPSS authenticated: the modem is running; waiting for SMP2P ready\n");
+-
+-	/* qcom_q6v5_wait_for_start: 5 s for "ready" (or "fatal") */
+-	uint32_t v = 0, fl = 0, ver = 0;
+-	uint64_t t1 = mach_absolute_time();
+-	bool have = false;
+-	while (ms_since(t1) < 5000) {
+-		have = smp2p_in_state(&v, &fl, &ver);
+-		if (have) {
+-			smp2p_service(fl, ver);
+-			if (v & (MODEM_READY | MODEM_FATAL)) {
+-				break;
+-			}
+-		}
+-		delay(10000);
+-	}
+-	printf("BLUELINE WIFI: smp2p slave-kernel %s %#x after %u ms%s%s\n", have ? "state" : "ABSENT", v, ms_since(t1),
+-	    v & MODEM_READY ? " READY" : "", v & MODEM_FATAL ? " ERR-FATAL" : "");
+-	if (v & MODEM_FATAL) {
+-		crash_reason();
+-	}
+-	if (!(v & MODEM_READY)) {
+-		printf("BLUELINE WIFI: no ready: leaving the modem as it is for the watcher (Linux would stop it)\n");
+-	} else {
+-		(void)assign("mba (after start)", MBA_PA, MBA_SIZE, &w2.mba_own, true, false);
+-	}
+-	return true;
+-}
+-
+-static void
+-stage2(void)
+-{
+-	static bool once;
+-	thread_t th;
+-
+-	if (once) {
+-		return;
+-	}
+-	once = true;
+-	w2.step = 1;
+-	w2.watch_s = 90;
+-	strlcpy(w2.part, "modem_b", sizeof(w2.part));
+-	w2.mpss_own = w2.mba_own = w2.mdata_own = OWN_HLOS;
+-	(void)PE_parse_boot_argn("bluewifi_step", &w2.step, sizeof(w2.step));
+-	(void)PE_parse_boot_argn("bluewifi_watch", &w2.watch_s, sizeof(w2.watch_s));
+-	(void)PE_parse_boot_argn("bluewifi_fw", w2.part, sizeof(w2.part));
+-	if (strcmp(w2.part, "modem_a") != 0 && strcmp(w2.part, "modem_b") != 0) {
+-		printf("BLUELINE WIFI: bluewifi_fw=%s: only modem_a or modem_b\n", w2.part);
+-		return;
+-	}
+-	w2.watch_s = MIN(w2.watch_s, 600u);
+-	printf("BLUELINE WIFI: stage 2 step %d: firmware from %s; MPSS %#x+%#x, MBA %#x+%#x, metadata %#x\n", w2.step,
+-	    w2.part, MPSS_PA, MPSS_SIZE, MBA_PA, MBA_SIZE, MDATA_PA);
+-	if (!step1_reads()) {
+-		printf("BLUELINE WIFI: step 1 stopped\n");
+-		return;
+-	}
+-	printf("BLUELINE WIFI: step 1 done (read only)\n");
+-	if (w2.step < 2 || !step2_power()) {
+-		return;
+-	}
+-	printf("BLUELINE WIFI: step 2 done (powered, still in reset)\n");
+-	if (w2.step < 3 || !step3_mba()) {
+-		return;
+-	}
+-	printf("BLUELINE WIFI: step 3 done (MBA running, MPSS and MBA owned by the modem)\n");
+-	if (w2.step < 4 || !step4_mpss()) {
+-		return;
 +/* ---------------- WMI (TLV, ath10k wmi-tlv.c) and the passive scan */
 +
 +#define WMI_EV_SERVICE_READY 0x1
@@ -937,7 +1870,12 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 + */
 +static uint32_t scan_nch = 13;
 +#define NFREQ (scan_nch != 0 && scan_nch < NFREQ_ALL ? scan_nch : NFREQ_ALL)
-+struct bss { uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen; };
++struct bss {
++	uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen;
++	uint8_t raw_ssid[32], raw_ssid_len; uint16_t freq, bintval, capab, ie_len; uint32_t last_ms; uint8_t ie[768];
++};
++static volatile uint32_t api_scans_done;
++static uint32_t htt_msdus;
 +static struct bss bss[64];
 +static uint32_t nbss, scans, scan_frames;
 +static bool scan_started, scanning;
@@ -1101,7 +2039,9 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	if (e[0] == 0x002 || e[0] == 0x040 || e[0] == 0x010) {
 +		scanning = false;
 +		scans++;
-+		RLOG("*** scan %u done (event %x): %u networks, %u beacons/probe responses ***", scans, e[0], nbss, scan_frames);
++		api_scans_done++;
++		RLOG("*** scan %u done (event %x): %u networks, %u beacons/probe responses, %u htt msdus ***", scans, e[0], nbss,
++		    scan_frames, htt_msdus);
 +		next_scan_ms = scans < 3 ? ms_since(wlfw_t0) + 10000 : 0;
 +	}
 +}
@@ -1134,6 +2074,10 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +		return;
 +	}
 +	flen = MIN(hdr[4], flen);
++	if (flen >= 24 && (f[0] & 0x0C) == 0 && (f[0] >> 4) != 8 && (f[0] >> 4) != 5) {
++		w_assoc_mgmt_rx(f, flen);		/* auth, assoc response, deauth, disassoc */
++		return;
++	}
 +	if (flen < 36 || (f[0] & 0x0C) != 0 || ((f[0] >> 4) != 8 && (f[0] >> 4) != 5)) {
 +		return;                                 /* beacons and probe responses only */
 +	}
@@ -1156,24 +2100,44 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			chan = f[o + 2];
 +		}
 +	}
++	struct bss *b = NULL;
++	bool fresh = false;
 +	for (uint32_t i = 0; i < nbss; i++) {
 +		if (memcmp(bss[i].bssid, f + 16, 6) == 0) {
-+			bss[i].seen++;
-+			if (rssi > bss[i].rssi) {
-+				bss[i].rssi = (int8_t)rssi;
-+			}
-+			return;
++			b = &bss[i];
++			break;
 +		}
 +	}
-+	if (nbss >= 64) {
++	if (b == NULL) {
++		if (nbss >= 64) {
++			return;
++		}
++		b = &bss[nbss++];
++		bzero(b, sizeof(*b));
++		memcpy(b->bssid, f + 16, 6);
++		fresh = true;
++	}
++	b->seen++;
++	b->rssi = (int8_t)rssi;
++	b->chan = (uint8_t)chan;
++	b->freq = (uint16_t)(chan == 14 ? 2484 : chan < 14 ? 2407 + 5 * chan : 5000 + 5 * chan);
++	b->last_ms = W_NOW;
++	memcpy(&b->bintval, f + 32, 2);
++	memcpy(&b->capab, f + 34, 2);
++	b->ie_len = (uint16_t)MIN(flen - 36, (uint32_t)sizeof(b->ie));
++	memcpy(b->ie, f + 36, b->ie_len);
++	strlcpy(b->ssid, ssid, sizeof(b->ssid));
++	b->raw_ssid_len = 0;
++	for (uint32_t o = 36; o + 2 <= flen && o + 2 + f[o + 1] <= flen; o += 2 + f[o + 1]) {
++		if (f[o] == 0) {
++			b->raw_ssid_len = (uint8_t)MIN((uint32_t)f[o + 1], 32u);
++			memcpy(b->raw_ssid, f + o + 2, b->raw_ssid_len);
++			break;
++		}
++	}
++	if (!fresh) {
 +		return;
 +	}
-+	struct bss *b = &bss[nbss++];
-+	memcpy(b->bssid, f + 16, 6);
-+	strlcpy(b->ssid, ssid, sizeof(b->ssid));
-+	b->chan = (uint8_t)chan;
-+	b->rssi = (int8_t)rssi;
-+	b->seen = 1;
 +	RLOG("net %2u: %02x:%02x:%02x:**:**:** ch %3u %4d dBm '%s'", nbss, b->bssid[0], b->bssid[1],
 +	    b->bssid[2], b->chan, b->rssi, b->ssid);
 +}
@@ -1211,6 +2175,7 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +static volatile uint32_t *htt_idx;
 +static uint8_t *htt_buf;
 +static uint32_t htt_alloc, htt_state, htt_msgs;
++static uint8_t *htt_bank;
 +static unsigned htt_req_ms;
 +
 +static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
@@ -1301,6 +2266,7 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +	htt_ring_pa = pa;
 +	htt_idx = (volatile uint32_t *)(va + HTT_RING_SIZE * 8);
 +	htt_idx_pa = pa + HTT_RING_SIZE * 8;
++	htt_bank = va + ring;
 +	htt_bank_pa = pa + ring;
 +	htt_buf = va + ring + bank;
 +	htt_buf_pa = pa + ring + bank;
@@ -1323,9 +2289,1382 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +		}
 +		return;
 +	}
++	if (type == 0x07 && len >= 4) {		/* TX_COMPL_IND */
++		htt_tx_compl(p, len);
++		return;
++	}
++	if (type == 0x12 && len >= 8) {		/* RX_IN_ORD_PADDR_IND (ios-topaz 0125/0129) */
++		uint16_t n;
++		memcpy(&n, p + 6, 2);
++		const uint8_t *d = p + 8;
++		for (uint32_t i = 0; i < n && 8 + (i + 1) * 12 <= len; i++, d += 12) {
++			uint64_t pa;
++			uint16_t mlen;
++			memcpy(&pa, d, 8);
++			if (pa < htt_buf_pa || pa >= htt_buf_pa + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE ||
++			    ((pa - htt_buf_pa) % HTT_BUF_SIZE) != 0) {
++				continue;
++			}
++			htt_msdus++;
++			memcpy(&mlen, d + 8, 2);
++			if (mlen <= HTT_BUF_SIZE - 4 * OFF_MSDU_PAYLOAD) {
++				w_rx_native(htt_buf + (pa - htt_buf_pa) + 4 * OFF_MSDU_PAYLOAD, mlen);
++			}
++			htt_post((uint32_t)((pa - htt_buf_pa) / HTT_BUF_SIZE));	/* recycle the same buffer */
++		}
++		RMB();
++		*htt_idx = htt_alloc;
++		RMB();
++		return;
++	}
 +	if (said++ < 16) {
 +		RLOG("htt: message type %#x, %u bytes", type, len);
 +	}
++}
++
++/* ---------------- the radio for the rest of the kernel (ios-topaz 0126/0129/0130, APSL 2.0)
++ *
++ * Kept under topaz's names (topaz_wlan_*) so en0 and Apple80211 (ios-topaz 0900, from HackiOS)
++ * port over unchanged.
++ */
++struct topaz_wlan_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;				/* MHz */
++	int16_t rssi;					/* dBm */
++	uint16_t beacon_interval, capability;
++	uint32_t age_ms;
++	uint16_t elements_length;
++	uint8_t elements[768];
++};
++void (*topaz_wlan_ready_hook)(void);
++extern void topaz_sta_init(void) __attribute__((weak));	/* 0173: bsd/dev/topaz_sta.c */
++bool topaz_wlan_ready(void);
++int topaz_wlan_scan(void);
++bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
++void topaz_wlan_address(uint8_t address[6]);
++extern void read_random(void *buffer, unsigned int numBytes);
++static volatile bool api_scan_asked;
++static bool api_ready;
++
++bool
++topaz_wlan_ready(void)
++{
++	return api_ready;
++}
++
++void
++topaz_wlan_address(uint8_t address[6])
++{
++	memcpy(address, wlan_mac, 6);
++}
++
++int
++topaz_wlan_scan(void)
++{
++	if (!api_ready) {
++		return ENXIO;
++	}
++	uint32_t before = api_scans_done;
++	api_scan_asked = true;
++	for (int i = 0; i < 300 && api_scans_done == before; i++) {	/* 30 s */
++		delay(100000);
++	}
++	return api_scans_done != before ? 0 : ETIMEDOUT;
++}
++
++bool
++topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *out)
++{
++	if (index >= nbss) {
++		return false;
++	}
++	const struct bss *b = &bss[index];
++	bzero(out, sizeof(*out));
++	memcpy(out->bssid, b->bssid, 6);
++	memcpy(out->ssid, b->raw_ssid, b->raw_ssid_len);
++	out->ssid_length = b->raw_ssid_len;
++	out->frequency = b->freq;
++	out->rssi = b->rssi;
++	out->beacon_interval = b->bintval;
++	out->capability = b->capab;
++	out->age_ms = W_NOW - b->last_ms;
++	out->elements_length = MIN(b->ie_len, (uint16_t)sizeof(out->elements));
++	memcpy(out->elements, b->ie, out->elements_length);
++	return true;
++}
++
++/* ---------------- WPA2-PSK crypto, self-contained (SHA-1, HMAC, PBKDF2, PRF, AES-128 unwrap) */
++
++/*
++ * The handshake is done here, in the kernel: wifid hands over the passphrase as typed. Small and
++ * self-contained on purpose: libkern's SHA-1/AES go through corecrypto, which this kernel may not
++ * have registered.
++ */
++struct w_sha1 { uint32_t h[5]; uint64_t n; uint8_t b[64]; uint32_t bl; };
++
++static inline uint32_t rol32(uint32_t v, int s) { return (v << s) | (v >> (32 - s)); }
++
++static void
++w_sha1_block(struct w_sha1 *c, const uint8_t *p)
++{
++	uint32_t w[80], a = c->h[0], b = c->h[1], d = c->h[2], e = c->h[3], f = c->h[4];
++	for (int i = 0; i < 16; i++) {
++		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
++	}
++	for (int i = 16; i < 80; i++) {
++		w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++	}
++	for (int i = 0; i < 80; i++) {
++		uint32_t k, x;
++		if (i < 20) {
++			x = (b & d) | (~b & e); k = 0x5A827999;
++		} else if (i < 40) {
++			x = b ^ d ^ e; k = 0x6ED9EBA1;
++		} else if (i < 60) {
++			x = (b & d) | (b & e) | (d & e); k = 0x8F1BBCDC;
++		} else {
++			x = b ^ d ^ e; k = 0xCA62C1D6;
++		}
++		uint32_t t = rol32(a, 5) + x + f + k + w[i];
++		f = e; e = d; d = rol32(b, 30); b = a; a = t;
++	}
++	c->h[0] += a; c->h[1] += b; c->h[2] += d; c->h[3] += e; c->h[4] += f;
++}
++
++static void
++w_sha1_init(struct w_sha1 *c)
++{
++	c->h[0] = 0x67452301; c->h[1] = 0xEFCDAB89; c->h[2] = 0x98BADCFE; c->h[3] = 0x10325476; c->h[4] = 0xC3D2E1F0;
++	c->n = 0;
++	c->bl = 0;
++}
++
++static void
++w_sha1_update(struct w_sha1 *c, const uint8_t *p, size_t len)
++{
++	c->n += len;
++	while (len > 0) {
++		uint32_t take = (uint32_t)MIN((size_t)(64 - c->bl), len);
++		memcpy(c->b + c->bl, p, take);
++		c->bl += take;
++		p += take;
++		len -= take;
++		if (c->bl == 64) {
++			w_sha1_block(c, c->b);
++			c->bl = 0;
++		}
++	}
++}
++
++static void
++w_sha1_final(struct w_sha1 *c, uint8_t out[20])
++{
++	uint64_t bits = c->n * 8;
++	uint8_t pad = 0x80, z = 0;
++	w_sha1_update(c, &pad, 1);
++	while (c->bl != 56) {
++		w_sha1_update(c, &z, 1);
++	}
++	uint8_t l[8];
++	for (int i = 0; i < 8; i++) {
++		l[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	w_sha1_update(c, l, 8);
++	for (int i = 0; i < 5; i++) {
++		out[4 * i] = (uint8_t)(c->h[i] >> 24);
++		out[4 * i + 1] = (uint8_t)(c->h[i] >> 16);
++		out[4 * i + 2] = (uint8_t)(c->h[i] >> 8);
++		out[4 * i + 3] = (uint8_t)c->h[i];
++	}
++}
++
++/* HMAC-SHA1 over up to three pieces */
++static void
++w_hmac_sha1(const uint8_t *key, size_t klen, const uint8_t *a, size_t al, const uint8_t *b, size_t bl,
++    const uint8_t *c3, size_t cl, uint8_t out[20])
++{
++	uint8_t k[64] = {}, ipad[64], opad[64], inner[20];
++	struct w_sha1 s;
++	if (klen > 64) {
++		w_sha1_init(&s);
++		w_sha1_update(&s, key, klen);
++		w_sha1_final(&s, k);
++	} else {
++		memcpy(k, key, klen);
++	}
++	for (int i = 0; i < 64; i++) {
++		ipad[i] = k[i] ^ 0x36;
++		opad[i] = k[i] ^ 0x5c;
++	}
++	w_sha1_init(&s);
++	w_sha1_update(&s, ipad, 64);
++	if (al) w_sha1_update(&s, a, al);
++	if (bl) w_sha1_update(&s, b, bl);
++	if (cl) w_sha1_update(&s, c3, cl);
++	w_sha1_final(&s, inner);
++	w_sha1_init(&s);
++	w_sha1_update(&s, opad, 64);
++	w_sha1_update(&s, inner, 20);
++	w_sha1_final(&s, out);
++}
++
++/* PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32) */
++static void
++w_pbkdf2_pmk(const uint8_t *pass, size_t plen, const uint8_t *ssid, size_t slen, uint8_t pmk[32])
++{
++	for (uint32_t blk = 1; blk <= 2; blk++) {
++		uint8_t cnt[4] = { (uint8_t)(blk >> 24), (uint8_t)(blk >> 16), (uint8_t)(blk >> 8), (uint8_t)blk };
++		uint8_t u[20], t[20];
++		w_hmac_sha1(pass, plen, ssid, slen, cnt, 4, NULL, 0, u);
++		memcpy(t, u, 20);
++		for (int i = 1; i < 4096; i++) {
++			w_hmac_sha1(pass, plen, u, 20, NULL, 0, NULL, 0, u);
++			for (int j = 0; j < 20; j++) {
++				t[j] ^= u[j];
++			}
++		}
++		memcpy(pmk + 20 * (blk - 1), t, blk == 1 ? 20 : 12);
++	}
++}
++
++/* IEEE 802.11 PRF-SHA1 */
++static void
++w_prf(const uint8_t *key, size_t klen, const char *label, const uint8_t *data, size_t dlen, uint8_t *out, size_t olen)
++{
++	uint8_t buf[128], h[20];
++	size_t ll = strlen(label);
++	for (uint8_t i = 0; olen > 0; i++) {
++		memcpy(buf, label, ll);
++		buf[ll] = 0;
++		memcpy(buf + ll + 1, data, dlen);
++		buf[ll + 1 + dlen] = i;
++		w_hmac_sha1(key, klen, buf, ll + 2 + dlen, NULL, 0, NULL, 0, h);
++		size_t take = MIN(olen, (size_t)20);
++		memcpy(out, h, take);
++		out += take;
++		olen -= take;
++	}
++}
++
++/* AES-128 decryption of one block (FIPS-197), for the key unwrap of the GTK */
++static const uint8_t aes_sbox[256] = {
++	0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
++	0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
++	0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
++	0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
++	0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
++	0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
++	0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
++	0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
++};
++
++static uint8_t aes_xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
++static uint8_t aes_mul(uint8_t a, uint8_t b) { uint8_t r = 0; while (b) { if (b & 1) r ^= a; a = aes_xt(a); b >>= 1; } return r; }
++
++static void
++aes128_expand(const uint8_t key[16], uint8_t rk[176])
++{
++	uint8_t rcon = 1;
++	memcpy(rk, key, 16);
++	for (int i = 16; i < 176; i += 4) {
++		uint8_t t[4];
++		memcpy(t, rk + i - 4, 4);
++		if (i % 16 == 0) {
++			uint8_t x = t[0];
++			t[0] = aes_sbox[t[1]] ^ rcon; t[1] = aes_sbox[t[2]]; t[2] = aes_sbox[t[3]]; t[3] = aes_sbox[x];
++			rcon = aes_xt(rcon);
++		}
++		for (int j = 0; j < 4; j++) {
++			rk[i + j] = rk[i - 16 + j] ^ t[j];
++		}
++	}
++}
++
++static void
++aes128_decrypt(const uint8_t rk[176], uint8_t s[16])
++{
++	uint8_t inv[256];
++	for (int i = 0; i < 256; i++) {
++		inv[aes_sbox[i]] = (uint8_t)i;
++	}
++	for (int j = 0; j < 16; j++) {
++		s[j] ^= rk[160 + j];
++	}
++	for (int r = 9; r >= 0; r--) {
++		uint8_t t[16];
++		for (int c = 0; c < 4; c++) {           /* inverse shift rows + inverse sub bytes */
++			for (int row = 0; row < 4; row++) {
++				t[4 * ((c + row) % 4) + row] = inv[s[4 * c + row]];
++			}
++		}
++		for (int j = 0; j < 16; j++) {
++			t[j] ^= rk[16 * r + j];
++		}
++		if (r == 0) {
++			memcpy(s, t, 16);
++			break;
++		}
++		for (int c = 0; c < 4; c++) {           /* inverse mix columns */
++			uint8_t *q = t + 4 * c, a0 = q[0], a1 = q[1], a2 = q[2], a3 = q[3];
++			s[4 * c] = aes_mul(a0, 14) ^ aes_mul(a1, 11) ^ aes_mul(a2, 13) ^ aes_mul(a3, 9);
++			s[4 * c + 1] = aes_mul(a0, 9) ^ aes_mul(a1, 14) ^ aes_mul(a2, 11) ^ aes_mul(a3, 13);
++			s[4 * c + 2] = aes_mul(a0, 13) ^ aes_mul(a1, 9) ^ aes_mul(a2, 14) ^ aes_mul(a3, 11);
++			s[4 * c + 3] = aes_mul(a0, 11) ^ aes_mul(a1, 13) ^ aes_mul(a2, 9) ^ aes_mul(a3, 14);
++		}
++	}
++}
++
++/* RFC 3394 key unwrap with a 128-bit KEK; out gets len-8 bytes. False if the check value is wrong. */
++static bool
++aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t len, uint8_t *out)
++{
++	uint8_t rk[176], a[8], b[16];
++	size_t n = len / 8 - 1;
++	if (len < 24 || len % 8 != 0) {
++		return false;
++	}
++	aes128_expand(kek, rk);
++	memcpy(a, in, 8);
++	memcpy(out, in + 8, len - 8);
++	for (int j = 5; j >= 0; j--) {
++		for (size_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++			memcpy(b, a, 8);
++			for (int k = 0; k < 8; k++) {
++				b[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(b + 8, out + 8 * (i - 1), 8);
++			aes128_decrypt(rk, b);
++			memcpy(a, b, 8);
++			memcpy(out + 8 * (i - 1), b + 8, 8);
++		}
++	}
++	for (int k = 0; k < 8; k++) {
++		if (a[k] != 0xA6) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++w_crypto_selftest(void)
++{
++	static const uint8_t kek[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
++	static const uint8_t ct[24] = { 0x1F,0xA6,0x8B,0x0A,0x81,0x12,0xB4,0x47,0xAE,0xF3,0x4B,0xD8,0xFB,0x5A,0x7B,0x82,
++		0x9D,0x3E,0x86,0x23,0x71,0xD2,0xCF,0xE5 };
++	static const uint8_t pt[16] = { 0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF };
++	static const uint8_t pmk_ref[4] = { 0xf4, 0x2c, 0x6f, 0xc5 };     /* "password"/"IEEE" (802.11 annex) */
++	uint8_t out[16], pmk[32];
++	bool a = aes_unwrap(kek, ct, 24, out) && memcmp(out, pt, 16) == 0;
++	w_pbkdf2_pmk((const uint8_t *)"password", 8, (const uint8_t *)"IEEE", 4, pmk);
++	bool b = memcmp(pmk, pmk_ref, 4) == 0;
++	RLOG("wpa: crypto self-test: key unwrap %s, pbkdf2 %s", a ? "ok" : "FAILED", b ? "ok" : "FAILED");
++	return a && b;
++}
++
++/* ---------------- station: HTT data TX, association, WPA2-PSK, Ethernet bridge */
++
++/*
++ * Port of topaz-woa assoc.c and the TX half of htt.c, plus the 4-way handshake that Windows did
++ * there: VDEV_START on the AP's channel, PEER_CREATE, open-system AUTH and ASSOC REQ as WMI
++ * management frames, PEER_ASSOC + VDEV_UP, then EAPOL over the data path, keys by
++ * VDEV_INSTALL_KEY. Frames to and from the rest of the kernel are Ethernet; the radio's are
++ * native wifi (802.11 header without QoS + LLC/SNAP).
++ */
++#define CMD_VDEV_START          0x5003
++#define CMD_VDEV_UP             0x5005
++#define CMD_VDEV_STOP           0x5006
++#define CMD_VDEV_DOWN           0x5007
++#define CMD_VDEV_INSTALL_KEY    0x5009
++#define CMD_PEER_CREATE         0x6001
++#define CMD_PEER_DELETE         0x6002
++#define CMD_PEER_SET_PARAM      0x6004
++#define CMD_PEER_ASSOC          0x6005
++#define CMD_MGMT_TX_SEND        0x7008
++#define CMD_STA_PS_MODE         0x9001
++#define TAG_VDEV_START          0x58
++#define TAG_VDEV_UP             0x5c
++#define TAG_VDEV_STOP           0x5d
++#define TAG_VDEV_DOWN           0x5e
++#define TAG_VDEV_INSTALL_KEY    0x60
++#define TAG_PEER_CREATE         0x61
++#define TAG_PEER_DELETE         0x62
++#define TAG_PEER_SET_PARAM      0x64
++#define TAG_PEER_ASSOC          0x65
++#define TAG_VHT_RATE_SET        0x66
++#define TAG_STA_PS_MODE         0x6c
++#define TAG_MGMT_TX             0x1a6
++#define PEER_FLAG_AUTH          0x1
++#define PEER_FLAG_NEED_PTK_4WAY 0x4
++#define PEER_PARAM_AUTHORIZE    3
++#define WMI_CIPHER_TKIP         2
++#define WMI_CIPHER_CCMP         4
++#define FC_ASSOC_REQ            0x00
++#define FC_ASSOC_RESP           0x10
++#define FC_DISASSOC             0xA0
++#define FC_AUTH                 0xB0
++#define FC_DEAUTH               0xC0
++
++enum sta_state { S_IDLE, S_START, S_AUTH, S_ASSOC, S_4WAY, S_UP };
++static volatile enum sta_state s_state;
++static volatile int s_result;                   /* of the last join: 0 joined, else an errno (EAUTH: passphrase) */
++static volatile bool s_join_asked, s_leave_asked;
++static volatile uint32_t s_join_done;           /* bumped when a join ends either way */
++static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
++static uint8_t s_body[768];                     /* the AP's beacon IEs */
++static uint32_t s_body_len, s_freq, s_aid, s_tries, s_deadline, s_desc, s_msg1s;
++static bool s_rsn, s_start_resp, s_ptk_set;
++static int32_t s_start_status;
++static uint8_t s_assoc_req[512];
++static uint32_t s_assoc_req_len;
++static uint8_t s_rsn_ie[22];
++static uint8_t s_ptk[48], s_anonce[32], s_snonce[32], s_group_cipher;
++static uint64_t s_replay;
++static uint8_t *s_mgmt_va;
++static uint64_t s_mgmt_pa;
++
++void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
++void (*topaz_wlan_link_hook)(bool up);
++
++static uint8_t *w_p32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); return p + 4; }
++static uint8_t *w_pmac(uint8_t *p, const uint8_t *mac) { bzero(p, 8); memcpy(p, mac, 6); return p + 8; }
++
++static uint8_t *
++w_channel(uint8_t *p, uint32_t freq)
++{
++	uint8_t *c = wmi_put_tlv(p, TAG_CHANNEL, 24);
++	c = w_p32(c, freq);
++	c = w_p32(c, freq);
++	c = w_p32(c, 0);
++	c = w_p32(c, freq < 4000 ? 1 : 0);
++	c = w_p32(c, (40u << 8) | (40u << 16));
++	return w_p32(c, 40u << 8);
++}
++
++static const uint8_t *
++w_find_ie(const uint8_t *ies, uint32_t len, uint8_t id)
++{
++	for (uint32_t o = 0; o + 2 <= len && o + 2 + ies[o + 1] <= len; o += 2 + ies[o + 1]) {
++		if (ies[o] == id) {
++			return ies + o;
++		}
++	}
++	return NULL;
++}
++
++/* ---- HTT data TX (ath10k_htt_tx_64, native wifi) */
++#define TX_SLOTS        64
++#define TX_SLOT_SIZE    2048
++#define H2T_TX_FRM      1
++#define TXF0_MAC_HDR    0x01
++#define TXF0_NO_ENCRYPT 0x04
++#define TXF0_NATIVE     (1u << 5)
++#define TXF1_TID_NONQOS (16u << 6)
++#define TXF1_POSTPONED  (1u << 11)
++#define PREFETCH_LEN    50
++#define T2H_TX_COMPL_IND 0x07
++
++static uint8_t *tx_pool;
++static uint64_t tx_pool_pa, tx_busy;
++static uint32_t tx_sent, tx_done, tx_fail, tx_drop, rx_up;
++
++static bool
++htt_tx_frame(const uint8_t *f, uint32_t len, bool clear)
++{
++	uint8_t m[20 + 52], *p = m;
++	uint32_t id, pf = (MIN(len, (uint32_t)PREFETCH_LEN) + 3) & ~3u;
++	if (tx_pool == NULL) {
++		tx_pool = (uint8_t *)pool_alloc(TX_SLOTS * TX_SLOT_SIZE, &tx_pool_pa);
++	}
++	if (tx_pool == NULL || htt_bank == NULL || htt_state != 2 || len > TX_SLOT_SIZE) {
++		return false;
++	}
++	for (id = 0; id < TX_SLOTS && (tx_busy & (1ull << id)) != 0; id++) {
++	}
++	if (id == TX_SLOTS) {
++		return false;
++	}
++	uint64_t pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
++	memcpy(tx_pool + id * TX_SLOT_SIZE, f, len);
++	uint8_t *ext = htt_bank + id * HTT_EXT_DESC_SIZE;  /* frags[0] at +24: paddr_lo, paddr_hi16, len16 */
++	bzero(ext, HTT_EXT_DESC_SIZE);
++	uint32_t lo = (uint32_t)pa;
++	uint16_t hi = (uint16_t)(pa >> 32), l16 = (uint16_t)len;
++	memcpy(ext + 24, &lo, 4);
++	memcpy(ext + 28, &hi, 2);
++	memcpy(ext + 30, &l16, 2);
++	RMB();
++	bzero(m, sizeof(m));
++	*p++ = H2T_TX_FRM;
++	*p++ = (uint8_t)(TXF0_MAC_HDR | TXF0_NATIVE | (clear ? TXF0_NO_ENCRYPT : 0));
++	p = put16(p, (uint16_t)(TXF1_TID_NONQOS | TXF1_POSTPONED));   /* vdev 0 */
++	p = put16(p, (uint16_t)len);
++	p = put16(p, (uint16_t)id);
++	p = put64(p, htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE);
++	p = w_p32(p, 0xFFFF);                       /* peer id: invalid */
++	memcpy(p, f, MIN(len, pf));
++	if (!htt_send(m, 20 + pf)) {
++		return false;
++	}
++	tx_busy |= 1ull << id;
++	tx_sent++;
++	return true;
++}
++
++static void
++htt_tx_compl(const uint8_t *p, uint32_t len)
++{
++	uint32_t n = p[2], st = p[1] & 7;
++	for (uint32_t i = 0; i < n && 4 + 2 * (i + 1) <= len; i++) {
++		uint16_t id;
++		memcpy(&id, p + 4 + 2 * i, 2);
++		if (id < TX_SLOTS) {
++			tx_busy &= ~(1ull << id);
++		}
++	}
++	tx_done += n;
++	if (st != 0) {
++		tx_fail += n;
++		if (tx_fail <= 4) {
++			RLOG("htt tx: %u frame(s) status %u", n, st);
++		}
++	}
++}
++
++/* ---- WMI commands for the join (layouts: ath10k wmi-tlv) */
++static bool
++w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
++{
++	uint8_t m[4 + 72 + 4 + 24 + 4] = {}, *p;
++	p = wmi_put_tlv(m, TAG_VDEV_START, 72);
++	p = w_p32(p, 0);
++	p = w_p32(p, 0);
++	p = w_p32(p, bcn);
++	p = w_p32(p, dtim);
++	p = w_p32(p, 0);
++	p += 36 + 16;                               /* ssid (empty for a station), tx rate/power, noa, hw ack */
++	p = w_channel(p, freq);
++	wmi_put_tlv(p, TAG_ARRAY_STRUCT, 0);
++	return wmi_send(CMD_VDEV_START, m, sizeof(m));
++}
++
++static bool
++w_vdev_simple(uint32_t cmd, uint16_t tag)
++{
++	uint8_t m[8], *p = wmi_put_tlv(m, tag, 4);
++	w_p32(p, 0);
++	return wmi_send(cmd, m, sizeof(m));
++}
++
++static bool
++w_peer(uint32_t cmd, uint16_t tag, bool create)
++{
++	uint8_t m[4 + 16] = {}, *p = wmi_put_tlv(m, tag, create ? 16 : 12);
++	p = w_p32(p, 0);
++	p = w_pmac(p, s_bssid);
++	if (create) {
++		w_p32(p, 0);
++	}
++	return wmi_send(cmd, m, create ? 20 : 16);
++}
++
++static bool
++w_peer_param(uint32_t param, uint32_t value)
++{
++	uint8_t m[4 + 20], *p = wmi_put_tlv(m, TAG_PEER_SET_PARAM, 20);
++	p = w_p32(p, 0);
++	p = w_pmac(p, s_bssid);
++	p = w_p32(p, param);
++	w_p32(p, value);
++	return wmi_send(CMD_PEER_SET_PARAM, m, sizeof(m));
++}
++
++static bool
++w_ps_off(void)
++{
++	uint8_t m[12], *p = wmi_put_tlv(m, TAG_STA_PS_MODE, 8);
++	p = w_p32(p, 0);
++	w_p32(p, 0);
++	return wmi_send(CMD_STA_PS_MODE, m, sizeof(m));
++}
++
++static bool
++w_mgmt_tx(const uint8_t *f, uint32_t len)
++{
++	uint8_t m[4 + 28 + 4 + 64] = {}, *p;
++	uint32_t buf = (MIN(len, 64u) + 3) & ~3u;
++	if (s_mgmt_va == NULL) {
++		s_mgmt_va = (uint8_t *)pool_alloc(0x1000, &s_mgmt_pa);
++	}
++	if (s_mgmt_va == NULL || len > 0x1000 - 8) {
++		return false;
++	}
++	bzero(s_mgmt_va, ((len + 3) & ~3u) + 4);
++	memcpy(s_mgmt_va, f, len);
++	RMB();
++	p = wmi_put_tlv(m, TAG_MGMT_TX, 28);
++	p = w_p32(p, 0);
++	p = w_p32(p, ++s_desc);
++	p = w_p32(p, 0);
++	p = put64(p, s_mgmt_pa);
++	p = w_p32(p, len);
++	p = w_p32(p, buf);
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, buf);
++	memcpy(p, s_mgmt_va, buf);
++	return wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++}
++
++static uint32_t
++w_ap_rates(uint8_t *out)
++{
++	static const uint8_t ids[2] = { 1, 50 };
++	uint32_t n = 0;
++	for (int k = 0; k < 2; k++) {
++		const uint8_t *ie = w_find_ie(s_body, s_body_len, ids[k]);
++		for (uint32_t i = 0; ie != NULL && i < ie[1] && n < 16; i++) {
++			out[n++] = ie[2 + i];
++		}
++	}
++	return n;
++}
++
++static bool
++w_peer_assoc(uint32_t caps)
++{
++	uint8_t m[4 + 76 + 4 + 16 + 4 + 4 + 16] = {}, *p, *r, rates[16];
++	uint32_t n = w_ap_rates(rates), rl = (MIN(n, 16u) + 3) & ~3u;
++	p = wmi_put_tlv(m, TAG_PEER_ASSOC, 76);
++	p = w_pmac(p, s_bssid);
++	p = w_p32(p, 0);
++	p = w_p32(p, 1);                            /* new assoc */
++	p = w_p32(p, s_aid);
++	p = w_p32(p, PEER_FLAG_AUTH | (s_rsn ? PEER_FLAG_NEED_PTK_4WAY : 0));
++	p = w_p32(p, caps);
++	p = w_p32(p, 1);                            /* listen interval */
++	p += 4 * 6;                                 /* ht caps, max mpdu, density, rate caps; nss below */
++	p -= 4 * 2;
++	p = w_p32(p, 1);                            /* nss */
++	p = w_p32(p, 0);                            /* vht caps */
++	p = w_p32(p, s_freq < 4000 ? 1 : 0);        /* phy mode: 11g / 11a */
++	p += 8;
++	p = w_p32(p, MIN(n, 16u));
++	p = w_p32(p, 0);
++	r = wmi_put_tlv(p, TAG_ARRAY_BYTE, rl);
++	for (uint32_t i = 0; i < n && i < 16; i++) {
++		uint8_t v = rates[i] & 0x7F;
++		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80) : v;
++	}
++	p = r + rl;
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, 0);
++	wmi_put_tlv(p, TAG_VHT_RATE_SET, 16);
++	return wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + 4 + 16);
++}
++
++static bool
++w_install_key(bool group, uint32_t idx, uint32_t cipher, const uint8_t *key, uint32_t klen)
++{
++	uint8_t m[4 + 92 + 4 + 32] = {}, *p;
++	uint32_t kl = (klen + 3) & ~3u;
++	p = wmi_put_tlv(m, TAG_VDEV_INSTALL_KEY, 92);
++	p = w_p32(p, 0);
++	p = w_pmac(p, s_bssid);
++	p = w_p32(p, idx);
++	p = w_p32(p, group ? 1 : 0);
++	p = w_p32(p, cipher);
++	p += 3 * 8 + 16 + 16;
++	p = w_p32(p, klen);
++	p = w_p32(p, cipher == WMI_CIPHER_TKIP ? 8 : 0);
++	p = w_p32(p, cipher == WMI_CIPHER_TKIP ? 8 : 0);
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, kl);
++	memcpy(p, key, klen);
++	return wmi_send(CMD_VDEV_INSTALL_KEY, m, 4 + 92 + 4 + kl);
++}
++
++/* ---- 802.11 management frames */
++static uint8_t *
++w_mgmt_hdr(uint8_t *f, uint8_t fc)
++{
++	bzero(f, 24);
++	f[0] = fc;
++	memcpy(f + 4, s_bssid, 6);
++	memcpy(f + 10, wlan_mac, 6);
++	memcpy(f + 16, s_bssid, 6);
++	return f + 24;
++}
++
++static bool
++w_send_auth(void)
++{
++	uint8_t f[30], *b = w_mgmt_hdr(f, FC_AUTH);
++	bzero(b, 6);
++	b[2] = 1;                                   /* open system, transaction 1 */
++	return w_mgmt_tx(f, sizeof(f));
++}
++
++static void
++w_build_assoc_req(void)
++{
++	uint8_t *f = s_assoc_req, *p = w_mgmt_hdr(f, FC_ASSOC_REQ), rates[16];
++	uint32_t n = w_ap_rates(rates), cap = 0x0001 | 0x0020 | 0x0400;   /* ESS, short preamble, short slot */
++	if (s_rsn) {
++		cap |= 0x0010;
++	}
++	*p++ = (uint8_t)cap;
++	*p++ = (uint8_t)(cap >> 8);
++	*p++ = 10;
++	*p++ = 0;
++	*p++ = 0;
++	*p++ = s_ssid_len;
++	memcpy(p, s_ssid, s_ssid_len);
++	p += s_ssid_len;
++	*p++ = 1;
++	*p++ = (uint8_t)MIN(n, 8u);
++	for (uint32_t k = 0; k < n && k < 8; k++) {
++		*p++ = rates[k];
++	}
++	if (n > 8) {
++		*p++ = 50;
++		*p++ = (uint8_t)(n - 8);
++		for (uint32_t k = 8; k < n; k++) {
++			*p++ = rates[k];
++		}
++	}
++	if (s_rsn) {
++		memcpy(p, s_rsn_ie, sizeof(s_rsn_ie));
++		p += sizeof(s_rsn_ie);
++	}
++	s_assoc_req_len = (uint32_t)(p - f);
++}
++
++/* ---- Ethernet <-> native wifi */
++static void
++w_link(bool up)
++{
++	if (topaz_wlan_link_hook != NULL) {
++		topaz_wlan_link_hook(up);
++	}
++}
++
++/* an Ethernet frame (dst, src, type, payload) to the AP as a to-DS data frame */
++static bool
++w_tx_ether(const uint8_t *e, size_t len, bool clear)
++{
++	uint8_t f[TX_SLOT_SIZE];
++	if (len < 14 || len - 14 + 24 + 8 > sizeof(f)) {
++		return false;
++	}
++	bzero(f, 24);
++	f[0] = 0x08;                                /* data */
++	f[1] = (uint8_t)(0x01 | (s_ptk_set && !clear ? 0x40 : 0));   /* to DS (+ protected once keyed) */
++	memcpy(f + 4, s_bssid, 6);                  /* addr1: the AP */
++	memcpy(f + 10, wlan_mac, 6);                 /* addr2: us */
++	memcpy(f + 16, e, 6);                       /* addr3: the destination */
++	static const uint8_t snap[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
++	memcpy(f + 24, snap, 6);
++	memcpy(f + 30, e + 12, 2);                  /* ethertype */
++	memcpy(f + 32, e + 14, len - 14);
++	return htt_tx_frame(f, (uint32_t)(len - 14 + 32), clear);
++}
++
++/* ---- WPA2 4-way handshake (EAPOL-Key, descriptor version 2: HMAC-SHA1-128 MIC, AES key wrap) */
++static void w_join_end(int result);
++
++static void
++w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t dlen)
++{
++	uint8_t e[14 + 4 + 95 + 64] = {}, *k = e + 14 + 4, mic[20];
++	memcpy(e, s_bssid, 6);
++	memcpy(e + 6, wlan_mac, 6);
++	e[12] = 0x88;
++	e[13] = 0x8E;
++	uint16_t body = (uint16_t)(95 + dlen);
++	e[14] = 1;                                  /* EAPOL version */
++	e[15] = 3;                                  /* key */
++	e[16] = (uint8_t)(body >> 8);
++	e[17] = (uint8_t)body;
++	k[0] = 2;                                   /* RSN key descriptor */
++	k[1] = (uint8_t)(info >> 8);
++	k[2] = (uint8_t)info;
++	k[3] = 0;                                   /* key length 0 (from the STA) */
++	k[4] = 0;
++	for (int i = 0; i < 8; i++) {
++		k[5 + i] = (uint8_t)(s_replay >> (56 - 8 * i));
++	}
++	if (nonce != NULL) {
++		memcpy(k + 13, nonce, 32);
++	}
++	k[93] = (uint8_t)(dlen >> 8);
++	k[94] = (uint8_t)dlen;
++	if (dlen) {
++		memcpy(k + 95, data, dlen);
++	}
++	w_hmac_sha1(s_ptk, 16, e + 14, 4 + body, NULL, 0, NULL, 0, mic);
++	memcpy(k + 77, mic, 16);
++	(void)w_tx_ether(e, 14 + 4 + body, true);
++}
++
++static bool
++w_eapol_mic_ok(uint8_t *eapol, size_t len)
++{
++	uint8_t want[16], got[20];
++	if (len < 4 + 95) {
++		return false;
++	}
++	memcpy(want, eapol + 4 + 77, 16);
++	bzero(eapol + 4 + 77, 16);
++	w_hmac_sha1(s_ptk, 16, eapol, len, NULL, 0, NULL, 0, got);
++	memcpy(eapol + 4 + 77, want, 16);
++	return memcmp(want, got, 16) == 0;
++}
++
++static void
++w_eapol_rx(const uint8_t *e, size_t elen)
++{
++	uint8_t frame[512];
++	const uint8_t *src = e + 6;
++	if (s_state != S_4WAY || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) || memcmp(src, s_bssid, 6) != 0) {
++		return;
++	}
++	size_t len = elen - 14;
++	memcpy(frame, e + 14, len);
++	uint8_t *k = frame + 4;
++	if (frame[1] != 3 || k[0] != 2) {
++		return;
++	}
++	uint16_t info = (uint16_t)(k[1] << 8 | k[2]), dlen = (uint16_t)(k[93] << 8 | k[94]);
++	uint64_t replay = 0;
++	for (int i = 0; i < 8; i++) {
++		replay = replay << 8 | k[5 + i];
++	}
++	if (95 + (size_t)dlen > len - 4) {
++		return;
++	}
++	bool pairwise = info & 0x0008, ack = info & 0x0080, has_mic = info & 0x0100, install = info & 0x0040;
++	if (pairwise && ack && !has_mic) {
++		/* message 1: ANonce -> PTK, answer with message 2 */
++		if (++s_msg1s > 3) {
++			RLOG("wpa: the AP keeps sending message 1: wrong passphrase");
++			w_join_end(EAUTH);
++			return;
++		}
++		s_replay = replay;
++		memcpy(s_anonce, k + 13, 32);
++		read_random(s_snonce, 32);
++		uint8_t data[76];
++		const uint8_t *aa = s_bssid, *spa = wlan_mac;
++		bool amin = memcmp(aa, spa, 6) < 0, nmin = memcmp(s_anonce, s_snonce, 32) < 0;
++		memcpy(data, amin ? aa : spa, 6);
++		memcpy(data + 6, amin ? spa : aa, 6);
++		memcpy(data + 12, nmin ? s_anonce : s_snonce, 32);
++		memcpy(data + 44, nmin ? s_snonce : s_anonce, 32);
++		w_prf(s_pmk, 32, "Pairwise key expansion", data, sizeof(data), s_ptk, 48);
++		w_eapol_send(0x010A, s_snonce, s_rsn_ie, sizeof(s_rsn_ie));
++		RLOG("wpa: message 1 -> message 2 sent");
++		return;
++	}
++	if (pairwise && ack && has_mic && install) {
++		/* message 3: check, unwrap the GTK, answer with message 4, install the keys */
++		if (!w_eapol_mic_ok(frame, len)) {
++			RLOG("wpa: message 3 MIC wrong: wrong passphrase");
++			w_join_end(EAUTH);
++			return;
++		}
++		s_replay = replay;
++		uint8_t plain[256];
++		uint8_t gtk[32], gtk_len = 0, gtk_idx = 1;
++		if ((info & 0x1000) && dlen >= 24 && dlen <= sizeof(plain) + 8 && aes_unwrap(s_ptk + 16, k + 95, dlen, plain)) {
++			for (uint32_t o = 0; o + 2 <= (uint32_t)dlen - 8 && o + 2 + plain[o + 1] <= (uint32_t)dlen - 8; o += 2 + plain[o + 1]) {
++				if (plain[o] == 0xDD && plain[o + 1] >= 6 && plain[o + 2] == 0x00 && plain[o + 3] == 0x0F &&
++				    plain[o + 4] == 0xAC && plain[o + 5] == 0x01) {
++					gtk_idx = plain[o + 6] & 3;
++					gtk_len = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
++					memcpy(gtk, plain + o + 8, gtk_len);
++				}
++			}
++		}
++		w_eapol_send(0x030A, NULL, NULL, 0);
++		delay(5 * 1000);                             /* message 4 out in the clear before the keys go in */
++		w_install_key(false, 0, WMI_CIPHER_CCMP, s_ptk + 32, 16);
++		if (gtk_len != 0) {
++			w_install_key(true, gtk_idx, s_group_cipher == 2 ? WMI_CIPHER_TKIP : WMI_CIPHER_CCMP, gtk, gtk_len);
++		}
++		w_peer_param(PEER_PARAM_AUTHORIZE, 1);
++		s_ptk_set = true;
++		bzero(gtk, sizeof(gtk));
++		RLOG("*** WPA2 keys installed (group key %s, idx %u) ***", gtk_len ? "yes" : "NO", gtk_idx);
++		w_join_end(0);
++		return;
++	}
++}
++
++/* ---- the join, step by step from the modem thread */
++/* which teardown steps run (bluewifi_td): 1 VDEV_DOWN, 2 PEER_DELETE, 4 VDEV_STOP, 8 deauth to the AP,
++ * 16 PEER_DELETE before VDEV_DOWN */
++static uint32_t w_td = 31;			/* VDEV_DOWN with the peer still there asserts in the firmware
++						 * (_wlan_vdev_down) and a rejoin without a deauth gets no auth reply */
++
++static void
++w_teardown(void)
++{
++	if (s_state >= S_START) {
++		bool down = s_state >= S_4WAY && (w_td & 1), peer = s_state >= S_AUTH && (w_td & 2), stop = (w_td & 4) != 0;
++		bool deauth = s_state >= S_ASSOC && (w_td & 8);
++		bool late = (w_td & 16) != 0;
++		RLOG("teardown from state %u:%s%s%s%s%s", s_state, deauth ? " deauth" : "", down && !late ? " vdev down" : "",
++		    peer ? " peer delete" : "", down && late ? " vdev down" : "", stop ? " vdev stop" : "");
++		if (deauth) {				/* tell the AP, as mac80211 does, so a rejoin starts clean */
++			uint8_t f[26], *r = w_mgmt_hdr(f, FC_DEAUTH);
++			r[0] = 3;			/* reason: leaving */
++			r[1] = 0;
++			(void)w_mgmt_tx(f, sizeof(f));
++		}
++		if (down && !(w_td & 16)) {
++			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		}
++		if (peer) {
++			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
++		}
++		if (down && (w_td & 16)) {		/* mac80211/ath10k order: the station goes before the vdev */
++			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		}
++		if (stop) {
++			w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++		}
++	}
++	if (s_state == S_UP) {
++		w_link(false);
++	}
++	s_state = S_IDLE;
++	s_ptk_set = false;
++}
++
++static void
++w_join_end(int result)
++{
++	if (result != 0) {
++		RLOG("join: failed (%d) in state %u", result, s_state);
++		w_teardown();
++	} else {
++		s_state = S_UP;
++		RLOG("*** joined (%u MHz) ***", s_freq);
++		w_link(true);
++	}
++	bzero(s_pmk, sizeof(s_pmk));
++	s_result = result;
++	s_join_done++;
++}
++
++static void
++w_join_begin(void)
++{
++	/* the AP: the strongest one heard with that name (or the BSSID asked for) */
++	int best = -1;
++	for (uint32_t i = 0; i < nbss; i++) {
++		if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
++		    (best < 0 || bss[i].rssi > bss[best].rssi)) {
++			best = (int)i;
++		}
++	}
++	bool want_bssid = false;
++	for (int i = 0; i < 6; i++) {
++		want_bssid |= s_bssid[i] != 0;
++	}
++	if (want_bssid) {
++		for (uint32_t i = 0; i < nbss; i++) {
++			if (memcmp(bss[i].bssid, s_bssid, 6) == 0) {
++				best = (int)i;
++			}
++		}
++	}
++	if (best < 0) {
++		RLOG("join: no such network heard");
++		w_join_end(ENOENT);
++		return;
++	}
++	memcpy(s_bssid, bss[best].bssid, 6);
++	s_freq = bss[best].freq;
++	s_body_len = bss[best].ie_len;
++	memcpy(s_body, bss[best].ie, s_body_len);
++	const uint8_t *rsn = w_find_ie(s_body, s_body_len, 48);
++	s_rsn = rsn != NULL;
++	s_group_cipher = (rsn != NULL && rsn[1] >= 8) ? rsn[2 + 2 + 3] : 4;
++	static const uint8_t hdr[4] = { 48, 20, 1, 0 };
++	memcpy(s_rsn_ie, hdr, 4);
++	uint8_t *q = s_rsn_ie + 4;
++	*q++ = 0x00; *q++ = 0x0F; *q++ = 0xAC; *q++ = s_group_cipher;
++	*q++ = 1; *q++ = 0; *q++ = 0x00; *q++ = 0x0F; *q++ = 0xAC; *q++ = 4;   /* pairwise CCMP */
++	*q++ = 1; *q++ = 0; *q++ = 0x00; *q++ = 0x0F; *q++ = 0xAC; *q++ = 2;   /* AKM PSK */
++	*q++ = 0; *q++ = 0;
++	uint32_t bcn = bss[best].bintval ? bss[best].bintval : 100, dtim = 1;
++	const uint8_t *tim = w_find_ie(s_body, s_body_len, 5);
++	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
++		dtim = tim[3];
++	}
++	s_msg1s = 0;
++	s_start_resp = false;
++	RLOG("join: %02x:%02x:%02x:**:**:** %u MHz %s", s_bssid[0], s_bssid[1],
++	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
++	w_ps_off();
++	if (!w_vdev_start(s_freq, bcn, dtim)) {
++		w_join_end(EIO);
++		return;
++	}
++	s_state = S_START;
++	s_deadline = W_NOW + 1500;
++}
++
++static void
++w_assoc_mgmt_rx(const uint8_t *f, uint32_t len)
++{
++	if (len < 26 || s_state == S_IDLE || memcmp(f + 10, s_bssid, 6) != 0) {
++		return;
++	}
++	uint8_t fc = f[0];
++	uint16_t v = (uint16_t)(f[24] | f[25] << 8);
++	if (fc == FC_AUTH && s_state == S_AUTH && len >= 30 && f[26] == 2) {
++		v = (uint16_t)(f[28] | f[29] << 8);
++		RLOG("join: auth reply status %u", v);
++		if (v != 0) {
++			w_join_end(ECONNREFUSED);
++			return;
++		}
++		s_state = S_ASSOC;
++		s_tries = 1;
++		w_build_assoc_req();
++		w_mgmt_tx(s_assoc_req, s_assoc_req_len);
++		s_deadline = W_NOW + 400;
++	} else if (fc == FC_ASSOC_RESP && s_state == S_ASSOC && len >= 30) {
++		v = (uint16_t)(f[26] | f[27] << 8);
++		s_aid = (uint32_t)(f[28] | f[29] << 8) & 0x3FFF;
++		RLOG("join: assoc reply status %u aid %u", v, s_aid);
++		if (v != 0) {
++			w_join_end(ECONNREFUSED);
++			return;
++		}
++		w_peer_assoc((uint32_t)(f[24] | f[25] << 8));
++		uint8_t m[20], *p = wmi_put_tlv(m, TAG_VDEV_UP, 16);
++		p = w_p32(p, 0);
++		p = w_p32(p, s_aid);
++		w_pmac(p, s_bssid);
++		wmi_send(CMD_VDEV_UP, m, sizeof(m));
++		if (!s_rsn) {
++			w_peer_param(PEER_PARAM_AUTHORIZE, 1);
++			s_state = S_4WAY;                   /* (teardown order) */
++			w_join_end(0);
++		} else {
++			s_state = S_4WAY;
++			s_deadline = W_NOW + 8000;
++			RLOG("join: associated, waiting for the 4-way handshake");
++		}
++	} else if (fc == FC_DEAUTH || fc == FC_DISASSOC) {
++		RLOG("join: the AP ended the link, reason %u (state %u)", v, s_state);
++		if (s_state == S_UP) {
++			w_teardown();
++		} else {
++			w_join_end(s_state == S_4WAY ? EAUTH : ECONNREFUSED);
++		}
++	}
++}
++
++static void
++w_join_event(uint32_t id, const uint8_t *t, uint32_t len)
++{
++	uint16_t l = 0;
++	uint32_t v[4] = {};
++	if (len >= 4) {
++		memcpy(&l, t, 2);
++	}
++	if (len < 4u + l) {
++		return;
++	}
++	memcpy(v, t + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
++	if (id == 0x5001 && l >= 16) {             /* VDEV_START_RESP {vdev, req, type, status} */
++		s_start_status = (int32_t)v[3];
++		s_start_resp = true;
++	} else if (id == 0x6001 && s_state == S_UP) {   /* PEER_STA_KICKOUT */
++		RLOG("join: peer kickout");
++		w_teardown();
++	}
++}
++
++/* every pass of the modem loop */
++static void
++w_join_poll(void)
++{
++	if (s_leave_asked) {
++		s_leave_asked = false;
++		w_teardown();
++	}
++	if (s_join_asked && !scanning) {
++		s_join_asked = false;
++		w_teardown();
++		w_join_begin();
++		return;
++	}
++	if (s_state == S_START) {
++		if (s_start_resp) {
++			if (s_start_status != 0) {
++				w_join_end(EIO);
++				return;
++			}
++			s_state = S_AUTH;
++			s_tries = 1;
++			w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, true);
++			w_send_auth();
++			s_deadline = W_NOW + 400;
++		} else if (W_NOW > s_deadline) {
++			w_join_end(ETIMEDOUT);
++		}
++	} else if ((s_state == S_AUTH || s_state == S_ASSOC) && W_NOW > s_deadline) {
++		if (s_tries >= 4) {
++			w_join_end(ETIMEDOUT);
++		} else {
++			s_tries++;
++			if (s_state == S_AUTH) {
++				w_send_auth();
++			} else {
++				w_mgmt_tx(s_assoc_req, s_assoc_req_len);
++			}
++			s_deadline = W_NOW + 400;
++		}
++	} else if (s_state == S_4WAY && W_NOW > s_deadline) {
++		RLOG("join: no 4-way handshake (%u message 1s)", s_msg1s);
++		w_join_end(s_msg1s != 0 ? EAUTH : ETIMEDOUT);
++	}
++}
++
++/* a received data frame (native wifi, from the HTT rx ring) */
++static void
++w_rx_native(const uint8_t *f, uint32_t len)
++{
++	uint8_t e[14 + 1600];
++	if (len < 24 + 8 || (f[0] & 0x0C) != 0x08) {
++		return;                                 /* data frames only */
++	}
++	uint32_t hl = ((f[1] & 3) == 3) ? 30 : 24;
++	const uint8_t *da = f + 4, *sa = (f[1] & 2) ? f + 16 : f + 10;   /* from DS: addr3 is the source */
++	const uint8_t *llc = f + hl;
++	if (len < hl + 8 || llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) {
++		return;
++	}
++	uint32_t plen = len - hl - 8;
++	if (plen > 1600 - 0) {
++		return;
++	}
++	memcpy(e, da, 6);
++	memcpy(e + 6, sa, 6);
++	memcpy(e + 12, llc + 6, 2);
++	memcpy(e + 14, llc + 8, plen);
++	if (e[12] == 0x88 && e[13] == 0x8E) {
++		w_eapol_rx(e, 14 + plen);
++		return;
++	}
++	if (s_state == S_UP && topaz_wlan_rx_hook != NULL) {
++		rx_up++;
++		topaz_wlan_rx_hook(e, 14 + plen);
++	}
++}
++
++/* ---- the C API */
++int topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len);
++int topaz_wlan_leave(void);
++bool topaz_wlan_joined(void);
++bool topaz_wlan_transmit(const uint8_t *frame, size_t length);
++int topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32]);
++static int w_join_with(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pmk);
++
++/* Blocks until joined or failed (EAUTH: wrong passphrase; ENOENT: not heard; ETIMEDOUT). */
++int
++topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len)
++{
++	static bool tested, crypto_ok;
++	if (!api_ready || ssid_len == 0 || ssid_len > 32) {
++		return api_ready ? EINVAL : ENXIO;
++	}
++	if (!tested) {
++		tested = true;
++		crypto_ok = w_crypto_selftest();
++	}
++	if (pass_len != 0 && (!crypto_ok || pass_len < 8 || pass_len > 63)) {
++		return crypto_ok ? EINVAL : EIO;
++	}
++	uint8_t pmk[32] = {};
++	if (pass_len != 0) {
++		w_pbkdf2_pmk(pass, pass_len, ssid, ssid_len, pmk);
++	}
++	int r = w_join_with(ssid, ssid_len, bssid, pass_len != 0 ? pmk : NULL);
++	bzero(pmk, sizeof(pmk));
++	return r;
++}
++
++/* the same with the PMK already made of the passphrase (what wifid hands over; ios-topaz 0130) */
++int
++topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32])
++{
++	if (!api_ready || ssid_len == 0 || ssid_len > 32) {
++		return api_ready ? EINVAL : ENXIO;
++	}
++	return w_join_with(ssid, ssid_len, bssid, pmk);
++}
++
++static int
++w_join_with(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pmk)
++{
++	while (s_state != S_IDLE && s_state != S_UP && s_join_asked) {
++		delay(50 * 1000);
++	}
++	memcpy(s_ssid, ssid, ssid_len);
++	s_ssid_len = (uint8_t)ssid_len;
++	if (bssid != NULL) {
++		memcpy(s_bssid, bssid, 6);
++	} else {
++		bzero(s_bssid, 6);
++	}
++	if (pmk != NULL) {
++		memcpy(s_pmk, pmk, 32);
++	} else {
++		bzero(s_pmk, 32);
++	}
++	uint32_t before = s_join_done;
++	s_join_asked = true;
++	for (int i = 0; i < 300 && s_join_done == before; i++) {   /* 30 s */
++		delay(100 * 1000);
++	}
++	return s_join_done != before ? s_result : ETIMEDOUT;
++}
++
++int
++topaz_wlan_leave(void)
++{
++	s_leave_asked = true;
++	return 0;
++}
++
++bool
++topaz_wlan_joined(void)
++{
++	return s_state == S_UP;
++}
++
++/* frames from the network stack wait here for the modem thread */
++#define ETXQ 32
++static struct { uint16_t len; uint8_t d[1514]; } etxq[ETXQ];
++static volatile uint32_t etxq_head, etxq_tail;
++static lck_spin_t *etxq_lock;
++
++bool
++topaz_wlan_transmit(const uint8_t *frame, size_t length)
++{
++	if (s_state != S_UP || length < 14 || length > 1514 || etxq_lock == NULL) {
++		return false;
++	}
++	bool ok = false;
++	lck_spin_lock(etxq_lock);
++	if (etxq_tail - etxq_head < ETXQ) {
++		uint32_t i = etxq_tail % ETXQ;
++		etxq[i].len = (uint16_t)length;
++		memcpy(etxq[i].d, frame, length);
++		etxq_tail++;
++		ok = true;
++	}
++	lck_spin_unlock(etxq_lock);
++	if (!ok) {
++		tx_drop++;
++	}
++	return ok;
++}
++
++static void
++w_tx_pump(void)
++{
++	static uint8_t one[1514];
++	for (int n = 0; n < 16 && etxq_head != etxq_tail; n++) {
++		uint16_t len;
++		lck_spin_lock(etxq_lock);
++		uint32_t i = etxq_head % ETXQ;
++		len = etxq[i].len;
++		memcpy(one, etxq[i].d, len);
++		lck_spin_unlock(etxq_lock);
++		if (s_state != S_UP || !w_tx_ether(one, len, false)) {
++			if (s_state != S_UP) {
++				lck_spin_lock(etxq_lock);
++				etxq_head = etxq_tail;          /* not joined: drop them */
++				lck_spin_unlock(etxq_lock);
++			}
++			break;
++		}
++		lck_spin_lock(etxq_lock);
++		etxq_head++;
++		lck_spin_unlock(etxq_lock);
++	}
++}
++static lck_grp_t *etxq_grp;
++
++/*
++ * Test without credentials: bluewifi_join=N asks to join net N (as logged, 1-based) after the first
++ * scan with no key: an open network joins; a WPA2 one gets through auth and association and to
++ * the handshake's message 1 (the data path's first received frame), then fails with EAUTH.
++ */
++static void
++w_join_test(void)
++{
++	static bool done;
++	static uint32_t joins = 1, left, end_seen, end_ms;
++	uint32_t n = 0;
++	if (done && left > 0 && s_state == S_IDLE && !s_join_asked) {
++		/* again, bluewifi_joins times in all, 3 s after each end: does a rejoin work after a teardown? */
++		if (end_seen != s_join_done) {
++			end_seen = s_join_done;
++			end_ms = W_NOW;
++		} else if (W_NOW > end_ms + 3000) {
++			left--;
++			RLOG("join test: again (%u of %u)", joins - left, joins);
++			s_join_asked = true;
++		}
++		return;
++	}
++	if (done || scans < 1 || scanning) {
++		return;
++	}
++	done = true;
++	(void)PE_parse_boot_argn("bluewifi_td", &w_td, sizeof(w_td));
++	(void)PE_parse_boot_argn("bluewifi_joins", &joins, sizeof(joins));
++	left = joins > 0 ? joins - 1 : 0;
++	end_seen = s_join_done;
++	(void)PE_parse_boot_argn("bluewifi_join", &n, sizeof(n));
++	if (nbss == 0) {
++		return;
++	}
++	if (n == 255) {					/* the strongest one heard (at home: our own) */
++		n = 1;
++		for (uint32_t i = 1; i < nbss; i++) {
++			if (bss[i].rssi > bss[n - 1].rssi) {
++				n = i + 1;
++			}
++		}
++	}
++	uint32_t oui = 0;
++	if (PE_parse_boot_argn("bluewifi_joinoui", &oui, sizeof(oui)) && oui != 0) {	/* the strongest with this prefix */
++		n = 0;
++		for (uint32_t i = 0; i < nbss; i++) {
++			uint32_t o = (uint32_t)bss[i].bssid[0] << 16 | (uint32_t)bss[i].bssid[1] << 8 | bss[i].bssid[2];
++			if (o == oui && (n == 0 || bss[i].rssi > bss[n - 1].rssi)) {
++				n = i + 1;
++			}
++		}
++	}
++	if (n == 0 || n > nbss) {
++		return;
++	}
++	(void)w_crypto_selftest();
++	memcpy(s_ssid, bss[n - 1].raw_ssid, bss[n - 1].raw_ssid_len);
++	s_ssid_len = bss[n - 1].raw_ssid_len;
++	memcpy(s_bssid, bss[n - 1].bssid, 6);
++	bzero(s_pmk, sizeof(s_pmk));
++	RLOG("join test: net %u, no key", n);
++	s_join_asked = true;
 +}
 +
 +static void
@@ -1375,6 +3714,10 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +		break;
 +	case WMI_EV_SCAN:
 +		scan_event(d + 4, len - 4);
++		break;
++	case 0x5001:				/* VDEV_START_RESP */
++	case 0x6001:				/* PEER_STA_KICKOUT */
++		w_join_event(id, d + 4, len - 4);
 +		break;
 +	case WMI_EV_MGMT_RX:
 +		scan_mgmt_rx(d + 4, len - 4);
@@ -1473,7 +3816,31 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +			echo_ms = echoes < 2 ? ms_since(wlfw_t0) + 10000 : 0;
 +		}
 +	}
-+	if (scan_started && !scanning && next_scan_ms != 0 && ms_since(wlfw_t0) >= next_scan_ms) {
++	if (scan_started && !api_ready) {
++		if (etxq_lock == NULL) {
++			etxq_grp = lck_grp_alloc_init("blueline-wlan", LCK_GRP_ATTR_NULL);
++			etxq_lock = lck_spin_alloc_init(etxq_grp, LCK_ATTR_NULL);
++		}
++		api_ready = true;
++		RLOG("wlan: radio ready for the rest of the kernel");
++		if (topaz_wlan_ready_hook != NULL) {
++			topaz_wlan_ready_hook();
++		}
++	}
++	if (api_ready) {
++		w_join_test();
++		w_join_poll();
++		w_tx_pump();
++	}
++	if (scan_started && !scanning && api_scan_asked && (s_state == S_IDLE || s_state == S_UP)) {
++		api_scan_asked = false;
++		next_scan_ms = 0;
++		scanning = scan_send_start();
++		if (!scanning) {
++			api_scans_done++;
++		}
++	}
++	if (scan_started && !scanning && next_scan_ms != 0 && ms_since(wlfw_t0) >= next_scan_ms && s_state == S_IDLE) {
 +		next_scan_ms = 0;
 +		scanning = scan_send_start();
 +		RLOG("scan: passive scan %u %s", scans + 1, scanning ? "requested" : "FAILED");
@@ -1493,23 +3860,54 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +}
 +
 +static bool
- wdog_pending(void)
- {
- 	return w2.gicd && ((rd(w2.gicd + 0x200 + 4 * (MSS_WDOG_INTID / 32)) >> (MSS_WDOG_INTID % 32)) & 1u);
-@@ -2457,6 +3861,9 @@
- 		}
- 		if (w2.level >= 4 && !gl.up && !crashed && last != 0xffffffffu && (last & MODEM_READY) && !link_tried) {
- 			link_tried = true;
++wdog_pending(void)
++{
++	return w2.gicd && ((rd(w2.gicd + 0x200 + 4 * (MSS_WDOG_INTID / 32)) >> (MSS_WDOG_INTID % 32)) & 1u);
++}
++
++static void
++watch_thread(__unused void *arg, __unused wait_result_t wres)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint32_t last = 0xffffffffu, v, fl, ver;
++	bool wd = false, crashed = false, link_tried = false;
++
++	if (w2.watch_s == 0) {
++		printf("BLUELINE WIFI: watcher: following the modem for good (bluewifi_watch=0)\n");
++	} else {
++		printf("BLUELINE WIFI: watcher: following the modem for %u s\n", w2.watch_s);
++	}
++	while (w2.watch_s == 0 || ms_since(t0) < w2.watch_s * 1000u) {
++		if (smp2p_in_state(&v, &fl, &ver)) {
++			smp2p_service(fl, ver);
++			if (v != last) {
++				printf("BLUELINE WIFI: [+%u ms] modem state %#x%s%s%s%s\n", ms_since(t0), v,
++				    v & MODEM_FATAL ? " ERR-FATAL" : "", v & MODEM_READY ? " ready" : "",
++				    v & MODEM_HANDOVER ? " handover" : "", v & MODEM_STOP_ACK ? " stop-ack" : "");
++				last = v;
++			}
++			if ((v & MODEM_FATAL) && !crashed) {
++				crashed = true;
++				crash_reason();
++			}
++		}
++		if (w2.level >= 4 && !gl.up && !crashed && last != 0xffffffffu && (last & MODEM_READY) && !link_tried) {
++			link_tried = true;
 +			if (w2.level >= 6 && !radio_smmu_ok) {
 +				radio_smmu_ok = radio_smmu();	/* before the WLAN block is powered */
 +			}
- 			if (w2.level >= 5 && !wf.powered) {
- 				wf.powered = wlan_power();
- 			}
-@@ -2469,9 +3876,20 @@
- 			int e = wlfw_start();
- 			printf("BLUELINE WIFI: wlfw: %s (%d) after %u ms\n", e ? "stopped" : "chip up, mission mode", e,
- 			    ms_since(wlfw_t0));
++			if (w2.level >= 5 && !wf.powered) {
++				wf.powered = wlan_power();
++			}
++			(void)link_up();
++		}
++		if (w2.level >= 5 && gl.up && wlfw_srv_seen && !wf.started && !crashed) {
++			wf.started = true;
++			wf.node = wlfw_srv_node;
++			wf.port = wlfw_srv_port;
++			int e = wlfw_start();
++			printf("BLUELINE WIFI: wlfw: %s (%d) after %u ms\n", e ? "stopped" : "chip up, mission mode", e,
++			    ms_since(wlfw_t0));
 +			if (e == 0 && w2.level >= 6) {
 +				if (!radio_smmu_ok) {
 +					printf("BLUELINE WIFI: radio: no SMMU path for the WLAN stream: copy engines left alone\n");
@@ -1518,20 +3916,982 @@ L25a (WLAN chain 0) is now 3.312 V, as in sdm845-google-common.dtsi
 +					(void)ce_start();
 +				}
 +			}
- 		}
- 		if (gl.up) {
- 			link_poll();
++		}
++		if (gl.up) {
++			link_poll();
 +		}
 +		if (ce_up) {
 +			radio_poll();
- 		}
- 		if (!wd && wdog_pending()) {
- 			wd = true;
-@@ -2485,6 +3903,7 @@
- 		printf("BLUELINE WIFI: rmtfs: %u reads (%u sectors), %u writes dropped (%u sectors)\n", rf.reads, rf.read_sectors,
- 		    rf.writes, rf.write_sectors);
- 	}
++		}
++		if (!wd && wdog_pending()) {
++			wd = true;
++			printf("BLUELINE WIFI: [+%u ms] modem watchdog (SPI 266) pending\n", ms_since(t0));
++			crash_reason();
++		}
++		delay(gl.up ? 5000 : 100000);
++	}
++	if (gl.up) {
++		printf("BLUELINE WIFI: glink: %u servers announced, %d modem intents\n", gl.servers, gl.nri);
++		printf("BLUELINE WIFI: rmtfs: %u reads (%u sectors), %u writes dropped (%u sectors)\n", rf.reads, rf.read_sectors,
++		    rf.writes, rf.write_sectors);
++	}
 +	radio_summary();
- 	printf("BLUELINE WIFI: watcher done: last state %#x, rmb mba_status %d\n", last, (int32_t)rd(w2.rmb + RMB_MBA_STATUS));
- }
- 
++	printf("BLUELINE WIFI: watcher done: last state %#x, rmb mba_status %d\n", last, (int32_t)rd(w2.rmb + RMB_MBA_STATUS));
++}
++
++/* ---- AOP QMP (qcom_aoss.c) ---- */
++
++static bool
++qmp_wait(uint32_t reg, uint32_t want, const char *what)
++{
++	uint32_t v;
++	if (poll32(w2.qmp + reg, 0xffffffffu, want, 1000, &v)) {
++		return true;
++	}
++	printf("BLUELINE WIFI: qmp: %s timed out (%#x)\n", what, v);
++	return false;
++}
++
++static bool
++qmp_open(void)
++{
++	printf("BLUELINE WIFI: about to read the AOP QMP descriptor at %#x\n", QMP_PA);
++	uint32_t magic = rd(w2.qmp), ver = rd(w2.qmp + 4);
++	w2.qmp_off = rd(w2.qmp + QMP_MCORE_MBOX_OFF);
++	w2.qmp_size = rd(w2.qmp + QMP_MCORE_MBOX_SIZE);
++	printf("BLUELINE WIFI: qmp magic %#x version %u mbox %#x+%#x links ucore %#x mcore %#x/%#x ch ucore %#x mcore %#x/%#x\n",
++	    magic, ver, w2.qmp_off, w2.qmp_size, rd(w2.qmp + QMP_UCORE_LINK), rd(w2.qmp + QMP_MCORE_LINK),
++	    rd(w2.qmp + QMP_MCORE_LINK_ACK), rd(w2.qmp + QMP_UCORE_CH), rd(w2.qmp + QMP_MCORE_CH), rd(w2.qmp + QMP_MCORE_CH_ACK));
++	if (magic != QMP_MAGIC || ver != 1 || w2.qmp_size < QMP_MSG_LEN + 4 || w2.qmp_off < 0x40 ||
++	    w2.qmp_off + QMP_MSG_LEN + 4 > 0x400) {
++		printf("BLUELINE WIFI: qmp descriptor not usable\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++qmp_link(void)
++{
++	wr(w2.qmp + QMP_UCORE_LINK_ACK, rd(w2.qmp + QMP_UCORE_LINK));
++	wr(w2.qmp + QMP_MCORE_LINK, QMP_UP);
++	printf("BLUELINE WIFI: about to ring APCS IPC bit %u (AOP)\n", IPC_AOP);
++	kick(IPC_AOP);
++	if (!qmp_wait(QMP_MCORE_LINK_ACK, QMP_UP, "link ack")) {
++		return false;
++	}
++	wr(w2.qmp + QMP_MCORE_CH, QMP_UP);
++	kick(IPC_AOP);
++	if (!qmp_wait(QMP_UCORE_CH, QMP_UP, "ucore channel")) {
++		return false;
++	}
++	wr(w2.qmp + QMP_UCORE_CH_ACK, QMP_UP);
++	kick(IPC_AOP);
++	return qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, "channel ack");
++}
++
++static bool
++qmp_send(const char *msg)
++{
++	char buf[QMP_MSG_LEN] = { 0 };
++	strlcpy(buf, msg, sizeof(buf));
++	for (uint32_t i = 0; i < QMP_MSG_LEN; i += 4) {
++		uint32_t x;
++		memcpy(&x, buf + i, 4);
++		wr(w2.qmp + w2.qmp_off + 4 + i, x);
++	}
++	wr(w2.qmp + w2.qmp_off, QMP_MSG_LEN);
++	(void)rd(w2.qmp + w2.qmp_off);
++	kick(IPC_AOP);
++	uint32_t v;
++	bool ok = poll32(w2.qmp + w2.qmp_off, 0xffffffffu, 0, 1000, &v);
++	if (!ok) {
++		wr(w2.qmp + w2.qmp_off, 0);
++	}
++	printf("BLUELINE WIFI: qmp \"%s\": %s\n", msg, ok ? "acked" : "NOT acked (cleared)");
++	return ok;
++}
++
++/* ---- RPMh votes (rpmhpd: ARC level index; clk-rpmh: xo.lvl on = 3) ---- */
++
++static int
++arc_levels(const char *id, uint16_t *lv, int max, uint32_t *addr)
++{
++	uint8_t b[64] = { 0 };
++	*addr = blueline_cmddb_addr(id);
++	uint32_t len = blueline_cmddb_aux(id, b, sizeof(b));
++	int n = (int)(MIN(len, (uint32_t)sizeof(b)) / 2);
++	if (n > max) {
++		n = max;
++	}
++	for (int i = 0; i < n; i++) {
++		lv[i] = (uint16_t)(b[2 * i] | b[2 * i + 1] << 8);
++	}
++	while (n > 0 && !lv[n - 1]) {
++		n--;
++	}
++	printf("BLUELINE WIFI: cmd-db %s at %#x, %d levels:", id, *addr, n);
++	for (int i = 0; i < n; i++) {
++		printf(" %u", lv[i]);
++	}
++	printf("\n");
++	return n;
++}
++
++/* The lowest level index whose voltage level is >= vlvl (downstream rpmh-regulator), else the top one. */
++static bool
++arc_vote(const char *id, uint32_t vlvl, bool dry)
++{
++	uint16_t lv[32];
++	uint32_t a;
++	int n = arc_levels(id, lv, 32, &a), i;
++	if (!a || n <= 0) {
++		printf("BLUELINE WIFI: %s not in cmd-db: not voted\n", id);
++		return false;
++	}
++	for (i = 0; i < n - 1 && lv[i] < vlvl; i++) {
++	}
++	uint32_t data = (uint32_t)i;
++	if (dry) {
++		printf("BLUELINE WIFI: would vote %s = index %u (level %u)\n", id, data, lv[i]);
++		return true;
++	}
++	printf("BLUELINE WIFI: about to RPMh %s (%#x) = index %u (level %u)\n", id, a, data, lv[i]);
++	int err = blueline_rpmh_write(&a, &data, 1);
++	printf("BLUELINE WIFI: RPMh %s err=%d\n", id, err);
++	return err == 0;
++}
++
++/* ---- GCC (gcc-sdm845.c) ---- */
++
++static bool
++branch_on(const char *what, uint32_t cbcr, bool check)
++{
++	uint32_t v = rd(w2.gcc + cbcr);
++	if (!(v & 1u)) {
++		wr(w2.gcc + cbcr, v | 1u);
++	}
++	if (!check) {
++		printf("BLUELINE WIFI: gcc %s %#x -> %#x (voted, no halt check)\n", what, v, rd(w2.gcc + cbcr));
++		return true;
++	}
++	bool ok = poll32(w2.gcc + cbcr, 1u << 31, 0, 10, &v);
++	printf("BLUELINE WIFI: gcc %s -> %#x %s\n", what, v, ok ? "on" : "STILL OFF");
++	return ok;
++}
++
++static bool
++clocks_on(void)
++{
++	printf("BLUELINE WIFI: about to write GCC vote %#x |= boot_rom, prng, gpll0_mss\n", GCC_PA + GCC_VOTE);
++	uint32_t vote = rd(w2.gcc + GCC_VOTE);
++	wr(w2.gcc + GCC_VOTE, vote | (1u << 10) | (1u << 13) | (1u << 17));
++	delay(1);
++	uint32_t v;
++	bool ok = poll32(w2.gcc + GCC_BOOT_ROM_HALT, 1u << 31, 0, 10, &v);
++	printf("BLUELINE WIFI: gcc votes %#x -> %#x, boot_rom %#x%s\n", vote, rd(w2.gcc + GCC_VOTE), v, ok ? "" : " STILL OFF");
++	ok &= poll32(w2.gcc + GCC_PRNG_HALT, 1u << 31, 0, 10, &v);
++	printf("BLUELINE WIFI: gcc prng %#x\n", v);
++	ok &= branch_on("mss_cfg_ahb (iface)", GCC_MSS_CFG_AHB, true);
++	ok &= branch_on("mss_snoc_axi", GCC_MSS_SNOC_AXI, true);
++	ok &= branch_on("mss_q6_memnoc_axi (bus)", GCC_MSS_Q6_MEMNOC_AXI, false);
++	ok &= branch_on("mss_mfab_axis (mnoc_axi)", GCC_MSS_MFAB_AXIS, false);
++	return ok;
++}
++
++/* ---- resets (q6v5_reset_assert/deassert with has_alt_reset; pil_mss_assert/deassert_resets) ---- */
++
++static void
++pdc_sync(bool on)
++{
++	uint32_t v = rd(w2.pdc + PDC_SYNC_RESET);
++	wr(w2.pdc + PDC_SYNC_RESET, on ? (v | PDC_MODEM_BIT) : (v & ~PDC_MODEM_BIT));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(2);
++}
++
++static void
++mss_reset_pulse(bool alt)
++{
++	pdc_sync(true);
++	delay(200);
++	if (alt) {
++		wr(w2.rmb + RMB_MBA_ALT_RESET, 1);
++		delay(2);
++	}
++	wr(w2.aoss, 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(200);
++	wr(w2.aoss, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(200);
++	if (alt) {
++		wr(w2.rmb + RMB_MBA_ALT_RESET, 0);
++		delay(2);
++	}
++	pdc_sync(false);
++}
++
++static void
++halt_port(const char *what, vm_offset_t h)
++{
++	uint32_t v;
++	if (rd(h + AXI_IDLE)) {
++		printf("BLUELINE WIFI: axi %s already idle\n", what);
++		return;
++	}
++	wr(h + AXI_HALTREQ, 1);
++	bool ok = poll32(h + AXI_HALTACK, 0xffffffffu, 1, 100, &v) || v;
++	printf("BLUELINE WIFI: axi %s halt ack %#x%s, idle %#x\n", what, v, ok ? "" : " (timed out)", rd(h + AXI_IDLE));
++	wr(h + AXI_HALTREQ, 0);
++}
++
++/* q6v5_mba_reclaim / the halt_axi_ports path: stop the Q6, give the memory back if we know its state. */
++static void
++fail_stop(const char *why)
++{
++	printf("BLUELINE WIFI: FAILED: %s; rmb pbl %#x mba_status %d mss_status %#x\n", why, rd(w2.rmb + RMB_PBL_STATUS),
++	    (int32_t)rd(w2.rmb + RMB_MBA_STATUS), rd(w2.rmb + RMB_MBA_MSS_STATUS));
++	if (w2.q6_started) {
++		printf("BLUELINE WIFI: halting the modem AXI ports and resetting the MSS\n");
++		halt_port("q6", w2.halt_q6);
++		halt_port("modem", w2.halt_modem);
++		halt_port("nc", w2.halt_nc);
++		mss_reset_pulse(false);
++		w2.q6_started = false;
++	}
++	(void)assign("mpss (reclaim)", MPSS_PA, MPSS_SIZE, &w2.mpss_own, true, false);
++	(void)assign("mba (reclaim)", MBA_PA, MBA_SIZE, &w2.mba_own, true, false);
++	(void)assign("metadata (reclaim)", MDATA_PA, MDATA_SIZE, &w2.mdata_own, true, false);
++	printf("BLUELINE WIFI: ownership now mpss %#x mba %#x metadata %#x (8 = HLOS; RPMh votes and clocks left on)\n",
++	    w2.mpss_own, w2.mba_own, w2.mdata_own);
++}
++
++/* ---- the firmware: FAT16 in the modem partition (read only) ---- */
++
++struct fat {
++	uint32_t bps, clus;		/* bytes per sector, per cluster */
++	uint64_t root_off, data_off;
++	uint32_t root_bytes, nclus;
++	uint16_t *tab;
++	uint32_t tab_bytes;
++};
++
++struct ffile {
++	uint32_t clus, size;
++};
++
++static struct fat fs;
++
++static int
++part_read(uint64_t off, void *buf, uint32_t len)
++{
++	return sweet_ufs_read_part(w2.part, off, buf, len, NULL);
++}
++
++static uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static bool
++fat_open(void)
++{
++	uint8_t bs[512];
++	uint64_t pbytes = 0;
++	printf("BLUELINE WIFI: about to read %s (read only, UFS LUN 0) boot sector\n", w2.part);
++	int err = sweet_ufs_read_part(w2.part, 0, bs, sizeof(bs), &pbytes);
++	if (err) {
++		printf("BLUELINE WIFI: %s: read error %d\n", w2.part, err);
++		return false;
++	}
++	uint32_t bps = le16(bs + 11), spc = bs[13], rsvd = le16(bs + 14), nfats = bs[16], rootent = le16(bs + 17);
++	uint32_t spf = le16(bs + 22), tot = le16(bs + 19) ? le16(bs + 19) : le32(bs + 32);
++	printf("BLUELINE WIFI: %s %llu MiB: bps %u spc %u reserved %u fats %u root %u spf %u sectors %u sig %02x%02x\n",
++	    w2.part, pbytes >> 20, bps, spc, rsvd, nfats, rootent, spf, tot, bs[510], bs[511]);
++	if (bs[510] != 0x55 || bs[511] != 0xaa || bps < 512 || bps > 4096 || (bps & (bps - 1)) || !spc || (spc & (spc - 1)) ||
++	    !nfats || nfats > 2 || !rootent || !spf || !tot || (uint64_t)tot * bps > pbytes) {
++		printf("BLUELINE WIFI: %s is not a FAT16 volume we can read\n", w2.part);
++		return false;
++	}
++	fs.bps = bps;
++	fs.clus = bps * spc;
++	fs.root_off = (uint64_t)(rsvd + nfats * spf) * bps;
++	fs.root_bytes = rootent * 32;
++	fs.data_off = fs.root_off + (fs.root_bytes + bps - 1) / bps * bps;
++	if (fs.data_off / bps >= tot) {
++		printf("BLUELINE WIFI: %s: data area past the end of the volume\n", w2.part);
++		return false;
++	}
++	uint64_t data_secs = tot - (fs.data_off / bps);
++	fs.nclus = (uint32_t)(data_secs / spc);
++	fs.tab_bytes = spf * bps;
++	if (fs.nclus < 4085 || fs.nclus >= 65525 || fs.tab_bytes < (fs.nclus + 2) * 2 || fs.tab_bytes > (256u << 10)) {
++		printf("BLUELINE WIFI: %s: %u clusters, FAT %u bytes: not FAT16\n", w2.part, fs.nclus, fs.tab_bytes);
++		return false;
++	}
++	fs.tab = kalloc_data(fs.tab_bytes, Z_WAITOK | Z_ZERO);
++	if (!fs.tab || part_read((uint64_t)rsvd * bps, fs.tab, fs.tab_bytes)) {
++		printf("BLUELINE WIFI: %s: cannot read the FAT\n", w2.part);
++		return false;
++	}
++	printf("BLUELINE WIFI: %s: FAT16, %u clusters of %u bytes, data at %#llx\n", w2.part, fs.nclus, fs.clus, fs.data_off);
++	return true;
++}
++
++static uint32_t
++fat_next(uint32_t c)
++{
++	return (c >= 2 && c < fs.nclus + 2) ? fs.tab[c] : 0xffffu;
++}
++
++static bool
++clus_ok(uint32_t c)
++{
++	return c >= 2 && c < fs.nclus + 2;
++}
++
++/* Read len bytes at off of a file (or a directory: size 0 = follow the chain). */
++static int
++fat_read(const struct ffile *f, uint32_t off, void *dst, uint32_t len)
++{
++	uint8_t *d = dst;
++	uint32_t c = f->clus, skip = off / fs.clus, steps = 0;
++	if (f->size && (off > f->size || len > f->size - off)) {
++		return EINVAL;
++	}
++	while (skip--) {
++		c = fat_next(c);
++		if (!clus_ok(c) || ++steps > fs.nclus) {
++			return EIO;
++		}
++	}
++	off %= fs.clus;
++	while (len) {
++		if (!clus_ok(c)) {
++			return EIO;
++		}
++		/* a run of consecutive clusters, one read */
++		uint32_t first = c, n = 1;
++		while ((uint64_t)n * fs.clus - off < len && fat_next(c) == c + 1 && n < (LOAD_WINDOW / fs.clus)) {
++			c++;
++			n++;
++		}
++		uint32_t take = MIN(len, n * fs.clus - off);
++		int err = part_read(fs.data_off + (uint64_t)(first - 2) * fs.clus + off, d, take);
++		if (err) {
++			return err;
++		}
++		d += take;
++		len -= take;
++		off = 0;
++		c = fat_next(c);
++		if (++steps > fs.nclus) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++static bool
++dir_find(const uint8_t *dir, uint32_t bytes, const char name11[11], bool want_dir, struct ffile *f)
++{
++	for (uint32_t o = 0; o + 32 <= bytes; o += 32) {
++		const uint8_t *e = dir + o;
++		if (e[0] == 0) {
++			break;
++		}
++		if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x08)) {
++			continue;
++		}
++		if (memcmp(e, name11, 11) == 0 && !!(e[11] & 0x10) == want_dir) {
++			f->clus = (uint32_t)le16(e + 26) | (uint32_t)le16(e + 20) << 16;
++			f->size = le32(e + 28);
++			return true;
++		}
++	}
++	return false;
++}
++
++static uint8_t *image_dir;
++static uint32_t image_dir_bytes;
++
++static bool
++fw_find(const char name11[11], struct ffile *f)
++{
++	if (!dir_find(image_dir, image_dir_bytes, name11, false, f) || !clus_ok(f->clus)) {
++		printf("BLUELINE WIFI: /IMAGE/%.8s.%.3s not found\n", name11, name11 + 8);
++		return false;
++	}
++	return true;
++}
++
++static bool
++fw_open(void)
++{
++	if (!fat_open()) {
++		return false;
++	}
++	uint8_t *root = kalloc_data(fs.root_bytes, Z_WAITOK | Z_ZERO);
++	struct ffile d;
++	if (!root || part_read(fs.root_off, root, fs.root_bytes) || !dir_find(root, fs.root_bytes, "IMAGE      ", true, &d)) {
++		printf("BLUELINE WIFI: %s: no /IMAGE directory\n", w2.part);
++		if (root) {
++			kfree_data(root, fs.root_bytes);
++		}
++		return false;
++	}
++	kfree_data(root, fs.root_bytes);
++	image_dir_bytes = MIN(64u << 10, ((64u << 10) / fs.clus) * fs.clus);
++	image_dir = kalloc_data(image_dir_bytes, Z_WAITOK | Z_ZERO);
++	if (!image_dir) {
++		return false;
++	}
++	/* the directory chain, up to 64 KiB */
++	uint32_t c = d.clus, got = 0;
++	while (clus_ok(c) && got + fs.clus <= image_dir_bytes) {
++		if (part_read(fs.data_off + (uint64_t)(c - 2) * fs.clus, image_dir + got, fs.clus)) {
++			return false;
++		}
++		got += fs.clus;
++		c = fat_next(c);
++	}
++	image_dir_bytes = got;
++	printf("BLUELINE WIFI: /IMAGE: cluster %u, %u bytes of entries\n", d.clus, got);
++	return got > 0;
++}
++
++static uint8_t *
++fw_load(const char name11[11], uint32_t max, uint32_t *len)
++{
++	struct ffile f;
++	if (!fw_find(name11, &f)) {
++		return NULL;
++	}
++	if (!f.size || f.size > max) {
++		printf("BLUELINE WIFI: /IMAGE/%.8s.%.3s: %u bytes, want 1..%u\n", name11, name11 + 8, f.size, max);
++		return NULL;
++	}
++	uint8_t *b = kalloc_data(f.size, Z_WAITOK | Z_ZERO);
++	if (!b || fat_read(&f, 0, b, f.size)) {
++		printf("BLUELINE WIFI: /IMAGE/%.8s.%.3s: read failed\n", name11, name11 + 8);
++		return NULL;
++	}
++	*len = f.size;
++	return b;
++}
++
++/* ---- the MDT: program headers (qcom_mdt_read_metadata, q6v5_phdr_valid, q6v5_mpss_load checks) ---- */
++
++struct phdr32 {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++static const struct phdr32 *
++mdt_phdrs(uint32_t *n)
++{
++	const uint8_t *e = w2.mdt;
++	if (w2.mdt_len < 52 || memcmp(e, "\177ELF", 4) || e[4] != 1 || le16(e + 18) != 164 /* EM_QDSP6 */) {
++		printf("BLUELINE WIFI: MODEM.MDT is not a 32-bit Hexagon ELF\n");
++		return NULL;
++	}
++	uint32_t phoff = le32(e + 28), phnum = le16(e + 44), phent = le16(e + 42);
++	if (phent != 32 || phnum < 2 || phnum > PHDR_MAX || phoff > w2.mdt_len || phnum * 32 > w2.mdt_len - phoff || (phoff & 3)) {
++		printf("BLUELINE WIFI: MODEM.MDT program headers %u x %u at %#x: bad\n", phnum, phent, phoff);
++		return NULL;
++	}
++	*n = phnum;
++	return (const struct phdr32 *)(const void *)(e + phoff);
++}
++
++static bool
++seg_valid(const struct phdr32 *p)
++{
++	return p->type == PT_LOAD_ && (p->flags & MDT_TYPE_MASK) != MDT_TYPE_HASH && p->memsz;
++}
++
++/*
++ * Checks everything stage 2 relies on. *meta_len = header + hash, *hash_at = where the hash is in the
++ * .mdt, *reloc = the address that maps to MPSS_PA, *boot = RMB code start (q6v5_mpss_load).
++ */
++static bool
++mdt_check(uint32_t *meta_len, uint32_t *hash_at, uint32_t *reloc, uint32_t *boot, uint64_t *segbytes)
++{
++	uint32_t n, hash = 0, minpa = 0xffffffffu, maxpa = 0;
++	bool relocatable = false;
++	const struct phdr32 *ph = mdt_phdrs(&n);
++	if (!ph) {
++		return false;
++	}
++	if (ph[0].type == PT_LOAD_) {
++		return false;
++	}
++	for (uint32_t i = 1; i < n && !hash; i++) {
++		if ((ph[i].flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++			hash = i;
++		}
++	}
++	if (!hash) {
++		printf("BLUELINE WIFI: MODEM.MDT: no hash segment\n");
++		return false;
++	}
++	uint32_t ehdr = ph[0].filesz, hsz = ph[hash].filesz;
++	/* the split-firmware case: header and hash packed in the .mdt (mdt_loader) */
++	if (ehdr + hsz == w2.mdt_len) {
++		*hash_at = ehdr;
++	} else if (ehdr <= w2.mdt_len && ph[hash].offset <= w2.mdt_len && hsz <= w2.mdt_len - ph[hash].offset) {
++		*hash_at = ph[hash].offset;
++	} else {
++		printf("BLUELINE WIFI: MODEM.MDT: header %#x + hash %#x not in the %u-byte file\n", ehdr, hsz, w2.mdt_len);
++		return false;
++	}
++	if (ehdr + hsz > MDATA_SIZE) {
++		printf("BLUELINE WIFI: metadata %#x bytes > %#x\n", ehdr + hsz, MDATA_SIZE);
++		return false;
++	}
++	*meta_len = ehdr + hsz;
++	*segbytes = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		if (!seg_valid(&ph[i])) {
++			continue;
++		}
++		relocatable |= (ph[i].flags & MDT_RELOCATABLE) != 0;
++		minpa = MIN(minpa, ph[i].paddr);
++		maxpa = MAX(maxpa, ph[i].paddr + ph[i].memsz);
++	}
++	*reloc = relocatable ? minpa : MPSS_PA;
++	*boot = relocatable ? MPSS_PA : minpa;
++	for (uint32_t i = 0; i < n; i++) {
++		if (!seg_valid(&ph[i])) {
++			continue;
++		}
++		uint64_t off = (uint64_t)ph[i].paddr - *reloc;
++		if (ph[i].paddr < *reloc || off + ph[i].memsz > MPSS_SIZE || ph[i].filesz > ph[i].memsz) {
++			printf("BLUELINE WIFI: segment %u %#x+%#x/%#x outside the MPSS region\n", i, ph[i].paddr, ph[i].filesz, ph[i].memsz);
++			return false;
++		}
++		if (ph[i].filesz) {
++			char nm[12];
++			struct ffile f = { 0, 0 };
++			snprintf(nm, sizeof(nm), "MODEM   B%02u", i);
++			if (!fw_find(nm, &f) || f.size != ph[i].filesz) {
++				printf("BLUELINE WIFI: MODEM.B%02u: %u bytes, the header says %u\n", i, f.size, ph[i].filesz);
++				return false;
++			}
++		}
++		*segbytes += ph[i].filesz;
++	}
++	printf("BLUELINE WIFI: MODEM.MDT: %u phdrs, hash in %u, metadata %#x bytes, %s, %#x..%#x, %llu bytes of segments\n",
++	    n, hash, *meta_len, relocatable ? "relocatable" : "fixed", minpa, maxpa, *segbytes);
++	return true;
++}
++
++/* Copy (or zero) [pa, pa + len) of a carve-out through write-combined windows that are unmapped again. */
++static int
++fill_region(uint64_t pa, const struct ffile *src, uint32_t filesz, uint32_t memsz, const uint8_t *from_buf)
++{
++	for (uint32_t done = 0; done < memsz;) {
++		uint32_t len = MIN(LOAD_WINDOW, memsz - done);
++		uint64_t wpa = pa + done, mpa = trunc_page_64(wpa);
++		vm_size_t moff = (vm_size_t)(wpa - mpa), msz = round_page(moff + len);
++		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)mpa, msz, VM_WIMG_WCOMB);
++		if (!va) {
++			return ENOMEM;
++		}
++		uint8_t *w = (uint8_t *)(trunc_page(va) + moff);
++		uint32_t fpart = done < filesz ? MIN(len, filesz - done) : 0;
++		int err = 0;
++		if (fpart) {
++			if (from_buf) {
++				memcpy(w, from_buf + done, fpart);
++			} else {
++				err = fat_read(src, done, w, fpart);
++			}
++		}
++		/* the rest of the window: zero, byte-exact (bss of the segment) */
++		uint32_t o = err ? len : fpart;
++		for (; o < len && (o & 3u); o++) {
++			*(volatile uint8_t *)(w + o) = 0;
++		}
++		for (; o + 4 <= len; o += 4) {
++			*(volatile uint32_t *)(void *)(w + o) = 0;
++		}
++		for (; o < len; o++) {
++			*(volatile uint8_t *)(w + o) = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(trunc_page(va), msz);
++		if (err) {
++			return err;
++		}
++		done += len;
++	}
++	return 0;
++}
++
++/* ---- the steps ---- */
++
++static bool
++step1_reads(void)
++{
++	uint32_t v;
++
++	w2.gcc = map_block("GCC", GCC_PA, GCC_SIZE);
++	w2.qdsp6 = map_block("QDSP6SS", QDSP6_PA, 0x1000);
++	w2.rmb = map_block("RMB", RMB_PA, 0x1000);
++	w2.aoss = map_block("AOSS MSS restart", AOSS_MSS_RESTART_PA, 0x1000);
++	w2.pdc = map_block("PDC sync reset", PDC_RESET_PA, PDC_RESET_SIZE);
++	w2.halt_q6 = map_block("TCSR halt_q6", TCSR_HALT_Q6_PA, 0x1000);
++	w2.halt_nc = map_block("TCSR halt_nc", TCSR_HALT_NC_PA, 0x1000);
++	w2.halt_modem = map_block("TCSR halt_modem", TCSR_HALT_MODEM_PA, 0x1000);
++	w2.apcs = map_block("APCS IPC", APCS_PA, 0x1000);
++	w2.qmp = map_block("AOP QMP", QMP_PA, 0x400);
++	w2.mutex = map_block("TCSR mutex 3", TCSR_MUTEX3_PA, 0x1000);
++	w2.smem = map_block("SMEM", SMEM_PA, SMEM_SIZE);
++	w2.gicd = map_block("GICD", GICD_PA, 0x1000);
++	if (!w2.gcc || !w2.qdsp6 || !w2.rmb || !w2.aoss || !w2.pdc || !w2.halt_q6 || !w2.halt_nc || !w2.halt_modem ||
++	    !w2.apcs || !w2.qmp || !w2.mutex || !w2.smem || !w2.gicd) {
++		return false;
++	}
++
++	printf("BLUELINE WIFI: about to read GCC mss_cfg_ahb\n");
++	uint32_t ahb = rd(w2.gcc + GCC_MSS_CFG_AHB);
++	printf("BLUELINE WIFI: gcc mss_cfg_ahb %#x (%s) snoc_axi %#x q6_memnoc_axi %#x mfab_axis %#x votes %#x\n", ahb,
++	    (ahb & 1u) && !(ahb >> 31) ? "on" : "OFF", rd(w2.gcc + GCC_MSS_SNOC_AXI), rd(w2.gcc + GCC_MSS_Q6_MEMNOC_AXI),
++	    rd(w2.gcc + GCC_MSS_MFAB_AXIS), rd(w2.gcc + GCC_VOTE));
++
++	printf("BLUELINE WIFI: about to read PDC sync reset %#x\n", PDC_RESET_PA + PDC_SYNC_RESET);
++	v = rd(w2.pdc + PDC_SYNC_RESET);
++	printf("BLUELINE WIFI: pdc sync_reset %#x (modem %u)\n", v, (v >> 9) & 1);
++
++	printf("BLUELINE WIFI: about to read AOSS MSS restart %#x\n", AOSS_MSS_RESTART_PA);
++	printf("BLUELINE WIFI: aoss mss_restart %#x\n", rd(w2.aoss));
++
++	if ((ahb & 1u) && !(ahb >> 31)) {
++		printf("BLUELINE WIFI: about to read RMB %#x\n", RMB_PA);
++		printf("BLUELINE WIFI: rmb image %#x pbl %#x cmd %#x mba_status %d meta %#x code %#x+%#x mss_status %#x alt_reset %#x\n",
++		    rd(w2.rmb + RMB_MBA_IMAGE), rd(w2.rmb + RMB_PBL_STATUS), rd(w2.rmb + RMB_MBA_COMMAND),
++		    (int32_t)rd(w2.rmb + RMB_MBA_STATUS), rd(w2.rmb + RMB_PMI_META_DATA), rd(w2.rmb + RMB_PMI_CODE_START),
++		    rd(w2.rmb + RMB_PMI_CODE_LENGTH), rd(w2.rmb + RMB_MBA_MSS_STATUS), rd(w2.rmb + RMB_MBA_ALT_RESET));
++		printf("BLUELINE WIFI: about to read QDSP6SS %#x\n", QDSP6_PA);
++		printf("BLUELINE WIFI: qdsp6ss sleep %#x boot_core_start %#x boot_cmd %#x\n", rd(w2.qdsp6 + QDSP6SS_SLEEP),
++		    rd(w2.qdsp6 + QDSP6SS_BOOT_CORE_START), rd(w2.qdsp6 + QDSP6SS_BOOT_CMD));
++	} else {
++		printf("BLUELINE WIFI: mss_cfg_ahb off: RMB/QDSP6SS reads wait for step 2\n");
++	}
++
++	printf("BLUELINE WIFI: about to read TCSR halt_q6 %#x\n", TCSR_HALT_Q6_PA);
++	printf("BLUELINE WIFI: axi q6 req %#x ack %#x idle %#x\n", rd(w2.halt_q6), rd(w2.halt_q6 + 4), rd(w2.halt_q6 + 8));
++	printf("BLUELINE WIFI: about to read TCSR halt_modem %#x\n", TCSR_HALT_MODEM_PA);
++	printf("BLUELINE WIFI: axi modem req %#x ack %#x idle %#x\n", rd(w2.halt_modem), rd(w2.halt_modem + 4), rd(w2.halt_modem + 8));
++	printf("BLUELINE WIFI: about to read TCSR halt_nc %#x\n", TCSR_HALT_NC_PA);
++	printf("BLUELINE WIFI: axi nc req %#x ack %#x idle %#x\n", rd(w2.halt_nc), rd(w2.halt_nc + 4), rd(w2.halt_nc + 8));
++
++	printf("BLUELINE WIFI: about to read TCSR mutex 3\n");
++	printf("BLUELINE WIFI: tcsr mutex 3 owner %#x\n", rd(w2.mutex));
++
++	printf("BLUELINE WIFI: about to read GICD pending for INTID %u\n", MSS_WDOG_INTID);
++	printf("BLUELINE WIFI: modem wdog pending %u\n", wdog_pending());
++
++	if (!qmp_open()) {
++		return false;
++	}
++
++	smem_parts();
++	if (!w2.pm_off) {
++		printf("BLUELINE WIFI: no apps-modem SMEM partition\n");
++		return false;
++	}
++	uint32_t sz = 0;
++	uint32_t o428 = smem_find(w2.pm_off, w2.pm_size, w2.pm_cl, SMP2P_OUT, &sz);
++	printf("BLUELINE WIFI: smem 428 (smp2p apps->modem) %s %#x\n", o428 ? "at" : "absent", o428 ? SMEM_PA + o428 : 0);
++	uint32_t o435 = smem_find(w2.pm_off, w2.pm_size, w2.pm_cl, SMP2P_IN, &sz);
++	printf("BLUELINE WIFI: smem 435 (smp2p modem->apps) %s %#x\n", o435 ? "at" : "absent", o435 ? SMEM_PA + o435 : 0);
++	crash_reason();
++
++	(void)arc_vote("mx.lvl", 385, true);
++	(void)arc_vote("cx.lvl", 385, true);
++	(void)arc_vote("mss.lvl", 385, true);
++	printf("BLUELINE WIFI: cmd-db xo.lvl at %#x\n", blueline_cmddb_addr("xo.lvl"));
++
++	/* The firmware. */
++	if (!fw_open()) {
++		return false;
++	}
++	w2.mba = fw_load("MBA     MBN", MBA_MAX, &w2.mba_len);
++	w2.mdt = fw_load("MODEM   MDT", MDT_MAX, &w2.mdt_len);
++	if (!w2.mba || !w2.mdt) {
++		return false;
++	}
++	sha256_log("MBA.MBN", w2.mba, w2.mba_len);
++	sha256_log("MODEM.MDT", w2.mdt, w2.mdt_len);
++	uint32_t meta, hash_at, reloc, boot;
++	uint64_t segbytes;
++	return mdt_check(&meta, &hash_at, &reloc, &boot, &segbytes);
++}
++
++static bool
++step2_power(void)
++{
++	printf("BLUELINE WIFI: step 2: AOP load_state, RPMh votes, GCC clocks\n");
++	if (!qmp_link() || !qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
++		return false;
++	}
++	if (!arc_vote("mx.lvl", 385, false) || !arc_vote("cx.lvl", 385, false) || !arc_vote("mss.lvl", 385, false)) {
++		return false;
++	}
++	uint32_t xo = blueline_cmddb_addr("xo.lvl"), on = 3;
++	if (xo) {
++		printf("BLUELINE WIFI: about to RPMh xo.lvl (%#x) = 3\n", xo);
++		printf("BLUELINE WIFI: RPMh xo.lvl err=%d\n", blueline_rpmh_write(&xo, &on, 1));
++	}
++	if (!clocks_on()) {
++		return false;
++	}
++	printf("BLUELINE WIFI: about to read RMB %#x\n", RMB_PA);
++	printf("BLUELINE WIFI: rmb pbl %#x mba_status %d mss_status %#x; qdsp6ss sleep %#x\n", rd(w2.rmb + RMB_PBL_STATUS),
++	    (int32_t)rd(w2.rmb + RMB_MBA_STATUS), rd(w2.rmb + RMB_MBA_MSS_STATUS), rd(w2.qdsp6 + QDSP6SS_SLEEP));
++	return true;
++}
++
++static bool
++step3_mba(void)
++{
++	uint32_t v;
++	bool to;
++
++	printf("BLUELINE WIFI: step 3: SMP2P, MBA, assign, reset, boot FSM\n");
++	if (blueline_scm_is_call_avail(SVC_MP, MP_ASSIGN) != 1) {
++		printf("BLUELINE WIFI: MP_ASSIGN not available\n");
++		return false;
++	}
++	if (!smp2p_create()) {
++		return false;
++	}
++	printf("BLUELINE WIFI: about to write the MBA region: MBA.MBN (%u bytes) at %#x\n", w2.mba_len, MBA_PA);
++	if (fill_region(MBA_PA, NULL, w2.mba_len, w2.mba_len, w2.mba)) {
++		printf("BLUELINE WIFI: MBA copy failed\n");
++		return false;
++	}
++	/* some MBAs wipe the MPSS region at boot: give the Q6 both (q6v5_mba_load) */
++	if (assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, false, true) ||
++	    assign("mba", MBA_PA, MBA_SIZE, &w2.mba_own, false, true)) {
++		fail_stop("assigning MPSS/MBA to the modem");
++		return false;
++	}
++	printf("BLUELINE WIFI: about to reset the MSS (pdc sync, alt reset, aoss restart pulse)\n");
++	mss_reset_pulse(true);
++	printf("BLUELINE WIFI: about to write RMB image %#x and start the QDSP6 boot FSM\n", MBA_PA);
++	wr(w2.rmb + RMB_MBA_IMAGE, MBA_PA);
++	wr(w2.rmb + RMB_PMI_CODE_START, 0);
++	wr(w2.rmb + RMB_PMI_CODE_LENGTH, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* q6v5proc_reset, MSS_SDM845 / __pil_q6v65_reset */
++	wr(w2.qdsp6 + QDSP6SS_SLEEP, rd(w2.qdsp6 + QDSP6SS_SLEEP) | 1u);
++	if (!poll32(w2.qdsp6 + QDSP6SS_SLEEP, 1u << 31, 0, 1, &v)) {
++		printf("BLUELINE WIFI: QDSP6SS sleep clock did not come on (%#x)\n", v);
++		fail_stop("sleep clock");
++		return false;
++	}
++	w2.q6_started = true;
++	wr(w2.qdsp6 + QDSP6SS_BOOT_CORE_START, 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(w2.qdsp6 + QDSP6SS_BOOT_CMD, 1);
++	uint64_t t0 = mach_absolute_time();
++	bool fsm = poll32(w2.rmb + RMB_MBA_MSS_STATUS, 1u, 1u, 10, &v);
++	printf("BLUELINE WIFI: boot FSM %s (mss_status %#x, %u ms)\n", fsm ? "done" : "TIMED OUT", v, ms_since(t0));
++	if (!fsm) {
++		fail_stop("boot FSM");
++		return false;
++	}
++	/* q6v5_rmb_pbl_wait: any non-zero status ends it, 1 = success */
++	uint64_t pend = mach_absolute_time() + ms_abs(1000);
++	while (!(v = rd(w2.rmb + RMB_PBL_STATUS)) && mach_absolute_time() < pend) {
++		delay(1000);
++	}
++	printf("BLUELINE WIFI: PBL status %#x after %u ms%s\n", v, ms_since(t0), v == 1 ? " (success)" : v ? " (ERROR)" : " (TIMED OUT)");
++	if (v != 1) {
++		fail_stop("PBL");
++		return false;
++	}
++	int32_t s = mba_wait(0, 5000, &to);
++	if (to || (s != MBA_XPU_UNLOCKED && s != MBA_XPU_UNLOCKED_SCRIBBLED)) {
++		fail_stop("MBA boot");
++		return false;
++	}
++	printf("BLUELINE WIFI: MBA booted (%s)\n", s == MBA_XPU_UNLOCKED ? "XPU unlocked" : "XPU unlocked, scribbled");
++	return true;
++}
++
++static bool
++step4_mpss(void)
++{
++	uint32_t meta, hash_at, reloc, boot, n, code = 0;
++	uint64_t segbytes, t0 = mach_absolute_time();
++	bool to;
++
++	printf("BLUELINE WIFI: step 4: MPSS metadata, segments, authentication\n");
++	if (!mdt_check(&meta, &hash_at, &reloc, &boot, &segbytes)) {
++		fail_stop("MDT");
++		return false;
++	}
++	const struct phdr32 *ph = mdt_phdrs(&n);
++	wr(w2.rmb + RMB_PMI_CODE_LENGTH, 0);
++
++	/* metadata: ELF header + hash segment, in its own buffer (q6v5_mpss_init_image) */
++	uint8_t *mbuf = kalloc_data(meta, Z_WAITOK | Z_ZERO);
++	if (!mbuf || !ph) {
++		fail_stop("metadata buffer");
++		return false;
++	}
++	memcpy(mbuf, w2.mdt, ph[0].filesz);
++	memcpy(mbuf + ph[0].filesz, w2.mdt + hash_at, meta - ph[0].filesz);
++	printf("BLUELINE WIFI: about to write %u bytes of metadata to %#x\n", meta, MDATA_PA);
++	int err = fill_region(MDATA_PA, NULL, meta, meta, mbuf);
++	kfree_data(mbuf, meta);
++	if (err || assign("metadata", MDATA_PA, MDATA_SIZE, &w2.mdata_own, false, true)) {
++		fail_stop("metadata");
++		return false;
++	}
++	wr(w2.rmb + RMB_PMI_META_DATA, MDATA_PA);
++	wr(w2.rmb + RMB_MBA_COMMAND, RMB_CMD_META_DATA_READY);
++	int32_t s = mba_wait(MBA_META_DATA_AUTH_SUCCESS, 1000, &to);
++	printf("BLUELINE WIFI: MPSS header authentication %s\n", s == MBA_META_DATA_AUTH_SUCCESS ? "ok" : "FAILED");
++	if (assign("metadata", MDATA_PA, MDATA_SIZE, &w2.mdata_own, true, false) || s != MBA_META_DATA_AUTH_SUCCESS) {
++		fail_stop("metadata authentication");
++		return false;
++	}
++
++	/* the modem can give MPSS back only now that the MBA runs; then share it while loading */
++	if (assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, true, false) ||
++	    assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, true, true)) {
++		fail_stop("sharing MPSS");
++		return false;
++	}
++	printf("BLUELINE WIFI: about to load %llu bytes of segments into %#x from %s\n", segbytes, MPSS_PA, w2.part);
++	for (uint32_t i = 0; i < n; i++) {
++		if (!seg_valid(&ph[i])) {
++			continue;
++		}
++		struct ffile f = { 0, 0 };
++		if (ph[i].filesz) {
++			char nm[12];
++			snprintf(nm, sizeof(nm), "MODEM   B%02u", i);
++			if (!fw_find(nm, &f)) {
++				fail_stop("segment file");
++				return false;
++			}
++		}
++		uint64_t pa = MPSS_PA + (ph[i].paddr - reloc);
++		err = fill_region(pa, &f, ph[i].filesz, ph[i].memsz, NULL);
++		if (err) {
++			printf("BLUELINE WIFI: segment %u: error %d\n", i, err);
++			fail_stop("segment load");
++			return false;
++		}
++		if (!rd(w2.rmb + RMB_PMI_CODE_LENGTH)) {
++			wr(w2.rmb + RMB_PMI_CODE_START, boot);
++			wr(w2.rmb + RMB_MBA_COMMAND, RMB_CMD_LOAD_READY);
++		}
++		code += ph[i].memsz;
++		wr(w2.rmb + RMB_PMI_CODE_LENGTH, code);
++		s = (int32_t)rd(w2.rmb + RMB_MBA_STATUS);
++		printf("BLUELINE WIFI: segment %2u %#llx +%#x/%#x loaded, code length %#x, mba_status %d\n", i, pa,
++		    ph[i].filesz, ph[i].memsz, code, s);
++		if (s < 0) {
++			fail_stop("MPSS segment authentication");
++			return false;
++		}
++	}
++	printf("BLUELINE WIFI: segments loaded in %u ms\n", ms_since(t0));
++	if (assign("mpss", MPSS_PA, MPSS_SIZE, &w2.mpss_own, false, true)) {
++		fail_stop("giving MPSS to the modem");
++		return false;
++	}
++	s = mba_wait(MBA_AUTH_COMPLETE, 10000, &to);
++	if (s != MBA_AUTH_COMPLETE) {
++		fail_stop("MPSS authentication");
++		return false;
++	}
++	printf("BLUELINE WIFI: MPSS authenticated: the modem is running; waiting for SMP2P ready\n");
++
++	/* qcom_q6v5_wait_for_start: 5 s for "ready" (or "fatal") */
++	uint32_t v = 0, fl = 0, ver = 0;
++	uint64_t t1 = mach_absolute_time();
++	bool have = false;
++	while (ms_since(t1) < 5000) {
++		have = smp2p_in_state(&v, &fl, &ver);
++		if (have) {
++			smp2p_service(fl, ver);
++			if (v & (MODEM_READY | MODEM_FATAL)) {
++				break;
++			}
++		}
++		delay(10000);
++	}
++	printf("BLUELINE WIFI: smp2p slave-kernel %s %#x after %u ms%s%s\n", have ? "state" : "ABSENT", v, ms_since(t1),
++	    v & MODEM_READY ? " READY" : "", v & MODEM_FATAL ? " ERR-FATAL" : "");
++	if (v & MODEM_FATAL) {
++		crash_reason();
++	}
++	if (!(v & MODEM_READY)) {
++		printf("BLUELINE WIFI: no ready: leaving the modem as it is for the watcher (Linux would stop it)\n");
++	} else {
++		(void)assign("mba (after start)", MBA_PA, MBA_SIZE, &w2.mba_own, true, false);
++	}
++	return true;
++}
++
++static void
++stage2(void)
++{
++	static bool once;
++	thread_t th;
++
++	if (once) {
++		return;
++	}
++	once = true;
++	w2.step = 1;
++	w2.watch_s = 90;
++	strlcpy(w2.part, "modem_b", sizeof(w2.part));
++	w2.mpss_own = w2.mba_own = w2.mdata_own = OWN_HLOS;
++	(void)PE_parse_boot_argn("bluewifi_step", &w2.step, sizeof(w2.step));
++	(void)PE_parse_boot_argn("bluewifi_watch", &w2.watch_s, sizeof(w2.watch_s));
++	(void)PE_parse_boot_argn("bluewifi_fw", w2.part, sizeof(w2.part));
++	if (strcmp(w2.part, "modem_a") != 0 && strcmp(w2.part, "modem_b") != 0) {
++		printf("BLUELINE WIFI: bluewifi_fw=%s: only modem_a or modem_b\n", w2.part);
++		return;
++	}
++	/* bluewifi_watch=0: for good -- the watcher is the radio's poll loop, so iOS's Wi-Fi stops with it */
++	w2.watch_s = MIN(w2.watch_s, 86400u);
++	printf("BLUELINE WIFI: stage 2 step %d: firmware from %s; MPSS %#x+%#x, MBA %#x+%#x, metadata %#x\n", w2.step,
++	    w2.part, MPSS_PA, MPSS_SIZE, MBA_PA, MBA_SIZE, MDATA_PA);
++	if (!step1_reads()) {
++		printf("BLUELINE WIFI: step 1 stopped\n");
++		return;
++	}
++	printf("BLUELINE WIFI: step 1 done (read only)\n");
++	if (w2.step < 2 || !step2_power()) {
++		return;
++	}
++	printf("BLUELINE WIFI: step 2 done (powered, still in reset)\n");
++	if (w2.step < 3 || !step3_mba()) {
++		return;
++	}
++	printf("BLUELINE WIFI: step 3 done (MBA running, MPSS and MBA owned by the modem)\n");
++	if (w2.step < 4 || !step4_mpss()) {
++		return;
++	}
++	if (w2.level >= 6 && topaz_sta_init != NULL) {
++		topaz_sta_init();			/* en0 + Apple80211 for wifid (0173), on the radio's ready hook */
+ 	}
+ 	if (kernel_thread_start(watch_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);

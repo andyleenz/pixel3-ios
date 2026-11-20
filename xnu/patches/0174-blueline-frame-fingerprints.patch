@@ -1,0 +1,129 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: frame fingerprints for finding blinks without a camera
+
+bluetouchscript step print,N: the next N frames shown are logged as a
+6 x 12 grid of mean greens ("SWEET FP:" lines), so that tools/fpblink.py
+can find a frame that steps back to an older picture.
+---
+--- a/bsd/dev/blueline_touch.c
++++ b/bsd/dev/blueline_touch.c
+@@ -681,6 +681,9 @@
+  *   volchord               a fake-accelerometer quarter turn, as volume up +
+  *                          down (needs bluefakeaccel=1; BlueFakeMotion.cpp)
+  *   snap                   a screenshot now (bluesnap, sweet_ufs.c)
++ *   print,N                a fingerprint of each of the next N frames shown
++ *                          (SweetFramebuffer.cpp: "SWEET FP:" lines), for
++ *                          tools/fpblink.py to find frames that step back
+  * Steps run in order, each at its time (at once if that has passed).
+  * X, Y are panel pixels (0..1079, 0..2159) and go through sweet_hid_touch's
+  * mapping, as finger 0. While a touch step runs, the touch screen's own
+@@ -693,6 +696,7 @@
+ extern void sweet_hid_key(int key, int down);
+ extern int blueline_fake_accel_turn(const char *why);
+ extern int bluesnap_take(const char *why);
++extern void sweet_fb_print_frames(uint32_t n);
+ extern bool blue_when_parse(const char **s, bool *sb, uint32_t *ms);
+ extern bool blue_when_wait(bool sb, uint32_t ms);
+ extern void blue_when_now(uint32_t *ms, int32_t *sb_ms);
+@@ -792,7 +796,7 @@
+ 		}
+ 		const char *act = p;
+ 		bool ok = true;
+-		enum { S_TAP, S_HOLD, S_SWIPE, S_KEY, S_CHORD, S_SNAP } kind;
++		enum { S_TAP, S_HOLD, S_SWIPE, S_KEY, S_CHORD, S_SNAP, S_PRINT } kind;
+ 		if (script_word(&p, "tap")) {
+ 			kind = S_TAP;
+ 			ok = script_int(&p, &a[0]) && script_int(&p, &a[1]);
+@@ -817,6 +821,9 @@
+ 			kind = S_CHORD;
+ 		} else if (script_word(&p, "snap")) {
+ 			kind = S_SNAP;
++		} else if (script_word(&p, "print")) {
++			kind = S_PRINT;
++			ok = script_int(&p, &a[0]) && a[0] > 0 && a[0] <= 2000;
+ 		} else {
+ 			ok = false;
+ 			kind = S_SNAP;
+@@ -870,6 +877,9 @@
+ 			break;
+ 		case S_SNAP:
+ 			(void)bluesnap_take("bluetouchscript");
++			break;
++		case S_PRINT:
++			sweet_fb_print_frames((uint32_t)a[0]);
+ 			break;
+ 		}
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -779,9 +779,70 @@
+ 	}
+ }
+ 
++/*
++ * bluetouchscript print,N: a fingerprint of each of the next N frames shown -- the first layer's surface as
++ * a grid of 6 x 12 cells, each the mean of 8 x 8 pixels spread over the cell (green), one hex byte a cell, with
++ * the number of frames shown since the last line (only frames that changed are logged, so that a log line
++ * holds a frame and the log keeps up) --
++ * so that a frame that steps back to an older picture (Control Center blinking) shows in the log without a
++ * camera: tools/fpblink.py.
++ */
++static volatile uint32_t sweet_fb_prints_left;
++extern "C" void
++sweet_fb_print_frames(uint32_t n)
++{
++	sweet_fb_prints_left = n;
++}
++
++static void
++sweet_fb_print(uint32_t swap, uint32_t id)
++{
++	enum { GX = 6, GY = 12, S = 8 };
++	static char last[2 * GX * GY + 1];
++	static uint32_t same;
++	char line[2 * GX * GY + 1];
++	SweetSurface *s = sweet_surface_copy(id);
++	uint64_t ns = 0;
++
++	if (s == NULL || s->memory == NULL || s->bytesPerElement != 4 || s->planeCount != 0 || s->width < GX * S ||
++	    s->height < GY * S || (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
++		OSSafeReleaseNULL(s);
++		return;
++	}
++	const uint8_t *base = (const uint8_t *)s->kernelAddress() + s->offset;
++	uint32_t cw = s->width / GX, ch = s->height / GY;
++	for (uint32_t gy = 0; gy < GY; gy++) {
++		for (uint32_t gx = 0; gx < GX; gx++) {
++			uint32_t sum = 0;
++			for (uint32_t y = 0; y < S; y++) {
++				const uint8_t *row = base + (uint64_t)(gy * ch + y * ch / S + ch / (2 * S)) * s->bytesPerRow;
++				for (uint32_t x = 0; x < S; x++) {
++					sum += row[4 * (gx * cw + x * cw / S + cw / (2 * S)) + 1];
++				}
++			}
++			snprintf(line + 2 * (gy * GX + gx), 3, "%02x", sum / (S * S));
++		}
++	}
++	OSSafeReleaseNULL(s);
++	if (strcmp(line, last) == 0) {
++		same++;
++		return;
++	}
++	memcpy(last, line, sizeof(last));
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	IOLog("SWEET FP: %u %llu %u %u %s\n", swap, ns / 1000000, id, same, line);
++	same = 0;
++	return;
++	OSSafeReleaseNULL(s);
++}
++
+ void
+ AppleCLCD::showSwap(const uint8_t *rec)
+ {
++	if (sweet_fb_prints_left != 0 && (get32(rec, 0x104) & 1) && get32(rec, 0x54) != 0) {
++		sweet_fb_prints_left--;
++		sweet_fb_print(get32(rec, 0x50), get32(rec, 0x54));
++	}
+ 	bool flipped = fFlip && swapFlip(rec);
+ 	if (sweet_fb_swaplog > 16 && sweet_fb_shown_logged < sweet_fb_swaplog) {
+ 		uint32_t mask = get32(rec, 0x104);

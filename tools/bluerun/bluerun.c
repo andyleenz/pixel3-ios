@@ -18,6 +18,10 @@
  *   bluerun_env=K=V;K=V        extra environment variables
  *   bluerun_wait=S             give up waiting for SpringBoard after S s
  *                              (default 300)
+ *   bluerun_end=reboot         once the program has ended, reboot at once
+ *                              as bluereboot= says (sysctl kern.bluedone,
+ *                              patch 0175), instead of waiting out
+ *                              bluereboot_after/bluereboot_delay
  *
  * Without bluerun= it prints one line and exits. Every line the program
  * writes to stdout or stderr goes to /dev/console as "BLUERUN: text" (the
@@ -284,5 +288,13 @@ main(void)
 		    WTERMSIG(st) == SIGKILL && !timed_out ? " (SIGKILL: code signing? see SWEET/cs_ lines)" : "");
 	}
 	say("done");
+	char end[16];
+	if (bootarg(args, "bluerun_end", end, sizeof(end)) && strcmp(end, "reboot") == 0) {
+		int one = 1;
+		sleep(1);       /* the console lines above into the log first */
+		if (sysctlbyname("kern.bluedone", NULL, NULL, &one, sizeof(one)) != 0) {
+			say("kern.bluedone: %s", strerror(errno));
+		}
+	}
 	return 0;
 }

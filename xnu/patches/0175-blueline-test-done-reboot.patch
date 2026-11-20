@@ -1,0 +1,56 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: kern.bluedone, reboot as soon as the test is over
+
+A test boot reboots when the test says it is done (sysctl kern.bluedone=1
+from tools/bluerun with bluerun_end=reboot, or blue_test_done() in the
+kernel) instead of waiting out bluereboot_after/bluereboot_delay.
+---
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -28,6 +28,7 @@
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
+ #include <sys/uio.h>
++#include <sys/sysctl.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -1674,6 +1675,38 @@
+ 		bluereboot_fire("after GPU probe");
+ 	}
+ }
++
++/*
++ * The test is over: reboot now, the way bluereboot= says, instead of waiting out bluereboot_after and
++ * bluereboot_delay (which stay as the fallback). For whatever knows when it is done: the test program's
++ * runner (tools/bluerun: sysctl kern.bluedone=1 with bluerun_end=reboot) or a kernel test
++ * (blue_test_done()). Nothing happens unless bluereboot= is set.
++ */
++static int bluedone_fired;
++void blue_test_done(const char *why);
++void
++blue_test_done(const char *why)
++{
++	if (br.when == BR_OFF || !os_atomic_cmpxchg(&bluedone_fired, 0, 1, relaxed)) {
++		return;
++	}
++	printf("BLUELINE REBOOT: test done (%s)\n", why);
++	bluereboot_fire(why);
++}
++
++static int
++sysctl_bluedone SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error == 0 && req->newptr != USER_ADDR_NULL && v != 0) {
++		blue_test_done("kern.bluedone");
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, bluedone, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_bluedone, "I", "the test is over: reboot as bluereboot= says");
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);

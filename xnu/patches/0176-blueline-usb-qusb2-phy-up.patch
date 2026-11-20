@@ -1,0 +1,266 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: power the QUSB2 PHY up before the DWC3 starts
+
+ABL leaves the USB 2.0 PHY powered down (PWR_CTRL1 0x23, PLL not ready),
+so the controller had no UTMI clock and SETEPCONFIG timed out. Undo the
+power-down (blueusbphy=1), or run the Linux sdm845 init table (=2, =3 with
+a PHY reset); VBUS override before the soft reset (blueusbvbus); the 0124
+PIPE-to-UTMI switch now off by default (blueusbpipe=1 restores it).
+After Linux phy-qcom-qusb2.c and dwc3-qcom.c.
+---
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -387,8 +387,208 @@
+ }
+ 
+ /*
+- * blueline 0124: map what ud_blue_diag reads, and (blueusbpipe, default 1)
+- * clock the DWC3's PIPE side from UTMI before the soft reset.
++ * blueline USB PHY fix (draft; boot-arg blueusbphy, default 1).
++ * The 0124 log shows ABL leaving the QUSB2 HS PHY switched off exactly the
++ * way Linux's qusb2 driver switches it off: PWR_CTRL1 (0x210) reads 0x23 =
++ * VREF_SUPPLY_TRIM | CLAMP_N_EN | POWER_DOWN (qusb2_v2_phy_cfg.disable_ctrl)
++ * and PLL_STATUS (0x1a0) reads 0x64, CORE_READY_STATUS (bit 0) clear: the
++ * check qusb2_phy_init fails with "pll lock failed". (flame's ABL left its
++ * HS PHY powered, which is why the same driver ran there.) Without the
++ * PHY's 60 MHz UTMI clock a high-speed DWC3 does not finish an endpoint
++ * command: DEPSTARTCFG completed, SETEPCONFIG (ep0 cmd 0x1) timed out.
++ * Linux powers the PHYs up before the core soft reset (dwc3_core_init:
++ * dwc3_phy_init, then dwc3_core_soft_reset), so this runs from
++ * ud_blue_prepare. Steps, each logged before/after, stopping once
++ * CORE_READY is set:
++ *  A (blueusbphy>=1): runtime-resume style: clear the PLL core reset
++ *    override (CORE_RESET | CORE_RESET_MUX) and POWER_DOWN, ABL's tuning kept;
++ *  B (blueusbphy>=1, or first with 2): qusb2_phy_init for sdm845 (v2 table,
++ *    blueline DT tuning from sdm845-google-common.dtsi), PHY disabled
++ *    while programming, then enabled;
++ *  C (blueusbphy=3 only): GCC_QUSB2PHY_PRIM_BCR pulse (as Linux) then B.
++ * blueusbphy=0 leaves the PHY alone (0124 behaviour).
++ */
++#define QP_PLL_ANALOG_CONTROLS_TWO      0x004
++#define QP_PLL_CMODE                    0x02c
++#define QP_PLL_CORE_INPUT_OVERRIDE      0x0a8
++#define   QP_CORE_PLL_EN_FROM_RESET     (1u << 4)
++#define   QP_CORE_RESET                 (1u << 5)
++#define   QP_CORE_RESET_MUX             (1u << 6)
++#define QP_PLL_DIGITAL_TIMERS_TWO       0x0b4
++#define QP_PLL_LOCK_DELAY               0x184
++#define QP_PLL_CLOCK_INVERTERS          0x18c
++#define QP_PLL_BIAS_CONTROL_1           0x194
++#define QP_PLL_BIAS_CONTROL_2           0x198
++#define QP_PLL_STATUS                   0x1a0
++#define   QP_CORE_READY                 (1u << 0)
++#define QP_PWR_CTRL1                    0x210
++#define   QP_POWER_DOWN                 (1u << 0)
++#define   QP_DISABLE_CTRL               0x23    /* VREF_SUPPLY_TRIM | CLAMP_N_EN | POWER_DOWN */
++#define QP_PWR_CTRL2                    0x214
++#define QP_IMP_CTRL1                    0x220
++#define QP_IMP_CTRL2                    0x224
++#define QP_INTR_CTRL                    0x230
++#define QP_CHG_CTRL2                    0x23c
++#define QP_TUNE1                        0x240
++#define QP_TUNE2                        0x244
++#define QP_TUNE3                        0x248
++#define QP_TUNE4                        0x24c
++#define QP_TUNE5                        0x250
++#define QP_TEST1                        0x254
++#define GCC_QUSB2PHY_PRIM_BCR           0x12000
++
++static void
++qp_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ud_blue_qusb + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	(void)usb_rd(ud_blue_qusb, off);        /* as Linux: make sure the write is through */
++}
++
++static uint32_t
++qp_rd(uint32_t off)
++{
++	return usb_rd(ud_blue_qusb, off) & 0xff;        /* 8-bit registers (read back replicated) */
++}
++
++static void
++qp_dump(const char *when)
++{
++	printf("SWEET USB: qusb2 [%s] PLL_STATUS %02x PWR_CTRL1 %02x PWR_CTRL2 %02x CORE_INPUT_OVR %02x INTR_CTRL %02x "
++	    "TUNE1-5 %02x %02x %02x %02x %02x IMP1 %02x IMP2 %02x CHG2 %02x TEST1 %02x CMODE %02x\n",
++	    when, qp_rd(QP_PLL_STATUS), qp_rd(QP_PWR_CTRL1), qp_rd(QP_PWR_CTRL2), qp_rd(QP_PLL_CORE_INPUT_OVERRIDE),
++	    qp_rd(QP_INTR_CTRL), qp_rd(QP_TUNE1), qp_rd(QP_TUNE2), qp_rd(QP_TUNE3), qp_rd(QP_TUNE4),
++	    qp_rd(QP_TUNE5), qp_rd(QP_IMP_CTRL1), qp_rd(QP_IMP_CTRL2), qp_rd(QP_CHG_CTRL2), qp_rd(QP_TEST1),
++	    qp_rd(QP_PLL_CMODE));
++}
++
++/* Poll CORE_READY for up to 5 ms (Linux waits 150 + 100 us, then checks once). */
++static bool
++qp_wait_ready(const char *step)
++{
++	int us;
++	for (us = 0; us < 5000; us += 10) {
++		if (qp_rd(QP_PLL_STATUS) & QP_CORE_READY) {
++			break;
++		}
++		delay(10);
++	}
++	bool ok = (qp_rd(QP_PLL_STATUS) & QP_CORE_READY) != 0;
++	printf("SWEET USB: qusb2 step %s: CORE_READY %s after ~%d us\n", step, ok ? "SET" : "still clear", us);
++	qp_dump(step);
++	if (ud.dwc != 0) {
++		ud_blue_diag(step);
++	}
++	return ok;
++}
++
++/* qusb2_phy_init (phy-qcom-qusb2.c) for qcom,sdm845-qusb2-phy, minus regulators/clocks. */
++static void
++qp_linux_init(uint32_t abl_tune1)
++{
++	uint32_t tune1;
++
++	qp_wr(QP_PWR_CTRL1, qp_rd(QP_PWR_CTRL1) | QP_DISABLE_CTRL);    /* "Disable the PHY" */
++	/* qusb2_v2_init_tbl */
++	qp_wr(QP_PLL_ANALOG_CONTROLS_TWO, 0x03);
++	qp_wr(QP_PLL_CLOCK_INVERTERS, 0x7c);
++	qp_wr(QP_PLL_CMODE, 0x80);
++	qp_wr(QP_PLL_LOCK_DELAY, 0x0a);
++	qp_wr(QP_PLL_DIGITAL_TIMERS_TWO, 0x19);
++	qp_wr(QP_PLL_BIAS_CONTROL_1, 0x40);
++	qp_wr(QP_PLL_BIAS_CONTROL_2, 0x20);
++	qp_wr(QP_PWR_CTRL2, 0x21);
++	qp_wr(QP_IMP_CTRL1, 0x00);
++	qp_wr(QP_IMP_CTRL2, 0x58);
++	qp_wr(QP_TUNE1, 0x30);
++	qp_wr(QP_TUNE2, 0x29);
++	qp_wr(QP_TUNE3, 0xca);
++	qp_wr(QP_TUNE4, 0x04);
++	qp_wr(QP_TUNE5, 0x03);
++	qp_wr(QP_CHG_CTRL2, 0x00);
++	/*
++	 * qusb2_phy_override_phy_params, blueline DT: imp-res-offset 8,
++	 * hstx-trim 21.6 mA (4), preemphasis 5 % (1), width half bit.
++	 */
++	qp_wr(QP_IMP_CTRL1, (qp_rd(QP_IMP_CTRL1) & ~0x3fu) | 8);
++	tune1 = (qp_rd(QP_TUNE1) & ~0xf0u) | (4u << 4);
++	tune1 = (tune1 & ~0x3u) | 1u;
++	tune1 |= 1u << 2;
++	/*
++	 * qusb2_phy_set_tune2_param: the fused HSTX trim (qfprom
++	 * qusb2p_hstx_trim) replaces TUNE1[7:4] when non-zero. We cannot read
++	 * the nvmem cell here; ABL's TUNE1 high nibble is the best stand-in.
++	 */
++	if (abl_tune1 & 0xf0) {
++		tune1 = (tune1 & ~0xf0u) | (abl_tune1 & 0xf0);
++	}
++	qp_wr(QP_TUNE1, tune1);
++	qp_wr(QP_PWR_CTRL1, qp_rd(QP_PWR_CTRL1) & ~QP_POWER_DOWN);      /* "Enable the PHY" */
++	delay(150);     /* "Required to get phy pll lock successfully" */
++	delay(100);
++}
++
++static void
++ud_blue_phy_up(void)
++{
++	int level = 1;
++	PE_parse_boot_argn("blueusbphy", &level, sizeof(level));
++	if (level <= 0) {
++		printf("SWEET USB: qusb2: blueusbphy=0, PHY left as ABL left it\n");
++		return;
++	}
++	if (ud_blue_qusb == 0 || ud_blue_gcc == 0) {
++		printf("SWEET USB: qusb2: not mapped\n");
++		return;
++	}
++	uint32_t ahb2phy = usb_rd(ud_blue_gcc, GCC_AHB2PHY_CBCR);
++	if (ahb2phy & CBCR_CLK_OFF) {
++		printf("SWEET USB: qusb2: ahb2phy clock off (%08x), PHY not touched\n", ahb2phy);
++		return;
++	}
++	printf("SWEET USB: qusb2: blueusbphy=%d, GCC QUSB2PHY_PRIM_BCR %08x\n", level,
++	    usb_rd(ud_blue_gcc, GCC_QUSB2PHY_PRIM_BCR));
++	qp_dump("as ABL left it");
++	uint32_t abl_tune1 = qp_rd(QP_TUNE1);
++	if (qp_rd(QP_PLL_STATUS) & QP_CORE_READY) {
++		printf("SWEET USB: qusb2: CORE_READY already set, nothing to do\n");
++		return;
++	}
++	if (level == 1) {
++		/* A: qusb2_phy_runtime_resume + the "Enable the PHY" write of qusb2_phy_init */
++		qp_wr(QP_INTR_CTRL, 0);
++		qp_wr(QP_PLL_CORE_INPUT_OVERRIDE, qp_rd(QP_PLL_CORE_INPUT_OVERRIDE) & ~(QP_CORE_RESET | QP_CORE_RESET_MUX));
++		qp_wr(QP_PWR_CTRL1, qp_rd(QP_PWR_CTRL1) & ~QP_POWER_DOWN);
++		delay(250);
++		if (qp_wait_ready("A power-down off")) {
++			return;
++		}
++	}
++	if (level >= 3) {
++		/* C: block reset first, as qusb2_phy_init does (100 us in reset) */
++		*(volatile uint32_t *)(ud_blue_gcc + GCC_QUSB2PHY_PRIM_BCR) = 1;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(150);
++		*(volatile uint32_t *)(ud_blue_gcc + GCC_QUSB2PHY_PRIM_BCR) = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(10);
++		qp_dump("C after BCR reset");
++	} else {
++		/* without the block reset, also drop a core reset override ABL may have left */
++		qp_wr(QP_INTR_CTRL, 0);
++		qp_wr(QP_PLL_CORE_INPUT_OVERRIDE, qp_rd(QP_PLL_CORE_INPUT_OVERRIDE) & ~(QP_CORE_RESET | QP_CORE_RESET_MUX));
++	}
++	qp_linux_init(abl_tune1);
++	if (!qp_wait_ready(level >= 3 ? "C bcr+linux init" : "B linux init")) {
++		printf("SWEET USB: qusb2: PLL still not ready; next suspect: its supplies "
++		    "(L1A 0.875 V, L12A 1.8 V PLL, L24A 3.075 V) switched off by ABL\n");
++	}
++}
++
++/*
++ * blueline 0124: map what ud_blue_diag reads, and (blueusbpipe, default 0
++ * since the PHY fix; 1 = the 0124 behaviour) clock the DWC3's PIPE side
++ * from UTMI before the soft reset.
+  */
+ static void
+ ud_blue_prepare(void)
+@@ -404,10 +604,31 @@
+ 	ud_blue_qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	ud_blue_qusb = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+ 	ud_blue_diag("as ABL left it");
++	ud_blue_phy_up();
+ 	if (ud_blue_qs == 0) {
+ 		return;
+ 	}
+-	int pipe = 1;
++	/*
++	 * Linux (dr_mode peripheral) sets the VBUS-valid override in the glue's
++	 * probe, before the core is initialised; this driver set it only just
++	 * before RUN_STOP. Harmless to do both (blueusbvbus=0 skips this one).
++	 */
++	int vbus = 1;
++	PE_parse_boot_argn("blueusbvbus", &vbus, sizeof(vbus));
++	if (vbus) {
++		*(volatile uint32_t *)(ud_blue_qs + QSCRATCH_HS_PHY_CTRL) =
++		    usb_rd(ud_blue_qs, QSCRATCH_HS_PHY_CTRL) | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
++		*(volatile uint32_t *)(ud_blue_qs + QSCRATCH_SS_PHY_CTRL) =
++		    usb_rd(ud_blue_qs, QSCRATCH_SS_PHY_CTRL) | LANE0_PWR_PRESENT;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ud_blue_diag("vbus override");
++	}
++	/*
++	 * Neither Linux (sdm845 has no qcom,select-utmi-as-pipe-clk) nor flame
++	 * (which enumerated) moves the PIPE clock to UTMI, and with the HS PHY
++	 * off it left the core with no PHY clock at all: off by default now.
++	 */
++	int pipe = 0;
+ 	PE_parse_boot_argn("blueusbpipe", &pipe, sizeof(pipe));
+ 	if (pipe) {
+ 		vm_offset_t g = ud_blue_qs + QSCRATCH_GENERAL_CFG;
+@@ -1448,6 +1669,9 @@
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	if (ud_blue_fix) {
++		ud_blue_diag("after soft reset");
++	}
+ 
+ 	printf("SWEET USB: step event buffer at 0x%llx\n", ud.dma_pa + UD_EVT);
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));

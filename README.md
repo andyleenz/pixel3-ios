@@ -5,7 +5,9 @@
 > ([@erikkunz](https://github.com/erikkunz)), who did the original port to the Pixel 3 and wrote most of the
 > README below. It is now developed here on its own. The main additions are the Adreno 630 GPU, a GPU-drawn
 > iOS UI, zero-copy display flips and more board support. Thanks to Erik for the foundation, and to
-> [ios-sweet](https://github.com/dipa-studio/ios-sweet) and HakiOS (the EAGL shim in `gpu/eagl-ios`, MIT).
+> [ios-sweet](https://github.com/dipa-studio/ios-sweet) and HakiOS (the EAGL shim in `gpu/eagl-ios`, MIT), and to
+> [ios-topaz](https://github.com/MakrSas/ios-topaz) and HackiOS (the Wi-Fi station, `en0` and Apple80211, APSL 2.0)
+> and [ios-flame](https://github.com/NWylynko/ios-flame) (USB live log, MIT).
 > Please report problems [here](https://github.com/andyleenz/pixel3-ios/issues).
 
 <p>
@@ -16,6 +18,12 @@
 </p>
 
 **New since the fork (2026-11):**
+- **Wi-Fi works in iOS.** Join a 2.4 GHz WPA2 network from Settings (the password typed on the phone), get
+  an address by DHCP, and browse in Safari. The WCN3990 radio, its WPA2 handshake and `en0` run in our kernel;
+  wifid and configd are Apple's own.
+- **USB live channel.** With `sweetusb=2` the phone is a USB network adapter: the kernel log streams to the
+  Mac live, and `tools/bluesh.py` runs programs and swaps files on the running phone (a userland change takes
+  seconds instead of a reboot).
 - The UI is drawn by the Adreno 630 at about 60 fps (`blueui=1`). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
@@ -52,11 +60,12 @@ partition.
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
-| Wi-Fi | The WCN3990's firmware runs (modem WLAN domain, copy engines, HTC/WMI/HTT), and a passive scan of the 2.4 GHz channels finds the networks nearby. Kernel-side only so far: iOS doesn't see it yet, and 5 GHz scans don't start |
+| Wi-Fi | **Works in iOS on 2.4 GHz.** The WCN3990's firmware runs in the modem's WLAN domain (copy engines, HTC/WMI/HTT). Settings lists the networks nearby; joining a WPA2 network with the password typed on the phone associates, does the 4-way handshake in the kernel, gets a DHCP address, and Safari loads pages. `en0` and Apple80211 (ported from ios-topaz/HackiOS) serve Apple's own wifid and configd. 5 GHz scans don't start yet |
 | Other | Haptics, modem boot (no cellular data yet) |
-| Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery |
+| USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
+| Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
 
-**Not working yet:** Metal, Wi-Fi in iOS, audio, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal, 5 GHz Wi-Fi, audio, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
@@ -70,8 +79,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - GMEM (on-chip tile) rendering instead of sysmem, for the blur-heavy screens (dock, Control Center).
 
 **In progress: Wi-Fi**
-- Join a network (HTT data path, station vdev, WPA2), then `en0` and Apple80211 for wifid
-  (ios-topaz's 0125-0130 and 0900 are the map). Then 5 GHz scans.
+- 5 GHz scans and joins; make the radio part of the default boot; WPA3 and open networks; Wi-Fi off/on
+  from Control Center without a stall.
 
 **Next**
 - Make the GPU path (`blueui=1`) the default boot.
@@ -80,7 +89,7 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Widgets ("Waiting..."), GPU clock scaling (DCVS).
 
 **Later**
-- Audio, display power-off on lock, USB networking.
+- Audio, display power-off on lock.
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).
