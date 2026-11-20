@@ -577,6 +577,32 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+/*
+ * A display buffer let go of (its texture deleted, or attached to another surface): its place in the pool is free for
+ * the next one. CoreAnimation lets its display buffers go when the screen has been still and makes new ones for the
+ * next animation; with the places kept, those were never carried into (target_carry()) and showed old pictures where
+ * they were not redrawn -- Control Center blinking as it is pulled down and pushed away.
+ */
+static unsigned pool_said;
+static void
+pool_leave(struct eagl *e, struct image *image, const char *how)
+{
+	if (!image->pool) {
+		return;
+	}
+	image->pool = false;
+	if (e->pool_attached > 0) {
+		e->pool_attached--;
+	}
+	if (e->carry_from == image->texture) {
+		e->carry_from = 0;
+	}
+	if (pool_said++ < 40) {
+		say("hakios-gl: display texture %u (surface %u) %s: %u in the pool\n", image->texture,
+		    IOSurfaceGetID(image->surface), how, e->pool_attached);
+	}
+}
+
 static struct image *
 image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 {
@@ -592,6 +618,7 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
+		pool_leave(e, image, "attached again");
 		CFRelease(image->surface);
 	}
 	memset(image, 0, sizeof(*image));
@@ -609,6 +636,7 @@ image_forget(struct eagl *e, GLuint texture)
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
+		pool_leave(e, image, "deleted");
 		CFRelease(image->surface);
 		*image = e->images[--e->image_count];
 	}
@@ -4395,9 +4423,15 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
-	if (image->mirror != 0 && image->width >= 1000 && image->height >= 2000 && e->pool_attached < 3) {
-		image->pool = true;                     /* the display's buffers come first (surfaces 2, 4 and 22, say) */
-		e->pool_attached++;
+	if (image->mirror != 0 && image->width >= 1000 && image->height >= 2000) {
+		if (e->pool_attached < 3) {
+			image->pool = true;             /* the display's buffers come first (surfaces 2, 4 and 22, say) */
+			e->pool_attached++;
+		}
+		if (pool_said++ < 40) {
+			say("hakios-gl: display-sized texture %u (surface %u) attached: %s, %u in the pool\n", texture,
+			    IOSurfaceGetID(surface), image->pool ? "in the pool" : "NOT in the pool", e->pool_attached);
+		}
 	}
 	if (attached++ < 24) {
 		say("hakios-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
