@@ -266,6 +266,18 @@ def haptic_firmware(d):
     return wmfw, wt
 
 
+def adsp_firmware(d):
+    """adsp.mdt + adsp.b00..bNN from DIR (the vendor image's /firmware): {"mdt": ..., "b00": ...}."""
+    props = {'mdt': open(os.path.join(d, 'adsp.mdt'), 'rb').read()}
+    if props['mdt'][:4] != b'\x7fELF':
+        sys.exit('--adsp-fw %s: adsp.mdt is not an ELF' % d)
+    for i in range(16):
+        f = os.path.join(d, 'adsp.b%02d' % i)
+        if os.path.exists(f):
+            props['b%02d' % i] = open(f, 'rb').read()
+    return props
+
+
 def wlan_firmware(d):
     """wlanmdsp.mbn (an ELF) + bdwlan-blueline.bin from DIR (the vendor image's /firmware)."""
     mdsp = open(os.path.join(d, 'wlanmdsp.mbn'), 'rb').read()
@@ -276,7 +288,7 @@ def wlan_firmware(d):
 
 
 def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None,
-          haptic_fw=None, wlan_fw=None):
+          haptic_fw=None, wlan_fw=None, adsp_fw=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -428,6 +440,9 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
             gpu['zap-elf'] = zap_fw		# 0144, bluegpu=7
         extra.append(node('blueline-gpu', gpu))
 
+    if adsp_fw is not None:
+        # Read by bsd/dev/blueline_audio.c (0186): loaded into the ADSP's carve-out and started through PAS.
+        extra.append(node('blueline-adsp', adsp_fw))
     if wlan_fw is not None:
         # Read by bsd/dev/blueline_wifi.c (0167): served to the modem's WLAN PD over TFTP, and the board file.
         extra.append(node('blueline-wlan', {'wlanmdsp': wlan_fw[0], 'bdwlan': wlan_fw[1]}))
@@ -453,6 +468,8 @@ if __name__ == '__main__':
                     help='with --gpu-fw: the "sqe-firmware" to add (default auto: vendor/ copy, else linux-firmware)')
     ap.add_argument('--gpu-zap', default='auto', metavar='auto|none|PATH.mdt',
                     help='with --gpu-fw: the "zap-elf" to add (default auto: DIR/vendor/a630_zap.mdt + .bNN)')
+    ap.add_argument('--adsp-fw', metavar='DIR',
+                    help='add /blueline-adsp: DIR/adsp.mdt and adsp.bNN (from vendor /firmware)')
     ap.add_argument('--wlan-fw', metavar='DIR',
                     help='add /blueline-wlan: DIR/wlanmdsp.mbn and DIR/bdwlan-blueline.bin (from vendor /firmware)')
     ap.add_argument('--haptic-fw', metavar='DIR',
@@ -475,8 +492,9 @@ if __name__ == '__main__':
     zap_fw, zap_why = zap_firmware(a.gpu_zap, a.gpu_fw) if a.gpu_fw else (None, None)
     haptic_fw = haptic_firmware(a.haptic_fw) if a.haptic_fw else None
     wlan_fw = wlan_firmware(a.wlan_fw) if a.wlan_fw else None
+    adsp_fw = adsp_firmware(a.adsp_fw) if a.adsp_fw else None
     root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw,
-                 haptic_fw=haptic_fw, wlan_fw=wlan_fw)
+                 haptic_fw=haptic_fw, wlan_fw=wlan_fw, adsp_fw=adsp_fw)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:

@@ -1,0 +1,650 @@
+0186: blueline speaker stage 2: boot the ADSP (bluesnd=2)
+
+The speaker's QUAT TDM port belongs to the ADSP. bluesnd=2 loads its
+firmware (adsp.mdt + bNN from the ADT, tools/mkadt.py --adsp-fw) into its
+carve-out (0x8c500000 + 26 MiB) and starts it through TrustZone PAS (id 1:
+init_image with the .mdt, mem_setup, auth_and_reset) after the AOP's
+load_state, then waits for its SMP2P ready bit (items 443/429, IPC bit
+10), as mainline's qcom_q6v5_pas for sdm845-adsp-pas.
+
+blueline_wifi.c exports blueline_qmp_send() and a lock shared with its
+SMEM allocations (blueline_smem_lock/unlock).
+
+---
+diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
+--- a/bsd/dev/blueline_audio.c
++++ b/bsd/dev/blueline_audio.c
+@@ -22,6 +22,9 @@
+  *   bluesnd=0   off (default)
+  *   bluesnd=1   probe: log the pins, pulse each amp's reset, read DEVID,
+  *               REVID and OTPID, put the reset pins back as found
++ *   bluesnd=2   boot the ADSP (patch 0186): firmware from the ADT
++ *               (/blueline-adsp, tools/mkadt.py --adsp-fw), TrustZone PAS
++ *               (id 1), wait for its SMP2P "ready"
+  * Log prefix "BLUE SOUND:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -29,15 +32,28 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include "blueline_scm.h"
+ 
+ extern void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);	/* blueline_touch.c */
+ extern int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
+     uint32_t rlen);
+ extern void IOSleep(unsigned int milliseconds);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern bool blueline_smem_lock(void);		/* blueline_wifi.c (0186) */
++extern void blueline_smem_unlock(void);
++extern int blueline_qmp_send(const char *msg);
+ void blueline_audio_start(void);
+ 
+ #define TLMM_NORTH_PA	0x03900000u	/* GPIO 49, 50, 112, 115 */
+@@ -142,9 +158,454 @@
+ 	wr32(a->rst_va, cfg);
+ }
+ 
++
++/*
++ * ---- Stage 2 (bluesnd=2): the ADSP ----
++ *
++ * As mainline's qcom_q6v5_pas.c for sdm845-adsp-pas (PAS id 1, AOP load_state "adsp", crash reason SMEM
++ * item 423) and sdm845.dtsi (carve-out 0x8c500000 + 26 MiB; SMP2P items 443 in / 429 out, remote pid 2,
++ * doorbell APCS IPC bit 10; GLINK doorbell bit 8). The firmware's ELF is split (adsp.mdt + adsp.bNN): the
++ * .mdt (ELF header, program headers and the hash segment) is the metadata TrustZone authenticates first,
++ * then the loadable segments are copied into the carve-out and TrustZone checks them and starts the DSP.
++ * The SMEM helpers follow blueline_wifi.c's for the modem, here for the apps-ADSP partition.
++ */
++#define SMEM_PA			0x86000000u
++#define SMEM_SIZE		0x200000u
++#define SMEM_TOC		(SMEM_SIZE - 0x1000u)
++#define SMEM_TOC_MAGIC		0x434f5424u	/* "$TOC" */
++#define SMEM_PRT_MAGIC		0x54525024u	/* "$PRT" */
++#define SMEM_CANARY		0xa5a5u
++#define SMEM_HOST_APPS		0u
++#define SMEM_HOST_ADSP		2u
++#define SMEM_HOST_GLOBAL	0xfffeu
++#define SMEM_ITEM_CRASH		423u
++#define APCS_PA			0x17990000u
++#define APCS_IPC		0x0cu
++#define IPC_ADSP_SMP2P		10u
++#define TCSR_MUTEX3_PA		0x01f43000u
++#define APPS_PROC_ID		1u
++#define SMP2P_OUT		429u
++#define SMP2P_IN		443u
++#define SMP2P_MAGIC		0x504d5324u	/* "$SMP" */
++#define SMP2P_ENTRIES		16u
++#define SMP2P_SIZE		(20u + 20u * SMP2P_ENTRIES)
++#define SMP2P_FATAL		(1u << 0)
++#define SMP2P_READY		(1u << 1)
++#define SMP2P_HANDOVER		(1u << 2)
++#define ADSP_PAS_ID		1u
++#define ADSP_MEM_PA		0x8c500000ull
++#define ADSP_MEM_SIZE		0x1a00000u
++#define ADSP_SEGS		16
++#define SVC_PIL			0x02u
++#define PAS_INIT_IMAGE		0x01u
++#define PAS_MEM_SETUP		0x02u
++#define PAS_AUTH_RESET		0x05u
++#define COPY_WINDOW		0x100000u
++
++static struct {
++	vm_offset_t smem, apcs, mutex;
++	uint32_t pa_off, pa_size, pa_cl;	/* the apps-ADSP partition */
++	uint32_t pg_off, pg_size, pg_cl;	/* the global one */
++	uint32_t out_off;
++} dsp;
++
++static uint32_t
++rd(vm_offset_t a)
++{
++	return rd32(a);
++}
++
+ static void
++wr(vm_offset_t a, uint32_t v)
++{
++	wr32(a, v);
++}
++
++static uint16_t
++rd16(vm_offset_t a)
++{
++	return (uint16_t)(rd(a & ~(vm_offset_t)3) >> (8 * (a & 2)));
++}
++
++static uint64_t
++ms_abs(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++static void
++smem_parts(void)
++{
++	vm_offset_t toc = dsp.smem + SMEM_TOC;
++	if (rd(toc) != SMEM_TOC_MAGIC) {
++		printf("BLUE SOUND: smem: no $TOC\n");
++		return;
++	}
++	uint32_t n = MIN(rd(toc + 8), 32u);
++	for (uint32_t i = 0; i < n; i++) {
++		vm_offset_t e = toc + 32 + 48 * i;
++		uint32_t off = rd(e), size = rd(e + 4), hosts = rd(e + 12), cl = rd(e + 16);
++		uint32_t h0 = hosts & 0xffffu, h1 = hosts >> 16;
++		if (!off || !size || off >= SMEM_SIZE || size > SMEM_SIZE - off) {
++			continue;
++		}
++		/* only partitions with apps in them: the others stall the bus */
++		bool adsp = (h0 == SMEM_HOST_APPS && h1 == SMEM_HOST_ADSP) || (h1 == SMEM_HOST_APPS && h0 == SMEM_HOST_ADSP);
++		bool global = h0 == SMEM_HOST_GLOBAL && h1 == SMEM_HOST_GLOBAL;
++		if ((!adsp && !global) || rd(dsp.smem + off) != SMEM_PRT_MAGIC) {
++			continue;
++		}
++		if (adsp) {
++			dsp.pa_off = off, dsp.pa_size = size, dsp.pa_cl = cl ? cl : 64;
++		} else {
++			dsp.pg_off = off, dsp.pg_size = size, dsp.pg_cl = cl ? cl : 64;
++		}
++		printf("BLUE SOUND: smem partition %s at %#x+%#x\n", adsp ? "apps-adsp" : "global", SMEM_PA + off, size);
++	}
++}
++
++/* An item in a private partition: the offset of its data from SMEM_PA, 0 if absent. */
++static uint32_t
++smem_find(uint32_t poff, uint32_t psize, uint32_t pcl, uint32_t item, uint32_t *size)
++{
++	if (!poff) {
++		return 0;
++	}
++	vm_offset_t p = dsp.smem + poff;
++	uint32_t fu = rd(p + 12), fc = rd(p + 16);
++	if (fu > psize || fc > psize) {
++		return 0;
++	}
++	for (uint32_t e = 32; e + 16 <= fu;) {
++		if (rd16(p + e) != SMEM_CANARY) {
++			return 0;
++		}
++		uint32_t sz = rd(p + e + 4), pd = rd16(p + e + 8), ph = rd16(p + e + 10);
++		if (sz > psize || e + 16 + ph + sz > fu) {
++			return 0;
++		}
++		if (rd16(p + e + 2) == item) {
++			*size = sz - pd;
++			return poff + e + 16 + ph;
++		}
++		e += 16 + ph + sz;
++	}
++	uint32_t hdr = (16 + pcl - 1) & ~(pcl - 1);
++	for (uint32_t e = psize - hdr; e > fc && e < psize;) {
++		if (rd16(p + e) != SMEM_CANARY) {
++			return 0;
++		}
++		uint32_t sz = rd(p + e + 4);
++		if (sz > e) {
++			return 0;
++		}
++		if (rd16(p + e + 2) == item) {
++			*size = sz - rd16(p + e + 8);
++			return poff + e - sz;
++		}
++		if (sz + hdr > e) {
++			break;
++		}
++		e -= sz + hdr;
++	}
++	return 0;
++}
++
++/* qcom_smem_alloc_private in the apps-ADSP partition, uncached side. */
++static uint32_t
++smem_alloc(uint32_t item, uint32_t size)
++{
++	uint32_t got;
++	uint32_t off = smem_find(dsp.pa_off, dsp.pa_size, dsp.pa_cl, item, &got);
++	if (off || !dsp.pa_off) {
++		return off;
++	}
++	if (!blueline_smem_lock()) {
++		return 0;
++	}
++	int i;
++	for (i = 0; i < 1000; i++) {
++		wr(dsp.mutex, APPS_PROC_ID);
++		if (rd(dsp.mutex) == APPS_PROC_ID) {
++			break;
++		}
++		delay(10);
++	}
++	if (i == 1000) {
++		blueline_smem_unlock();
++		printf("BLUE SOUND: TCSR mutex 3 held by %#x\n", rd(dsp.mutex));
++		return 0;
++	}
++	vm_offset_t p = dsp.smem + dsp.pa_off;
++	uint32_t fu = rd(p + 12), fc = rd(p + 16), asize = (size + 7) & ~7u;
++	if (fu < 32 || fc > dsp.pa_size || fu + 16 + asize > fc) {
++		off = 0;
++		printf("BLUE SOUND: smem apps-adsp full (free %#x..%#x)\n", fu, fc);
++	} else {
++		vm_offset_t e = p + fu;
++		wr(e, SMEM_CANARY | (item << 16));
++		wr(e + 4, asize);
++		wr(e + 8, asize - size);
++		wr(e + 12, 0);
++		for (uint32_t o = 0; o < asize; o += 4) {
++			wr(e + 16 + o, 0);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		wr(p + 12, fu + 16 + asize);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		off = dsp.pa_off + fu + 16;
++	}
++	wr(dsp.mutex, 0);
++	blueline_smem_unlock();
++	return off;
++}
++
++static void
++kick(unsigned bit)
++{
++	wr(dsp.apcs + APCS_IPC, 1u << bit);
++}
++
++/* Our SMP2P item 429, "master-kernel" (its bit 0 asks the ADSP to stop; never set here). */
++static bool
++smp2p_create(void)
++{
++	uint32_t off = smem_alloc(SMP2P_OUT, SMP2P_SIZE);
++	if (!off) {
++		printf("BLUE SOUND: no SMP2P item %u\n", SMP2P_OUT);
++		return false;
++	}
++	vm_offset_t o = dsp.smem + off;
++	if (rd(o) != SMP2P_MAGIC) {
++		static const char name[16] = "master-kernel";
++		wr(o + 8, 0u | (SMEM_HOST_ADSP << 16));		/* local pid 0, remote pid 2 */
++		wr(o + 12, SMP2P_ENTRIES | (1u << 16));
++		wr(o + 16, 0);
++		for (int i = 0; i < 16; i += 4) {
++			wr(o + 20 + (uint32_t)i, (uint32_t)(uint8_t)name[i] | (uint32_t)(uint8_t)name[i + 1] << 8 |
++			    (uint32_t)(uint8_t)name[i + 2] << 16 | (uint32_t)(uint8_t)name[i + 3] << 24);
++		}
++		wr(o + 36, 0);
++		wr(o, SMP2P_MAGIC);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		wr(o + 4, 1u | (1u << 8));			/* version 1; features: SSR ack */
++	}
++	dsp.out_off = off;
++	kick(IPC_ADSP_SMP2P);
++	return true;
++}
++
++/* The ADSP's "slave-kernel" bits (fatal, ready, handover, stop-ack); false while item 443 or the entry is not there. */
++static bool
++smp2p_in(uint32_t *v)
++{
++	uint32_t sz;
++	uint32_t off = smem_find(dsp.pa_off, dsp.pa_size, dsp.pa_cl, SMP2P_IN, &sz);
++	if (!off || sz < 20 || rd(dsp.smem + off) != SMP2P_MAGIC) {
++		return false;
++	}
++	vm_offset_t in = dsp.smem + off;
++	uint32_t n = MIN(rd(in + 12) >> 16, SMP2P_ENTRIES);
++	for (uint32_t i = 0; i < n && 20 + 20 * (i + 1) <= sz; i++) {
++		vm_offset_t e = in + 20 + 20 * i;
++		if (rd(e) == 0x76616c73u && rd(e + 4) == 0x656b2d65u && rd(e + 8) == 0x6c656e72u) {	/* "slave-kernel" */
++			*v = rd(e + 16);
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++crash_reason(void)
++{
++	uint32_t sz = 0, off = smem_find(dsp.pg_off, dsp.pg_size, dsp.pg_cl, SMEM_ITEM_CRASH, &sz);
++	char msg[161];
++	uint32_t n = off ? MIN(sz, (uint32_t)sizeof(msg) - 1) : 0;
++	for (uint32_t i = 0; i < n; i++) {
++		char c = (char)(rd(dsp.smem + ((off + i) & ~3u)) >> (8 * ((off + i) & 3u)));
++		if (!c) {
++			n = i;
++			break;
++		}
++		msg[i] = (c >= 32 && c < 127) ? c : '.';
++	}
++	msg[n] = 0;
++	printf("BLUE SOUND: adsp crash reason (smem 423): \"%s\"\n", off ? msg : "(absent)");
++}
++
++/* Copy (or zero, past filesz) [pa, pa + memsz) of the carve-out through write-combined windows. */
++static void
++fill_region(uint64_t pa, const uint8_t *src, uint32_t filesz, uint32_t memsz)
++{
++	for (uint32_t done = 0; done < memsz;) {
++		uint32_t len = MIN(COPY_WINDOW, memsz - done);
++		uint64_t wpa = pa + done, mpa = trunc_page_64(wpa);
++		vm_size_t moff = (vm_size_t)(wpa - mpa), msz = round_page(moff + len);
++		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)mpa, msz, VM_WIMG_WCOMB);
++		uint8_t *w = (uint8_t *)(trunc_page(va) + moff);
++		uint32_t fpart = done < filesz ? MIN(len, filesz - done) : 0;
++		if (fpart) {
++			memcpy(w, src + done, fpart);
++		}
++		for (uint32_t o = fpart; o < len; o++) {
++			*(volatile uint8_t *)(w + o) = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(trunc_page(va), msz);
++		done += len;
++	}
++}
++
++static int64_t
++pas_call(uint32_t cmd, uint32_t arginfo, const uint64_t *args, unsigned n, const char *what)
++{
++	uint64_t res[3] = { 0 };
++	unsigned resumes = 0;
++	int64_t rc = blueline_scm_call(false, SCM_FNID(SVC_PIL, cmd), arginfo, args, n, res, &resumes);
++	printf("BLUE SOUND: PAS %s -> %lld %s, result %#llx\n", what, (long long)rc, blueline_scm_err(rc), res[0]);
++	return rc ? rc : (int64_t)res[0];
++}
++
++static bool
++adsp_boot(void)
++{
++	DTEntry node;
++	const void *mdt = NULL, *seg[ADSP_SEGS] = { 0 };
++	unsigned int mdt_len = 0, seg_len[ADSP_SEGS] = { 0 };
++
++	if (SecureDTLookupEntry(NULL, "/blueline-adsp", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "mdt", &mdt, &mdt_len) != kSuccess || mdt_len < 52) {
++		printf("BLUE SOUND: no ADSP firmware in the device tree (tools/mkadt.py --adsp-fw)\n");
++		return false;
++	}
++	const uint8_t *m = mdt;
++	uint32_t phoff, phnum, phent;
++	memcpy(&phoff, m + 0x1c, 4);
++	phnum = m[0x2c] | m[0x2d] << 8;
++	phent = m[0x2a] | m[0x2b] << 8;
++	if (memcmp(m, "\177ELF", 4) || m[4] != 1 || phent != 32 || phnum > ADSP_SEGS || phoff + phnum * 32 > mdt_len) {
++		printf("BLUE SOUND: adsp.mdt is not the 32-bit ELF expected\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < phnum; i++) {
++		char name[4] = { 'b', (char)('0' + i / 10), (char)('0' + i % 10), 0 };
++		(void)SecureDTGetProperty(node, name, &seg[i], &seg_len[i]);
++	}
++
++	/* Map SMEM, the IPC register and the TCSR mutex; find the partitions; our SMP2P item. */
++	dsp.smem = ml_io_map(SMEM_PA, SMEM_SIZE);
++	dsp.apcs = ml_io_map(APCS_PA, 0x1000);
++	dsp.mutex = ml_io_map(TCSR_MUTEX3_PA, 0x1000);
++	if (!dsp.smem || !dsp.apcs || !dsp.mutex) {
++		return false;
++	}
++	smem_parts();
++	if (!dsp.pa_off || !smp2p_create()) {
++		return false;
++	}
++
++	/* The AOP turns the LPASS's power on (the Wi-Fi driver links QMP while it brings up the modem). */
++	int e = EAGAIN;
++	for (int i = 0; i < 1200 && (e = blueline_qmp_send("{class: image, res: load_state, name: adsp, val: on}")) == EAGAIN; i++) {
++		IOSleep(100);
++	}
++	if (e) {
++		printf("BLUE SOUND: AOP load_state adsp: %d\n", e);
++		return false;
++	}
++
++	/* The metadata, then where the image goes (relocatable: the carve-out's start). */
++	vm_offset_t meta = 0;
++	if (kmem_alloc_contig(kernel_map, &meta, round_page(mdt_len), PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	memcpy((void *)meta, mdt, mdt_len);
++	uint64_t meta_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta));
++	flush_dcache64((addr64_t)meta_pa, mdt_len, TRUE);
++	uint64_t a[3] = { ADSP_PAS_ID, meta_pa, 0 };
++	int64_t r = pas_call(PAS_INIT_IMAGE, SCM_ARGS(2, SCM_VAL, SCM_RW, 0, 0, 0), a, 2, "init_image");
++	if (r == 0) {
++		a[1] = ADSP_MEM_PA;
++		a[2] = ADSP_MEM_SIZE;
++		r = pas_call(PAS_MEM_SETUP, SCM_ARGS(3, 0, 0, 0, 0, 0), a, 3, "mem_setup");
++	}
++	if (r) {
++		kmem_free(kernel_map, meta, round_page(mdt_len));
++		return false;
++	}
++
++	/* The loadable segments (not the hash), each at its place in the carve-out. */
++	uint64_t base = ~0ull;
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint8_t *ph = m + phoff + 32 * i;
++		uint32_t type, paddr, memsz, flags;
++		memcpy(&type, ph, 4), memcpy(&paddr, ph + 12, 4), memcpy(&memsz, ph + 20, 4), memcpy(&flags, ph + 24, 4);
++		if (type == 1 && memsz && ((flags >> 24) & 7u) != 2u && paddr < base) {
++			base = paddr;
++		}
++	}
++	uint32_t loaded = 0;
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint8_t *ph = m + phoff + 32 * i;
++		uint32_t type, paddr, filesz, memsz, flags;
++		memcpy(&type, ph, 4), memcpy(&paddr, ph + 12, 4), memcpy(&filesz, ph + 16, 4), memcpy(&memsz, ph + 20, 4);
++		memcpy(&flags, ph + 24, 4);
++		if (type != 1 || !memsz || ((flags >> 24) & 7u) == 2u) {
++			continue;
++		}
++		uint64_t off = paddr - base;
++		if (filesz > memsz || off + memsz > ADSP_MEM_SIZE || (filesz && (!seg[i] || seg_len[i] < filesz))) {
++			printf("BLUE SOUND: segment %u (%#x+%#x, file %#x, have %u) does not fit\n", i, paddr, memsz, filesz,
++			    seg_len[i]);
++			kmem_free(kernel_map, meta, round_page(mdt_len));
++			return false;
++		}
++		fill_region(ADSP_MEM_PA + off, seg[i], filesz, memsz);
++		loaded += memsz;
++	}
++	printf("BLUE SOUND: %u bytes of ADSP image at %#llx\n", loaded, ADSP_MEM_PA);
++
++	r = pas_call(PAS_AUTH_RESET, SCM_ARGS(1, 0, 0, 0, 0, 0), a, 1, "auth_and_reset");
++	kmem_free(kernel_map, meta, round_page(mdt_len));
++	if (r) {
++		return false;
++	}
++
++	/* Ready within 5 s, as mainline (qcom_q6v5_wait_for_start). */
++	uint64_t t0 = mach_absolute_time(), end = t0 + ms_abs(5000);
++	uint32_t v = 0;
++	bool seen = false;
++	while (mach_absolute_time() < end) {
++		if (smp2p_in(&v)) {
++			seen = true;
++			if (v & (SMP2P_FATAL | SMP2P_READY)) {
++				break;
++			}
++		}
++		IOSleep(10);
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("BLUE SOUND: adsp after %llu ms: %s, bits %#x%s%s%s\n", ns / NSEC_PER_MSEC, seen ? "SMP2P up" : "no SMP2P",
++	    v, (v & SMP2P_READY) ? " READY" : "", (v & SMP2P_HANDOVER) ? " handover" : "", (v & SMP2P_FATAL) ? " FATAL" : "");
++	if (!(v & SMP2P_READY)) {
++		crash_reason();
++		return false;
++	}
++	return true;
++}
++
++static void
+ snd_thread(void *arg __unused, wait_result_t w __unused)
+ {
++	if (snd_mode >= 2) {
++		printf("BLUE SOUND: adsp %s\n", adsp_boot() ? "up" : "NOT up");
++		return;
++	}
+ 	snd_bus = blueline_bbi2c_open(TLMM_NORTH_PA, AMP_SDA, AMP_SCL);
+ 	if (!snd_bus) {
+ 		printf("BLUE SOUND: no I2C bus\n");
+diff -ruN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -105,6 +105,7 @@
+ #include <kern/thread.h>
+ #include <kern/locks.h>
+ #include <libkern/crypto/sha2.h>
++#include <libkern/OSAtomic.h>
+ #include <pexpert/device_tree.h>
+ #include "blueline_scm.h"
+ 
+@@ -663,9 +664,39 @@
+ 	return 0;
+ }
+ 
++/*
++ * TCSR mutex 3 tells processors apart, not threads: the apps side holds a flag of its own first, shared with
++ * blueline_audio.c's ADSP allocations (blueline_smem_lock/unlock).
++ */
++static volatile SInt32 smem_flag;
++
++bool blueline_smem_lock(void);
++void blueline_smem_unlock(void);
++
++bool
++blueline_smem_lock(void)
++{
++	for (int i = 0; !OSCompareAndSwap(0, 1, &smem_flag); i++) {
++		if (i >= 1000) {
++			return false;
++		}
++		delay(100);
++	}
++	return true;
++}
++
++void
++blueline_smem_unlock(void)
++{
++	OSCompareAndSwap(1, 0, &smem_flag);
++}
++
+ static bool
+ hwlock(void)
+ {
++	if (!blueline_smem_lock()) {
++		return false;
++	}
+ 	for (int i = 0; i < 1000; i++) {
+ 		wr(w2.mutex, APPS_PROC_ID);
+ 		if (rd(w2.mutex) == APPS_PROC_ID) {
+@@ -673,9 +704,17 @@
+ 		}
+ 		delay(10);
+ 	}
++	blueline_smem_unlock();
+ 	return false;
+ }
+ 
++static void
++hwunlock(void)
++{
++	wr(w2.mutex, 0);
++	blueline_smem_unlock();
++}
++
+ /* qcom_smem_alloc_private, uncached side. */
+ static uint32_t
+ smem_alloc_modem(uint32_t item, uint32_t size)
+@@ -694,7 +733,7 @@
+ 	vm_offset_t p = w2.smem + w2.pm_off;
+ 	uint32_t fu = rd(p + 12), fc = rd(p + 16), asize = (size + 7) & ~7u;
+ 	if (fu < 32 || fc > w2.pm_size || fu + 16 + asize > fc) {
+-		wr(w2.mutex, 0);
++		hwunlock();
+ 		printf("BLUELINE WIFI: smem apps-modem full (free %#x..%#x)\n", fu, fc);
+ 		return 0;
+ 	}
+@@ -709,7 +748,7 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	wr(p + 12, fu + 16 + asize);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	wr(w2.mutex, 0);
++	hwunlock();
+ 	printf("BLUELINE WIFI: smem item %u allocated at %#x (%u bytes)\n", item, SMEM_PA + w2.pm_off + fu + 16, asize);
+ 	return w2.pm_off + fu + 16;
+ }
+@@ -5402,9 +5441,15 @@
+ 	return qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, "channel ack");
+ }
+ 
++static volatile bool qmp_up;	/* linked: blueline_qmp_send() may be used */
++static volatile SInt32 qmp_flag;
++
+ static bool
+ qmp_send(const char *msg)
+ {
++	while (!OSCompareAndSwap(0, 1, &qmp_flag)) {
++		delay(100);
++	}
+ 	char buf[QMP_MSG_LEN] = { 0 };
+ 	strlcpy(buf, msg, sizeof(buf));
+ 	for (uint32_t i = 0; i < QMP_MSG_LEN; i += 4) {
+@@ -5420,10 +5465,23 @@
+ 	if (!ok) {
+ 		wr(w2.qmp + w2.qmp_off, 0);
+ 	}
++	OSCompareAndSwap(1, 0, &qmp_flag);
+ 	printf("BLUELINE WIFI: qmp \"%s\": %s\n", msg, ok ? "acked" : "NOT acked (cleared)");
+ 	return ok;
+ }
+ 
++/* For blueline_audio.c (0186): an AOP message once this driver has linked QMP (step 2). 0, EAGAIN or EIO. */
++int blueline_qmp_send(const char *msg);
++
++int
++blueline_qmp_send(const char *msg)
++{
++	if (!qmp_up) {
++		return EAGAIN;
++	}
++	return qmp_send(msg) ? 0 : EIO;
++}
++
+ /* ---- RPMh votes (rpmhpd: ARC level index; clk-rpmh: xo.lvl on = 3) ---- */
+ 
+ static int
+@@ -6053,7 +6111,11 @@
+ step2_power(void)
+ {
+ 	printf("BLUELINE WIFI: step 2: AOP load_state, RPMh votes, GCC clocks\n");
+-	if (!qmp_link() || !qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
++	if (!qmp_link()) {
++		return false;
++	}
++	qmp_up = true;
++	if (!qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
+ 		return false;
+ 	}
+ 	if (!arc_vote("mx.lvl", 385, false) || !arc_vote("cx.lvl", 385, false) || !arc_vote("mss.lvl", 385, false)) {

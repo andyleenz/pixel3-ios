@@ -1,0 +1,213 @@
+0185: blueline speaker stage 1: probe the CS35L36 amps (bluesnd=1)
+
+The Pixel 3's speaker path is QUAT TDM from the ADSP into two Cirrus
+CS35L36 amps on qupv3_se12_i2c (0x40 bottom, 0x41 top), not the WCD9340.
+bluesnd=1 pulses each amp's reset (GPIO 112, 75) and reads DEVID, REVID
+and OTPID over the bit-banged bus on GPIO 49/50.
+
+---
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@
+ bsd/dev/blueline_gpu.c			standard
+ bsd/dev/blueline_gpu_mem.c			standard
+ bsd/dev/blueline_haptic.c		standard
++bsd/dev/blueline_audio.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
+--- a/bsd/dev/blueline_audio.c
++++ b/bsd/dev/blueline_audio.c
+@@ -0,0 +1,175 @@
++/*
++ * Pixel 3 (blueline) speaker (patch 0185 on): two Cirrus Logic CS35L36
++ * boosted amplifiers fed by the ADSP's QUAT TDM port.
++ *
++ * Hardware, from the production device tree overlay (stock dtbo.img entry 8,
++ * "B1 DVT1.1") and the vendor audio configuration (mixer_paths_tavil_b1.xml:
++ * the "speaker" path is QUAT_TDM_RX_0, S32_LE, "AMP" and "R AMP"; the WCD9340
++ * codec is not on it):
++ *   cs35l36@40 (bottom) and cs35l36@41 (top) on qupv3_se12_i2c (i2c@a90000):
++ *   SDA GPIO 49, SCL GPIO 50 (TLMM north tile, shared with the MAX1720x
++ *   gauge, 0141), bottom reset GPIO 112 (north) / IRQ GPIO 115, top reset
++ *   GPIO 75 (east) / IRQ GPIO 40, VA from PM8998 S4 (1.8 V, always on),
++ *   boost 1.0 uH, 10 V, 3.7 A peak; TDM bit clock 12.288 MHz (48 kHz, 8 slots
++ *   of 32 bits).
++ *
++ * Registers from Linux's sound/soc/codecs/cs35l36.c (Cirrus Logic, GPL), used
++ * only as a description of the chip; this file is written from scratch. The
++ * bus is bit-banged (blueline_touch.c's blueline_bbi2c_*): 32-bit register
++ * addresses and values, big-endian.
++ *
++ * Boot-args:
++ *   bluesnd=0   off (default)
++ *   bluesnd=1   probe: log the pins, pulse each amp's reset, read DEVID,
++ *               REVID and OTPID, put the reset pins back as found
++ * Log prefix "BLUE SOUND:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);	/* blueline_touch.c */
++extern int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
++    uint32_t rlen);
++extern void IOSleep(unsigned int milliseconds);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void blueline_audio_start(void);
++
++#define TLMM_NORTH_PA	0x03900000u	/* GPIO 49, 50, 112, 115 */
++#define TLMM_EAST_PA	0x03500000u	/* GPIO 75 */
++#define TLMM_SOUTH_PA	0x03d00000u	/* GPIO 40 */
++#define GPIO_CFG(n)	(0x1000u * (n))
++#define GPIO_IO(n)	(0x1000u * (n) + 4u)
++#define AMP_SDA		49
++#define AMP_SCL		50
++
++/* CS35L36 registers */
++#define R_DEVID		0x00000000u
++#define R_REVID		0x00000004u
++#define R_OTPID		0x00000010u
++#define DEVID_L36	0x035a36u
++
++struct amp {
++	const char *name;
++	uint8_t addr;
++	uint32_t rst_tile, irq_tile;
++	int rst, irq;
++	vm_offset_t rst_va, irq_va;
++};
++
++static struct amp amps[2] = {
++	{ "bottom", 0x40, TLMM_NORTH_PA, TLMM_NORTH_PA, 112, 115, 0, 0 },
++	{ "top",    0x41, TLMM_EAST_PA,  TLMM_SOUTH_PA, 75,  40,  0, 0 },
++};
++
++static int snd_mode;
++static void *snd_bus;
++
++static uint32_t
++rd32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)a = v;
++}
++
++/* Map one pin's two registers (config, in/out). */
++static vm_offset_t
++pin_map(uint32_t tile, int n)
++{
++	return ml_io_map(tile + GPIO_CFG(n), 0x1000);
++}
++
++/* Plain GPIO output, 2 mA, no pull. */
++static void
++pin_out(vm_offset_t p, int high)
++{
++	wr32(p + 4u, high ? 2u : 0u);
++	wr32(p, 1u << 9);
++}
++
++static int
++amp_rd(const struct amp *a, uint32_t reg, uint32_t *val)
++{
++	uint8_t r[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg };
++	uint8_t v[4];
++	int err = blueline_bbi2c_xfer(snd_bus, a->addr, r, 4, v, 4);
++	*val = err ? 0 : (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
++	return err;
++}
++
++static void
++amp_probe(struct amp *a)
++{
++	a->rst_va = pin_map(a->rst_tile, a->rst);
++	a->irq_va = pin_map(a->irq_tile, a->irq);
++	if (!a->rst_va || !a->irq_va) {
++		printf("BLUE SOUND: %s amp: pin mapping failed\n", a->name);
++		return;
++	}
++	uint32_t cfg = rd32(a->rst_va), io = rd32(a->rst_va + 4u);
++	printf("BLUE SOUND: %s amp 0x%02x: reset GPIO %d cfg 0x%x io 0x%x, IRQ GPIO %d cfg 0x%x io 0x%x\n",
++	    a->name, a->addr, a->rst, cfg, io, a->irq, rd32(a->irq_va), rd32(a->irq_va + 4u));
++
++	uint32_t devid = 0, revid = 0, otpid = 0;
++	int before = amp_rd(a, R_DEVID, &devid);
++	printf("BLUE SOUND: %s amp: before the reset pulse DEVID %s 0x%x\n", a->name, before ? "NACK" : "", devid);
++
++	pin_out(a->rst_va, 0);
++	IOSleep(3);
++	pin_out(a->rst_va, 1);
++	IOSleep(10);
++	int e1 = amp_rd(a, R_DEVID, &devid);
++	int e2 = amp_rd(a, R_REVID, &revid);
++	int e3 = amp_rd(a, R_OTPID, &otpid);
++	printf("BLUE SOUND: %s amp: after reset DEVID 0x%x%s REVID 0x%x OTPID 0x%x (errors %d %d %d)\n", a->name,
++	    devid, devid == DEVID_L36 ? " (CS35L36)" : " (unexpected)", revid, otpid, e1, e2, e3);
++
++	/* As found. */
++	wr32(a->rst_va + 4u, io);
++	wr32(a->rst_va, cfg);
++}
++
++static void
++snd_thread(void *arg __unused, wait_result_t w __unused)
++{
++	snd_bus = blueline_bbi2c_open(TLMM_NORTH_PA, AMP_SDA, AMP_SCL);
++	if (!snd_bus) {
++		printf("BLUE SOUND: no I2C bus\n");
++		return;
++	}
++	for (int i = 0; i < 2; i++) {
++		amp_probe(&amps[i]);
++	}
++	printf("BLUE SOUND: probe done\n");
++}
++
++/* bsd/dev/sweet_ufs.c, after the haptics. */
++void
++blueline_audio_start(void)
++{
++	PE_parse_boot_argn("bluesnd", &snd_mode, sizeof(snd_mode));
++	if (snd_mode <= 0) {
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(snd_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("BLUE SOUND: no thread\n");
++		return;
++	}
++	thread_deallocate(th);
++	printf("BLUE SOUND: bluesnd=%d: CS35L36 at 0x40/0x41 on GPIO 49/50\n", snd_mode);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-20 23:35:28
++++ b/bsd/dev/sweet_ufs.c	2026-11-20 23:36:19
+@@ -736,6 +736,11 @@
+ 		extern void blueline_haptic_start(void);
+ 		blueline_haptic_start();
+ 	}
++	{
++		/* CS35L36 speaker amps, off unless bluesnd=N (patch 0185, blueline_audio.c). */
++		extern void blueline_audio_start(void);
++		blueline_audio_start();
++	}
+ 	/* Wi-Fi stage 1: SCM queries and read-only state, off unless bluewifi=1 (blueline_wifi.c). */
+ 	blueline_wifi_probe();
+ 	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
