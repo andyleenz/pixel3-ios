@@ -16,3 +16,9 @@ showing; 540x1080, half the panel's resolution, RGB565). Newest first.
 | 2026-11-20-full-width-status-bar.png | Home screen filling the whole panel (1125x2250 scaled by 0.96, 0184) with iOS's own status bar (Jindo off) and Wi-Fi joined by itself after boot (0183) |
 | 2026-11-20-full-width-apps.png | Second home page (the stock apps) at the full-width canvas |
 | 2026-11-20-full-width-settings.png | Settings at the full-width canvas, with the status bar |
+| 2026-11-20-wifi-safari-google.png | Safari loading google.com over Wi-Fi |
+| 2026-11-21-lock.png | Lock screen at the full-width canvas, after a lock/wake cycle with the panel asleep (`bluefb_dcs=2`) |
+| 2026-11-21-home1.png | Home screen, settled, full width |
+| 2026-11-21-home2.png | Second home page (stock apps), full width |
+| 2026-11-21-settings.png | Settings scrolled past the Wi-Fi row |
+| 2026-11-21-safari.png | Safari on apple.com over Wi-Fi |

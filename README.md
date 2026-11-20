@@ -11,10 +11,11 @@
 > Please report problems [here](https://github.com/andyleenz/pixel3-ios/issues).
 
 <p>
-<img src="docs/screenshots/2026-11-20-full-width-status-bar.png" width="180" alt="Home screen filling the panel, with the status bar">
-<img src="docs/screenshots/2026-11-20-full-width-apps.png" width="180" alt="Second home page: the stock apps">
-<img src="docs/screenshots/2026-11-20-full-width-settings.png" width="180" alt="Settings">
-<img src="docs/screenshots/2026-11-20-wifi-safari-google.png" width="180" alt="Safari loading google.com over Wi-Fi">
+<img src="docs/screenshots/2026-11-21-lock.png" width="150" alt="Lock screen">
+<img src="docs/screenshots/2026-11-21-home1.png" width="150" alt="Home screen">
+<img src="docs/screenshots/2026-11-21-home2.png" width="150" alt="Second home page: the stock apps">
+<img src="docs/screenshots/2026-11-21-settings.png" width="150" alt="Settings, scrolled">
+<img src="docs/screenshots/2026-11-21-safari.png" width="150" alt="Safari over Wi-Fi">
 </p>
 
 **New since the fork (2026-11):**
@@ -65,7 +66,7 @@ partition.
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
 
-**Not working yet:** Metal, 5 GHz Wi-Fi, audio, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal, 5 GHz Wi-Fi, audio from iOS (a kernel test tone plays, `bluesnd=3`), camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
@@ -89,7 +90,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Widgets ("Waiting..."), GPU clock scaling (DCVS).
 
 **Later**
-- Audio (speaker amps and the ADSP are up; the DSP link and playback are next, see LOG), display power-off on lock.
+- Audio from iOS: `/dev/redwood-audio` and HackiOS's HAL plug-in on top of the kernel speaker path (a test tone plays, see LOG).
+- Panel sleep on lock (`bluefb_dcs=2`) by default.
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).
