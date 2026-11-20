@@ -386,6 +386,11 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
         product = node('product')
         for k, v in d22ap_product(iphone):
             product.set(k, v)
+        # The panel shows sRGB, and with "P3" CoreAnimation draws wide-colour
+        # layers and snapshots into 'b3a8' surfaces (10-bit colour plus an
+        # alpha plane) that the GPU path can't draw into: the wallpaper
+        # blurs (App Library, Control Center) came out black.
+        product.set('artwork-display-gamut', b'sRGB\0')
         extra.append(product)
 
     storage = []
