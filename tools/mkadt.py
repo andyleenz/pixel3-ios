@@ -60,7 +60,7 @@ leaves it out; or a .mdt path. Only the pinned SHA-256 is accepted.
 """
 import argparse
 
-CANVAS = (1125, 2436)        # --canvas
+CANVAS = (1125, 2250)        # --canvas
 import hashlib
 import os
 import struct
@@ -387,8 +387,8 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
         # watchdogd: no PMU to report boot stages to.
         arm_io.children.append(node('wdt', {'no-pmu': u32(1)}))
         # IOMobileFramebuffer counts these; canvas = what iOS draws: the
-        # iPhone X panel, which the kernel (patch 0061) presents and crops
-        # to the 1080x2160 Pixel panel.
+        # iPhone X's width at the Pixel's 2:1 (1125x2250, patch 0184), which
+        # the kernel scales by 0.96 to the 1080x2160 panel.
         arm_io.children.append(node('disp0', {
             'device_type': strs('display-subsystem'),
             'compatible': strs('sweet,display'),
@@ -457,8 +457,9 @@ if __name__ == '__main__':
                     help='add /blueline-wlan: DIR/wlanmdsp.mbn and DIR/bdwlan-blueline.bin (from vendor /firmware)')
     ap.add_argument('--haptic-fw', metavar='DIR',
                     help='add /blueline-haptic "wmfw" + "wavetable" from DIR/cs40l20.wmfw, cs40l20.bin')
-    ap.add_argument('--canvas', default='1125x2436', metavar='WxH',
-                    help="the display iOS draws (disp0 canvas): 1125x2436 = iPhone X (default), "
+    ap.add_argument('--canvas', default='1125x2250', metavar='WxH',
+                    help="the display iOS draws (disp0 canvas): 1125x2250 = the X's width at 2:1 (default, as "
+                         "the kernel since 0184), 1125x2436 = iPhone X (with bluefb_canvas_h=2436), "
                          "1080x2160 = the Pixel's own panel (with sweetfb_native=1)")
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()

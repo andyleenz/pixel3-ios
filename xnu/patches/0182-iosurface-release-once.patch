@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -472,6 +472,7 @@
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapReleaseSecond(void *id, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -1062,6 +1063,23 @@
+ 	}
+ 	IOLockUnlock(fLock);
+ 	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++/*
++ * 0182: trap 5. IOSurfaceClientRelease (iOS 16) sends trap 4 and then trap 5
++ * for the same id when a client object dies; both went to trapRelease, so one
++ * dying client took two counts. A process that had looked a surface up twice
++ * (two client objects, count 2) lost the mapping while the other object still
++ * used it: backboardd's QuartzCore then read the unmapped state page
++ * (IOSurfaceClientGetBulkAttachments, +0x30) and died, e.g. when typing in
++ * Safari. Trap 4 alone drops the count. The library's other trap 5 (undoing a
++ * lookup whose client object could not be made) is rare; it leaks one mapping
++ * until the connection closes.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapReleaseSecond(void *, void *, void *, void *, void *, void *)
++{
++	return kIOReturnSuccess;
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+@@ -1070,7 +1088,7 @@
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapReleaseSecond },
+ };
+ 
+ IOExternalTrap *

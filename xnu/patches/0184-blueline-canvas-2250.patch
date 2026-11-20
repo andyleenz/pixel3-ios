@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -119,9 +119,16 @@
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ *
++ * Pixel 3 (blueline): 1125 wide as the X, but 2250 tall (375x750 points),
++ * the panel's 2:1. Scaled by 0.96 it is exactly the 1080x2160 panel: no
++ * black bars. The status bar is still the X's (UIKit's Split1125 matches the
++ * 1125 width and the X's notch; a 1080-wide canvas, as sweetfb_native=1,
++ * matches none and gets the red bar). As the 12 mini, which draws 1125 wide
++ * and shows 1080. bluefb_canvas_h=2436: the X's own height (bars at the sides).
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
++#define SWEET_FB_LOGICAL_H              2250
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -290,9 +297,11 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	uint32_t canvas_h = SWEET_FB_LOGICAL_H;
++	PE_parse_boot_argn("bluefb_canvas_h", &canvas_h, sizeof(canvas_h));
++	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= canvas_h && canvas_h <= 4096) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
++		fLogicalH = canvas_h;
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -440,9 +440,11 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	/* Pixel 3 panel: 1080x2160 (centered in the presented 1125x2436). */
++	/* Pixel 3 panel: 1080x2160 in the presented 1125x2250 (bluefb_canvas_h, SweetFramebuffer.cpp). */
++	int canvas_h = 2250;
++	PE_parse_boot_argn("bluefb_canvas_h", &canvas_h, sizeof(canvas_h));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2160 : 2436;
++	fLogicalH = native ? 2160 : canvas_h;
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - 2160) / 2;
+ 	/* As SweetFramebuffer.cpp shows it: scaled to the panel's height, centred. */

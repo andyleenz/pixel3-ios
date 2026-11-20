@@ -854,3 +854,19 @@ Faster loop found on the way: restarting securityd over bluesh (`bluesh.py kill 
 **eagl:** the unaligned-row copy path (native mode) is limited to the 1080x2160 panel buffer; applying it to every unaligned target crashed backboardd in fit mode.
 
 Open: backboardd SIGSEGV in `IOSurfaceClientGetBulkAttachments` (QuartzCore) when typing in Safari, fault at +0x30 of an unmapped 16K page (likely a surface's state page unmapped while still in use); Wallet card image garbled; native-mode status bar placeholder.
+
+### Safari typing, Wi-Fi rejoin, a full-width screen (2026-11-20)
+
+**Safari crash when typing (0182).** iOS 16's `IOSurfaceClientRelease` sends trap 4 and then trap 5 for the same surface; both dropped a mapping count, so a surface's mapping went while another client object still used it, and backboardd read its unmapped state page (`IOSurfaceClientGetBulkAttachments`, +0x30) a few key presses into Google's search field. Trap 5 is now a no-op (the rare other use, an undone lookup, leaks one mapping until the connection closes). 25 key presses and two Control Center rounds: no backboardd restart.
+
+**Wi-Fi joins by itself after boot (0183).** wifid saw the known network and turned it down, "Below minimum RSSI threshold", at -60 dBm: its floor comes from the driver's RSSI_BOUNDS (ioctl 106), which was refused, so it kept a default of +7 dBm. The driver now answers -100..0 with -80 as the join floor; wifid logs "Device RSSI bounds (-100, 0) with treshold (-80)" and the first auto-join after boot ("aj_enabled_by_user", once the driver is up) joins with no tap. (Its later "non-6G is not allowed with current trigger" lines are roaming retries while joined.)
+
+**Full width (0184).** The canvas is now 1125x2250: the X's width at the panel's 2:1 (375x750 points). Fit mode scales it by exactly 0.96 to the 1080x2160 panel, so there are no side bars (as the 12 mini draws 1125 wide for its 1080 panel). The touch mapping follows (SweetHID). `bluefb_canvas_h=2436` gives the old picture back; `tools/mkadt.py --canvas` follows (default 1125x2250).
+
+The status bar is still UIKit's red "rdar:45025538" placeholder. UIKit picks a layout by screen (`_UIStatusBarVisualProvider_Split`): one whose `nativeDisplayWidth` equals the screen's width in pixels and whose `notchSize` matches the screen's exclusion area (scaled by `_nativeScale` / `referenceScreenScale`); with no exclusion area, the classic status bar. SpringBoard takes the exclusion area from its screen-type table (`sb_thisDeviceDisplayShape` → `SBHScreenTypeForCurrentDevice`, by reference size and scale), which has no 375x750 or 360x720 entry. Neither the "has notch" MobileGestalt answer nor the artwork subtype (2208, 2340 in the cache) changes it. (The jailbreak scene's XR/11 fix, FixRDAR4XR11, moves to a known size: a 786x1704 canvas, the 14 Pro's points.)
+
+**tools/bluelog.py**: iOS's own unified log from the running phone over the USB link (recent tracev3 files + the root image's uuidtext, decoded with mandiant's unifiedlog_iterator, filtered while parsed).
+
+**Wallet's card picture (eagl).** It was sheared, each row 16 pixels on: a 1326x1160 picture with rows of 5312 bytes, read in place by the GPU as rows of 5376 (the next multiple of 256). Pictures whose rows are not a multiple of 256 bytes are now copied rather than read in place (the 1125-wide ones, rows of 4608, still are). Also: four backboardd restarts in one boot trip blueeagl's crash counter and CoreAnimation draws in software (banding, a red clock); an empty /var/mobile/blueeagl.starts resets it.
+
+Open: the red status bar placeholder (SpringBoard's screen-type table has no 375x750 entry; being looked at).
