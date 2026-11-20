@@ -6,9 +6,9 @@
 #
 # The phone starts in recovery (or fastboot). Needs the IPSW's original
 # launchd.plist in work/orig and its OS volume as work/OS.dmg (see
-# remigrate.sh). The staged apps are larger than one push payload, so a
-# short first boot (NAME-apps) puts in the first half; the migration boot
-# (NAME) puts in the rest, with the migration reset and launchd.plist.
+# remigrate.sh). The staged apps (about 500 MiB) are larger than one push
+# payload, so short boots (NAME-apps1, 2...) put most of them in; the
+# migration boot (NAME) puts in the rest, with the reset and launchd.plist.
 # Options and boot-args after NAME go to the migration boot, e.g.
 #   tools/remigrate-push.sh migr5 --wait 40 --grep 'panic|BLUELINE: snap' blueui=1 ...
 set -euo pipefail
@@ -53,22 +53,31 @@ plistlib.dump({}, open(mig, 'wb'), fmt=plistlib.FMT_BINARY)
 EOF
 : > "$tmp/migrate"
 
-# split the apps in two halves by size
-all=() first=() rest=() half=0 total=0
-while IFS= read -r a; do all+=("$a"); done < <(ls "$apps")
-total=$(du -skA "$apps" | cut -f1)
-for a in "${all[@]}"; do
-	k=$(du -skA "$apps/$a" | cut -f1)
-	if (( half + k <= total / 2 )); then first+=("$a"); half=$((half + k)); else rest+=("$a"); fi
-done
-echo "staged apps: ${#all[@]} (${#first[@]} in the first boot, ${#rest[@]} with the migration)"
+# pack the apps into boots: a push holds 255 MiB, and the migration boot
+# keeps room for its own files and the test's (GPU libraries etc.)
+mig_kib=$((150 * 1024)) boot_kib=$((235 * 1024))
+rest=() rest_k=0 boots=() cur=() cur_k=0
+while IFS=$'\t' read -r k a; do
+	if (( rest_k + k <= mig_kib )); then rest+=("$a"); rest_k=$((rest_k + k)); continue; fi
+	if (( cur_k + k > boot_kib )); then boots+=("${cur[*]}"); cur=() cur_k=0; fi
+	cur+=("$a"); cur_k=$((cur_k + k))
+done < <(cd "$apps" && du -skA -- *.app | sort -rn)
+(( ${#cur[@]} )) && boots+=("${cur[*]}")
+echo "staged apps: $(ls "$apps" | wc -l | tr -d ' ') (${#boots[@]} app boots, ${#rest[@]} with the migration)"
 push() { for a in "$@"; do printf -- '--push\0%s\0' "$apps/$a:/private/var/staged_system_apps/$a:755:501:501"; done; }
 
-a=()
-while IFS= read -r -d '' x; do a+=("$x"); done < <(push "${first[@]}")
-# (a migration moves the apps out, so the folder must be mobile's)
-tools/phonetest.sh --name "$name-apps" --wait 6 --grep panic --end recovery \
-	--mkdir /private/var/staged_system_apps:755:501:501 "${a[@]}" | tail -2
+# (a migration moves the apps out, so the folder must be mobile's. The pushes
+# are applied as the kernel starts; reboot on a timer, since SpringBoard may
+# never come up, e.g. while lsd waits for a database seed)
+n=0
+for b in "${boots[@]}"; do
+	n=$((n + 1)) a=()
+	read -r -a list <<< "$b"
+	while IFS= read -r -d '' x; do a+=("$x"); done < <(push "${list[@]}")
+	tools/phonetest.sh --name "$name-apps$n" --wait 6 --grep panic --end recovery \
+		--mkdir /private/var/staged_system_apps:755:501:501 "${a[@]}" \
+		bluereboot=recovery bluereboot_after=120 | tail -1
+done
 
 a=()
 while IFS= read -r -d '' x; do a+=("$x"); done < <(push "${rest[@]}")
