@@ -1,0 +1,514 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: Wi-Fi stage 3d, WLAN power and the WLFW handshake (bluewifi=5)
+
+With the WLAN image served (0167) the modem's WLAN domain starts and
+WLFW, the WLAN firmware's QMI control service (0x45), comes up. With
+bluewifi=5 the kernel votes the WCN3990's rails on through RPMh (L5a,
+L7a, L17a, L25a, RF_CLK2; shared with Bluetooth, never voted off), then
+drives WLFW as ath10k qmi.c does on SDM845: indications, the 8-bit host
+caps, MSA info and the MSA region (0x8df00000, 1 MiB, below XNU's RAM)
+given to the modem and WLAN VMs, MSA ready, capabilities, the board data
+from the device tree (/blueline-wlan "bdwlan"), cal report, then on FW
+READY the copy engine config from ath10k snoc.c and mission mode.
+bluewifi=4 boots are unchanged.
+
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -1231,6 +1231,17 @@
+ 
+ /* Data for one of our ports (stage 3b on: rmtfs, pd-mapper, WLFW, TFTP). */
+ static void qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);
++
++static uint32_t wlfw_srv_node, wlfw_srv_port;
++static bool wlfw_srv_seen;
++
++static void
++wlfw_seen_at(uint32_t node, uint32_t port)
++{
++	wlfw_srv_node = node;
++	wlfw_srv_port = port;
++	wlfw_srv_seen = true;
++}
+ 
+ static void
+ qrtr_rx(const uint8_t *d, uint32_t n)
+@@ -1267,6 +1278,9 @@
+ 	}
+ 	case Q_NEW_SERVER:
+ 		gl.servers++;
++		if (w[1] == 0x45u) {	/* WLFW: stage 3d (bluewifi=5) */
++			wlfw_seen_at(w[3], w[4]);
++		}
+ 		printf("BLUELINE WIFI: qrtr: server: service %u (%#x) version %u instance %u at %u:%#x\n", w[1], w[1], w[2] & 0xffu,
+ 		    w[2] >> 8, w[3], w[4]);
+ 		break;
+@@ -1922,10 +1936,436 @@
+ 	} else if (op == T_ERROR) {
+ 		printf("BLUELINE WIFI: tftp: client error %u: %.*s (block %u)\n", blk, (int)(n - 4), (const char *)d + 4, x->last_sent);
+ 		x->used = false;
++	}
++}
++
++/*
++ * ---- Stage 3d (bluewifi=5): WLAN power and WLFW, the WLAN firmware's control service (QMI service 0x45) ----
++ *
++ * Driven as Linux ath10k qmi.c does for WCN3990 on SDM845 (snoc, qcom,snoc-host-cap-8bit-quirk) and ios-flame's
++ * wlfw.c: indications, host caps, MSA memory (0x8df00000, 1 MiB, the phone's wlan_fw_region, below XNU's RAM)
++ * given to the modem and the WLAN VMs, MSA ready, capabilities, board data (/blueline-wlan "bdwlan"), cal report,
++ * then on FW READY: wlan config (ath10k snoc.c's copy engine tables) and mission mode.
++ *
++ * Power (ath10k snoc.c vregs, sdm845-google-common.dtsi &wifi): L5a 0.8 V, L7a 1.8 V, L17a 1.304 V, L25a 3.104 V,
++ * HPM, and RF_CLK2, through RPMh. Bluetooth shares them: voted on, never off.
++ */
++#define WLFW_SERVICE		0x45u
++#define WLFW_PORT		0x20u
++#define WLFW_MSA_PA		0x8df00000ull
++#define WLFW_MSA_SIZE		0x100000u
++#define VMID_WLAN		0x18u
++#define VMID_WLAN_CE		0x19u
++#define QMI_INDICATION		4
++enum {
++	WLFW_IND_REGISTER = 0x20, WLFW_FW_READY_IND = 0x21, WLFW_WLAN_MODE = 0x22, WLFW_WLAN_CFG = 0x23, WLFW_CAP = 0x24,
++	WLFW_BDF_DOWNLOAD = 0x25, WLFW_CAL_REPORT = 0x26, WLFW_MSA_READY_IND = 0x2b, WLFW_PIN_RESULT_IND = 0x2c,
++	WLFW_MSA_INFO = 0x2d, WLFW_MSA_READY = 0x2e, WLFW_HOST_CAP = 0x34, WLFW_FW_INIT_DONE_IND = 0x38,
++};
++
++static struct {
++	uint32_t node, port;
++	bool seen, started, powered;
++	volatile bool fw_ready, msa_ready;
++	uint16_t txn;
++	volatile bool waiting, done;
++	uint16_t want_txn;
++	uint8_t resp[1024];
++	uint32_t resp_n;
++} wf;
++
++/* A request up to 7 KiB (board data in 6 KiB segments): the QMI header, then TLVs. */
++static struct {
++	uint8_t b[7200];
++	uint32_t n;
++} wq;
++
++static void
++w_start(uint16_t id)
++{
++	wq.b[0] = QMI_REQUEST;
++	memcpy(wq.b + 3, &id, 2);
++	wq.n = 7;
++}
++
++static void
++w_tlv(uint8_t t, const void *v, uint16_t len)
++{
++	if (wq.n + 3u + len > sizeof(wq.b)) {
++		wq.n = sizeof(wq.b) + 1;
++		return;
++	}
++	wq.b[wq.n] = t;
++	memcpy(wq.b + wq.n + 1, &len, 2);
++	memcpy(wq.b + wq.n + 3, v, len);
++	wq.n += 3u + len;
++}
++
++static void
++w_u8(uint8_t t, uint8_t v)
++{
++	w_tlv(t, &v, 1);
++}
++
++static void
++w_u32(uint8_t t, uint32_t v)
++{
++	w_tlv(t, &v, 4);
++}
++
++static void
++w_u64(uint8_t t, uint64_t v)
++{
++	w_tlv(t, &v, 8);
++}
++
++static uint64_t wlfw_t0;
++
++/* Send the request and wait for its response (into wf.resp); the QMI error, 1 for a failure with no code, -1 on timeout. */
++static int
++w_request(struct qmi_msg *r, unsigned ms)
++{
++	uint16_t id;
++	if (wq.n > sizeof(wq.b)) {
++		printf("BLUELINE WIFI: wlfw: request too big\n");
++		return -1;
++	}
++	memcpy(&id, wq.b + 3, 2);
++	uint16_t len = (uint16_t)(wq.n - 7), txn = ++wf.txn;
++	memcpy(wq.b + 1, &txn, 2);
++	memcpy(wq.b + 5, &len, 2);
++	wf.want_txn = txn;
++	wf.done = false;
++	wf.waiting = true;
++	if (qrtr_send(Q_DATA, WLFW_PORT, wf.node, wf.port, wq.b, wq.n)) {
++		wf.waiting = false;
++		printf("BLUELINE WIFI: wlfw: request %#x not sent\n", id);
++		return -1;
+ 	}
++	uint64_t t0 = mach_absolute_time();
++	while (!wf.done && ms_since(t0) < ms) {
++		link_poll();
++		delay(1000);
++	}
++	wf.waiting = false;
++	if (!wf.done) {
++		printf("BLUELINE WIFI: wlfw: request %#x timed out after %u ms\n", id, ms);
++		return -1;
++	}
++	(void)qmi_parse(wf.resp, wf.resp_n, r);
++	uint16_t l = 0, rr[2] = { 0, 0 };
++	const uint8_t *res = qmi_get(r, 2, &l);
++	if (res && l >= 4) {
++		memcpy(rr, res, 4);
++	}
++	if (rr[0]) {
++		printf("BLUELINE WIFI: wlfw: request %#x -> result %u error %#x\n", id, rr[0], rr[1]);
++		return rr[1] ? rr[1] : 1;
++	}
++	return 0;
+ }
+ 
+ static void
++wlfw_handle(const struct qmi_msg *m, const uint8_t *d, uint32_t n)
++{
++	if (m->type == QMI_RESPONSE) {
++		if (wf.waiting && m->txn == wf.want_txn && n <= sizeof(wf.resp)) {
++			memcpy(wf.resp, d, n);
++			wf.resp_n = n;
++			wf.done = true;
++		}
++		return;
++	}
++	if (m->type != QMI_INDICATION) {
++		return;
++	}
++	switch (m->id) {
++	case WLFW_FW_READY_IND:
++		printf("BLUELINE WIFI: wlfw: [+%u ms] < FW READY\n", ms_since(wlfw_t0));
++		wf.fw_ready = true;
++		break;
++	case WLFW_MSA_READY_IND:
++		printf("BLUELINE WIFI: wlfw: [+%u ms] < MSA READY\n", ms_since(wlfw_t0));
++		wf.msa_ready = true;
++		break;
++	case WLFW_FW_INIT_DONE_IND:
++		printf("BLUELINE WIFI: wlfw: [+%u ms] < FW INIT DONE\n", ms_since(wlfw_t0));
++		break;
++	case WLFW_PIN_RESULT_IND:
++		printf("BLUELINE WIFI: wlfw: < pin connect result: power %#x phy io %#x rf %#x\n", qmi_u32(m, 0x10, 0),
++		    qmi_u32(m, 0x11, 0), qmi_u32(m, 0x12, 0));
++		break;
++	default:
++		printf("BLUELINE WIFI: wlfw: < indication %#x (%u bytes)\n", m->id, m->len);
++		break;
++	}
++}
++
++static bool
++wlan_power(void)
++{
++	static const struct { const char *res; uint32_t mv; } ldo[] = {
++		{ "ldoa5", 800 }, { "ldoa7", 1800 }, { "ldoa17", 1304 }, { "ldoa25", 3104 },
++	};
++	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
++		uint32_t a = blueline_cmddb_addr(ldo[i].res);
++		if (!a) {
++			printf("BLUELINE WIFI: wlan power: %s not in cmd-db\n", ldo[i].res);
++			return false;
++		}
++		const uint32_t addr[3] = { a + 0, a + 8, a + 4 }, data[3] = { ldo[i].mv, 7, 1 };	/* mV, HPM, on */
++		int err = blueline_rpmh_write(addr, data, 3);
++		printf("BLUELINE WIFI: wlan power: %s (%#x) %u mV HPM on -> %d\n", ldo[i].res, a, ldo[i].mv, err);
++		if (err) {
++			return false;
++		}
++	}
++	uint32_t a = blueline_cmddb_addr("rfclka2"), on = 1;
++	if (!a) {
++		printf("BLUELINE WIFI: wlan power: rfclka2 not in cmd-db\n");
++		return false;
++	}
++	a += 4;		/* clk-rpmh VRM enable */
++	int err = blueline_rpmh_write(&a, &on, 1);
++	printf("BLUELINE WIFI: wlan power: rfclka2 on -> %d\n", err);
++	return err == 0;
++}
++
++/* MSA region: HLOS -> MSS_MSA + WLAN (+ WLAN_CE unless secure), once per boot. */
++static int
++msa_assign(uint64_t pa, uint32_t size, bool secure)
++{
++	uint64_t res[3] = { 0 }, bpa;
++	unsigned resumes = 0, nd = 0;
++	uint8_t *b = blueline_scm_payload(128 + 3 * sizeof(struct perm_info), &bpa);
++	if (!b) {
++		return ENOMEM;
++	}
++	bzero(b, 128 + 3 * sizeof(struct perm_info));
++	uint32_t *src = (uint32_t *)(void *)b;
++	src[0] = VMID_HLOS;
++	uint64_t *map = (uint64_t *)(void *)(b + 64);
++	map[0] = pa;
++	map[1] = size;
++	struct perm_info *d = (struct perm_info *)(void *)(b + 128);
++	d[nd].vmid = VMID_MSS_MSA;
++	d[nd++].perm = PERM_RW;
++	d[nd].vmid = VMID_WLAN;
++	d[nd++].perm = PERM_RW;
++	if (!secure) {
++		d[nd].vmid = VMID_WLAN_CE;
++		d[nd++].perm = PERM_RW;
++	}
++	const uint64_t args[7] = { bpa + 64, 16, bpa, 4, bpa + 128, sizeof(struct perm_info) * nd, 0 };
++	printf("BLUELINE WIFI: about to SMC MP_ASSIGN msa %#llx+%#x: HLOS -> MSS WLAN%s\n", pa, size, secure ? "" : " WLAN_CE");
++	int64_t rc = blueline_scm_call(false, SCM_FNID(SVC_MP, MP_ASSIGN),
++	    SCM_ARGS(7, SCM_RO, SCM_VAL, SCM_RO, SCM_VAL, SCM_RO), args, 7, res, &resumes);
++	printf("BLUELINE WIFI: MP_ASSIGN msa -> %lld %s, x1 %#llx, %u resumes\n", (long long)rc, blueline_scm_err(rc), res[0],
++	    resumes);
++	return rc || res[0] ? EIO : 0;
++}
++
++/* ath10k snoc.c target_ce_config_wlan: pipe, dir, nentries, nbytes_max, flags */
++static const uint32_t wlfw_ce[12][5] = {
++	{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
++	{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
++	{ 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 }, { 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
++};
++/* target_service_to_ce_map_wlan: service, dir, pipe (with the zero entry, as ath10k sends it) */
++static const uint32_t wlfw_svc[21][3] = {
++	{ 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 },
++	{ 0x103, 2, 3 }, { 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 },
++	{ 0xfe00, 2, 0 }, { 0xfe00, 1, 2 }, { 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xfe00, 2, 5 }, { 0x301, 1, 9 },
++	{ 0x302, 1, 10 }, { 0x600, 1, 11 }, { 0, 0, 0 },
++};
++/* target_shadow_reg_cfg_map: ce, register offset */
++static const uint16_t wlfw_shadow[12][2] = {
++	{ 0, 0x3c }, { 3, 0x3c }, { 4, 0x3c }, { 5, 0x3c }, { 7, 0x3c }, { 1, 0x40 },
++	{ 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
++};
++
++static int
++wlfw_bdf(void)
++{
++	DTEntry node;
++	void const *p = NULL;
++	unsigned int len = 0;
++	struct qmi_msg r;
++	if (SecureDTLookupEntry(NULL, "/blueline-wlan", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "bdwlan", &p, &len) != kSuccess || !len) {
++		printf("BLUELINE WIFI: wlfw: no board data in the device tree (/blueline-wlan bdwlan)\n");
++		return -1;
++	}
++	const uint8_t *bdf = p;
++	uint32_t seg = 0;
++	for (uint32_t off = 0; off < len; seg++) {
++		uint16_t chunk = (uint16_t)MIN(len - off, 6144u);
++		bool end = off + chunk >= len;
++		static uint8_t data[2 + 6144];
++		w_start(WLFW_BDF_DOWNLOAD);
++		w_u8(0x01, 1);			/* valid */
++		w_u32(0x10, 0);			/* file_id */
++		w_u32(0x11, len);		/* total_size */
++		w_u32(0x12, seg);		/* seg_id */
++		memcpy(data, &chunk, 2);
++		memcpy(data + 2, bdf + off, chunk);
++		w_tlv(0x13, data, (uint16_t)(2 + chunk));
++		w_u8(0x14, end);
++		int e = w_request(&r, 5000);
++		if (e) {
++			printf("BLUELINE WIFI: wlfw: board data segment %u (%u bytes at %u%s) -> %d\n", seg, chunk, off, end ? ", end" : "", e);
++		}
++		if (e && !(end && e == 1)) {	/* ath10k: a CRC complaint at the end is not fatal */
++			return -1;
++		}
++		off += chunk;
++	}
++	printf("BLUELINE WIFI: wlfw: board data sent, %u bytes in %u segments\n", len, seg);
++	return 0;
++}
++
++static int
++wlfw_enable(void)
++{
++	struct qmi_msg r;
++	uint8_t b[1 + 20 * 21];
++	w_start(WLFW_WLAN_CFG);			/* (no host version, as ath10k) */
++	b[0] = 12;
++	for (int i = 0; i < 12; i++) {
++		memcpy(b + 1 + 20 * i, wlfw_ce[i], 20);
++	}
++	w_tlv(0x11, b, 1 + 20 * 12);
++	b[0] = 21;
++	for (int i = 0; i < 21; i++) {
++		memcpy(b + 1 + 12 * i, wlfw_svc[i], 12);
++	}
++	w_tlv(0x12, b, 1 + 12 * 21);
++	b[0] = 12;
++	for (int i = 0; i < 12; i++) {
++		memcpy(b + 1 + 4 * i, wlfw_shadow[i], 4);
++	}
++	w_tlv(0x13, b, 1 + 4 * 12);
++	if (w_request(&r, 5000)) {
++		return -1;
++	}
++	w_start(WLFW_WLAN_MODE);
++	w_u32(0x01, 0);				/* mission */
++	w_u8(0x10, 0);				/* hw_debug */
++	if (w_request(&r, 5000)) {
++		return -1;
++	}
++	printf("BLUELINE WIFI: wlfw: [+%u ms] wlan config sent, mission mode on\n", ms_since(wlfw_t0));
++	return 0;
++}
++
++static int
++wlfw_start(void)
++{
++	struct qmi_msg r;
++	uint16_t l = 0;
++	const uint8_t *p;
++
++	wlfw_t0 = mach_absolute_time();
++	printf("BLUELINE WIFI: wlfw: starting with the server at %u:%#x\n", wf.node, wf.port);
++	w_start(WLFW_IND_REGISTER);
++	w_u8(0x10, 1);				/* fw_ready_enable */
++	w_u8(0x13, 1);				/* msa_ready_enable */
++	w_u8(0x14, 1);				/* pin_connect_result_enable */
++	w_u32(0x15, 0x4b4e454c);		/* client_id, ath10k's */
++	if (w_request(&r, 5000)) {
++		return -1;
++	}
++	uint64_t fw_status = 0;
++	if ((p = qmi_get(&r, 0x10, &l)) && l >= 8) {
++		memcpy(&fw_status, p, 8);
++	}
++	printf("BLUELINE WIFI: wlfw: registered for indications, fw status %#llx\n", fw_status);
++	if (fw_status & 2) {
++		wf.fw_ready = true;
++	}
++	if (!wf.fw_ready) {
++		w_start(WLFW_HOST_CAP);
++		w_u8(0x10, 0);			/* daemon_support = 0, one byte (snoc-host-cap-8bit-quirk) */
++		int e = w_request(&r, 5000);
++		if (e && e != 0x5e) {		/* QMI_ERR_NOT_SUPPORTED: older firmware */
++			return -1;
++		}
++		w_start(WLFW_MSA_INFO);
++		w_u64(0x01, WLFW_MSA_PA);
++		w_u32(0x02, WLFW_MSA_SIZE);
++		if (w_request(&r, 5000)) {
++			return -1;
++		}
++		p = qmi_get(&r, 0x03, &l);
++		unsigned nreg = p && l ? p[0] : 0;
++		for (unsigned i = 0; i < nreg && 1 + 13 * (i + 1) <= l; i++) {
++			uint64_t a;
++			uint32_t sz;
++			memcpy(&a, p + 1 + 13 * i, 8);
++			memcpy(&sz, p + 1 + 13 * i + 8, 4);
++			bool secure = p[1 + 13 * i + 12] != 0;
++			printf("BLUELINE WIFI: wlfw: MSA region %u: %#llx+%#x%s\n", i, a, sz, secure ? " secure" : "");
++			if (a < WLFW_MSA_PA || a + sz > WLFW_MSA_PA + WLFW_MSA_SIZE) {
++				printf("BLUELINE WIFI: wlfw: MSA region outside %#llx+%#x: stopping\n", WLFW_MSA_PA, WLFW_MSA_SIZE);
++				return -1;
++			}
++			delay(20000);		/* ath10k: SDM845 crashes on an XPU update right after the reply */
++			if (msa_assign(a, sz, secure)) {
++				return -1;
++			}
++		}
++		w_start(WLFW_MSA_READY);
++		if (w_request(&r, 5000)) {
++			return -1;
++		}
++	}
++	w_start(WLFW_CAP);
++	if (w_request(&r, 5000)) {
++		return -1;
++	}
++	uint32_t chip[2] = { 0, 0 }, board = 0, soc = 0, fwv = 0;
++	char build[132] = "";
++	if ((p = qmi_get(&r, 0x10, &l)) && l >= 8) {
++		memcpy(chip, p, 8);
++	}
++	if ((p = qmi_get(&r, 0x11, &l)) && l >= 4) {
++		memcpy(&board, p, 4);
++	}
++	if ((p = qmi_get(&r, 0x12, &l)) && l >= 4) {
++		memcpy(&soc, p, 4);
++	}
++	if ((p = qmi_get(&r, 0x13, &l)) && l >= 4) {
++		memcpy(&fwv, p, 4);
++	}
++	if ((p = qmi_get(&r, 0x14, &l)) && l) {
++		memcpy(build, p, MIN((size_t)l, sizeof(build) - 1));
++	}
++	printf("BLUELINE WIFI: wlfw: chip %#x family %#x board %#x soc %#x fw %#x \"%s\"\n", chip[0], chip[1], board, soc, fwv,
++	    build);
++	if (!wf.fw_ready) {
++		for (uint64_t t = mach_absolute_time(); !wf.msa_ready && ms_since(t) < 5000;) {
++			link_poll();
++			delay(1000);
++		}
++		if (wlfw_bdf()) {
++			return -1;
++		}
++		w_start(WLFW_CAL_REPORT);
++		w_u8(0x01, 0);			/* meta_data[]: none */
++		printf("BLUELINE WIFI: wlfw: cal report -> %d\n", w_request(&r, 5000));
++		for (uint64_t t = mach_absolute_time(); !wf.fw_ready && ms_since(t) < 10000;) {
++			link_poll();
++			delay(1000);
++		}
++		if (!wf.fw_ready) {
++			printf("BLUELINE WIFI: wlfw: no FW READY after 10 s\n");
++			return -1;
++		}
++	}
++	return wlfw_enable();
++}
++
++static void
+ qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ {
+ 	struct qmi_msg m;
+@@ -1934,6 +2374,12 @@
+ 		tftp_handle(h, d, n);
+ 		return;
+ 	}
++	if (h->dst_port == WLFW_PORT) {
++		if (qmi_parse(d, n, &m)) {
++			wlfw_handle(&m, d, n);
++		}
++		return;
++	}
+ 	if (!qmi_parse(d, n, &m) || m.type != QMI_REQUEST) {
+ 		printf("BLUELINE WIFI: qrtr: < DATA %u:%#x -> port %#x, %u bytes (not a request)\n", h->src_node, h->src_port,
+ 		    h->dst_port, n);
+@@ -2011,8 +2457,19 @@
+ 		}
+ 		if (w2.level >= 4 && !gl.up && !crashed && last != 0xffffffffu && (last & MODEM_READY) && !link_tried) {
+ 			link_tried = true;
++			if (w2.level >= 5 && !wf.powered) {
++				wf.powered = wlan_power();
++			}
+ 			(void)link_up();
+ 		}
++		if (w2.level >= 5 && gl.up && wlfw_srv_seen && !wf.started && !crashed) {
++			wf.started = true;
++			wf.node = wlfw_srv_node;
++			wf.port = wlfw_srv_port;
++			int e = wlfw_start();
++			printf("BLUELINE WIFI: wlfw: %s (%d) after %u ms\n", e ? "stopped" : "chip up, mission mode", e,
++			    ms_since(wlfw_t0));
++		}
+ 		if (gl.up) {
+ 			link_poll();
+ 		}
