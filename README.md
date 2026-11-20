@@ -9,9 +9,9 @@
 > Please report problems [here](https://github.com/andyleenz/pixel3-ios/issues).
 
 <p>
-<img src="docs/screenshots/2026-11-19-gpu-home.png" width="180" alt="Home screen">
+<img src="docs/screenshots/2026-11-20-home-wallpaper.png" width="180" alt="Home screen with wallpaper and widgets">
+<img src="docs/screenshots/2026-11-20-system-apps.png" width="180" alt="Second home page: the stock apps">
 <img src="docs/screenshots/2026-11-19-gpu-settings.png" width="180" alt="Settings">
-<img src="docs/screenshots/2026-11-19-gpu-settings-scrolled.png" width="180" alt="Settings, scrolled">
 <img src="docs/screenshots/2026-11-19-gpu-safari.png" width="180" alt="Safari">
 </p>
 
@@ -19,6 +19,8 @@
 - The UI is drawn by the Adreno 630 at about 60 fps (`blueui=1`). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
+- The first-boot migration installs all the stock apps (Weather, Wallet, Contacts, Files, Shortcuts...),
+  and the wallpaper, lock screen and widgets work.
 - Brightness, haptics, battery gauge, RTC, CPU clocks and thermal limits, watchdog, modem boot.
 - A hands-off test loop with scripted touches and screenshots ([docs/TESTING.md](docs/TESTING.md)). The
   engineering log is on the [`linux-host`](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md)
@@ -37,30 +39,51 @@ partition.
 > anything personal on it. No Apple software is stored in this repository: the iOS root is built on your own
 > Mac from Apple's IPSW. Not affiliated with or endorsed by Apple or Google.
 
-## What works (2026-10-23)
+## What works (2026-11-20)
 
 | Area | State |
 | --- | --- |
 | Boot | Google ABL (unlocked) starts our shim, which loads XNU with an Apple device tree. Test kernels go in with `fastboot boot`; a kernel flashed to `boot_a` starts at power-on, while slot B keeps LineageOS and its recovery |
 | CPU | All 8 cores (4x Kryo 385 Silver at 1.77 GHz, 4x Gold at 2.65 GHz), PSCI |
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
-| Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436); the frame is scaled to fit (thin side bars), copied by the CPU at 30 Hz |
-| iOS | Data migration, lock screen, SpringBoard, Settings and the stock core apps; software rendering (no GPU yet) |
+| Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436). With `blueui=1` the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; without it, a CPU copy at 30 Hz. Brightness works |
+| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim. Settings and Safari scroll at 55-62 fps |
+| iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. Photos crashes (no photo library yet); the App Library and Control Center blurs and the lock screen shortcut buttons don't draw yet |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
-| Battery | A static battery (100 %, on power) so iOS shows one; no fuel gauge yet |
+| Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
+| Other | Haptics, modem boot (no data yet) |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery |
 
-**Being worked on:** USB Ethernet (live kernel log, command and file servers; ported from ios-flame, not yet
-working on the phone), the removable system apps and wallpapers after migration.
-**Known issue:** the power button locks the phone, but the panel is never switched off: it keeps showing
-the last frame (ios-sweet's 0079 display-power patch is the likely fix).
-**Not working yet:** GPU / Metal, Wi-Fi, real battery readings, the RTC (time of day), audio, camera,
-Bluetooth, cellular, sensors, Face ID / SEP.
+**Not working yet:** Metal, Wi-Fi, audio, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+FairPlay: App Store apps).
+
+## Roadmap
+
+Updated as work lands. The detail is in the [engineering log](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md).
+
+**In progress: smoothness**
+- Remove the remaining hitches (frames of 30-120 ms when a screen or app first appears). Measured causes:
+  IOSurfaces whose rows aren't 64-byte aligned are copied by the CPU instead of read by the GPU in place
+  (up to 9 ms per full-screen copy); texture uploads; first-use shader compiles (now cached on disk).
+- GMEM (on-chip tile) rendering instead of sysmem, for the blur-heavy screens (dock, Control Center).
+
+**Next**
+- Make the GPU path (`blueui=1`) the default boot.
+- Photos: find out why it sees no photo library (assetsd never starts).
+- GPU memory: a larger BO pool than 32 MiB, and a 4th scanout buffer.
+- Widgets ("Waiting..."), GPU clock scaling (DCVS).
+
+**Later**
+- Wi-Fi, audio, display power-off on lock, USB networking.
+- iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
+  a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
+- Metal: a much larger project (no Apple GPU driver to stand on).
 
 **Why iOS 16:** every iOS for newer iPhones is built for arm64e, which uses ARMv8.3 pointer authentication.
-The Pixel 3's cores are ARMv8.2 and have none, so iOS 16 for the iPhone X (plain arm64) is the newest iOS that
-can run natively here.
+The Pixel 3's cores are ARMv8.2 and have none, so iOS 16 for the iPhone X (plain arm64) is the newest *iPhone*
+iOS that can run natively here. iPadOS 18 for the iPad 7 (A10, also plain arm64) is newer and could run too
+(see Roadmap).
 
 ## How it boots
 
