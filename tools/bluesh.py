@@ -8,6 +8,9 @@
   tools/bluesh.py kill NAME                         SIGKILL processes named NAME (launchd restarts daemons)
   tools/bluesh.py wait [SECONDS]                    wait until bluesh answers
   tools/bluesh.py done                              end the session: the phone reboots as bluereboot= says
+  tools/bluesh.py snap OUT.png                      a screenshot now (bluectl snap, kern.bluesnap, 0177)
+  tools/bluesh.py touch STEP[;STEP...]              touches now (kern.bluetouch): bluetouchscript= steps,
+                                                    time optional: "tap,540,1200;wait,800;swipe,540,2150,540,900,300"
 
 Needs the phone booted with sweetusb=2 and bluesh running (bluerun=/usr/local/bin/bluesh
 bluerun_after=launchd bluerun_timeout=36000), and the Mac's "Sweet iOS (USB Ethernet)" service at
@@ -15,6 +18,7 @@ bluerun_after=launchd bluerun_timeout=36000), and the Mac's "Sweet iOS (USB Ethe
 """
 import os
 import socket
+import struct
 import sys
 import time
 
@@ -55,6 +59,33 @@ def main(argv):
                 time.sleep(1)
         print('bluesh: no answer')
         return 1
+    if cmd == 'snap':
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import importlib
+        sp = importlib.import_module('snap2png')
+        s = connect()
+        s.sendall(b'run 20 /usr/local/bin/bluectl snap\n')
+        data = b''
+        while True:
+            d = s.recv(1 << 20)
+            if not d:
+                break
+            data += d
+        if not data.startswith(b'BLUESNAP'):
+            print(data[-300:].decode(errors='replace'))
+            return 1
+        (_m, _n, _v, _i, w, h, bpp, _sc, nbytes, ms, sb_ms, sw, sh, _r, _why) = sp.SNAP.unpack_from(data, 0)
+        pix = data[sp.SNAP.size:sp.SNAP.size + nbytes]
+        if len(pix) < nbytes:
+            print('snap: %d of %d bytes' % (len(pix), nbytes))
+            return 1
+        sp.png(argv[1], w, h, sp.to_rgb(pix, bpp, w * h))
+        print('%s  (%dx%d of %dx%d, SpringBoard +%d ms)' % (argv[1], w, h, sw, sh, sb_ms))
+        return 0
+    if cmd == 'touch':
+        steps = [t if ':' in t else '0:' + t for t in ';'.join(argv[1:]).replace('/', ';').split(';') if t]
+        argv = ['run', '/usr/local/bin/bluectl', 'touch', ';'.join(steps)]
+        cmd = 'run'
     s = connect()
     if cmd == 'run':
         secs = 60
