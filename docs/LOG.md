@@ -772,3 +772,49 @@ The remigrations had also dropped the test runner's launchd job; `remigrate.sh` 
 
 Still wrong (seen by hand): the App Library blurs the wallpaper and then shows black; Control Center's pull-down glitches; the lock screen's shortcut buttons don't draw; the Photos widget is black (empty library?); Weather has no data (no network). The first three all use wallpaper-derived materials. Thin black bars show at the left and right edges (1125-wide iOS scaled to the panel).
 
+
+## 2026-11-20: blurs, Wi-Fi up to the WLAN firmware service
+
+**Blurs (e9c38e8).** The black App Library and Control Center backgrounds were the display's colour gamut. The ADT said nothing, so iOS took the D22's P3 panel and asked CoreAnimation for wide-gamut (`b3a8`, 10-bit) blur surfaces, which our GL path can't draw: they came out black. `tools/mkadt.py` now says `artwork-display-gamut = sRGB`. MobileGestalt caches the answer, so its cache has to go once (`--rm` of `com.apple.MobileGestalt.plist` under the mobilegestaltcache system group). Afterwards the App Library and Control Center blur the wallpaper as they should, and the weather widget draws.
+
+**Wi-Fi stage 3a/3b (0165, 0166).** The modem boots (stage 2), then stays up:
+- 0165: GLINK over SMEM with the modem (items 478-480, APCS IPC bit 12), the IPCRTR channel open 5-16 ms after the modem is ready, and QRTR on top (HELLO, server announcements).
+- 0166: rmtfs (service 14), serving the EFS partitions on UFS LUN 5 (modemst1/2, fsg, fsc) **read only**. The modem's writes are acknowledged and dropped; nothing is ever written to flash. Also pd-mapper (0x40), with mainline's sdm845 table.
+- Result (wifi4a): the modem reads its EFS (4 reads, 4224 sectors), announces 36 services and stays up for the whole 200 s watch, instead of ERR-FATAL at 40 s.
+
+**Wi-Fi stage 3c (0167).** TFTP over QRTR (service 4096) serves `wlanmdsp.mbn` from the device tree (`mkadt --wlan-fw`, from the vendor image's `/firmware`; the blobs stay out of git). The `/readwrite/` files the modem writes stay in RAM for the boot. Result (wifi4c): the modem reads the 3 MB image (2965 blocks of 1 KiB), starts its WLAN domain, and **WLFW (service 0x45), the WLAN firmware's control service, comes up**. 
+
+**Wi-Fi stage 3d (0168, `bluewifi=5`): the WLAN chip is up.** The kernel votes the WCN3990's rails on through RPMh (L5a 0.8 V, L7a 1.8 V, L17a 1.304 V, L25a 3.104 V, RF_CLK2), then drives WLFW as ath10k does on SDM845. Result (wifi5a):
+- The modem reports two MSA regions (16 KiB secure, then the rest of the 1 MiB at 0x8df00000), and both are handed to the modem and the WLAN VMs (MP_ASSIGN ok).
+- MSA READY comes back after 54 ms.
+- Capabilities: chip 0x30214 (WCN3990), soc 0x40030001, firmware `WLAN.HL.2.2.3-00526-QCAHLSWMTPLZ-1`.
+- The board data goes over (26328 bytes, 5 segments), with the cal report.
+- The pin-connect result arrives, then **FW READY 3.3 s after the start**, then the copy-engine config and mission mode.
+- The modem stays up for the whole watch.
+
+Next is stage 4: ath10k's data path (the copy engines and HTC/WMI over the WCN3990's register space) and a scan.
+
+**Control Center glyphs (0169).** The striped icons (airplane, cellular, flashlight, calculator, camera, the lock screen's buttons) were sheared pictures, not a bad draw. blueeagl's ASCII dumps of the `LA08` glyph surfaces showed diagonal bands in the surface memory itself. The CPU code that draws them asks for its own row (e.g. 105 px in 224 bytes) and keeps drawing with it. Sailfish's 0207 rounds every explicit row up to 64 bytes (256) for the GPU's pitch, so each row drifted by 32 bytes. Surfaces that aren't BGRA are always copied into a texture, never shared with the GPU, so 0169 lets them keep the row they ask for (`bluesurf_exactrow=0` turns that off). Result (rows1): every Control Center glyph and the lock screen's camera button draw cleanly (`docs/screenshots/2026-11-20-control-center.png`). The brightness slider then didn't take a drag (by hand or scripted); the drag dismissed Control Center instead.
+
+**Brightness slider (0170).** Without a backlight service, CoreBrightness treats the display as fixed, so the slider is inert. 0150's `bluebl=2` publishes `AppleARMBacklight` (`backlight-control`). backboardd then drives it: slider moves arrive as `brightness` requests (raw 0..65536) and go to the panel as DCS 0x51 writes (bl2a: `raw 7369 -> level 101`, then 109, 115 ..., every write ok in ~7 ms). Confirmed by hand. 0170 makes it the default; `bluebl=1` leaves the service out.
+
+**Control Center blink (open).** By hand: while the brightness module expands, Now Playing and other cards blink out for a frame, and animations sometimes step back and forward. Burst snaps (sub-second `bluesnap=` times work) caught it once in six automated runs (flick1): with Control Center sitting open, consecutive snaps cycled through three pictures (the finished panel, the panel mid-way through opening, and the lock screen from seconds before), one per pool buffer. So each display buffer held the last full frame it was given, and only small redraws landed after. What is ruled out:
+- The display side. 0171 (`bluefb_swaplog=N`) logs each swap as shown: every one was a single-layer flip of one of backboardd's three pool buffers, never a snapshot surface. The flip thread never timed out on the GPU wait and never dropped a queued swap.
+- blueeagl's every-8-frames check of still pictures (`glstill=0` still blinks).
+What is left is blueeagl's mirrored display targets: CoreAnimation draws into a texture of blueeagl's, which is copied whole into the surface at each frame end and never reloaded from the surface. A partial redraw into a stale texture would put an old frame on screen around the redrawn box. blueeagl now reloads a display texture whose surface's seed moved since its own copy (`glresync=0` turns that off). It never fired in the clean runs; the failure seems timing-dependent (both failing runs had rate-limited logging, all four clean ones `blueeagl_lograte=0`). Next: a demo boot filmed in slow motion, matched against the frame log.
+
+**The filmed blink, and target_carry.** A slow-motion video of the glitch showed the same cycling by hand: frames from earlier states flash in for one refresh. The resync never fired in that boot either, so the surfaces were not changed behind blueeagl's back. Instead CoreAnimation redraws only the damaged area into whichever pool buffer comes next, assuming the buffer already holds the previous frame. That is true for a real swap chain only when a buffer is "preserved" from the last frame, and with three pool buffers each one is two frames old. blueeagl now starts each frame's first draw into a pool target by copying the texture sent out last into it (`target_carry`, a full-size `glBlitFramebuffer`; `glcarry=0` turns it off). It fires as designed (demo6); confirmation by hand is pending.
+
+## 2026-11-20: Wi-Fi stage 4, the first scan
+
+**Copy engines, HTC, WMI (0172).** Ported from ios-topaz's 0123 and ios-flame's HTT setup, checked against ath10k. The WLAN stream (0x40) gets an identity context bank in the apps SMMU, and a 16 MiB DMA pool holds the rings and buffers. Then the copy engines at 0x18A40000 come up, and so do HTC (READY, two 2184-byte credits), the HTT (endpoint 1) and WMI (endpoint 2) services, WMI SERVICE_READY → INIT → READY, and HTT version 3.92 with its RX ring. The firmware's MAC is set over WLFW (0x33) to a locally administered address.
+
+**The silent scan.** START_SCAN was accepted (its credit came back) but no scan event ever arrived. To find out why:
+- A WMI ECHO sent during the stall came back in 6 ms, so the firmware was still taking commands.
+- The firmware's own log (WLFW INI 0x2f, `enablefwlog`; `bluewifi_fwlog=0` turns it off) arrives as WMI DIAG events, 1.5 KB every ~7 s. Decoding it needs Qualcomm's message tables.
+- `bluewifi_scanmode` (bit 1: no host channel list, 2: no scan channels, 4: no regdomain) split the problem. Without the channel list, scans start and finish at once, empty. With it, they never start.
+- `bluewifi_nch=N` (only the first N channels): 1 channel found a network, and the 13 2.4 GHz channels found 15 networks, -40 to -92 dBm, in three scans in a row (wifi6i). So the radio works, and the stall is in 5 GHz.
+
+**5 GHz (open).** A single 5 GHz channel (36) in the scan is enough to stall it; a channel list holding 5 GHz entries is fine, since 2.4 GHz scans with it (`bluewifi_nscan=13`). No STARTED event, and every WMI credit comes back. Tried without effect: `WMI_CHAN_FLAG_DFS` on radar channels (as ath10k), no VHT flag, regdomain 0x3a (FCC3_FCCA, the firmware's own), L25a at 3.312 V, and hardware mode 0. SERVICE_READY_EXT lists two modes, single-PHY with both bands and DBS (5 GHz on phy 0, 2.4 GHz on phy 1). PDEV_SET_HW_MODE 0 was answered with status 0 and no transition, so it was already in mode 0. ios-topaz scanned the same 37 channels the same way. The default scan is the 13 2.4 GHz channels (`bluewifi_nch=37` for all) while the next stages go on.
+
+L25a is now 3.312 V, as in the Pixel 3's upstream device tree (`bluewifi_ch0mv`); it was 3.104 V.

@@ -83,6 +83,8 @@ base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=u
 base="$base bluetest=1"	# 0161: bluebatt=1 bluemax=2 bluelmh=1 bluewdt=30 bluewdt_recovery=1 sweetfb_noconsole=1 sweetfb_hz=60
 [ -s work/rtc-offset ] && base="$base bluertc=2 bluertc_offset=$(cat work/rtc-offset)"
 case " $extra " in *" bluereboot="*) : "${wait:=5}" ;; *) : "${wait:=30}" ;; esac
+cmdline="$base $extra"	# XNU's boot-args line holds 607 bytes (mkpayload.py refuses more): fail before building anything
+[ ${#cmdline} -le 607 ] || { echo "boot-args are ${#cmdline} bytes, $(( ${#cmdline} - 607 )) over the 607-byte limit: shorten bluesnap=/bluetouchscript=" >&2; exit 1; }
 out=work/test; mkdir -p "$out"
 t0=$(date +%s)
 say() { printf '[%3ds] %s\n' $(( $(date +%s) - t0 )) "$*"; }
@@ -94,6 +96,7 @@ fi
 kernel=work/kbuild/out/kernel.development.sweet
 fw=(); [ -f work/fw/a630_gmu.bin ] && fw=(--gpu-fw work/fw/a630_gmu.bin)
 [ -f work/fw/vendor/cs40l20.wmfw ] && [ -f work/fw/vendor/cs40l20.bin ] && fw+=(--haptic-fw work/fw/vendor)	# 0150
+[ -f work/fw/wlan/wlanmdsp.mbn ] && [ -f work/fw/wlan/bdwlan-blueline.bin ] && fw+=(--wlan-fw work/fw/wlan)	# 0167
 python3 tools/mkadt.py --ufs --cpus 8 --iphone work/DeviceTree.d22ap.im4p "${fw[@]}" "$out/$name.adt" > /dev/null
 python3 tools/mkpayload.py "$kernel" "$out/$name.adt" "$out/$name-payload.bin" --cmdline "$base $extra" > /dev/null
 PATH=/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH p2-shim/build.sh "$out/$name-payload.bin" stock/boot.img > "$out/$name-shim.txt" 2>&1

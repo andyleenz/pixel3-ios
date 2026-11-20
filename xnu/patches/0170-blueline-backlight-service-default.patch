@@ -1,0 +1,21 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: brightness slider on by default (bluebl=2)
+
+Without a backlight service CoreBrightness treats the display as fixed:
+Control Center's brightness slider is inert and a drag on it dismisses
+Control Center. bluebl=2 publishes AppleARMBacklight (backlight-control),
+which backboardd then drives: slider moves arrive as brightness requests
+and go to the panel as DCS 0x51 writes (bl2a: every write ok). Make it
+the default; bluebl=1 leaves the service out as before.
+
+--- a/iokit/Kernel/arm/BlueBacklight.cpp
++++ b/iokit/Kernel/arm/BlueBacklight.cpp
+@@ -438,7 +438,7 @@
+ void
+ blue_bl_start(IOService *fb)
+ {
+-	gBlMode = 1;
++	gBlMode = 2;		/* 0170: AppleARMBacklight on, so CoreBrightness enables the slider (bluebl=1: off) */
+ 	PE_parse_boot_argn("bluebl", &gBlMode, sizeof(gBlMode));
+ 	PE_parse_boot_argn("bluebl_min", &gBlMin, sizeof(gBlMin));
+ 	PE_parse_boot_argn("bluebl_max", &gBlMax, sizeof(gBlMax));

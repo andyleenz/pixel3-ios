@@ -1,0 +1,62 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] SweetSurface: keep the row a client asks for on surfaces that are not BGRA
+
+Every explicit IOSurfaceBytesPerRow was rounded up to 64 bytes for the
+GPU's pitch, on the idea that clients take the real row from the lock
+result. The CPU code that draws Control Center's glyphs ('LA08' surfaces,
+e.g. 105 px in 224 bytes) goes by the row it asked for: drawn with 224,
+read with 256, the glyphs came out as sheared stripes. Surfaces that are
+not blue-first pixels are always copied into a texture, never shared
+with the GPU, so they keep the row they asked for (a multiple of 16).
+bluesurf_exactrow=0 rounds every row as before. Each changed row is
+logged, the first 24.
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -468,6 +468,36 @@
+ static TUNABLE(uint32_t, sweet_surf_wrap, "bluesurf_wrap", 1);  /* 0154: 0 = refuse selector 6 as before */
+ 
+ /*
++ * 0169: an explicit row on a surface that is not blue-first pixels ('LA08' glyphs, 'A008' masks...) stays as asked
++ * (a multiple of 16), not rounded up to 64 (0207-sf-0153). Those surfaces are always copied into a texture, never
++ * shared with the GPU, and the CPU code that draws Control Center's glyphs goes by the row it asked for, not the
++ * lock result: drawn with 224 bytes a row and read with 256, they came out as sheared stripes.
++ * bluesurf_exactrow=0: every row rounded, as before.
++ */
++static TUNABLE(uint32_t, sweet_surf_exactrow, "bluesurf_exactrow", 1);
++
++static void
++sweet_surface_exact_row(SweetSurface *s, OSDictionary *props)
++{
++	uint32_t asked = sweet_dict_u32(props, "IOSurfaceBytesPerRow", 0);
++	if (!sweet_surf_exactrow || asked == 0 || asked == s->bytesPerRow || s->planeCount != 0) {
++		return;
++	}
++	bool keep = (asked & 15u) == 0 && asked < s->bytesPerRow && s->pixelFormat != 0x42475241u /* 'BGRA' */ &&
++	    s->pixelFormat != 0 && asked >= sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement;
++	static uint32_t said;
++	if (said++ < 24) {
++		char fcc[5] = { (char)(s->pixelFormat >> 24), (char)(s->pixelFormat >> 16), (char)(s->pixelFormat >> 8),
++			        (char)s->pixelFormat, 0 };
++		IOLog("SweetSurface: '%s' %u x %u asked for %u bytes a row, given %u: %s\n", fcc, s->width, s->height, asked,
++		    s->bytesPerRow, keep ? "keeping the asked row" : "left rounded");
++	}
++	if (keep) {
++		s->bytesPerRow = asked;
++	}
++}
++
++/*
+  * 0154: a surface whose pixels are a range of the caller's own memory (wired
+  * while the surface lives; completed in SweetSurface::free), for writing if it
+  * can be, else for reading (a picture that is only shown).
+@@ -738,6 +768,9 @@
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
++	if (ret == kIOReturnSuccess) {
++		sweet_surface_exact_row(s, props);
++	}
+ 	/*
+ 	 * 0154: IOSurfaceAddress = a surface around memory the caller has already
+ 	 * (CoreAnimation's GL renderer makes them around app icons and layer contents).

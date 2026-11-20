@@ -264,8 +264,17 @@ def haptic_firmware(d):
     return wmfw, wt
 
 
+def wlan_firmware(d):
+    """wlanmdsp.mbn (an ELF) + bdwlan-blueline.bin from DIR (the vendor image's /firmware)."""
+    mdsp = open(os.path.join(d, 'wlanmdsp.mbn'), 'rb').read()
+    bdf = open(os.path.join(d, 'bdwlan-blueline.bin'), 'rb').read()
+    if mdsp[:4] != b'\x7fELF':
+        sys.exit('--wlan-fw %s: wlanmdsp.mbn is not an ELF' % d)
+    return mdsp, bdf
+
+
 def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None,
-          haptic_fw=None):
+          haptic_fw=None, wlan_fw=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -410,6 +419,10 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
             gpu['zap-elf'] = zap_fw		# 0144, bluegpu=7
         extra.append(node('blueline-gpu', gpu))
 
+    if wlan_fw is not None:
+        # Read by bsd/dev/blueline_wifi.c (0167): served to the modem's WLAN PD over TFTP, and the board file.
+        extra.append(node('blueline-wlan', {'wlanmdsp': wlan_fw[0], 'bdwlan': wlan_fw[1]}))
+
     if haptic_fw is not None:
         # Read by bsd/dev/blueline_haptic.c (0150) at bluehaptic=2.
         extra.append(node('blueline-haptic', {'wmfw': haptic_fw[0], 'wavetable': haptic_fw[1]}))
@@ -431,6 +444,8 @@ if __name__ == '__main__':
                     help='with --gpu-fw: the "sqe-firmware" to add (default auto: vendor/ copy, else linux-firmware)')
     ap.add_argument('--gpu-zap', default='auto', metavar='auto|none|PATH.mdt',
                     help='with --gpu-fw: the "zap-elf" to add (default auto: DIR/vendor/a630_zap.mdt + .bNN)')
+    ap.add_argument('--wlan-fw', metavar='DIR',
+                    help='add /blueline-wlan: DIR/wlanmdsp.mbn and DIR/bdwlan-blueline.bin (from vendor /firmware)')
     ap.add_argument('--haptic-fw', metavar='DIR',
                     help='add /blueline-haptic "wmfw" + "wavetable" from DIR/cs40l20.wmfw, cs40l20.bin')
     ap.add_argument('--dump', action='store_true')
@@ -445,13 +460,16 @@ if __name__ == '__main__':
     sqe_fw, sqe_why = sqe_firmware(a.gpu_sqe, a.gpu_fw) if a.gpu_fw else (None, None)
     zap_fw, zap_why = zap_firmware(a.gpu_zap, a.gpu_fw) if a.gpu_fw else (None, None)
     haptic_fw = haptic_firmware(a.haptic_fw) if a.haptic_fw else None
+    wlan_fw = wlan_firmware(a.wlan_fw) if a.wlan_fw else None
     root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw,
-                 haptic_fw=haptic_fw)
+                 haptic_fw=haptic_fw, wlan_fw=wlan_fw)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
         dump(root)
     print('%s: %d bytes' % (a.out, len(blob)), file=sys.stderr)
+    if wlan_fw is not None:
+        print('  /blueline-wlan wlanmdsp %d bytes, bdwlan %d bytes' % (len(wlan_fw[0]), len(wlan_fw[1])), file=sys.stderr)
     if haptic_fw is not None:
         print('  /blueline-haptic wmfw %d bytes, wavetable %d bytes' % (len(haptic_fw[0]), len(haptic_fw[1])),
               file=sys.stderr)
