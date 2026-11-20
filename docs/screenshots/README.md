@@ -12,3 +12,4 @@ showing; 540x1080, half the panel's resolution, RGB565). Newest first.
 | 2026-11-19-gpu-settings-subpage.png | A Settings sub-page |
 | 2026-11-20-home-wallpaper.png | Home screen after the first-boot migration: the wallpaper (PosterBoard) and widgets |
 | 2026-11-20-system-apps.png | Second home page: the removable stock apps the migration installed (0164) |
+| 2026-11-20-control-center.png | Control Center with its blurs and clean glyphs (sRGB gamut, 0169 exact rows) |

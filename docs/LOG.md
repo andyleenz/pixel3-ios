@@ -772,3 +772,26 @@ The remigrations had also dropped the test runner's launchd job; `remigrate.sh` 
 
 Still wrong (seen by hand): the App Library blurs the wallpaper and then shows black; Control Center's pull-down glitches; the lock screen's shortcut buttons don't draw; the Photos widget is black (empty library?); Weather has no data (no network). The first three all use wallpaper-derived materials. Thin black bars show at the left and right edges (1125-wide iOS scaled to the panel).
 
+
+## 2026-11-20: blurs, Wi-Fi up to the WLAN firmware service
+
+**Blurs (e9c38e8).** The black App Library and Control Center backgrounds were the display's colour gamut. The ADT said nothing, so iOS took the D22's P3 panel and asked CoreAnimation for wide-gamut (`b3a8`, 10-bit) blur surfaces, which our GL path can't draw: they came out black. `tools/mkadt.py` now says `artwork-display-gamut = sRGB`. MobileGestalt caches the answer, so its cache has to go once (`--rm` of `com.apple.MobileGestalt.plist` under the mobilegestaltcache system group). Afterwards the App Library and Control Center blur the wallpaper as they should, and the weather widget draws.
+
+**Wi-Fi stage 3a/3b (0165, 0166).** The modem boots (stage 2), then stays up:
+- 0165: GLINK over SMEM with the modem (items 478-480, APCS IPC bit 12), the IPCRTR channel open 5-16 ms after the modem is ready, and QRTR on top (HELLO, server announcements).
+- 0166: rmtfs (service 14), serving the EFS partitions on UFS LUN 5 (modemst1/2, fsg, fsc) **read only**. The modem's writes are acknowledged and dropped; nothing is ever written to flash. Also pd-mapper (0x40), with mainline's sdm845 table.
+- Result (wifi4a): the modem reads its EFS (4 reads, 4224 sectors), announces 36 services and stays up for the whole 200 s watch, instead of ERR-FATAL at 40 s.
+
+**Wi-Fi stage 3c (0167).** TFTP over QRTR (service 4096) serves `wlanmdsp.mbn` from the device tree (`mkadt --wlan-fw`, from the vendor image's `/firmware`; the blobs stay out of git). The `/readwrite/` files the modem writes stay in RAM for the boot. Result (wifi4c): the modem reads the 3 MB image (2965 blocks of 1 KiB), starts its WLAN domain, and **WLFW (service 0x45), the WLAN firmware's control service, comes up**. 
+
+**Wi-Fi stage 3d (0168, `bluewifi=5`): the WLAN chip is up.** The kernel votes the WCN3990's rails on through RPMh (L5a 0.8 V, L7a 1.8 V, L17a 1.304 V, L25a 3.104 V, RF_CLK2), then drives WLFW as ath10k does on SDM845. Result (wifi5a):
+- The modem reports two MSA regions (16 KiB secure, then the rest of the 1 MiB at 0x8df00000), and both are handed to the modem and the WLAN VMs (MP_ASSIGN ok).
+- MSA READY comes back after 54 ms.
+- Capabilities: chip 0x30214 (WCN3990), soc 0x40030001, firmware `WLAN.HL.2.2.3-00526-QCAHLSWMTPLZ-1`.
+- The board data goes over (26328 bytes, 5 segments), with the cal report.
+- The pin-connect result arrives, then **FW READY 3.3 s after the start**, then the copy-engine config and mission mode.
+- The modem stays up for the whole watch.
+
+Next is stage 4: ath10k's data path (the copy engines and HTC/WMI over the WCN3990's register space) and a scan.
+
+**Control Center glyphs (0169).** The striped icons (airplane, cellular, flashlight, calculator, camera, the lock screen's buttons) were sheared pictures, not a bad draw. blueeagl's ASCII dumps of the `LA08` glyph surfaces showed diagonal bands in the surface memory itself. The CPU code that draws them asks for its own row (e.g. 105 px in 224 bytes) and keeps drawing with it. Sailfish's 0207 rounds every explicit row up to 64 bytes (256) for the GPU's pitch, so each row drifted by 32 bytes. Surfaces that aren't BGRA are always copied into a texture, never shared with the GPU, so 0169 lets them keep the row they ask for (`bluesurf_exactrow=0` turns that off). Result (rows1): every Control Center glyph and the lock screen's camera button draw cleanly (`docs/screenshots/2026-11-20-control-center.png`). Still open: the brightness slider doesn't take a drag, by hand or scripted; the drag dismisses Control Center instead.
