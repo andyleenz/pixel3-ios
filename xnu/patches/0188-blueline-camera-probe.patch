@@ -1,0 +1,778 @@
+0188: blueline cameras: read-only sensor chip-ID probe (bluecam=N)
+
+bluecam=1 (rear IMX363), 2 (both front IMX355s), 3 (both groups). Powers
+one group up in the stock order (AVDD switch GPIO, LVS1 1.8 V by RPMh,
+reset), runs MCLK at 19.2 MHz from XO (no PLL), reads the Sony model ID
+(0x0016) over a bit-banged camera control bus, then powers down and puts
+every pin, clock and vote back as found. The camera clock controller is
+touched only when GCC's camera AHB and XO branches run. Bus reads are
+skipped when the lines are not both high. Log prefix "BLUE CAM:".
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-21 09:03:15
++++ b/bsd/conf/files	2026-11-21 09:03:15
+@@ -121,6 +121,7 @@
+ bsd/dev/blueline_haptic.c		standard
+ bsd/dev/blueline_audio.c		standard
+ bsd/dev/blueline_audio_apr.c		standard
++bsd/dev/blueline_camera_probe.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c	1970-01-01 10:00:00
++++ b/bsd/dev/blueline_camera_probe.c	2026-11-21 09:03:15
+@@ -0,0 +1,738 @@
++/*
++ * Pixel 3 (blueline) cameras, read-only chip-ID probe: power one camera
++ * group up in the stock order, read the Sony model ID over the camera
++ * control bus, power it down again and put every pin back as found. No
++ * streaming, no CSI PHY, no CCI block: the CCI pins are bit-banged as GPIOs.
++ *
++ * Hardware, from the production device tree overlay (stock dtbo.img entry 8,
++ * "B1 DVT1.1": qcom,cam-sensor@0..2 under cam_cci) and the stock CamX sensor
++ * modules (vendor.img /lib64/camera/com.qti.sensormodule.metric_imx363.bin,
++ * .primax_imx355_normal.bin, .primax_imx355_wide.bin: slave address, ID
++ * register, power-up and power-down lists):
++ *   rear IMX363:         CCI master 0 (SDA GPIO 17, SCL GPIO 18), 7-bit 0x1a
++ *                        (CamX 8-bit 0x34); MCLK0 on GPIO 13; reset (XCLR)
++ *                        GPIO 80 (north); AVDD switch enable GPIO 16 (from
++ *                        PMI8998 BOB); DVDD PM8998 S3 1.352 V; DOVDD PM8998
++ *                        LVS1 1.8 V. Stock order: VDIG, VANA, VIO, reset
++ *                        high + 1 ms, MCLK 24 MHz + 10 ms.
++ *   front IMX355 normal: CCI master 1 (SDA GPIO 19, SCL GPIO 20), 0x10;
++ *                        MCLK2 on GPIO 15 (shared); reset GPIO 21; AVDD
++ *                        enable GPIO 8 (east). Stock: VAF, VDIG, VANA, VIO,
++ *                        MCLK, reset high + 12 ms.
++ *   front IMX355 wide:   CCI master 1, 0x1a; MCLK2; reset GPIO 9 (east);
++ *                        AVDD enable GPIO 14. Stock: VDIG, VANA, VIO, MCLK,
++ *                        reset high.
++ * Model ID: 16-bit register 0x0016 (0x0016 high byte, 0x0017 low) = 0x0363 /
++ * 0x0355 (Linux imx355.c; the sdm670/sdm845-mainline IMX363 driver; the stock
++ * IMX355 modules' sensorIdRegAddr/sensorId).
++ *
++ * Clocks (Linux camcc-sdm845.c, gcc-sdm845.c, clk-rcg2.c, gdsc.c, all GPL,
++ * used only as a description of the hardware; this file is written from
++ * scratch): camcc at 0xad00000, reachable only with gcc_camera_ahb_clk
++ * (0x10b008) running; MCLK0 RCG 0x4004 / branch 0x401c, MCLK2 RCG 0x4044 /
++ * branch 0x405c; TITAN_TOP GDSC 0xb134 (status in CFG_GDSCR 0xb138). The
++ * stock sequence asks for 24 MHz, which needs cam_cc_pll2; this probe runs
++ * MCLK at 19.2 MHz straight from XO (the RCG's own table entry) so no PLL is
++ * touched. The stock driver turns TITAN_TOP on with MCLK ("cam_clk" supply);
++ * here it is turned on only if the MCLK branch will not start without it
++ * (bluecam_gdsc=2, default).
++ *
++ * Rails: only LVS1 (DOVDD, cmd-db "vsa1") is voted, through
++ * blueline_rpmh_write() (blueline_touch.c). S3 (DVDD) and BOB (the AVDD
++ * switches' input) are not voted, on or off: both are parents of rails in use
++ * (S3: LDO2/8/17/26 and the WCN3990 IO supply; BOB: most LDOs, among them
++ * LDO19 for touch), and an apps-DRV "off" could drop a vote someone else left.
++ *
++ * Boot-args:
++ *   bluecam=0        off (default)
++ *   bluecam=1        rear IMX363
++ *   bluecam=2        both front IMX355s
++ *   bluecam=3        rear, then front
++ *   bluecam_gdsc=N   TITAN_TOP GDSC: 0 never, 1 always (stock order),
++ *                    2 only if the MCLK branch stays off (default)
++ * Log prefix "BLUE CAM:". Patch 0188.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern uint32_t blueline_cmddb_addr(const char *id);			/* blueline_touch.c */
++extern int blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n);
++extern void IOSleep(unsigned int milliseconds);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void blueline_camera_start(void);
++
++/* TLMM (pinctrl-sdm845.c tiles; pin n's config at + 0x1000 * n, in/out at + 4) */
++#define TLMM_NORTH_PA		0x03900000u	/* GPIO 80 */
++#define TLMM_SOUTH_PA		0x03d00000u	/* GPIO 13-21 */
++#define TLMM_EAST_PA		0x03500000u	/* GPIO 8, 9 */
++#define GPIO_CFG(n)		(0x1000u * (uint32_t)(n))
++#define CFG_PULL_UP		3u		/* [1:0] */
++#define CFG_FUNC(f)		((uint32_t)(f) << 2)	/* [5:2]; drive [8:6] = 0 is 2 mA */
++#define CFG_OE			(1u << 9)
++#define IO_IN			(1u << 0)
++#define IO_OUT			(1u << 1)
++#define FUNC_CAM_MCLK		1u		/* GPIO 13-16 function 1 */
++
++/* GCC (gcc-sdm845.c): the camera clock controller's AHB and XO feeds, both CLK_IS_CRITICAL in Linux */
++#define GCC_CAM_PA		0x0010b000u
++#define GCC_CAMERA_AHB_CBCR	0x008u		/* 0x10b008, HW gating bit 1 */
++#define GCC_CAMERA_XO_CBCR	0x02cu		/* 0x10b02c */
++
++/* Camera clock controller (camcc-sdm845.c) */
++#define CAMCC_PA		0x0ad00000u
++#define CAMCC_SIZE		0x10000u
++#define CAMCC_MCLK0_RCGR	0x4004u
++#define CAMCC_MCLK0_CBCR	0x401cu
++#define CAMCC_MCLK2_RCGR	0x4044u
++#define CAMCC_MCLK2_CBCR	0x405cu
++#define CAMCC_TITAN_GDSCR	0xb134u
++
++/* RCG2 (clk-rcg2.c) */
++#define RCG_CMD_UPDATE		(1u << 0)
++#define RCG_CMD_ROOT_OFF	(1u << 31)
++#define RCG_CFG			0x4u
++#define RCG_M			0x8u
++#define RCG_N			0xcu
++#define RCG_D			0x10u
++#define RCG_CFG_DIV		0x1fu		/* hid_width 5: 2 * div - 1 */
++#define RCG_CFG_SRC		(7u << 8)	/* 0 = bi_tcxo */
++#define RCG_CFG_MODE		(3u << 12)	/* 0 = no M/N */
++#define RCG_CFG_HWCTL		(1u << 20)
++#define RCG_CFG_MASK		(RCG_CFG_DIV | RCG_CFG_SRC | RCG_CFG_MODE | RCG_CFG_HWCTL)
++#define RCG_CFG_XO_19M2		1u		/* F(19200000, P_BI_TCXO, 1, 0, 0) */
++
++/* Branches and GDSCs (clk-branch.c, gdsc.c) */
++#define CBCR_EN			(1u << 0)
++#define CBCR_HWCG		(1u << 1)
++#define CBCR_CLK_OFF		(1u << 31)
++#define GDSC_SW_COLLAPSE	(1u << 0)
++#define GDSC_HW_CONTROL		(1u << 1)
++#define GDSC_PWR_ON		(1u << 31)
++#define GDSC_CFG		0x4u		/* CFG_GDSCR */
++#define GDSC_UP_DONE		(1u << 16)
++#define GDSC_DOWN_DONE		(1u << 15)
++
++/* RPMh VRM/XOB command offsets (qcom-rpmh-regulator.c) */
++#define RPMH_REG_ENABLE		0x4u
++
++/* Sony sensor registers */
++#define REG_MODEL_ID		0x0016u		/* 16-bit big-endian, then 0x0018 revision */
++
++struct cam_pin {
++	const char *what;
++	uint32_t tile;
++	int n;
++	vm_offset_t va;
++	uint32_t cfg, io;	/* as found */
++};
++
++struct cam_sensor {
++	const char *name;
++	uint8_t addr;		/* 7-bit, from the stock CamX module */
++	uint8_t alt;		/* also tried if addr NACKs, 0 = none */
++	uint16_t id;
++};
++
++struct cam_group {
++	const char *name;
++	struct cam_pin sda, scl, mclk;
++	struct cam_pin vana[2], rst[2];
++	int npwr;
++	uint32_t rcgr, cbcr;
++	bool reset_first;	/* stock order: XCLR up before MCLK (rear) or after (front) */
++	unsigned settle_ms;
++	struct cam_sensor sensor[2];
++	int nsensor;
++};
++
++static struct cam_group groups[2] = {
++	{
++		.name = "rear",
++		.sda = { "CCI0 SDA", TLMM_SOUTH_PA, 17, 0, 0, 0 },
++		.scl = { "CCI0 SCL", TLMM_SOUTH_PA, 18, 0, 0, 0 },
++		.mclk = { "MCLK0", TLMM_SOUTH_PA, 13, 0, 0, 0 },
++		.vana = { { "AVDD enable", TLMM_SOUTH_PA, 16, 0, 0, 0 } },
++		.rst = { { "reset", TLMM_NORTH_PA, 80, 0, 0, 0 } },
++		.npwr = 1,
++		.rcgr = CAMCC_MCLK0_RCGR,
++		.cbcr = CAMCC_MCLK0_CBCR,
++		.reset_first = true,
++		.settle_ms = 10,
++		/* 0x10 is the IMX363's other address (Pocophone F1's board uses it) */
++		.sensor = { { "IMX363", 0x1a, 0x10, 0x0363 } },
++		.nsensor = 1,
++	},
++	{
++		.name = "front",
++		.sda = { "CCI1 SDA", TLMM_SOUTH_PA, 19, 0, 0, 0 },
++		.scl = { "CCI1 SCL", TLMM_SOUTH_PA, 20, 0, 0, 0 },
++		.mclk = { "MCLK2", TLMM_SOUTH_PA, 15, 0, 0, 0 },
++		.vana = { { "normal AVDD enable", TLMM_EAST_PA, 8, 0, 0, 0 },
++			  { "wide AVDD enable", TLMM_SOUTH_PA, 14, 0, 0, 0 } },
++		.rst = { { "normal reset", TLMM_SOUTH_PA, 21, 0, 0, 0 },
++			 { "wide reset", TLMM_EAST_PA, 9, 0, 0, 0 } },
++		.npwr = 2,
++		.rcgr = CAMCC_MCLK2_RCGR,
++		.cbcr = CAMCC_MCLK2_CBCR,
++		.reset_first = false,
++		.settle_ms = 12,
++		.sensor = { { "IMX355 normal", 0x10, 0, 0x0355 }, { "IMX355 wide", 0x1a, 0, 0x0355 } },
++		.nsensor = 2,
++	},
++};
++
++static int cam_mode;
++static int gdsc_mode = 2;
++static uint32_t lvs1;		/* cmd-db address of PM8998 LVS1 */
++static vm_offset_t gcc_cam, camcc;
++
++static uint32_t
++rd32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Poll until (reg & mask) == want, at most us microseconds. */
++static bool
++poll32(vm_offset_t a, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t i = 0; i < us; i++) {
++		if ((rd32(a) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return (rd32(a) & mask) == want;
++}
++
++/* ---- Pins ---- */
++
++static bool
++pin_save(struct cam_pin *p)
++{
++	if (!p->va) {
++		p->va = ml_io_map(p->tile + GPIO_CFG(p->n), 0x1000);
++	}
++	if (!p->va) {
++		printf("BLUE CAM: GPIO %d (%s): mapping failed\n", p->n, p->what);
++		return false;
++	}
++	p->cfg = rd32(p->va);
++	p->io = rd32(p->va + 4u);
++	printf("BLUE CAM: GPIO %d (%s): cfg 0x%x io 0x%x\n", p->n, p->what, p->cfg, p->io);
++	return true;
++}
++
++static void
++pin_restore(const struct cam_pin *p)
++{
++	wr32(p->va + 4u, p->io);
++	wr32(p->va, p->cfg);
++}
++
++/* Plain GPIO output, 2 mA, no pull. */
++static void
++pin_out(const struct cam_pin *p, int high)
++{
++	wr32(p->va + 4u, high ? IO_OUT : 0u);
++	wr32(p->va, CFG_OE);
++}
++
++/* ---- Bit-banged camera control bus ----
++ * Open drain by hand: "released" is GPIO input with the pad pull-up, "low" is
++ * output enabled with the output latch at 0. CCI0 also has board pull-ups
++ * (the stock overlay sets its sleep state to bias-disable), so the bus is
++ * opened only after DOVDD is up. About 100 kHz; Sony sensors accept any rate
++ * up to 1 MHz. Each transfer runs with interrupts masked on its own CPU.
++ */
++struct cam_bus {
++	vm_offset_t sda, scl;	/* each pin's config register (in/out at + 4) */
++};
++
++static void
++bus_pin(vm_offset_t p, int high)
++{
++	wr32(p, (high ? 0u : CFG_OE) | CFG_PULL_UP);
++}
++
++static int
++bus_get(vm_offset_t p)
++{
++	return rd32(p + 4u) & IO_IN;
++}
++
++static void
++bus_scl_high(const struct cam_bus *b)
++{
++	bus_pin(b->scl, 1);
++	for (int i = 0; i < 100 && !bus_get(b->scl); i++) {	/* clock stretching, 100 us at most (interrupts are masked) */
++		delay(1);
++	}
++}
++
++static void
++bus_start(const struct cam_bus *b)
++{
++	bus_pin(b->sda, 1);
++	bus_scl_high(b);
++	delay(5);
++	bus_pin(b->sda, 0);
++	delay(5);
++	bus_pin(b->scl, 0);
++	delay(5);
++}
++
++static void
++bus_stop(const struct cam_bus *b)
++{
++	bus_pin(b->sda, 0);
++	delay(5);
++	bus_scl_high(b);
++	delay(5);
++	bus_pin(b->sda, 1);
++	delay(5);
++}
++
++/* Returns 0 on ACK. */
++static int
++bus_wbyte(const struct cam_bus *b, uint8_t v)
++{
++	for (int i = 7; i >= 0; i--) {
++		bus_pin(b->sda, v >> i & 1);
++		delay(5);
++		bus_scl_high(b);
++		delay(5);
++		bus_pin(b->scl, 0);
++	}
++	bus_pin(b->sda, 1);
++	delay(5);
++	bus_scl_high(b);
++	int nack = bus_get(b->sda);
++	delay(5);
++	bus_pin(b->scl, 0);
++	return nack;
++}
++
++static uint8_t
++bus_rbyte(const struct cam_bus *b, int ack)
++{
++	uint8_t v = 0;
++
++	bus_pin(b->sda, 1);
++	for (int i = 0; i < 8; i++) {
++		delay(5);
++		bus_scl_high(b);
++		v = (uint8_t)(v << 1 | bus_get(b->sda));
++		delay(5);
++		bus_pin(b->scl, 0);
++	}
++	bus_pin(b->sda, !ack);
++	delay(5);
++	bus_scl_high(b);
++	delay(5);
++	bus_pin(b->scl, 0);
++	bus_pin(b->sda, 1);
++	return v;
++}
++
++/*
++ * Sony random read: S addr+W reg[15:8] reg[7:0] Sr addr+R data... P.
++ * Returns 0, or the stage that was not acknowledged: 1 address, 2 register
++ * high byte, 3 register low byte, 4 address for the read.
++ */
++static int
++bus_read(const struct cam_bus *b, uint8_t addr, uint16_t reg, uint8_t *out, uint32_t len)
++{
++	boolean_t intr = ml_set_interrupts_enabled(FALSE);
++	int stage = 0;
++
++	bus_start(b);
++	if (bus_wbyte(b, (uint8_t)(addr << 1))) {
++		stage = 1;
++	} else if (bus_wbyte(b, (uint8_t)(reg >> 8))) {
++		stage = 2;
++	} else if (bus_wbyte(b, (uint8_t)reg)) {
++		stage = 3;
++	} else {
++		bus_start(b);
++		if (bus_wbyte(b, (uint8_t)(addr << 1 | 1))) {
++			stage = 4;
++		} else {
++			for (uint32_t i = 0; i < len; i++) {
++				out[i] = bus_rbyte(b, i + 1 < len);
++			}
++		}
++	}
++	bus_stop(b);
++	ml_set_interrupts_enabled(intr);
++	return stage;
++}
++
++/* Both pins to GPIO, released; then 9 clocks and a stop with no start, so no device sees a command. Returns whether both lines are high after. */
++static bool
++bus_open(const struct cam_bus *b)
++{
++	wr32(b->sda + 4u, 0);
++	wr32(b->scl + 4u, 0);
++	bus_pin(b->sda, 1);
++	bus_pin(b->scl, 1);
++	delay(1000);
++	int sda0 = bus_get(b->sda), scl0 = bus_get(b->scl);
++	for (int i = 0; i < 9; i++) {
++		bus_pin(b->scl, 0);
++		delay(5);
++		bus_scl_high(b);
++		delay(5);
++	}
++	bus_stop(b);
++	int sda1 = bus_get(b->sda), scl1 = bus_get(b->scl);
++	printf("BLUE CAM: bus idle SDA %d SCL %d before the 9 clocks, %d %d after\n", sda0, scl0, sda1, scl1);
++	return sda1 && scl1;
++}
++
++/* ---- Clocks ---- */
++
++static bool
++branch_running(uint32_t v)
++{
++	return (v & CBCR_EN) && (!(v & CBCR_CLK_OFF) || (v & CBCR_HWCG));
++}
++
++/* clk_branch2 enable: set bit 0, wait up to 200 us for CLK_OFF to clear. Returns whether this call set it. */
++static bool
++branch_on(vm_offset_t a, const char *name, bool *running)
++{
++	uint32_t was = rd32(a);
++	bool turned = false;
++
++	if (!(was & CBCR_EN)) {
++		wr32(a, was | CBCR_EN);
++		turned = true;
++	}
++	(void)poll32(a, CBCR_CLK_OFF, 0, 200);
++	uint32_t now = rd32(a);
++	*running = branch_running(now);
++	printf("BLUE CAM: %s CBCR 0x%x -> 0x%x (%s)\n", name, was, now, *running ? "running" : "NOT running");
++	return turned;
++}
++
++static void
++branch_off(vm_offset_t a, const char *name)
++{
++	wr32(a, rd32(a) & ~CBCR_EN);
++	(void)poll32(a, CBCR_CLK_OFF, CBCR_CLK_OFF, 200);
++	printf("BLUE CAM: %s off again (CBCR 0x%x)\n", name, rd32(a));
++}
++
++/* TITAN_TOP GDSC on (gdsc.c with POLL_CFG_GDSCR). 1 = this call turned it on, 0 = was on, -1 = failed. */
++static int
++gdsc_on(void)
++{
++	vm_offset_t g = camcc + CAMCC_TITAN_GDSCR;
++	uint32_t v = rd32(g);
++
++	printf("BLUE CAM: TITAN_TOP GDSCR 0x%x CFG 0x%x\n", v, rd32(g + GDSC_CFG));
++	if (v & GDSC_PWR_ON) {
++		return 0;
++	}
++	if (v & GDSC_HW_CONTROL) {
++		printf("BLUE CAM: TITAN_TOP is under hardware control; not touched\n");
++		return -1;
++	}
++	wr32(g, v & ~GDSC_SW_COLLAPSE);
++	bool up = poll32(g + GDSC_CFG, GDSC_UP_DONE, GDSC_UP_DONE, 2000) && poll32(g, GDSC_PWR_ON, GDSC_PWR_ON, 100);
++	printf("BLUE CAM: TITAN_TOP on: %s (GDSCR 0x%x CFG 0x%x)\n", up ? "ok" : "TIMED OUT", rd32(g), rd32(g + GDSC_CFG));
++	return up ? 1 : -1;
++}
++
++static void
++gdsc_off(void)
++{
++	vm_offset_t g = camcc + CAMCC_TITAN_GDSCR;
++
++	wr32(g, rd32(g) | GDSC_SW_COLLAPSE);
++	bool down = poll32(g + GDSC_CFG, GDSC_DOWN_DONE, GDSC_DOWN_DONE, 2000);
++	printf("BLUE CAM: TITAN_TOP off again: %s (GDSCR 0x%x CFG 0x%x)\n", down ? "ok" : "no power-down ack",
++	    rd32(g), rd32(g + GDSC_CFG));
++}
++
++struct mclk_state {
++	uint32_t cfg;
++	bool rcg_written, branch_set;
++	int gdsc;		/* 1 if this probe turned TITAN_TOP on */
++};
++
++/* MCLK at 19.2 MHz from XO, branch on, pin to cam_mclk. */
++static bool
++mclk_on(struct cam_group *c, struct mclk_state *s)
++{
++	vm_offset_t r = camcc + c->rcgr, br = camcc + c->cbcr;
++	const char *name = c->mclk.what;
++	bool running = false;
++
++	s->cfg = rd32(r + RCG_CFG);
++	printf("BLUE CAM: %s RCG cmd 0x%x cfg 0x%x m 0x%x n 0x%x d 0x%x, CBCR 0x%x\n", name, rd32(r), s->cfg,
++	    rd32(r + RCG_M), rd32(r + RCG_N), rd32(r + RCG_D), rd32(br));
++
++	/* Reset value is XO undivided; reprogram only if something else left it elsewhere. */
++	if ((s->cfg & (RCG_CFG_SRC | RCG_CFG_MODE)) || (s->cfg & RCG_CFG_DIV) > 1) {
++		wr32(r + RCG_CFG, (s->cfg & ~RCG_CFG_MASK) | RCG_CFG_XO_19M2);
++		wr32(r, rd32(r) | RCG_CMD_UPDATE);
++		s->rcg_written = true;
++		if (!poll32(r, RCG_CMD_UPDATE, 0, 500)) {
++			printf("BLUE CAM: %s RCG did not take XO (cmd 0x%x): old source off?\n", name, rd32(r));
++			return false;
++		}
++		printf("BLUE CAM: %s RCG now XO/1 (cfg 0x%x)\n", name, rd32(r + RCG_CFG));
++	}
++
++	if (gdsc_mode == 1) {
++		s->gdsc = gdsc_on();
++	}
++	s->branch_set = branch_on(br, name, &running);
++	if (!running && gdsc_mode == 2) {
++		printf("BLUE CAM: %s did not start; TITAN_TOP GDSC first (stock order)\n", name);
++		s->gdsc = gdsc_on();
++		if (s->gdsc >= 0) {
++			running = poll32(br, CBCR_CLK_OFF, 0, 200);
++			printf("BLUE CAM: %s CBCR 0x%x (%s)\n", name, rd32(br), running ? "running" : "STILL OFF");
++		}
++	}
++	if (!running) {
++		return false;
++	}
++	wr32(c->mclk.va + 4u, 0);
++	wr32(c->mclk.va, CFG_FUNC(FUNC_CAM_MCLK));	/* 2 mA, no pull (cam_sensor_mclkN_active) */
++	return true;
++}
++
++static void
++mclk_off(struct cam_group *c, struct mclk_state *s)
++{
++	vm_offset_t r = camcc + c->rcgr, br = camcc + c->cbcr;
++
++	pin_restore(&c->mclk);
++	if (s->branch_set) {
++		branch_off(br, c->mclk.what);
++	}
++	/* Back to the old setting only if its source was XO too: a stopped PLL would leave the switch pending. */
++	if (s->rcg_written && !(s->cfg & RCG_CFG_SRC)) {
++		wr32(r + RCG_CFG, s->cfg);
++		wr32(r, rd32(r) | RCG_CMD_UPDATE);
++		(void)poll32(r, RCG_CMD_UPDATE, 0, 500);
++	}
++	if (s->gdsc == 1) {
++		gdsc_off();
++	}
++}
++
++/* ---- Rails ---- */
++
++static int
++vio_set(int on)
++{
++	const uint32_t addr[1] = { lvs1 + RPMH_REG_ENABLE };
++	const uint32_t data[1] = { on ? 1u : 0u };
++	int err = blueline_rpmh_write(addr, data, 1);
++
++	printf("BLUE CAM: RPMh vsa1 (LVS1 1.8 V, DOVDD) %s: err=%d\n", on ? "on" : "off", err);
++	return err;
++}
++
++/* ---- Probe ---- */
++
++static const char *const nack_stage[5] = { "", "address", "register high", "register low", "read address" };
++
++/* Read the model ID of every sensor in the group; returns how many answered. */
++static int
++read_ids(struct cam_group *c, const struct cam_bus *b, const char *when)
++{
++	int found = 0;
++
++	for (int i = 0; i < c->nsensor; i++) {
++		struct cam_sensor *s = &c->sensor[i];
++		const uint8_t addrs[2] = { s->addr, s->alt };
++		for (int k = 0; k < 2 && addrs[k]; k++) {
++			uint8_t id[4] = { 0 }, head[4] = { 0 };
++			int e = bus_read(b, addrs[k], REG_MODEL_ID, id, sizeof(id));
++			if (e) {
++				printf("BLUE CAM: %s %s @0x%02x %s: NACK at %s\n", c->name, s->name, addrs[k], when,
++				    nack_stage[e]);
++				continue;
++			}
++			int e2 = bus_read(b, addrs[k], 0x0000, head, sizeof(head));
++			uint16_t model = (uint16_t)(id[0] << 8 | id[1]);
++			printf("BLUE CAM: %s %s @0x%02x %s: model 0x%04x%s, 0x0018-19 %02x %02x, "
++			    "0x0000-03 %02x %02x %02x %02x%s\n", c->name, s->name, addrs[k], when, model,
++			    model == s->id ? " (match)" : " (UNEXPECTED)", id[2], id[3], head[0], head[1], head[2],
++			    head[3], e2 ? " (0x0000 NACK)" : "");
++			found++;
++			break;
++		}
++	}
++	return found;
++}
++
++static void
++group_probe(struct cam_group *c)
++{
++	struct cam_pin *pins[7];
++	int np = 0;
++	struct mclk_state ms = { 0, false, false, 0 };
++	struct cam_bus bus;
++
++	pins[np++] = &c->sda;
++	pins[np++] = &c->scl;
++	pins[np++] = &c->mclk;
++	for (int i = 0; i < c->npwr; i++) {
++		pins[np++] = &c->vana[i];
++		pins[np++] = &c->rst[i];
++	}
++	for (int i = 0; i < np; i++) {
++		if (!pin_save(pins[i])) {
++			return;
++		}
++	}
++
++	/* VDIG (S3) and the BOB input of the AVDD switches are already up; VANA, then VIO. */
++	for (int i = 0; i < c->npwr; i++) {
++		pin_out(&c->vana[i], 1);
++	}
++	IOSleep(1);
++	if (vio_set(1)) {
++		goto rails_down;
++	}
++	IOSleep(2);
++
++	bus.sda = c->sda.va;
++	bus.scl = c->scl.va;
++	if (!bus_open(&bus)) {
++		printf("BLUE CAM: %s: bus lines not both high (no pull-up?); not reading\n", c->name);
++		goto rails_down;
++	}
++
++	if (c->reset_first) {
++		for (int i = 0; i < c->npwr; i++) {
++			pin_out(&c->rst[i], 1);
++		}
++		IOSleep(1);
++		/* Does it answer without INCK? Expected: no. */
++		uint8_t id[2] = { 0 };
++		int e = bus_read(&bus, c->sensor[0].addr, REG_MODEL_ID, id, 2);
++		printf("BLUE CAM: %s %s @0x%02x before MCLK: %s 0x%02x%02x\n", c->name, c->sensor[0].name,
++		    c->sensor[0].addr, e ? "NACK" : "ACK", id[0], id[1]);
++	}
++
++	if (!mclk_on(c, &ms)) {
++		printf("BLUE CAM: %s: no MCLK, not reading\n", c->name);
++		goto clock_down;
++	}
++	if (!c->reset_first) {
++		for (int i = 0; i < c->npwr; i++) {
++			pin_out(&c->rst[i], 1);
++		}
++	}
++	IOSleep(c->settle_ms);
++
++	if (!read_ids(c, &bus, "19.2 MHz MCLK")) {
++		/* Mainline names 17/19 SDA; the vendor pinctrl comment says "CLK, DATA". Try the other way once. */
++		bus.sda = c->scl.va;
++		bus.scl = c->sda.va;
++		if (bus_open(&bus)) {
++			(void)read_ids(c, &bus, "SDA/SCL swapped");
++		}
++	}
++
++clock_down:
++	mclk_off(c, &ms);
++	IOSleep(1);
++	for (int i = 0; i < c->npwr; i++) {
++		pin_out(&c->rst[i], 0);
++	}
++	IOSleep(1);
++rails_down:
++	for (int i = 0; i < c->npwr; i++) {
++		pin_out(&c->vana[i], 0);
++	}
++	(void)vio_set(0);
++	for (int i = 0; i < np; i++) {
++		pin_restore(pins[i]);
++	}
++	printf("BLUE CAM: %s: powered down, pins as found\n", c->name);
++}
++
++static void
++cam_thread(void *arg __unused, wait_result_t w __unused)
++{
++	bool ahb_set = false, xo_set = false, ahb_ok = false, xo_ok = false;
++
++	lvs1 = blueline_cmddb_addr("vsa1");
++	printf("BLUE CAM: cmd-db vsa1 (LVS1, DOVDD) 0x%x; not voted: smpa3 (S3, DVDD) 0x%x, bobb1 (BOB) 0x%x\n", lvs1,
++	    blueline_cmddb_addr("smpa3"), blueline_cmddb_addr("bobb1"));
++	if (!lvs1) {
++		printf("BLUE CAM: no LVS1 in cmd-db; not probing\n");
++		return;
++	}
++	gcc_cam = ml_io_map(GCC_CAM_PA, 0x1000);
++	camcc = ml_io_map(CAMCC_PA, CAMCC_SIZE);
++	if (!gcc_cam || !camcc) {
++		printf("BLUE CAM: mapping GCC/camcc failed\n");
++		return;
++	}
++	/* camcc registers are only reachable with its AHB clock running: check before the first camcc access. */
++	ahb_set = branch_on(gcc_cam + GCC_CAMERA_AHB_CBCR, "gcc_camera_ahb", &ahb_ok);
++	xo_set = branch_on(gcc_cam + GCC_CAMERA_XO_CBCR, "gcc_camera_xo", &xo_ok);
++	if (!ahb_ok || !xo_ok) {
++		printf("BLUE CAM: camera clock controller feeds not running; not touching camcc\n");
++	} else {
++		for (int i = 0; i < 2; i++) {
++			if (cam_mode & (1 << i)) {
++				group_probe(&groups[i]);
++			}
++		}
++	}
++	if (xo_set) {
++		branch_off(gcc_cam + GCC_CAMERA_XO_CBCR, "gcc_camera_xo");
++	}
++	if (ahb_set) {
++		branch_off(gcc_cam + GCC_CAMERA_AHB_CBCR, "gcc_camera_ahb");
++	}
++	printf("BLUE CAM: probe done\n");
++}
++
++/* Hook: bsd/dev/sweet_ufs.c, after blueline_audio_start(). */
++void
++blueline_camera_start(void)
++{
++	PE_parse_boot_argn("bluecam", &cam_mode, sizeof(cam_mode));
++	if (cam_mode <= 0) {
++		return;
++	}
++	PE_parse_boot_argn("bluecam_gdsc", &gdsc_mode, sizeof(gdsc_mode));
++	thread_t th;
++	if (kernel_thread_start(cam_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("BLUE CAM: no thread\n");
++		return;
++	}
++	thread_deallocate(th);
++	printf("BLUE CAM: bluecam=%d gdsc=%d: rear IMX363 0x1a on GPIO 17/18, front IMX355 0x10/0x1a on 19/20\n",
++	    cam_mode, gdsc_mode);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-21 09:03:15
++++ b/bsd/dev/sweet_ufs.c	2026-11-21 09:03:15
+@@ -741,6 +741,11 @@
+ 		extern void blueline_audio_start(void);
+ 		blueline_audio_start();
+ 	}
++	{
++		/* Camera sensor chip-ID probe, off unless bluecam=N (patch 0188, blueline_camera_probe.c). */
++		extern void blueline_camera_start(void);
++		blueline_camera_start();
++	}
+ 	/* Wi-Fi stage 1: SCM queries and read-only state, off unless bluewifi=1 (blueline_wifi.c). */
+ 	blueline_wifi_probe();
+ 	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
