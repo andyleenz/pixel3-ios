@@ -674,6 +674,18 @@ bytes_a_pixel(GLenum format, GLenum type)
  * frame to be copied into by the GPU; the texture CoreAnimation draws into stays the library's own.
  * The texture that is bound is bound again after.
  */
+/*
+ * The panel's own buffer, drawn into when iOS draws the panel's size (sweetfb_native=1): 1080x2160 with rows of
+ * 4320 bytes, not a multiple of 64. Only that one: other surfaces with such rows are drawn in place as before
+ * (sending them to the copy path took backboardd down in a normal boot).
+ */
+static bool
+panel_rows(IOSurfaceRef surface)
+{
+	return IOSurfaceGetWidth(surface) == 1080 && IOSurfaceGetHeight(surface) == 2160 &&
+	    (IOSurfaceGetBytesPerRow(surface) & 63) != 0;
+}
+
 static bool
 surface_mirrored(struct eagl *e, struct image *image)
 {
@@ -685,7 +697,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	 * buffer (rows of 4320, drawn into directly when iOS draws the panel's size, sweetfb_native=1) is copied
 	 * out by the CPU instead; drawn into in place it came out sheared.
 	 */
-	if (image->target && (IOSurfaceGetBytesPerRow(surface) & 63) != 0) {
+	if (image->target && panel_rows(surface)) {
 		return false;
 	}
 	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
@@ -717,7 +729,7 @@ surface_shared(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    (image->target && (IOSurfaceGetBytesPerRow(surface) & 63) != 0) || image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    (image->target && panel_rows(surface)) || image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
 		/* why a surface is copied rather than its memory used: the first ones of a run, for the copies to be made fewer */

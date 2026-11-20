@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -30,7 +30,9 @@
+  * per-process tables); the IOMMU therefore does not keep clients apart.
+  *
+  * Security (v1): every struct is size-checked, every handle is looked up in
+- * the caller's own table, IBs must lie inside one of the caller's pool BOs.
++ * the caller's own table, IBs must lie inside one of the caller's pool or
++ * userptr BOs (0180: bluedrm puts BOs in its own memory when the 32 MiB pool
++ * is full, command buffers included; refusing those failed every submit).
+  * There is no CP_PROTECT and no per-process table yet, so a client's IB can
+  * still reach anything the GPU can (other BOs, the panel, GPU registers):
+  * keep the service to trusted clients until stage 2.
+@@ -704,9 +706,9 @@
+ 			goto out;
+ 		}
+ 		BGBo *b = bg_lookup(c, bos[k->submit_idx].handle);
+-		if (b->kind != BG_POOL || k->size == 0 || (k->size & 3) || (k->submit_offset & 3) ||
++		if ((b->kind != BG_POOL && b->kind != BG_UPTR) || k->size == 0 || (k->size & 3) || (k->submit_offset & 3) ||
+ 		    (uint64_t)k->submit_offset + k->size > b->size || k->size / 4 > BLUE_GPU_CORE_IB_MAX_DW) {
+-			ret = kIOReturnBadArgument;     /* IBs only from the caller's own pool BOs, inside them */
++			ret = kIOReturnBadArgument;     /* IBs only from the caller's own pool/userptr BOs, inside them */
+ 			goto out;
+ 		}
+ 		if (k->type == BLUE_GPU_SUBMIT_CMD_IB_TARGET_BUF) {
