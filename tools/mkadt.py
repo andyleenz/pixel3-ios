@@ -59,6 +59,8 @@ leaves it out; or a .mdt path. Only the pinned SHA-256 is accepted.
 (-M virt,gic-version=3) for emulator tests.
 """
 import argparse
+
+CANVAS = (1125, 2436)        # --canvas
 import hashlib
 import os
 import struct
@@ -390,8 +392,8 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
         arm_io.children.append(node('disp0', {
             'device_type': strs('display-subsystem'),
             'compatible': strs('sweet,display'),
-            'canvas-width': u32(1125),
-            'canvas-height': u32(2436),
+            'canvas-width': u32(CANVAS[0]),
+            'canvas-height': u32(CANVAS[1]),
         }))
         # MobileGestalt HomeButtonType 2: no Home button (gesture UI).
         extra.append(node('buttons', {
@@ -455,8 +457,12 @@ if __name__ == '__main__':
                     help='add /blueline-wlan: DIR/wlanmdsp.mbn and DIR/bdwlan-blueline.bin (from vendor /firmware)')
     ap.add_argument('--haptic-fw', metavar='DIR',
                     help='add /blueline-haptic "wmfw" + "wavetable" from DIR/cs40l20.wmfw, cs40l20.bin')
+    ap.add_argument('--canvas', default='1125x2436', metavar='WxH',
+                    help="the display iOS draws (disp0 canvas): 1125x2436 = iPhone X (default), "
+                         "1080x2160 = the Pixel's own panel (with sweetfb_native=1)")
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
+    CANVAS = tuple(int(v) for v in a.canvas.lower().split('x'))
     if not 1 <= a.cpus <= 8 or (a.qemu and a.cpus != 1):
         sys.exit('--cpus: 1..8 on the phone, 1 in QEMU')
     if a.qemu and a.ufs:

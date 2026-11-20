@@ -1,0 +1,20 @@
+--- a/iokit/Kernel/arm/BlueBacklight.cpp
++++ b/iokit/Kernel/arm/BlueBacklight.cpp
+@@ -377,6 +377,17 @@
+ 		} else if (n != NULL) {
+ 			for (int i = 0; kNitsKeys[i] != NULL; i++) {
+ 				if (!strcmp(k, kNitsKeys[i])) {
++					/*
++					 * 0 nits is not "dark": backboardd sends it for the
++					 * nits keys alongside every real "brightness" (it has
++					 * no nits table for this panel), and taking it dropped
++					 * the screen to the floor (bluebl_min) after each
++					 * change. The screen goes off through display power,
++					 * not here.
++					 */
++					if (n->unsigned64BitValue() == 0) {
++						continue;
++					}
+ 					bl_request_nits(n->unsigned64BitValue(), kNitsKeys[i]);
+ 					used = true;
+ 				}

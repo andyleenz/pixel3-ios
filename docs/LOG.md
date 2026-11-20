@@ -838,3 +838,19 @@ L25a is now 3.312 V, as in the Pixel 3's upstream device tree (`bluewifi_ch0mv`)
 **Filling the panel (0178).** `bluefb_fit=N` picks how iOS's 1125x2436 picture lands on the 1080x2160 panel, in the DPU flip (QSEED3), touch mapping and snaps alike: 1 fit to height (default; 41-px bars), 2 fill the width (rows 93-2342 of 2436: status bar and home indicator cut), 3 stretch (whole picture, 8% squashed vertically). Tested remotely (fill2, stretch3): unlock, a tap on Settings lands, the home gesture works in both. The CPU-copy path (before the first flip) still draws fit-to-height. Screenshot: docs/screenshots/2026-11-20-display-fit-fill-stretch.png.
 
 **Wi-Fi password forgotten at reboot.** All 18 keychain items were created in the current boot (keychain-2.db pulled over bluesh): the keychain is emptied at every start, not just the Wi-Fi item. Unwraps through the stand-in keystore succeed, so the suspect is how securityd sees the keybag at start (its identity or state from SweetKeyStore), next to trace.
+
+**Keychain, closer (kc1, `tools/bluerun/bluels`).** keychain-2.db comes through the reboot untouched (mtime from the previous boot), so nothing outside iOS resets it. Once securityd runs, a few items survive from earlier boots (com.apple.continuity.encryption, com.apple.passd), but every `apple` access-group item (where wifid keeps Wi-Fi passwords) and the ichat ones are new, with row ids climbing about 20 a boot: deleted and recreated at each start. Data migration is not re-running (its plists are hours old). Next: securityd's own messages around start-up (why it drops them: undecodable items, or their owners deleting them), e.g. by checking an item's `data` decodes with the stand-in wrap.
+
+### Keychain kept across reboots, Control Center stable, brightness steady (2026-11-20)
+
+**Keychain (0181).** iOS's own log (securityd) showed why every saved item vanished at start: "Unable to load metadatakey for class 0 from disk ... and not allowed to create new one", then "Deleted corrupt rowid". Every item on disk recorded protection class 0 (the `keyclass` field of the V7 item), which no metadata key has. `aks_wrap_key` answers the class it wrapped with in its one scalar out, and the stand-in (0111) answered 0. It now answers the class asked for (scalar in 1). New items carry 7/9/10/11; after a reboot all of the previous boot's items are still there, and tapping the saved network joins without the password prompt. Items written before 0181 are lost once. Still open: wifid does not join a known network by itself after boot (one tap needed).
+
+Faster loop found on the way: restarting securityd over bluesh (`bluesh.py kill securityd`) and diffing keychain-2.db; iOS's log files can be pulled over the USB link instead of a 30-minute `phone.sh sync`.
+
+**Control Center glitch and crash (0180).** Control Center's materials fill the 32 MiB GPU pool; bluedrm then puts BOs in the process's own memory (userptr), command buffers included, and the kernel refused IBs outside pool BOs (EINVAL on every submit, backboardd died). IBs may now come from userptr BOs too (mapped for the GPU, cleaned before each submit). User confirmed: no more glitch.
+
+**Brightness (0179).** backboardd sends `brightness-nits`/`IOMFBBrightnessLevel` = 0 beside every real `brightness` (no nits table for this panel); each 0 set the floor level (3%). Zero nits are now ignored; every write follows the slider.
+
+**eagl:** the unaligned-row copy path (native mode) is limited to the 1080x2160 panel buffer; applying it to every unaligned target crashed backboardd in fit mode.
+
+Open: backboardd SIGSEGV in `IOSurfaceClientGetBulkAttachments` (QuartzCore) when typing in Safari, fault at +0x30 of an unmapped 16K page (likely a surface's state page unmapped while still in use); Wallet card image garbled; native-mode status bar placeholder.
