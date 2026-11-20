@@ -1,0 +1,205 @@
+diff -ru a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1149,6 +1149,7 @@
+ 
+ extern int blue_fb_snapinfo(uintptr_t *pixels, uint32_t *w, uint32_t *h, uint32_t *stride);
+ extern int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
++extern void blue_dpu_snap_rows(uint32_t lh, int32_t *y0, int32_t *rows);
+ int bluesnap_take(const char *why);
+ 
+ static LCK_MTX_DECLARE(bluesnap_lock, &sweet_ufs_grp);
+@@ -1246,14 +1247,16 @@
+ 	*oh = h / sc;
+ 	uint32_t bytes = *ow * *oh * (bs.bpp / 8);
+ 	uint8_t *out = (uint8_t *)bs.buf;
++	int32_t y0, rows;
+ 
++	blue_dpu_snap_rows(sh, &y0, &rows);
+ 	for (uint32_t oy = 0; oy < *oh; oy++) {
+ 		int64_t py = (int64_t)oy * sc + sc / 2;
+ 		for (uint32_t ox = 0; ox < *ow; ox++) {
+ 			int64_t pxl = (int64_t)ox * sc + sc / 2, sx, sy;
+ 			if (fit_w > 0) {
+ 				sx = (pxl - fit_x) * (int64_t)sw / fit_w;
+-				sy = py * (int64_t)sh / h;
++				sy = y0 + py * (int64_t)rows / h;
+ 			} else {
+ 				sx = pxl + ((int64_t)sw - w) / 2;
+ 				sy = py + ((int64_t)sh - h) / 2;
+diff -ru a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+--- a/iokit/Kernel/arm/BlueDPU.cpp
++++ b/iokit/Kernel/arm/BlueDPU.cpp
+@@ -863,12 +863,15 @@
+ 	uint32_t step_h, step_v;                /* 21-bit fraction source pixels per output pixel */
+ };
+ 
++static int bd_fit;                      /* AppleCLCD's bluefb_fit */
++
+ struct bd_plan {
+ 	int      n;
+ 	bool     fit;
+ 	uint32_t stride;        /* bytes per row of the buffer */
+ 	uint32_t flush;
+ 	uint32_t fit_x, fit_w;  /* fit: panel columns the picture covers */
++	uint32_t src_y0, src_h; /* fit: buffer rows shown (all, except bluefb_fit=2) */
+ 	struct bd_rect_plan r[16];
+ };
+ 
+@@ -961,8 +964,25 @@
+ 		snprintf(why, sizeof(why), "buffer %ux%u stride %u: nothing to fit to %ux%u", lw, lh, stride, bd_w, bd_h);
+ 		return why;
+ 	}
+-	pl->fit_w = (uint32_t)((uint64_t)lw * bd_h / lh);
+-	pl->fit_x = pl->fit_w < bd_w ? (bd_w - pl->fit_w) / 2 : 0;
++	/*
++	 * bluefb_fit=1: the whole buffer, to the panel's height (bars at the sides). 2: the panel's width, the
++	 * middle rows (lw * H / W of them; 2250 of 2436: 93 cut at the top and the bottom). 3: stretched to the
++	 * whole panel (taller than wide by 1.11).
++	 */
++	pl->src_y0 = 0;
++	pl->src_h = lh;
++	if (bd_fit >= 2) {
++		pl->fit_w = bd_w;
++		pl->fit_x = 0;
++		if (bd_fit == 2) {
++			pl->src_h = (uint32_t)((uint64_t)bd_h * lw / bd_w);
++			pl->src_h = pl->src_h > lh ? lh : pl->src_h;
++			pl->src_y0 = (lh - pl->src_h) / 2;
++		}
++	} else {
++		pl->fit_w = (uint32_t)((uint64_t)lw * bd_h / lh);
++		pl->fit_x = pl->fit_w < bd_w ? (bd_w - pl->fit_w) / 2 : 0;
++	}
+ 	if (pl->fit_w > bd_w) {
+ 		snprintf(why, sizeof(why), "fitted width %u wider than the panel", pl->fit_w);
+ 		return why;
+@@ -1014,13 +1034,13 @@
+ 		*r = (struct bd_rect_plan){
+ 			.base = p->base, .rect = 0,
+ 			.addr_off = p->base + SSPP_SRC0_ADDR, .xy_off = p->base + SSPP_SRC_XY,
+-			.byte_off = 0, .xy = s0,
++			.byte_off = 0, .xy = pl->src_y0 << 16 | s0,
+ 			.fit = true,
+-			.src_size = lh << 16 | sw,
++			.src_size = pl->src_h << 16 | sw,
+ 			.out_size = bd_h << 16 | dw,
+ 			.out_xy = (oxy & 0xffff) + (d0 - p0),       /* ABL's x convention (absolute with source split) */
+ 			.step_h = (uint32_t)(((uint64_t)sw << QS3_PHASE_SHIFT) / dw),
+-			.step_v = (uint32_t)(((uint64_t)lh << QS3_PHASE_SHIFT) / bd_h),
++			.step_v = (uint32_t)(((uint64_t)pl->src_h << QS3_PHASE_SHIFT) / bd_h),
+ 		};
+ 	}
+ 	return NULL;
+@@ -1437,7 +1457,6 @@
+ static bool bd_flip_on;                 /* allowed (turned off for the boot on any trouble) */
+ static volatile bool bd_flipped;        /* the SSPPs fetch a pool buffer, not the panel buffer */
+ static bool bd_geom;                    /* the plan's geometry is written (only addresses change) */
+-static int bd_fit;                      /* AppleCLCD's bluefb_fit */
+ static struct bd_plan bd_fplan;
+ static uint32_t bd_fplan_stride;        /* stride bd_fplan was made for, 0 none */
+ static uint64_t bd_flip_pa;             /* buffer being fetched */
+@@ -1750,10 +1769,10 @@
+ 	}
+ 	IOLockUnlock(bd_flip_lock);
+ 	if (ok) {
+-		/* as bd_plan_fit: the whole surface height on the panel's, width to scale, centred */
++		/* as bd_plan_fit (rows: blue_dpu_snap_rows) */
+ 		uint32_t pw = bd_w, ph = bd_h;
+-		*fit_w = bd_fit ? (int32_t)(((uint64_t)*w * ph) / *h) : 0;
+-		*fit_x = bd_fit ? ((int32_t)pw - *fit_w) / 2 : 0;
++		*fit_w = bd_fit >= 2 ? (int32_t)pw : bd_fit ? (int32_t)(((uint64_t)*w * ph) / *h) : 0;
++		*fit_x = bd_fit >= 2 ? 0 : bd_fit ? ((int32_t)pw - *fit_w) / 2 : 0;
+ 	}
+ 	return ok;
+ }
+@@ -2023,6 +2042,19 @@
+ 	thread_deallocate(thread);
+ }
+ 
++/* The buffer rows a fitted flip shows (bluefb_fit=2 cuts the top and the bottom), for snaps. */
++extern "C" void
++blue_dpu_snap_rows(uint32_t lh, int32_t *y0, int32_t *rows)
++{
++	*y0 = 0;
++	*rows = (int32_t)lh;
++	if (bd_fit == 2 && bd_lw > 0) {
++		*rows = (int32_t)((uint64_t)bd_h * bd_lw / bd_w);
++		*rows = *rows > (int32_t)lh ? (int32_t)lh : *rows;
++		*y0 = ((int32_t)lh - *rows) / 2;
++	}
++}
++
+ /* AppleCLCD::start, after blue_dpu_start; fit is bluefb_fit. 1: swaps may flip. */
+ int
+ blue_dpu_flip_init(int fit)
+@@ -2032,7 +2064,8 @@
+ 	}
+ 	bd_fit = fit;
+ 	bd_flip_on = bd_flip_setup() != 0;
+-	IOLog("BLUE DPU: flip %s (%s)\n", bd_flip_on ? "ready" : "off, CPU copy", fit ? "fit" : "crop");
++	IOLog("BLUE DPU: flip %s (%s)\n", bd_flip_on ? "ready" : "off, CPU copy",
++	    fit == 3 ? "stretch" : fit == 2 ? "fill the width" : fit ? "fit" : "crop");
+ 	return bd_flip_on;
+ }
+ #endif /* SWEET */
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -148,6 +148,7 @@
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	/* blueline: the presented display scaled to the panel's height (bluefb_fit, default on) */
+ 	bool          fFit;
++	int fFitMode;
+ 	int32_t       fFitX, fFitW;             /* panel columns it covers */
+ 	uint16_t      fFitCol[1080];            /* panel column -> logical column */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+@@ -304,6 +305,7 @@
+ 	int fit = 1;
+ 	PE_parse_boot_argn("bluefb_fit", &fit, sizeof(fit));
+ 	fFit = fit && fLogicalH > fHeight && fWidth <= 1080;
++	fFitMode = fit < 1 || fit > 3 ? 1 : fit;          /* 2 fill the width, 3 stretch: the DPU flip (BlueDPU.cpp) */
+ 	if (fFit) {
+ 		fFitW = (int32_t)((uint64_t)fLogicalW * fHeight / fLogicalH);
+ 		fFitX = ((int32_t)fWidth - fFitW) / 2;
+@@ -343,7 +345,7 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	fPresentLock = IOLockAlloc();
+-	if (fPresentLock != NULL && blue_dpu_flip_init(fFit)) {
++	if (fPresentLock != NULL && blue_dpu_flip_init(fFit ? fFitMode : 0)) {
+ 		fFlip = true;   /* before registerService: no swap can come earlier */
+ 		IOLog("SWEET FB: zero-copy present on (bluedpu_flip=1, %s)\n", fFit ? "QSEED3 fit" : "crop");
+ 		int threaded = 1;
+diff -ru a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -371,6 +371,7 @@
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	int fFitX, fFitW;	/* bluefb_fit: panel columns the scaled display covers, 0 = crop */
++	int fFitY0, fFitH;	/* bluefb_fit: display rows on the panel (bluefb_fit=2 cuts top and bottom) */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -447,8 +448,10 @@
+ 	/* As SweetFramebuffer.cpp shows it: scaled to the panel's height, centred. */
+ 	int fit = 1;
+ 	PE_parse_boot_argn("bluefb_fit", &fit, sizeof(fit));
+-	fFitW = (fit && !native) ? fLogicalW * 2160 / fLogicalH : 0;
++	fFitW = (fit && !native) ? (fit >= 2 ? 1080 : fLogicalW * 2160 / fLogicalH) : 0;
+ 	fFitX = fFitW ? (1080 - fFitW) / 2 : 0;
++	fFitH = (fit == 2 && !native) ? 2160 * fLogicalW / 1080 : fLogicalH;
++	fFitY0 = (fLogicalH - fFitH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -481,7 +484,7 @@
+ 		int fx = x - fFitX;
+ 		fx = fx < 0 ? 0 : (fx >= fFitW ? fFitW - 1 : fx);
+ 		nx = (IOFixed)(((int64_t)fx << 16) / fFitW);
+-		ny = (IOFixed)(((int64_t)y << 16) / 2160);
++		ny = (IOFixed)((((int64_t)fFitY0 * 2160 + (int64_t)y * fFitH) << 16) / (2160 * (int64_t)fLogicalH));
+ 	}
+ 	if (!was && down) {
+ 		int left = fFitW ? fFitX : 0, right = fFitW ? fFitX + fFitW - 1 : 1079;
