@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iOS 16 on the Google Pixel 3 (pixel3-ios)</title>
+<meta name="description" content="Apple's XNU kernel ported to the Google Pixel 3 (blueline, Snapdragon 845), running the iOS 16.7 userland of the iPhone X. Adreno 630 GPU, touch, 2.4 GHz Wi-Fi, Safari. Source, build steps and engineering log.">
+<link rel="canonical" href="https://andyleenz.github.io/pixel3-ios/">
+<meta name="theme-color" content="#131314">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%230b57d0'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-size='13' font-weight='800' font-family='sans-serif' fill='white'%3EP3%3C/text%3E%3C/svg%3E">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pixel3-ios">
+<meta property="og:url" content="https://andyleenz.github.io/pixel3-ios/">
+<meta property="og:title" content="iOS 16 on the Google Pixel 3">
+<meta property="og:description" content="XNU port to the Pixel 3 (SDM845) running the iOS 16.7 userland. Adreno 630, touch, 2.4 GHz Wi-Fi, Safari.">
+<meta property="og:image" content="https://andyleenz.github.io/pixel3-ios/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="iOS 16 home screen on a Google Pixel 3">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="iOS 16 on the Google Pixel 3">
+<meta name="twitter:description" content="XNU port to the Pixel 3 (SDM845) running the iOS 16.7 userland. Adreno 630, touch, 2.4 GHz Wi-Fi, Safari.">
+<meta name="twitter:image" content="https://andyleenz.github.io/pixel3-ios/og.png">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"pixel3-ios","description":"Apple's XNU kernel ported to the Google Pixel 3 (blueline, Snapdragon 845), running the iOS 16.7 userland of the iPhone X. Adreno 630 GPU, touch, 2.4 GHz Wi-Fi, Safari. Source, build steps and engineering log.","codeRepository":"https://github.com/andyleenz/pixel3-ios","url":"https://andyleenz.github.io/pixel3-ios/","image":"https://andyleenz.github.io/pixel3-ios/og.png","programmingLanguage":["C","C++"],"targetProduct":{"@type":"SoftwareApplication","name":"XNU for Google Pixel 3","operatingSystem":"iOS 16.7"}}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wdth,wght,ROND@6..144,25..151,1..1000,0..100&family=Google+Sans+Code:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+ --primary:#0b57d0;--on-primary:#fff;--primary-container:#d3e3fd;--on-primary-container:#041e49;
+ --secondary-container:#c2e7ff;--on-secondary-container:#001d35;
+ --tertiary-container:#c4eed0;--on-tertiary-container:#072711;
+ --warn-container:#ffdf99;--on-warn-container:#251a00;
+ --error-container:#ffdad6;--on-error-container:#410002;
+ --surface:#f8fafd;--surface-low:#f0f4f9;--surface-mid:#e9eef6;--surface-high:#dde3ea;
+ --on-surface:#1f1f1f;--on-surface-variant:#444746;--outline:#747775;--outline-variant:#c4c7c5;
+ --blob:#d3e3fd;--blob2:#c2e7ff;
+ color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+ --primary:#a8c7fa;--on-primary:#062e6f;--primary-container:#0b57d0;--on-primary-container:#ffffff;
+ --secondary-container:#00639b;--on-secondary-container:#ffffff;
+ --tertiary-container:#146c2e;--on-tertiary-container:#ffffff;
+ --warn-container:#fcc934;--on-warn-container:#251a00;
+ --error-container:#8c1d18;--on-error-container:#f9dedc;
+ --surface:#131314;--surface-low:#1b1b1c;--surface-mid:#1e1f20;--surface-high:#282a2c;
+ --on-surface:#e3e3e3;--on-surface-variant:#c4c7c5;--outline:#8e918f;--outline-variant:#444746;
+ --blob:#0b57d0;--blob2:#00639b;color-scheme:dark}}
+:root[data-theme="dark"]{
+ --primary:#a8c7fa;--on-primary:#062e6f;--primary-container:#0b57d0;--on-primary-container:#ffffff;
+ --secondary-container:#00639b;--on-secondary-container:#ffffff;
+ --tertiary-container:#146c2e;--on-tertiary-container:#ffffff;
+ --warn-container:#fcc934;--on-warn-container:#251a00;
+ --error-container:#8c1d18;--on-error-container:#f9dedc;
+ --surface:#131314;--surface-low:#1b1b1c;--surface-mid:#1e1f20;--surface-high:#282a2c;
+ --on-surface:#e3e3e3;--on-surface-variant:#c4c7c5;--outline:#8e918f;--outline-variant:#444746;
+ --blob:#0b57d0;--blob2:#00639b;color-scheme:dark}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--surface);color:var(--on-surface);font-family:"Google Sans Flex","Roboto Flex",system-ui,sans-serif;font-size:16px;line-height:1.5;transition:background .4s,color .4s}
+a{color:var(--primary)}
+code,.mono{font-family:"Google Sans Code",ui-monospace,monospace;font-size:.88em}
+code{background:var(--surface-high);border-radius:8px;padding:1px 6px}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+/* top app bar */
+.bar{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--surface) 82%,transparent);backdrop-filter:blur(14px)}
+.bar .wrap{display:flex;align-items:center;gap:8px;height:64px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;text-decoration:none;color:var(--on-surface);font-variation-settings:"wdth" 110;margin-right:auto}
+.logo svg{width:32px;height:32px}
+.navl{color:var(--on-surface-variant);text-decoration:none;font-weight:500;font-size:15px;padding:10px 16px;border-radius:100px;transition:background .2s,border-radius .3s cubic-bezier(.3,1.6,.5,1)}
+.navl:hover{background:var(--surface-high);border-radius:12px}
+.icon-btn{width:44px;height:44px;border:0;border-radius:100px;background:var(--surface-high);color:var(--on-surface);display:grid;place-items:center;cursor:pointer;transition:border-radius .35s cubic-bezier(.3,1.6,.5,1),background .2s}
+.icon-btn:hover{border-radius:14px}
+.icon-btn svg{width:22px;height:22px}
+.icon-btn .sun{display:none}
+:root[data-theme="dark"] .icon-btn .sun{display:block}:root[data-theme="dark"] .icon-btn .moon{display:none}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .icon-btn .sun{display:block}:root:not([data-theme="light"]) .icon-btn .moon{display:none}}
+/* hero */
+.hero{display:grid;grid-template-columns:1.1fr .9fr;gap:24px;align-items:center;padding:16px 0 24px}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 8px;border-radius:100px;background:var(--secondary-container);color:var(--on-secondary-container);font-weight:600;font-size:14px}
+.chip i{width:10px;height:10px;border-radius:50%;background:currentColor;opacity:.8}
+h1{font-size:clamp(44px,6.4vw,84px);line-height:.98;margin:20px 0 20px;font-weight:800;letter-spacing:-.025em;font-variation-settings:"wdth" 118,"opsz" 144}
+h1 em{font-style:normal;color:var(--primary);font-variation-settings:"wdth" 151,"opsz" 144}
+.lede{font-size:20px;line-height:1.5;color:var(--on-surface-variant);max-width:560px;margin:0 0 28px}
+.btns{display:flex;flex-wrap:wrap;gap:12px}
+.btn{display:inline-flex;align-items:center;gap:8px;height:56px;padding:0 28px;border-radius:100px;font-weight:600;font-size:16px;text-decoration:none;transition:border-radius .4s cubic-bezier(.3,1.6,.5,1),transform .4s cubic-bezier(.3,1.6,.5,1),background .2s}
+.btn:hover{border-radius:18px}
+.btn:active{transform:scale(.95)}
+.btn.filled{background:var(--primary);color:var(--on-primary)}
+.btn.tonal{background:var(--secondary-container);color:var(--on-secondary-container)}
+.btn.out{border:1px solid var(--outline-variant);color:var(--on-surface)}
+.btn svg{width:20px;height:20px}
+/* stage */
+.stage{position:relative;height:580px}
+.stage .shape{position:absolute;inset:4% 2%;width:96%;height:92%;animation:spin 60s linear infinite}
+.stage .shape path{fill:var(--blob);transition:fill .4s}
+.stage canvas{position:absolute;inset:0;width:100%!important;height:100%!important;cursor:grab;touch-action:pan-y}
+.stage canvas:active{cursor:grabbing}
+.stage .fallback{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);height:84%;aspect-ratio:1/2;border-radius:28px;border:10px solid #111;display:none;object-fit:cover}
+.stage.nogl .fallback{display:block}
+@keyframes spin{to{transform:rotate(360deg)}}
+.picker{display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin-top:-8px}
+.pick{border:1px solid var(--outline-variant);background:transparent;color:var(--on-surface-variant);font:inherit;font-weight:600;font-size:14px;height:36px;padding:0 13px;border-radius:10px;cursor:pointer;transition:all .35s cubic-bezier(.3,1.6,.5,1)}
+.pick[aria-pressed="true"]{background:var(--primary-container);color:var(--on-primary-container);border-color:transparent;border-radius:100px}
+.hint{text-align:center;color:var(--on-surface-variant);font-size:13px;margin:10px 0 0}
+/* stats */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:56px 0 0}
+.stat{padding:24px;min-height:150px;display:flex;flex-direction:column;justify-content:space-between}
+.stat b{font-size:40px;line-height:1;font-weight:800;font-variation-settings:"wdth" 125,"opsz" 144;letter-spacing:-.02em}
+.stat span{font-size:15px;font-weight:500;opacity:.85}
+.stat:nth-child(1){background:var(--primary-container);color:var(--on-primary-container);border-radius:48px 16px 48px 16px}
+.stat:nth-child(2){background:var(--secondary-container);color:var(--on-secondary-container);border-radius:16px 48px 16px 48px}
+.stat:nth-child(3){background:var(--tertiary-container);color:var(--on-tertiary-container);border-radius:48px}
+.stat:nth-child(4){background:var(--surface-high);color:var(--on-surface);border-radius:16px 16px 48px 48px}
+/* sections */
+h2{font-size:clamp(32px,4vw,48px);line-height:1.05;font-weight:800;letter-spacing:-.02em;font-variation-settings:"wdth" 118,"opsz" 144;margin:96px 0 8px}
+.sub{color:var(--on-surface-variant);font-size:18px;margin:0 0 28px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.card{background:var(--surface-low);border-radius:28px;padding:22px 22px 24px;transition:border-radius .45s cubic-bezier(.3,1.6,.5,1),background .3s}
+.card:hover{border-radius:44px;background:var(--surface-mid)}
+.card h3{margin:14px 0 6px;font-size:20px;font-weight:700;font-variation-settings:"wdth" 110}
+.card p{margin:0;color:var(--on-surface-variant);font-size:15px}
+.st{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border-radius:100px;font-size:13px;font-weight:700}
+.st svg{width:16px;height:16px}
+.ok{background:var(--primary-container);color:var(--on-primary-container)}
+.part{background:var(--warn-container);color:var(--on-warn-container)}
+.no{background:var(--surface-high);color:var(--on-surface-variant)}
+/* how */
+.how{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.steps{background:var(--surface-low);border-radius:36px;padding:28px;list-style:none;margin:0}
+.steps li{display:grid;grid-template-columns:52px 1fr;gap:16px;align-items:start;padding:10px 0;position:relative}
+.steps li:not(:last-child)::after{content:"";position:absolute;left:25px;top:62px;bottom:-10px;width:2px;background:var(--outline-variant)}
+.badge{width:52px;height:52px;display:grid;place-items:center;font-weight:800;font-size:20px;color:var(--on-primary-container)}
+.badge svg{position:absolute;width:52px;height:52px}
+.badge svg path{fill:var(--primary-container)}
+.badge span{position:relative}
+.steps b{display:block;font-size:17px;margin-top:4px}
+.steps small{color:var(--on-surface-variant);font-size:14.5px}
+.facts{display:grid;gap:12px}
+.facts .card{display:flex;gap:16px;align-items:flex-start}
+.facts .card p{color:var(--on-surface)}
+.dot{flex:none;width:40px;height:40px;border-radius:14px;background:var(--secondary-container);color:var(--on-secondary-container);display:grid;place-items:center}
+.dot svg{width:22px;height:22px}
+.warn{margin-top:96px;background:var(--surface-low);color:var(--on-surface);border-radius:36px;padding:28px 32px;display:flex;gap:20px;align-items:flex-start}
+.warn svg{flex:none;width:48px;height:48px;padding:10px;border-radius:16px;background:var(--warn-container);color:var(--on-warn-container)}
+.warn h3{margin:0 0 6px;font-size:22px;font-variation-settings:"wdth" 115}
+.warn p{margin:0}
+.credits{color:var(--on-surface-variant);font-size:16px;max-width:820px}
+footer{margin-top:96px;background:var(--surface-low);border-radius:40px 40px 0 0;padding:36px 0 44px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;align-items:center;color:var(--on-surface-variant);font-size:14px}
+footer a{color:var(--on-surface);font-weight:600;text-decoration:none}
+@media (max-width:900px){
+ .hero{grid-template-columns:1fr;padding-top:24px}
+ .stage{height:480px}
+ .stats{grid-template-columns:1fr 1fr}
+ .how{grid-template-columns:1fr}
+}
+@media (max-width:560px){
+ .wrap{padding:0 16px}
+ .navl.opt{display:none}
+ .lede{font-size:17px}
+ .btn{height:52px;padding:0 22px}
+ .stage{height:440px}
+ .stat{min-height:120px;padding:20px}.stat b{font-size:30px}
+ h2{margin-top:72px}
+ .warn{flex-direction:column;padding:24px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+<script>
+var t='dark';try{t=localStorage.getItem('p3theme')||t}catch(e){}document.documentElement.dataset.theme=t;
+</script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head>
+<body>
+<header class="bar"><div class="wrap">
+ <a class="logo" href="#"><svg viewBox="0 0 32 32" aria-hidden="true"><path id="logoShape" fill="var(--primary)"/><text x="16" y="20.5" text-anchor="middle" font-size="12" font-weight="800" fill="var(--on-primary)" font-family="Google Sans Flex,sans-serif">P3</text></svg>pixel3-ios</a>
+ <a class="navl opt" href="#status">Status</a>
+ <a class="navl opt" href="#how">How it works</a>
+ <a class="navl" href="https://github.com/andyleenz/pixel3-ios">GitHub</a>
+ <button class="icon-btn" id="theme" aria-label="Toggle light or dark theme">
+  <svg class="moon" viewBox="0 0 24 24"><path fill="currentColor" d="M12 21q-3.75 0-6.375-2.625T3 12t2.625-6.375T12 3q.35 0 .688.025t.662.075q-1.025.725-1.638 1.888T11.1 7.5q0 2.25 1.575 3.825T16.5 12.9q1.375 0 2.525-.613T20.9 10.65q.05.325.075.662T21 12q0 3.75-2.625 6.375T12 21"/></svg>
+  <svg class="sun" viewBox="0 0 24 24"><path fill="currentColor" d="M12 17q-2.075 0-3.537-1.463T7 12t1.463-3.537T12 7t3.538 1.463T17 12t-1.463 3.538T12 17M2 13q-.425 0-.712-.288T1 12t.288-.712T2 11h2q.425 0 .713.288T5 12t-.288.713T4 13zm18 0q-.425 0-.712-.288T19 12t.288-.712T20 11h2q.425 0 .713.288T23 12t-.288.713T22 13zm-8-8q-.425 0-.712-.288T11 4V2q0-.425.288-.712T12 1t.713.288T13 2v2q0 .425-.288.713T12 5m0 18q-.425 0-.712-.288T11 22v-2q0-.425.288-.712T12 19t.713.288T13 20v2q0 .425-.288.713T12 23M5.65 7.05 4.575 6q-.3-.275-.288-.7t.288-.725q.3-.3.725-.3t.7.3L7.05 5.65q.275.3.275.7t-.275.7t-.687.288t-.713-.288M18 19.425l-1.05-1.075q-.275-.3-.275-.712t.275-.688q.275-.3.688-.287t.712.287L19.425 18q.3.275.288.7t-.288.725q-.3.3-.725.3t-.7-.3M16.95 7.05q-.3-.275-.288-.687t.288-.713L18 4.575q.275-.3.7-.288t.725.288q.3.3.3.725t-.3.7L18.35 7.05q-.3.275-.7.275t-.7-.275M4.575 19.425q-.3-.3-.3-.725t.3-.7l1.075-1.05q.3-.275.712-.275t.688.275q.3.275.288.688t-.288.712L6 19.425q-.275.3-.7.288t-.725-.288"/></svg>
+ </button>
+</div></header>
+
+<main class="wrap">
+<section class="hero">
+ <div>
+  <span class="chip"><i></i>Experimental · iOS 16.7 · 2026-11</span>
+  <h1>iOS 16 on the <em>Pixel&nbsp;3</em></h1>
+  <p class="lede">Apple's open-source XNU kernel, ported to the Google Pixel 3 (<code>blueline</code>, Snapdragon 845), running the iOS 16.7 userland of the iPhone X. The Adreno 630 draws the UI; touch, Wi-Fi and Safari work.</p>
+  <div class="btns">
+   <a class="btn filled" href="https://github.com/andyleenz/pixel3-ios"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.08.63-1.33-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2"/></svg>Source on GitHub</a>
+   <a class="btn tonal" href="https://github.com/andyleenz/pixel3-ios#building-and-running-macos">Build and install</a>
+   <a class="btn out" href="https://github.com/andyleenz/pixel3-ios/blob/master/docs/LOG.md">Engineering log</a>
+  </div>
+ </div>
+ <div>
+  <div class="stage" id="stage">
+   <svg class="shape" viewBox="-100 -100 200 200" aria-hidden="true"><path id="cookie"/></svg>
+   <img class="fallback" src="screenshots/2026-11-21-home1.png" alt="iOS 16 home screen on a Pixel 3">
+  </div>
+  <div class="picker" id="picker">
+   <button class="pick" data-i="0">Lock</button>
+   <button class="pick" data-i="1" aria-pressed="true">Home</button>
+   <button class="pick" data-i="2">Apps</button>
+   <button class="pick" data-i="3">Settings</button>
+   <button class="pick" data-i="4">Safari</button>
+  </div>
+  <p class="hint">Drag to rotate. Screens are real captures from the phone.</p>
+ </div>
+</section>
+
+<section class="stats">
+ <div class="stat"><b>iOS 16.7</b><span>iPhone X userland</span></div>
+ <div class="stat"><b>8 cores</b><span>Kryo 385, 4x 2.5 + 4x 1.6 GHz</span></div>
+ <div class="stat"><b>60 Hz</b><span>Adreno 630, Mesa freedreno</span></div>
+ <div class="stat"><b>Wi-Fi</b><span>WCN3990, 2.4 GHz WPA2</span></div>
+</section>
+
+<h2 id="status">What works</h2>
+<p class="sub">As of November 2026. Details in the <a href="https://github.com/andyleenz/pixel3-ios/blob/master/docs/LOG.md">engineering log</a>.</p>
+<div class="grid">
+ <div class="card"><span class="st ok">✓ Works</span><h3>Boot</h3><p>Google's bootloader (unlocked) starts a shim that loads XNU with an Apple device tree. Android stays in slot B.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>Display</h3><p>1080x2160 panel. iOS sees an iPhone X width at 2:1 (1125x2250, scaled 0.96). Triple-buffered scan-out at 60 Hz.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>GPU</h3><p>Adreno 630 under Mesa freedreno (GLES 3.2). CoreAnimation draws through an EAGL shim. No Metal.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>Touch and buttons</h3><p>ST FTM5 touch with edge gestures; power and volume keys.</p></div>
+ <div class="card"><span class="st part">◐ 2.4 GHz</span><h3>Wi-Fi</h3><p>WCN3990, WPA2, DHCP, joins at boot; Apple's wifid and configd. 5 GHz not yet.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>CPU and storage</h3><p>All 8 cores with frequency and thermal limits. UFS; the iOS root is an HFS+ image on <code>userdata</code>.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>Battery and haptics</h3><p>Fuel gauge, RTC, brightness, haptics.</p></div>
+ <div class="card"><span class="st part">◐ Kernel only</span><h3>Audio</h3><p>Speaker amps and the ADSP are up and a test tone plays. No audio from iOS yet.</p></div>
+ <div class="card"><span class="st part">◐ Probe</span><h3>Camera</h3><p>IMX363 (rear) and 2x IMX355 (front) answer on CCI with matching chip IDs. No capture pipeline.</p></div>
+ <div class="card"><span class="st no">Not yet</span><h3>Bluetooth</h3><p>Not started.</p></div>
+ <div class="card"><span class="st no">Not yet</span><h3>Cellular, sensors</h3><p>The modem boots; no data.</p></div>
+ <div class="card"><span class="st no">No</span><h3>Face ID / SEP</h3><p>So no FairPlay: App Store apps don't run.</p></div>
+</div>
+
+<h2 id="how">How it works</h2>
+<p class="sub">A ported kernel under Apple's own userland.</p>
+<div class="how">
+ <ol class="steps">
+  <li><div class="badge"><svg viewBox="-100 -100 200 200"><path class="sb"/></svg><span>1</span></div><div><b>ABL</b><small>Google's bootloader, unlocked, boots it like a Linux kernel.</small></div></li>
+  <li><div class="badge"><svg viewBox="-100 -100 200 200"><path class="sb"/></svg><span>2</span></div><div><b>Shim</b><small>Builds an Apple device tree and boot-args, then jumps to XNU.</small></div></li>
+  <li><div class="badge"><svg viewBox="-100 -100 200 200"><path class="sb"/></svg><span>3</span></div><div><b>XNU (xnu-8796)</b><small>ios-sweet's patches plus Pixel 3 drivers: display, GPU, touch, Wi-Fi, USB, PMIC, audio.</small></div></li>
+  <li><div class="badge"><svg viewBox="-100 -100 200 200"><path class="sb"/></svg><span>4</span></div><div><b>iOS 16.7 userland</b><small>The iPhone X's, built on your Mac from your own IPSW.</small></div></li>
+ </ol>
+ <div class="facts">
+  <div class="card"><div class="dot"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 20q-.825 0-1.412-.587T2 18V6q0-.825.588-1.412T4 4h6l2 2h8q.825 0 1.413.588T22 8v10q0 .825-.587 1.413T20 20z"/></svg></div><p>No Apple software is in the repository. The iOS root is built from Apple's IPSW on your Mac.</p></div>
+  <div class="card"><div class="dot"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m13 2-9 12h7l-1 8 9-12h-7z"/></svg></div><p>Test kernels boot from RAM with <code>fastboot boot</code>; nothing is flashed to try a change.</p></div>
+  <div class="card"><div class="dot"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M15 7v4h1v2h-3V5h2l-3-4-3 4h2v8H8v-2.07A1.993 1.993 0 0 0 7 7.25a2 2 0 0 0-1 3.68V13a2 2 0 0 0 2 2h3v3.05a2.5 2.5 0 1 0 2 0V15h3a2 2 0 0 0 2-2v-2h1V7z"/></svg></div><p>With <code>sweetusb=2</code> the phone is a USB network adapter: live kernel log, file transfer and a shell.</p></div>
+  <div class="card"><div class="dot"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 22q-.825 0-1.412-.587T4 20V4q0-.825.588-1.412T6 2h8l6 6v12q0 .825-.587 1.413T18 22zm7-13h5l-5-5z"/></svg></div><p>Write-up: <a href="https://github.com/andyleenz/pixel3-ios/blob/master/docs/ios16-red-status-bar.md">iOS 16's red status bar on unknown screen sizes</a>.</p></div>
+ </div>
+</div>
+
+<div class="warn">
+ <svg viewBox="0 0 24 24"><path fill="currentColor" d="M1 21 12 2l11 19zm11-3q.425 0 .713-.288T13 17t-.288-.712T12 16t-.712.288T11 17t.288.713T12 18m-1-3h2v-5h-2z"/></svg>
+ <div><h3>Before you try it</h3><p>Experimental bring-up, not a usable phone OS. Installing it erases Android's user data. Apple's security model is mostly switched off, so don't put anything personal on it. Not affiliated with or endorsed by Apple or Google.</p></div>
+</div>
+
+<h2>Credits</h2>
+<p class="credits">Started as a fork of <a href="https://github.com/erikkunz/pixel3-ios">erikkunz/pixel3-ios</a> by Erik Kunz, who did the original port. Built on <a href="https://github.com/dipa-studio/ios-sweet">ios-sweet</a> and HakiOS (EAGL shim, MIT), <a href="https://github.com/MakrSas/ios-topaz">ios-topaz</a> and HackiOS (Wi-Fi station, APSL 2.0), and <a href="https://github.com/NWylynko/ios-flame">ios-flame</a> (USB live log, MIT).</p>
+</main>
+
+<footer><div class="wrap"><a href="https://github.com/andyleenz/pixel3-ios">github.com/andyleenz/pixel3-ios</a><a href="https://github.com/andyleenz/pixel3-ios/issues">Report a problem</a><span>Not affiliated with Apple or Google.</span></div></footer>
+
+<script>
+// M3 Expressive shapes: a 9-lobe "cookie" (hero), 7-lobe (step badges), 6-lobe (logo).
+function shape(n,amp,R){let d='';for(let i=0;i<=360;i++){const a=i/360*2*Math.PI,r=R*(1+amp*Math.cos(n*a));d+=(i?'L':'M')+(r*Math.sin(a)).toFixed(2)+' '+(-r*Math.cos(a)).toFixed(2)}return d+'Z'}
+document.getElementById('cookie').setAttribute('d',shape(9,.07,90));
+document.querySelectorAll('.sb').forEach(p=>p.setAttribute('d',shape(7,.09,88)));
+document.getElementById('logoShape').setAttribute('d',(function(){let d='';for(let i=0;i<=360;i++){const a=i/360*2*Math.PI,r=14.5*(1+.08*Math.cos(6*a));d+=(i?'L':'M')+(16+r*Math.sin(a)).toFixed(2)+' '+(16-r*Math.cos(a)).toFixed(2)}return d+'Z'})());
+// Theme toggle: system default, override stored per viewer.
+function isDark(){const t=document.documentElement.dataset.theme;return t?t==='dark':matchMedia('(prefers-color-scheme: dark)').matches}
+document.getElementById('theme').onclick=()=>{const n=isDark()?'light':'dark';document.documentElement.dataset.theme=n;try{localStorage.setItem('p3theme',n)}catch(e){}window.dispatchEvent(new Event('p3theme'))};
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>window.dispatchEvent(new Event('p3theme')));
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const stage=document.getElementById('stage');
+const BASE='screenshots/2026-11-21-';
+const SHOTS=['lock','home1','home2','settings','safari'].map(n=>BASE+n+'.png');
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+let renderer;
+try{renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});}catch(e){stage.classList.add('nogl');throw e}
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+stage.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene();
+const pm=new THREE.PMREMGenerator(renderer);
+scene.environment=pm.fromScene(new RoomEnvironment(),.04).texture;
+const camera=new THREE.PerspectiveCamera(26,1,1,2000);
+const key=new THREE.DirectionalLight(0xffffff,1.6);key.position.set(120,180,260);scene.add(key);
+scene.add(new THREE.AmbientLight(0xffffff,.35));
+
+// Rounded rectangle with separate top/bottom radii; UVs normalised to the rectangle.
+function rr(w,h,rt,rb=rt){const s=new THREE.Shape(),x=-w/2,y=-h/2;
+ s.moveTo(x+rb,y);s.lineTo(x+w-rb,y);s.quadraticCurveTo(x+w,y,x+w,y+rb);s.lineTo(x+w,y+h-rt);s.quadraticCurveTo(x+w,y+h,x+w-rt,y+h);
+ s.lineTo(x+rt,y+h);s.quadraticCurveTo(x,y+h,x,y+h-rt);s.lineTo(x,y+rb);s.quadraticCurveTo(x,y,x+rb,y);return s}
+function plate(w,h,rt,rb){const g=new THREE.ShapeGeometry(rr(w,h,rt,rb),10),p=g.attributes.position,uv=g.attributes.uv;
+ for(let i=0;i<p.count;i++)uv.setXY(i,(p.getX(i)+w/2)/w,(p.getY(i)+h/2)/h);return g}
+const disc=(r)=>new THREE.CircleGeometry(r,48);
+
+// Pixel 3 (Just Black), mm, measured from the Wikimedia front drawing and an iFixit back-cover photo.
+const W=68.2,H=145.6,D=7.9,Z=D/2;
+const phone=new THREE.Group();scene.add(phone);
+const mats={
+ frame:new THREE.MeshPhysicalMaterial({color:0x2a2a2e,metalness:.55,roughness:.38}),
+ back:new THREE.MeshPhysicalMaterial({color:0x1f1f22,roughness:.62,clearcoat:.2}),
+ window:new THREE.MeshPhysicalMaterial({color:0x111114,roughness:.08,clearcoat:1,clearcoatRoughness:.05}),
+ key:new THREE.MeshPhysicalMaterial({color:0x3a3a3e,roughness:.35,metalness:.2}),
+ glass:new THREE.MeshPhysicalMaterial({color:0x050506,roughness:.06,clearcoat:1,clearcoatRoughness:.03,metalness:.1}),
+ dark:new THREE.MeshPhysicalMaterial({color:0x1a1a1c,roughness:.5}),
+ lens:new THREE.MeshPhysicalMaterial({color:0x0b1830,roughness:.05,clearcoat:1,metalness:.6}),
+ bump:new THREE.MeshPhysicalMaterial({color:0x121214,roughness:.25,clearcoat:.6}),
+ fp:new THREE.MeshPhysicalMaterial({color:0x161618,roughness:.75}),
+ ring:new THREE.MeshPhysicalMaterial({color:0x3a3d44,roughness:.3,metalness:.6}),
+ fpring:new THREE.MeshPhysicalMaterial({color:0x3a3a3f,roughness:.4,metalness:.2}),
+ flash:new THREE.MeshPhysicalMaterial({color:0xd8d2bf,roughness:.3,clearcoat:1})
+};
+const add=(g,m,x,y,z,ry=0)=>{const o=new THREE.Mesh(g,m);o.position.set(x,y,z);o.rotation.y=ry;phone.add(o);return o};
+{const b=1.6,g=new THREE.ExtrudeGeometry(rr(W-2*b,H-2*b,6.4),{depth:D-2*b,bevelEnabled:true,bevelThickness:b,bevelSize:b,bevelSegments:6,curveSegments:24});g.translate(0,0,-(D-2*b)/2);add(g,mats.frame,0,0,0)}
+// front
+add(plate(W-3.2,H-3.2,6.6,6.6),mats.glass,0,0,Z+.06);
+const scrGeo=plate(61.9,123.8,3,3);
+const scrA=new THREE.MeshBasicMaterial({toneMapped:false});
+const scrB=new THREE.MeshBasicMaterial({toneMapped:false,transparent:true,opacity:0});
+add(scrGeo,scrA,0,0,Z+.14);add(scrGeo,scrB,0,0,Z+.2);
+add(plate(16,1.8,.9,.9),mats.dark,0,H/2-4.9,Z+.14);
+add(plate(16,1.8,.9,.9),mats.dark,0,-H/2+4.9,Z+.14);
+add(disc(2.15),mats.ring,-13.15,H/2-7.4,Z+.12);add(disc(1.5),mats.lens,-13.15,H/2-7.4,Z+.16);
+add(disc(1.8),mats.ring,-21.6,H/2-7.3,Z+.12);add(disc(1.25),mats.lens,-21.6,H/2-7.3,Z+.16);add(disc(.9),mats.dark,10.9,H/2-7.2,Z+.14);
+// back (seen mirrored: phone +x is the viewer's left)
+add(plate(W-3.2,H-3.2,6.6,6.6),mats.back,0,0,-Z-.06,Math.PI);
+add(plate(W-3.2,22,6.6,0),mats.window,0,H/2-1.6-11,-Z-.12,Math.PI);
+{const c=new THREE.CylinderGeometry(4.6,4.6,.35,64);c.rotateX(Math.PI/2);add(c,mats.bump,W/2-14.3,H/2-11.9,-Z-.24)}
+add(disc(3.7),mats.ring,W/2-14.3,H/2-11.9,-Z-.43,Math.PI);add(disc(2.9),mats.lens,W/2-14.3,H/2-11.9,-Z-.46,Math.PI);
+add(disc(1.9),mats.flash,W/2-27.3,H/2-11.9,-Z-.18,Math.PI);
+add(disc(6.6),mats.fpring,0,H/2-36.4,-Z-.12,Math.PI);add(disc(6.1),mats.fp,0,H/2-36.4,-Z-.16,Math.PI);
+// right side: power and volume
+add(new RoundedBoxGeometry(1.4,10,2.6,2,.6),mats.key,W/2+.15,H/2-36.8,0);
+add(new RoundedBoxGeometry(1.4,20,2.6,2,.6),mats.frame,W/2+.15,H/2-61.8,0);
+
+// Screens
+const loader=new THREE.TextureLoader();loader.setCrossOrigin('anonymous');
+const tex=SHOTS.map(u=>{const t=loader.load(u,kick);t.colorSpace=THREE.SRGBColorSpace;t.anisotropy=renderer.capabilities.getMaxAnisotropy();return t});
+let cur=1,fade=null;scrA.map=tex[cur];
+const picks=[...document.querySelectorAll('.pick[data-i]')];
+function show(i){if(i===cur)return;cur=i;scrB.map=tex[i];scrB.needsUpdate=true;fade={t0:performance.now()};
+ picks.forEach(b=>b.setAttribute('aria-pressed',b.dataset.i==i));if(Math.cos(rot.y)<0){flipped=false;rot.base=rot.ty=-.52}kick()}
+let userPicked=false;
+picks.forEach(b=>b.onclick=()=>{userPicked=true;show(+b.dataset.i)});
+if(!reduce)setInterval(()=>{if(!userPicked&&!drag)show((cur+1)%SHOTS.length)},3800);
+
+// Motion: an underdamped spring towards a target pose (overshoot = the "expressive" bounce).
+const rot={x:.06,y:-.52,vx:0,vy:0,tx:.06,ty:-.52,base:-.52};let flipped=false;
+let drag=null,idleAt=0;
+const cv=renderer.domElement;
+cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY,ry:rot.ty,rx:rot.tx};cv.setPointerCapture(e.pointerId)});
+cv.addEventListener('pointermove',e=>{if(!drag)return;rot.ty=drag.ry+(e.clientX-drag.x)*.012;rot.tx=Math.max(-.6,Math.min(.6,drag.rx+(e.clientY-drag.y)*.006));kick()});
+const end=()=>{if(!drag)return;drag=null;const turns=Math.round((rot.ty+.52)/Math.PI);flipped=Math.abs(turns)%2===1;rot.base=rot.ty=turns*Math.PI-.52;rot.tx=.06;idleAt=performance.now()+1200;kick()};
+cv.addEventListener('pointerup',end);cv.addEventListener('pointercancel',end);
+
+function fit(){const w=stage.clientWidth,h=stage.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;
+ const t=Math.tan(THREE.MathUtils.degToRad(camera.fov/2));const d=Math.max((H*.56)/t,(W*1.2)/(t*camera.aspect));
+ camera.position.set(0,0,d);camera.updateProjectionMatrix();kick()}
+new ResizeObserver(fit).observe(stage);
+
+let running=false,last=0,visible=true;
+new IntersectionObserver(es=>{visible=es[0].isIntersecting;kick()}).observe(stage);
+function kick(){if(!running&&visible){running=true;last=performance.now();requestAnimationFrame(loop)}}
+function loop(now){const dt=Math.min(.033,(now-last)/1000);last=now;let busy=false;
+ if(!reduce&&!drag&&now>idleAt){const s=now/1000;rot.ty=rot.base+Math.sin(s*.55)*.2;rot.tx=.06+Math.sin(s*.4)*.05;busy=true}
+ for(const a of ['x','y']){const k=90,c=11;const acc=k*(rot['t'+a]-rot[a])-c*rot['v'+a];rot['v'+a]+=acc*dt;rot[a]+=rot['v'+a]*dt;
+  if(Math.abs(rot['v'+a])>1e-4||Math.abs(rot['t'+a]-rot[a])>1e-4)busy=true}
+ phone.rotation.set(rot.x,rot.y,-.05);
+ phone.position.y=reduce?0:Math.sin(now/1300)*1.6;
+ if(fade){const p=Math.min(1,(now-fade.t0)/420);scrB.opacity=p*p*(3-2*p);busy=true;if(p>=1){scrA.map=scrB.map;scrA.needsUpdate=true;scrB.opacity=0;fade=null}}
+ renderer.render(scene,camera);
+ if((busy||!reduce)&&visible)requestAnimationFrame(loop);else running=false}
+fit();
+</script>
+</body>
+</html>
