@@ -832,6 +832,55 @@ surface_to_texture(struct eagl *e, struct image *image)
 	e->upload_bytes += row * (size_t)image->height;
 }
 
+/*
+ * A surface drawn into through a texture of the library's own (a mirror: the display's pictures) is copied into
+ * whole at the end of each frame, and CoreAnimation draws only what has changed since it last drew into that surface.
+ * That holds while the texture is what the surface holds. When the surface's memory has been written since
+ * (its seed moved since our own copy: another texture of the same surface, in another context or attached
+ * again), the next frame's few changed rows would go out with a stale picture around them -- whole cards of
+ * Control Center blinking in and out, a lock screen from seconds before in one of the three buffers. So the
+ * first draw of a frame into such a texture takes the memory back into it first (boot-arg glresync=0: not).
+ */
+static int target_resync_on = 1;
+static unsigned resyncs;
+static void
+target_resync(struct eagl *e, struct image *image)
+{
+	uint32_t seed = IOSurfaceGetSeed(image->surface);
+	GLint read = 0, draw = 0;
+	GLboolean scissored;
+
+	if (!target_resync_on || image->mirror == 0 || seed == image->seed) {
+		return;
+	}
+	if (resyncs++ < 24) {
+		say("hakios-gl: frame %u: surface %u written behind texture %u (seed %u, ours %u): taken back before drawing\n",
+		    e->frames + 1, IOSurfaceGetID(image->surface), image->texture, seed, image->seed);
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	scissored = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
+	    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	if (scissored) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	image->seed = seed;
+}
+
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
 static void
 target_to_surface(struct eagl *e, struct image *image)
@@ -864,6 +913,7 @@ target_to_surface(struct eagl *e, struct image *image)
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
+		image->seed = IOSurfaceGetSeed(surface);        /* (what target_resync() compares with) */
 		return;
 	}
 	if (image->shared) {
@@ -1418,6 +1468,9 @@ drawing(struct eagl *e)
 
 	frame_begin(e);
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+		if (!image->drawn) {
+			target_resync(e, image);
+		}
 		image->drawn = image->painted = true;
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
@@ -4412,6 +4465,7 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
+		target_resync_on = strstr(arguments, "glresync=0") == NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		still_seldom = strstr(arguments, "glstill=0") == NULL;
 		if ((argument = strstr(arguments, "glprof=")) != NULL) {

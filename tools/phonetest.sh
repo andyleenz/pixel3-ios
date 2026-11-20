@@ -83,6 +83,8 @@ base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=u
 base="$base bluetest=1"	# 0161: bluebatt=1 bluemax=2 bluelmh=1 bluewdt=30 bluewdt_recovery=1 sweetfb_noconsole=1 sweetfb_hz=60
 [ -s work/rtc-offset ] && base="$base bluertc=2 bluertc_offset=$(cat work/rtc-offset)"
 case " $extra " in *" bluereboot="*) : "${wait:=5}" ;; *) : "${wait:=30}" ;; esac
+cmdline="$base $extra"	# XNU's boot-args line holds 607 bytes (mkpayload.py refuses more): fail before building anything
+[ ${#cmdline} -le 607 ] || { echo "boot-args are ${#cmdline} bytes, $(( ${#cmdline} - 607 )) over the 607-byte limit: shorten bluesnap=/bluetouchscript=" >&2; exit 1; }
 out=work/test; mkdir -p "$out"
 t0=$(date +%s)
 say() { printf '[%3ds] %s\n' $(( $(date +%s) - t0 )) "$*"; }
