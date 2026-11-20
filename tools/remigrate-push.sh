@@ -86,4 +86,6 @@ tools/phonetest.sh --name "$name" --end recovery "${a[@]}" \
 	--push "$tmp/migration.plist:/private/var/mobile/Library/Preferences/com.apple.migration.plist:600:501:501" \
 	--mkdir /private/var/datamigrator:755:501:501 \
 	--push "$tmp/migrate:/private/var/datamigrator/migrate:644:501:501" \
+	--mkdir /private/var/preferences/FeatureFlags/Domain:755:0:0 \
+	--push tools/featureflags/SpringBoard.plist:/private/var/preferences/FeatureFlags/Domain/SpringBoard.plist:644:0:0 \
 	"$@"
