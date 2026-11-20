@@ -12,8 +12,8 @@
 
 <p>
 <img src="docs/screenshots/2026-11-20-full-width-status-bar.png" width="180" alt="Home screen filling the panel, with the status bar">
-<img src="docs/screenshots/2026-11-20-system-apps.png" width="180" alt="Second home page: the stock apps">
-<img src="docs/screenshots/2026-11-19-gpu-settings.png" width="180" alt="Settings">
+<img src="docs/screenshots/2026-11-20-full-width-apps.png" width="180" alt="Second home page: the stock apps">
+<img src="docs/screenshots/2026-11-20-full-width-settings.png" width="180" alt="Settings">
 <img src="docs/screenshots/2026-11-20-wifi-safari-google.png" width="180" alt="Safari loading google.com over Wi-Fi">
 </p>
 
