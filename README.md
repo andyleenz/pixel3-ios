@@ -48,14 +48,15 @@ partition.
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
 | Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436). With `blueui=1` the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; without it, a CPU copy at 30 Hz. Brightness works |
 | GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim. Settings and Safari scroll at 55-62 fps |
-| iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. Photos crashes (no photo library yet); the App Library and Control Center blurs and the lock screen shortcut buttons don't draw yet |
+| iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. the App Library and Control Center blurs, Control Center's glyphs and brightness slider. Photos crashes (no photo library yet), and parts of Control Center blink while it animates |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
-| Other | Haptics, modem boot (no data yet) |
+| Wi-Fi | The WCN3990's firmware runs (modem WLAN domain, copy engines, HTC/WMI/HTT), and a passive scan of the 2.4 GHz channels finds the networks nearby. Kernel-side only so far: iOS doesn't see it yet, and 5 GHz scans don't start |
+| Other | Haptics, modem boot (no cellular data yet) |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery |
 
-**Not working yet:** Metal, Wi-Fi, audio, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal, Wi-Fi in iOS, audio, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
@@ -68,6 +69,10 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   (up to 9 ms per full-screen copy); texture uploads; first-use shader compiles (now cached on disk).
 - GMEM (on-chip tile) rendering instead of sysmem, for the blur-heavy screens (dock, Control Center).
 
+**In progress: Wi-Fi**
+- Join a network (HTT data path, station vdev, WPA2), then `en0` and Apple80211 for wifid
+  (ios-topaz's 0125-0130 and 0900 are the map). Then 5 GHz scans.
+
 **Next**
 - Make the GPU path (`blueui=1`) the default boot.
 - Photos: find out why it sees no photo library (assetsd never starts).
@@ -75,7 +80,7 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Widgets ("Waiting..."), GPU clock scaling (DCVS).
 
 **Later**
-- Wi-Fi, audio, display power-off on lock, USB networking.
+- Audio, display power-off on lock, USB networking.
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).
@@ -154,7 +159,9 @@ This builds directly on other people's work:
 - [ios-sweet](https://github.com/dipa-studio/ios-sweet) (dipa-studio, MIT): the XNU port this is based on.
   Its patches and its USB driver are fetched at build time.
 - [ios-flame](https://github.com/NWylynko/ios-flame) (Pixel 4, MIT): the USB driver, SMMU handling and USB
-  host tools, and the roadmap for GPU and Wi-Fi.
+  host tools, the roadmap for GPU and Wi-Fi, and the WCN3990 HTT setup in the Wi-Fi radio (0172).
+- [ios-topaz](https://github.com/MakrSas/ios-topaz) (Redmi Note 12 4G, kernel patches APSL 2.0): the WCN3990
+  copy engines, HTC, WMI and scan (its 0123, ported in 0172).
 - [ios-sailfish](https://github.com/joranv1/ios-sailfish) (Pixel 1): generic XNU fixes, GIC SPI support,
   touch-interrupt and performance ideas.
 - [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (OOSEX GANG,
@@ -162,7 +169,7 @@ This builds directly on other people's work:
   daemon findings, and the bit-banging idea.
 - [ios-raphael](https://github.com/Gsjsjzhznsz/ios-raphael): the ST FTS event format and the battery
   registration name.
-- Linux (`gcc-sdm845.c`, `gpi.c`, `i2c-qcom-geni.c`, `cmd-db.c`, `rpmh-rsc.c`, `arm-smmu-qcom.c`) and
+- Linux (`gcc-sdm845.c`, `gpi.c`, `i2c-qcom-geni.c`, `cmd-db.c`, `rpmh-rsc.c`, `arm-smmu-qcom.c`, ath10k) and
   Google's Pixel 3 FTM5 driver, used as hardware references.
 
 ## License

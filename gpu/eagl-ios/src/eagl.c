@@ -284,6 +284,7 @@ struct image {
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
+	bool pool;                      /* one of the display's buffers (the first three of its size): see target_carry() */
 };
 
 struct eagl {
@@ -297,6 +298,8 @@ struct eagl {
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
+	GLuint carry_from;              /* the display buffer's texture last sent out (target_carry()) */
+	unsigned pool_attached;         /* display buffers attached so far */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
@@ -881,6 +884,55 @@ target_resync(struct eagl *e, struct image *image)
 	image->seed = seed;
 }
 
+/*
+ * CoreAnimation draws into each of the display's three buffers only what has changed since it last drew into that
+ * buffer, and trusts the rest to be its own last picture there. Something breaks that trust -- a card of Control Center
+ * half faded in, one frame in three, while the panel sits open (a film of it, 2026-11-20), and before the mirrors,
+ * modules missing every other frame -- and target_resync() never found the surface written behind our back. So the
+ * first draw of a frame into a display buffer's texture starts from the last picture sent out, whichever buffer that
+ * was: what has changed since then is inside what CoreAnimation redraws in any case, so the result is right whatever
+ * the buffer held. One copy of the screen by the GPU a frame. Boot-arg glcarry=0: not.
+ */
+static int target_carry_on = 1;
+static unsigned carries;
+static void
+target_carry(struct eagl *e, struct image *image)
+{
+	struct image *from;
+	GLint read = 0, draw = 0;
+	GLboolean scissored;
+
+	if (!target_carry_on || !image->pool || e->carry_from == 0 || e->carry_from == image->texture ||
+	    (from = image_of(e, e->carry_from)) == NULL || !from->pool || from->width != image->width ||
+	    from->height != image->height) {
+		return;
+	}
+	if (carries++ < 6) {
+		say("hakios-gl: frame %u: display texture %u (surface %u) starts from texture %u (surface %u), the last sent out\n",
+		    e->frames + 1, image->texture, IOSurfaceGetID(image->surface), from->texture, IOSurfaceGetID(from->surface));
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	scissored = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, from->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glBlitFramebuffer(0, 0, image->width, image->height, 0, 0, image->width, image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	if (scissored) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+}
+
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
 static void
 target_to_surface(struct eagl *e, struct image *image)
@@ -914,6 +966,9 @@ target_to_surface(struct eagl *e, struct image *image)
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
 		image->seed = IOSurfaceGetSeed(surface);        /* (what target_resync() compares with) */
+		if (image->pool) {
+			e->carry_from = image->texture;         /* (what target_carry() starts the next one from) */
+		}
 		return;
 	}
 	if (image->shared) {
@@ -1470,6 +1525,7 @@ drawing(struct eagl *e)
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		if (!image->drawn) {
 			target_resync(e, image);
+			target_carry(e, image);
 		}
 		image->drawn = image->painted = true;
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
@@ -4339,6 +4395,10 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
+	if (image->mirror != 0 && image->width >= 1000 && image->height >= 2000 && e->pool_attached < 3) {
+		image->pool = true;                     /* the display's buffers come first (surfaces 2, 4 and 22, say) */
+		e->pool_attached++;
+	}
 	if (attached++ < 24) {
 		say("hakios-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
@@ -4466,6 +4526,7 @@ install(void)
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		target_resync_on = strstr(arguments, "glresync=0") == NULL;
+		target_carry_on = strstr(arguments, "glcarry=0") == NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		still_seldom = strstr(arguments, "glstill=0") == NULL;
 		if ((argument = strstr(arguments, "glprof=")) != NULL) {
