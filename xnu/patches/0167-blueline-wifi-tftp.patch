@@ -1,0 +1,366 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: Wi-Fi stage 3c, TFTP for the modem's WLAN image (bluewifi=4)
+
+With rmtfs and pd-mapper up (0166) the modem asks where kernel/elf_loader
+lives and starts its WLAN protection domain, which reads its image,
+/readonly/firmware/image/wlanmdsp.mbn, over TFTP (QRTR service 4096).
+Serve it from the device tree (/blueline-wlan "wlanmdsp", added by
+tools/mkadt.py --wlan-fw from the vendor image's /firmware). The small
+state files the modem writes under /readwrite/ are kept in RAM for this
+boot only, never written to flash. One port per transfer; blksize at most
+1024 to fit the modem's reusable GLINK intents. After tqftpserv and
+ios-flame's tftp.c.
+
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -104,6 +104,7 @@
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
+ #include <libkern/crypto/sha2.h>
++#include <pexpert/device_tree.h>
+ #include "blueline_scm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -1296,6 +1297,10 @@
+ #define RMTFS_PORT		0x10u
+ #define PDMAP_SERVICE		0x40u
+ #define PDMAP_PORT		0x11u
++#define TFTP_SERVICE		4096u
++#define TFTP_PORT		0x12u
++#define TFTP_XFER_PORT0		0x100u
++#define TFTP_XFERS		8
+ #define RMTFS_MEM_PA		0xf2701000u
+ #define RMTFS_MEM_SIZE		0x200000u
+ #define RMTFS_LUN		5u
+@@ -1445,12 +1450,13 @@
+ 		return;
+ 	}
+ 	rf.up = true;
+-	if (qrtr_new_server(RMTFS_SERVICE, 1, 0, RMTFS_PORT) || qrtr_new_server(PDMAP_SERVICE, 1, 1, PDMAP_PORT)) {
++	if (qrtr_new_server(RMTFS_SERVICE, 1, 0, RMTFS_PORT) || qrtr_new_server(PDMAP_SERVICE, 1, 1, PDMAP_PORT) ||
++	    qrtr_new_server(TFTP_SERVICE, 1, 0, TFTP_PORT)) {
+ 		printf("BLUELINE WIFI: qrtr: announcing our servers failed\n");
+ 		return;
+ 	}
+-	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x\n",
+-	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT);
++	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x, tftp at 1:%#x\n",
++	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT, TFTP_PORT);
+ }
+ 
+ /* One RW_IOVEC: reads from the partition into the buffer; writes dropped. false on a bad request. */
+@@ -1620,13 +1626,314 @@
+ 		qmi_tlv(&q, 0x12, list, (uint16_t)o);
+ 	}
+ 	qmi_reply(h, PDMAP_PORT, &q);
++}
++
++/*
++ * ---- Stage 3c: TFTP over QRTR (service 4096), as github.com/andersson/tqftpserv and ios-flame's tftp.c ----
++ *
++ * The modem's WLAN protection domain reads its image, /readonly/firmware/image/wlanmdsp.mbn, this way: it is
++ * served from the device tree (/blueline-wlan "wlanmdsp", tools/mkadt.py --wlan-fw). The modem also writes a few
++ * small state files under /readwrite/: they are kept in RAM for this boot only (read back if asked for), never
++ * written to flash. Each transfer has a port of its own. Options: blksize (at most 1024, to fit the modem's
++ * reusable GLINK intents), tsize, rsize, seek, wsize, timeoutms.
++ */
++#define TFTP_MAX_BLKSIZE	1024u
++#define TFTP_RO_PREFIX		"/readonly/firmware/image/"
++#define TFTP_RW_PREFIX		"/readwrite/"
++#define TFTP_RW_FILES		8
++#define TFTP_RW_MAX		(256u * 1024u)
++enum { T_RRQ = 1, T_WRQ, T_DATA, T_ACK, T_ERROR, T_OACK };
++
++static struct tftp_rw {
++	char name[64];
++	uint8_t *data;
++	uint32_t size, cap;
++} trw[TFTP_RW_FILES];
++
++static struct tftp_xfer {
++	bool used, write, done;
++	const uint8_t *src;		/* read: the file's bytes */
++	struct tftp_rw *dst;		/* write: the RAM file */
++	uint32_t node, port, blksize, wsize, last_sent, blocks;
++	uint64_t seek, rsize, size;
++} tx_[TFTP_XFERS];
++
++static void
++t_put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static uint16_t
++t_get16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] << 8 | p[1]);
++}
++
++static uint64_t
++t_num(const char *s)
++{
++	uint64_t v = 0;
++	while (*s >= '0' && *s <= '9') {
++		v = v * 10 + (uint64_t)(*s++ - '0');
++	}
++	return v;
++}
++
++static void
++t_error(uint32_t sport, uint32_t node, uint32_t port, uint16_t code, const char *msg)
++{
++	uint8_t b[96];
++	size_t l = MIN(strlen(msg) + 1, sizeof(b) - 4);
++	t_put16(b, T_ERROR);
++	t_put16(b + 2, code);
++	memcpy(b + 4, msg, l);
++	b[3 + l] = 0;
++	(void)qrtr_send(Q_DATA, sport, node, port, b, (uint32_t)(4 + l));
++}
++
++static void
++t_send_block(int i, uint32_t blk)
++{
++	static uint8_t b[4 + TFTP_MAX_BLKSIZE];
++	struct tftp_xfer *x = &tx_[i];
++	uint64_t off = (uint64_t)(blk - 1) * x->blksize, end = x->rsize ? x->rsize : (x->size > x->seek ? x->size - x->seek : 0);
++	uint32_t len = off >= end ? 0 : (uint32_t)MIN(end - off, (uint64_t)x->blksize);
++
++	t_put16(b, T_DATA);
++	t_put16(b + 2, (uint16_t)blk);
++	if (len) {
++		memcpy(b + 4, x->src + x->seek + off, len);
++	}
++	(void)qrtr_send(Q_DATA, TFTP_XFER_PORT0 + (uint32_t)i, x->node, x->port, b, 4 + len);
++	x->last_sent = blk;
++	if (len < x->blksize) {
++		x->done = true;
++	}
+ }
+ 
+ static void
++t_send_window(int i, uint32_t acked)
++{
++	for (uint32_t k = 0; k < tx_[i].wsize && !tx_[i].done; k++) {
++		t_send_block(i, acked + 1 + k);
++	}
++}
++
++/* The file a path names: read from the ADT or a RAM file; write into a RAM file. */
++static bool
++t_open(struct tftp_xfer *x, const char *path)
++{
++	if (strncmp(path, TFTP_RO_PREFIX, strlen(TFTP_RO_PREFIX)) == 0) {
++		const char *rest = path + strlen(TFTP_RO_PREFIX), *base = strrchr(rest, '/');
++		char name[48];
++		DTEntry node;
++		void const *p = NULL;
++		unsigned int size = 0;
++
++		strlcpy(name, base ? base + 1 : rest, sizeof(name));
++		for (char *c = name; *c; c++) {
++			*c = (*c >= 'A' && *c <= 'Z') ? (char)(*c - 'A' + 'a') : *c;
++		}
++		if (x->write || strcmp(name, "wlanmdsp.mbn") != 0 || SecureDTLookupEntry(NULL, "/blueline-wlan", &node) != kSuccess ||
++		    SecureDTGetProperty(node, "wlanmdsp", &p, &size) != kSuccess) {
++			return false;
++		}
++		x->src = p;
++		x->size = size;
++		return true;
++	}
++	if (strncmp(path, TFTP_RW_PREFIX, strlen(TFTP_RW_PREFIX)) != 0) {
++		return false;
++	}
++	const char *name = path + strlen(TFTP_RW_PREFIX);
++	struct tftp_rw *f = NULL;
++	for (int k = 0; k < TFTP_RW_FILES; k++) {
++		if (trw[k].data && strcmp(trw[k].name, name) == 0) {
++			f = &trw[k];
++		}
++	}
++	if (!x->write) {
++		if (!f) {
++			return false;
++		}
++		x->src = f->data;
++		x->size = f->size;
++		return true;
++	}
++	for (int k = 0; !f && k < TFTP_RW_FILES; k++) {
++		if (!trw[k].data && (trw[k].data = kalloc_data(TFTP_RW_MAX, Z_WAITOK | Z_ZERO)) != NULL) {
++			f = &trw[k];
++			strlcpy(f->name, name, sizeof(f->name));
++			f->cap = TFTP_RW_MAX;
++		}
++	}
++	if (!f) {
++		return false;
++	}
++	f->size = 0;
++	x->dst = f;
++	return true;
++}
++
++static void
++t_request(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n, bool write)
++{
++	char buf[512], opts[160] = "";
++	uint8_t oack[512];
++	size_t on = 2, ol = 0;
++	int i, nopts = 0;
++
++	n = MIN(n, (uint32_t)sizeof(buf) - 1);
++	memcpy(buf, d, n);
++	buf[n] = 0;
++	const char *file = buf + 2, *end = buf + n, *mode = file + strlen(file) + 1;
++	for (i = 0; i < TFTP_XFERS && tx_[i].used; i++) {
++	}
++	if (i == TFTP_XFERS) {
++		t_error(TFTP_PORT, h->src_node, h->src_port, 0, "busy");
++		return;
++	}
++	struct tftp_xfer *x = &tx_[i];
++	bzero(x, sizeof(*x));
++	x->node = h->src_node;
++	x->port = h->src_port;
++	x->blksize = 512;
++	x->wsize = 1;
++	x->write = write;
++	bool found = t_open(x, file);
++	t_put16(oack, T_OACK);
++	for (const char *o = mode < end ? mode + strlen(mode) + 1 : end; o < end && *o;) {
++		const char *k = o, *v = o + strlen(o) + 1;
++		char echo[24];
++		if (v >= end) {
++			break;
++		}
++		uint64_t val = t_num(v);
++		strlcpy(echo, v, sizeof(echo));
++		if (strcmp(k, "blksize") == 0) {
++			x->blksize = (uint32_t)MAX(MIN(val, (uint64_t)TFTP_MAX_BLKSIZE), 8ull);
++			snprintf(echo, sizeof(echo), "%u", x->blksize);
++		} else if (strcmp(k, "wsize") == 0) {
++			x->wsize = val ? (uint32_t)MIN(val, 64ull) : 1;
++		} else if (strcmp(k, "rsize") == 0) {
++			x->rsize = val;
++		} else if (strcmp(k, "seek") == 0) {
++			x->seek = val;
++		} else if (strcmp(k, "tsize") == 0) {
++			snprintf(echo, sizeof(echo), "%llu", x->size);
++		}
++		ol += (size_t)snprintf(opts + ol, ol < sizeof(opts) ? sizeof(opts) - ol : 0, " %s=%s", k, echo);
++		ol = MIN(ol, sizeof(opts) - 1);
++		size_t kl = strlen(k) + 1, el = strlen(echo) + 1;
++		if (on + kl + el < sizeof(oack)) {
++			memcpy(oack + on, k, kl);
++			memcpy(oack + on + kl, echo, el);
++			on += kl + el;
++			nopts++;
++		}
++		o = v + strlen(v) + 1;
++	}
++	printf("BLUELINE WIFI: tftp: %s \"%s\"%s%s\n", write ? "write" : "read", file, opts,
++	    found ? "" : (write ? " -> no room" : " -> not found"));
++	if (!found) {
++		t_error(TFTP_PORT, h->src_node, h->src_port, 1, "file not found");
++		return;
++	}
++	if (!write && (x->seek > x->size || (x->rsize && x->rsize > x->size - x->seek))) {
++		x->rsize = x->size > x->seek ? x->size - x->seek : 0;
++		x->seek = MIN(x->seek, x->size);
++	}
++	x->used = true;
++	if (nopts) {
++		(void)qrtr_send(Q_DATA, TFTP_XFER_PORT0 + (uint32_t)i, x->node, x->port, oack, (uint32_t)on);	/* ACK 0 follows */
++	} else if (write) {
++		uint8_t a[4];
++		t_put16(a, T_ACK);
++		t_put16(a + 2, 0);
++		(void)qrtr_send(Q_DATA, TFTP_XFER_PORT0 + (uint32_t)i, x->node, x->port, a, 4);
++	} else {
++		t_send_window(i, 0);
++	}
++}
++
++static void
++tftp_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	static bool in_window;
++	static int pend_i = -1;
++	static uint16_t pend_blk;
++
++	if (n < 4) {
++		return;
++	}
++	uint16_t op = t_get16(d), blk = t_get16(d + 2);
++	if (h->dst_port == TFTP_PORT) {
++		if (op == T_RRQ || op == T_WRQ) {
++			t_request(h, d, n, op == T_WRQ);
++		}
++		return;
++	}
++	int i = (int)(h->dst_port - TFTP_XFER_PORT0);
++	if (i < 0 || i >= TFTP_XFERS || !tx_[i].used) {
++		return;
++	}
++	struct tftp_xfer *x = &tx_[i];
++	if (op == T_ACK && !x->write) {
++		/* sending can wait for a GLINK intent, and that wait handles what comes in: note an ACK that arrives then */
++		if (in_window) {
++			pend_i = i;
++			pend_blk = blk;
++			return;
++		}
++		in_window = true;
++		for (;;) {
++			if (x->done && blk == (uint16_t)x->last_sent) {
++				printf("BLUELINE WIFI: tftp: read done, %u blocks of %u bytes\n", x->last_sent, x->blksize);
++				x->used = false;
++			} else {
++				uint32_t acked = x->last_sent - (uint16_t)(x->last_sent - blk);	/* 16-bit block numbers */
++				x->done = false;
++				t_send_window(i, acked);
++			}
++			if (pend_i != i || !x->used) {
++				break;
++			}
++			pend_i = -1;
++			blk = pend_blk;
++		}
++		in_window = false;
++	} else if (op == T_DATA && x->write) {
++		uint32_t len = n - 4;
++		uint64_t at = (uint64_t)(blk - 1) * x->blksize;
++		if (at + len <= x->dst->cap) {
++			memcpy(x->dst->data + at, d + 4, len);
++			x->dst->size = (uint32_t)MAX((uint64_t)x->dst->size, at + len);
++		}
++		uint8_t a[4];
++		t_put16(a, T_ACK);
++		t_put16(a + 2, blk);
++		(void)qrtr_send(Q_DATA, TFTP_XFER_PORT0 + (uint32_t)i, x->node, x->port, a, 4);
++		if (len < x->blksize) {
++			printf("BLUELINE WIFI: tftp: write \"%s\" done, %u bytes (kept in RAM, not on flash)\n", x->dst->name, x->dst->size);
++			x->used = false;
++		}
++	} else if (op == T_ERROR) {
++		printf("BLUELINE WIFI: tftp: client error %u: %.*s (block %u)\n", blk, (int)(n - 4), (const char *)d + 4, x->last_sent);
++		x->used = false;
++	}
++}
++
++static void
+ qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ {
+ 	struct qmi_msg m;
+ 
++	if (h->dst_port == TFTP_PORT || (h->dst_port >= TFTP_XFER_PORT0 && h->dst_port < TFTP_XFER_PORT0 + TFTP_XFERS)) {
++		tftp_handle(h, d, n);
++		return;
++	}
+ 	if (!qmi_parse(d, n, &m) || m.type != QMI_REQUEST) {
+ 		printf("BLUELINE WIFI: qrtr: < DATA %u:%#x -> port %#x, %u bytes (not a request)\n", h->src_node, h->src_port,
+ 		    h->dst_port, n);
