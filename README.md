@@ -9,9 +9,9 @@
 > Please report problems [here](https://github.com/andyleenz/pixel3-ios/issues).
 
 <p>
-<img src="docs/screenshots/2026-11-19-gpu-home.png" width="180" alt="Home screen">
+<img src="docs/screenshots/2026-11-20-home-wallpaper.png" width="180" alt="Home screen with wallpaper and widgets">
+<img src="docs/screenshots/2026-11-20-system-apps.png" width="180" alt="Second home page: the stock apps">
 <img src="docs/screenshots/2026-11-19-gpu-settings.png" width="180" alt="Settings">
-<img src="docs/screenshots/2026-11-19-gpu-settings-scrolled.png" width="180" alt="Settings, scrolled">
 <img src="docs/screenshots/2026-11-19-gpu-safari.png" width="180" alt="Safari">
 </p>
 
@@ -19,6 +19,8 @@
 - The UI is drawn by the Adreno 630 at about 60 fps (`blueui=1`). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
+- The first-boot migration installs all the stock apps (Weather, Wallet, Contacts, Files, Shortcuts...),
+  and the wallpaper, lock screen and widgets work.
 - Brightness, haptics, battery gauge, RTC, CPU clocks and thermal limits, watchdog, modem boot.
 - A hands-off test loop with scripted touches and screenshots ([docs/TESTING.md](docs/TESTING.md)). The
   engineering log is on the [`linux-host`](https://github.com/andyleenz/pixel3-ios/blob/linux-host/docs/LOG.md)
@@ -37,7 +39,7 @@ partition.
 > anything personal on it. No Apple software is stored in this repository: the iOS root is built on your own
 > Mac from Apple's IPSW. Not affiliated with or endorsed by Apple or Google.
 
-## What works (2026-11-19)
+## What works (2026-11-20)
 
 | Area | State |
 | --- | --- |
@@ -46,7 +48,7 @@ partition.
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
 | Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436). With `blueui=1` the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; without it, a CPU copy at 30 Hz. Brightness works |
 | GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim. Settings and Safari scroll at 55-62 fps |
-| iOS | Data migration, lock screen, SpringBoard, Settings, Safari and most stock apps. Photos crashes (no photo library yet) |
+| iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. Photos crashes (no photo library yet); the App Library and Control Center blurs and the lock screen shortcut buttons don't draw yet |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
