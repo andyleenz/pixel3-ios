@@ -680,6 +680,14 @@ surface_mirrored(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 	GLint bound = 0;
 
+	/*
+	 * The GPU writes a surface with rows a multiple of 64 bytes only (render target pitch): the panel's own
+	 * buffer (rows of 4320, drawn into directly when iOS draws the panel's size, sweetfb_native=1) is copied
+	 * out by the CPU instead; drawn into in place it came out sheared.
+	 */
+	if (image->target && (IOSurfaceGetBytesPerRow(surface) & 63) != 0) {
+		return false;
+	}
 	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
 	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
 	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
@@ -709,7 +717,7 @@ surface_shared(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    (image->target && (IOSurfaceGetBytesPerRow(surface) & 63) != 0) || image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
 		/* why a surface is copied rather than its memory used: the first ones of a run, for the copies to be made fewer */
