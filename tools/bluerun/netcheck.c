@@ -33,7 +33,7 @@ static void
 cfprint(const char *prefix, CFTypeRef thing)
 {
 	CFStringRef d = CFCopyDescription(thing);
-	char buf[2048];
+	char buf[8192];
 
 	if (d == NULL || !CFStringGetCString(d, buf, sizeof(buf), kCFStringEncodingUTF8)) {
 		snprintf(buf, sizeof(buf), "(too long or not text)");
@@ -86,6 +86,50 @@ keys(store_t store, const char *pattern, bool values)
 	CFRelease(p);
 }
 
+/* a preferences file: its top-level keys, and for the interface list and services, each entry (no network names) */
+static void
+plist(const char *path)
+{
+	CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), false);
+	CFReadStreamRef in = CFReadStreamCreateWithFile(NULL, url);
+	CFPropertyListRef p = NULL;
+
+	if (in != NULL && CFReadStreamOpen(in)) {
+		p = CFPropertyListCreateWithStream(NULL, in, 0, kCFPropertyListImmutable, NULL, NULL);
+		CFReadStreamClose(in);
+	}
+	if (p == NULL || CFGetTypeID(p) != CFDictionaryGetTypeID()) {
+		printf("  %s: %s\n", path, p == NULL ? "none or unreadable" : "not a dictionary");
+	} else {
+		CFIndex n = CFDictionaryGetCount(p);
+		const void *k[64], *v[64];
+
+		printf("  %s: %ld keys\n", path, (long)n);
+		CFDictionaryGetKeysAndValues(p, k, v);
+		for (CFIndex i = 0; i < n && i < 64; i++) {
+			char key[128];
+
+			CFStringGetCString(k[i], key, sizeof(key), kCFStringEncodingUTF8);
+			if (strcmp(key, "Interfaces") == 0 || strcmp(key, "NetworkServices") == 0 || strcmp(key, "Sets") == 0 ||
+			    strcmp(key, "CurrentSet") == 0 || strcmp(key, "Model") == 0) {
+				char prefix[160];
+
+				snprintf(prefix, sizeof(prefix), "    %s = ", key);
+				cfprint(prefix, v[i]);
+			} else {
+				printf("    %s\n", key);
+			}
+		}
+	}
+	if (p != NULL) {
+		CFRelease(p);
+	}
+	if (in != NULL) {
+		CFRelease(in);
+	}
+	CFRelease(url);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -128,9 +172,13 @@ main(int argc, char **argv)
 			keys(store, "Setup:/Network/Service/.*/Interface", true);
 			keys(store, "State:/Network/Interface/en0/.*", true);
 			keys(store, "State:/Network/Global/IPv4", true);
-			if (r == 1) {
-				keys(store, "Setup:/Network/Global/IPv4", true);
+			if (r == 1 || r == 4) {
+				keys(store, "Setup:/.*", false);
+				keys(store, "Plugin:.*", true);
 				keys(store, "State:/Network/Interface", true);
+				keys(store, "State:/Network/Interface/.*/Link", true);
+				plist("/private/var/preferences/SystemConfiguration/NetworkInterfaces.plist");
+				plist("/private/var/preferences/SystemConfiguration/preferences.plist");
 			}
 		}
 		if (r < rounds) {
