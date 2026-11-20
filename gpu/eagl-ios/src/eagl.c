@@ -728,8 +728,14 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
+	/*
+	 * A picture read in place whose rows are not a multiple of 256 bytes came out sheared, each row
+	 * 16 pixels on (Wallet's 1326 x 1160 card art, rows of 5312 bytes, read as 5376 = the next 256):
+	 * those are copied. Rows of 4608 (1125 wide: the wallpaper, the snapshots) are read in place.
+	 */
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    (image->target && panel_rows(surface)) || image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    (image->target && panel_rows(surface)) || (!image->target && IOSurfaceGetBytesPerRow(surface) % 256 != 0) ||
+	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
 		/* why a surface is copied rather than its memory used: the first ones of a run, for the copies to be made fewer */
