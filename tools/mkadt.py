@@ -328,6 +328,13 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
         '#size-cells': u32(2),
         'ranges': u64(0, SOC_BASE, (1 << 32) - SOC_BASE),
     }, [gic])
+    if wlan_fw is not None:
+        # launchd starts wifid only when the device tree has a "wlan" node (com.apple.wifid's
+        # _LimitLoadToDeviceTree: wlan, marconi-wifi); as ios-topaz's mkadt.py does.
+        arm_io.children.append(node('wlan', {
+            'device_type': strs('wlan'),
+            'compatible': strs('blueline,wcn3990'),
+        }))
 
     fbcon = node('sweet-fbcon', {
         'reg': u64(FB, FB_SIZE),		# absolute physical address
