@@ -507,7 +507,7 @@ wrap adds), unwrap checks and strips it (self-consistent, no secrecy, like
 the rest of the stand-in). Also: with `wfi=0` and no charger driver the
 battery ran flat overnight; let it charge in fastboot/recovery between runs.
 
-### USB networking and live log (built, not yet run)
+### USB networking and live log (not working yet; see "USB on the second phone")
 
 ios-sweet's USB driver (0072-0077, 0081: DWC3 device mode, CDC-ECM network
 adapter, console streamed as UDP) uses only addresses the Pixel 3 shares
@@ -533,51 +533,128 @@ command timeout, SDM845 clock/PHY diagnostics.
 Also from that log: 0106 found the Silver cluster already at its top level
 (17 = 1766 MHz); the Gold cluster's cpufreq controller reports "not enabled".
 
-### Volume up (prepared, needs one PMIC write)
+### Volume up (2026-10-22)
 
-GPIO 6 is an enabled input but has no pull-up, so the key changes nothing
-readable. `p3-input/out/input-volup.img` (built with `-DVOLUP_PULLUP`)
-writes GPIO 6 `DIG_PULL_CTL` (`0xc542`) = 0 (30 uA pull-up, as Linux's
-`bias-pull-up`) via the arbiter's write channel, if the apps EE owns that
-APID, then shows the key live. Only after approval; the kernel driver gets
-the same write behind `bluevolup=1` once the probe shows which status bit
-follows the key.
+GPIO 6 STATUS1 bit 0 follows the key (`0x81` released, `0x80` pressed); the
+pull-up (`DIG_PULL_CTL` `0xc542` = 0) was already set. `0109-blueline-volume-up.patch`
+reads it as key 1 (`bluevolup=0` skips).
 
-Probe run 2026-10-22: **volume up works** with STATUS1 bit 0 (`0x81`
-released, `0x80` pressed). The pull-up write reported `0x00 -> 0x00`: it
-was already set. Kernel `0109-blueline-volume-up.patch` reads it as key 1
-(writes the pull-up once anyway, `bluevolup=0` skips).
+### Wi-Fi
 
-**Touch: SE2 has its FIFO interface disabled** (`SE_GENI_IF_DISABLE_RO` = 1,
-"DMA only"); after an I2C command the engine sits active (`GENI_STATUS`
-`0x41`) waiting for GPI DMA. Touch therefore needs a GPI DMA I2C path (Linux
-`qcom-gpi-dma` + `i2c-qcom-geni` GPI mode).
+See the 2026-11-19 section below. The full plan (stages 2-5, about 45-100 h to
+Settings) lives with the drafts, outside the repo, as `wifi-plan.md`.
 
-### Wi-Fi: what it would take (research, nothing built)
+### A second phone from scratch, kernel built locally (2026-11-18)
 
-The Pixel 3's Wi-Fi is the WCN3990 on SDM845's SNOC bus (Linux `ath10k_snoc`).
-Unlike a self-contained PCIe/SDIO chip it needs, in order:
-1. **The modem DSP running**: WLAN firmware is loaded and managed through
-   the modem subsystem (MPSS). That means remoteproc bring-up through
-   TrustZone's PAS (peripheral authentication: signed `modem.mdt`/`.bNN`
-   from the vendor/modem partition, `qcom,msa` memory), plus the
-   `wlan_msa_mem` carve-out.
-2. **QMI over QRTR over GLINK/SMEM** to talk to the WLAN firmware service
-   (`wlfw`) and switch the firmware into mission mode.
-3. **The ath10k data path**: copy engines on SNOC, the WCN3990 IRQs, SMMU
-   context for its DMA.
-4. **The iOS side**: iOS's `wifid` expects Apple's IO80211 family with
-   Apple's Broadcom driver interface; there is no generic Wi-Fi driver to
-   plug a Qualcomm chip into. Scanning/association UI would need a large
-   IO80211-compatible implementation.
+A second Pixel 3 (stock `SP1A.210812.016.C1`, unlocked) set up from the README
+on an M1 Mac running macOS 26.6, without CI: GitHub has retired the `macos-14`
+runner image, and the newer ones only have Xcode 16+.
 
-Each of 1-3 is its own driver project on XNU, and 4 is the hardest. ios-sweet
-lists Wi-Fi as its own next big item with no code yet. **The realistic way
-to get networking first is USB**: ios-sweet's 0072-0077 bring up DWC3 USB
-device mode with CDC-ECM (the phone appears as a USB network adapter; sweet
-already pings over it and streams its console log live). SDM845 has DWC3 at
-`0xa600000` like SM7150, with a different PHY (QUSB2 v2 + QMP), so that is a
-much smaller port and would also replace the recovery round-trips for logs.
+- **LineageOS 22.2** `20261116` (sha256 checked against the download API):
+  `fastboot flash dtbo_b` / `boot_b`, Recovery mode from the bootloader menu
+  (`fastboot reboot recovery` is refused), Format data, `adb sideload` twice so
+  both slots have it. `adb` stopping at ~47% with `failed to read command` is
+  normal for A/B sideload.
+- **Backup**: `tools/backup-phone.sh`, 62 MB, kept off git.
+- **Kernel on the Mac**: Xcode 15.4 installed beside Xcode 27 (`xcodes`); its
+  command-line tools run on macOS 26 (only harmless duplicate-class warnings
+  from DVTDownloads). Built through `DEVELOPER_DIR`, not `xcode-select`.
+  darwin-xnu-build wants `sudo installer` for the Kernel Debug Kit; instead
+  `pkgutil --expand-full` of `KernelDebugKit.pkg` and `KDKROOT=<Payload dir>`.
+  All 95 listed patches applied. The workflow's patch loop must run in bash
+  (zsh rejects `[ "$num" \> ... ]`).
+- **Shim**: `p2-shim/build.sh` needs Homebrew's keg-only LLVM on PATH
+  (`/opt/homebrew/opt/llvm/bin`, `.../lld/bin`); without it `llvm-readelf` /
+  `llvm-objcopy` are "command not found" and no `shim.img` is written.
+- **Root**: `mkiosroot.sh` on the iPhone X 16.7.16 images, sparse 11 GB,
+  `fastboot flash userdata` in 399 s. ABL then hung on the next command, as
+  before; Power + Volume Down cleared it.
+
+**A fresh root stops at the Apple logo.** Two boots (`cpus=4 wfi=0`, then
+`cpus=8` real WFI, 30 Hz): launchd, backboardd and SpringBoard start, nothing
+crashes, backboardd presents 4-7 frames (the logo) and then nothing for 10+
+minutes; no DataMigrator. Cause: `iosroot-tweaks.py` writes the
+migration-done records (HackiOS's change), so a root that has never migrated
+never seeds the LaunchServices database (the `lsd` wait found on 2026-10-21).
+The first phone had migrated before those records were added, so it did not
+show this. Fix: `tools/phone.sh sync`, `tools/remigrate.sh` (needs the IPSW's
+original `System/Library/xpc/launchd.plist` in `work/orig`; copied from the
+mounted OS image), 4.4 MB diff. The next boot (8 cores) shows the migration
+progress bar.
+
+**Lock screen on the second phone (2026-11-18 23:26).** `cpus=8` (real WFI),
+`sweetfb_hz=30`, `sweetfb_noconsole=1`, RAM boot (`fastboot boot`) at 23:08:
+the migration bar ran steadily (20% at ~8 min, 80% at ~15 min, no stall near
+the end with 0111 in the kernel) and the lock screen followed after about
+18 minutes. The 8-core SMP stall did not appear in either 8-core boot.
+
+**Software rendering on the lock screen and home screen.** Laggy (CPU
+compositing, 30 Hz copy). The dock, widget backgrounds and Control Center
+panels draw as flat white (blur/backdrop materials without a GPU), widgets
+stay at "Waiting...", and some Control Center glyphs are garbled. Reduce
+Transparency is the first thing to try; not yet checked.
+
+**Screen off on lock (0123, draft).** ios-sweet's 0079 rebased onto 0115:
+on the framebuffer's power-off request the vsync timer stops copying frames
+and blacks the panel memory (AMOLED: black is off). Tested on the phone
+2026-11-18: the power button now blanks the screen and wakes it again. 0079
+halves the frame over 7 vsyncs; each pass rewrites ~9 MB on the CPU, so the
+fade took visibly long. Changed to one dimmed pass then black: visibly
+quicker. DCS sleep (`bluefb_dcs=2`) not tried.
+
+**USB on the second phone (0122 + 0124 draft, `sweetusb=2`).** Nothing
+enumerates on the Mac. Log: every GCC clock and the GDSC on, DWC3
+GSNPSID 0x5533300a, ABL's SMMU state as on the first phone, controller soft
+reset completes in 1 ms, then the first endpoint command (DEPSTARTCFG,
+`ep0 cmd 0x1`) times out after 20 ms with the PIPE clock switched to UTMI as
+well; DCFG/DSTS after the timeout `00480800`/`00520000`, QUSB2 PLL_STATUS
+`0x64`. So the SMMU fix in 0122 is not the blocker and neither is the PIPE
+clock; next suspects are the QUSB2/QMP PHY power and reset sequence.
+
+**GPU stage 1: the GMU answers (0125, 2026-11-19).** A boot-arg-gated probe
+(`bluegpu=1`) after Linux's a6xx_gmu.c, gpucc-sdm845.c and Google's
+crosshatch kernel, cross-checked with ios-flame's and HackiOS's stage 1.
+The A6xx has no chip-id register (Linux takes it from the device tree), so
+the proof of life is the GMU's always-on counter. On the phone, first try:
+ABL leaves `gcc_gpu_cfg_ahb` on and CX/GX collapsed (`0x222001`); cmd-db
+gives gfx.lvl `0x30050`, cx.lvl `0x30000`, mx.lvl `0x30010`; the CX GDSC
+comes on, memnoc_gfx/ddrss_gpu_axi/cx_gmu/cxo run with the GMU RCG on XO;
+the always-on counter reads 19195615 Hz; CM3 held in reset
+(`sysreset 0x1`), init result 0, RPMh power state `0xf`, RSCC TCS0-3 `0x1`.
+GX left off, RBBM not read; everything restored afterwards, boot unaffected.
+Next: GMU firmware (`a630_gmu.bin`) through an Adreno SMMU context, RSCC/PDC.
+
+**GPU stage 2a: GMU firmware running (0126, 2026-11-19).** `bluegpu=3`.
+linux-firmware's `qcom/a630_gmu.bin` (88ea23e7, 32 KiB raw Cortex-M3 image:
+16 KiB ITCM then DTCM) goes in the Apple device tree (`tools/mkadt.py
+--gpu-fw`, `/blueline-gpu` `gmu-firmware`; fetched by
+`tools/fetch-gpu-fw.sh`, never committed). Disassembly showed the firmware
+reports init before it touches system memory, so no SMMU or HFI is needed
+for this step. Sequence after Linux's a6xx_gmu_rpmh_init/fw_start: RSCC
+sequencer, GPU PDC (was all 0 as ABL left it), firmware into TCM (9 ms,
+read back: 0 bad words), start-up registers, CM3 out of reset. On the
+phone: **init result 0xbabeface after 364 us**, fault counters 0, GX
+still off, RSCC idle; CM3 back in reset and 66 registers restored; iOS
+then booted to the lock screen as usual. The GMU ran at 19.2 MHz from XO.
+Next (2b): an Adreno SMMU context for the GMU stream and the HFI queues.
+
+**Faster test loop.** `tools/build-xnu.sh --quick`: after one full build,
+only our changed patches are taken out and put back and make relinks:
+about 25 s instead of about 25 min.
+
+**Hands-off test loop (2026-11-19).** Three pieces:
+- LineageOS recovery in `boot_b` repacked with `ro.adb.secure.recovery=0`
+  (`tools/recovery-adb.py`): adb works in recovery without the Enable ADB
+  tap (recovery's only adb key source is userdata, which holds iOS).
+- 0127 `bluereboot=recovery|bootloader` (`bluereboot_after=gpu|springboard|N`):
+  final synchronous flush of the log ring, PM8998 PON `SOFT_RB_SPARE`
+  (`0x88f`, reason << 1, through the SPMI arbiter shared with the key
+  driver) plus the IMEM restart_reason cookie (`0x146bf65c`), then PSCI
+  SYSTEM_RESET. ABL honours it: PON `0x10 -> 0x02`, straight to recovery.
+- `tools/phonetest.sh [--quick] ARGS`: build, shim, RAM boot, wait for
+  recovery, pull the log, print, back to fastboot.
+First run (`bluegpu=3 bluereboot=recovery`): 72 s from the quick build to
+the log, nobody touching the phone; GMU init 0xbabeface after 366 us again.
 
 ## Pixel 3 facts used here
 
@@ -602,3 +679,96 @@ hardware). The kernel build fetches ios-sweet's XNU patches from their
 repository at build time and never stores them here; `xnu/patches/` holds
 only our own changes on top. Ask the author before publishing kernels or a
 fork that reuses their patches.
+
+## 2026-11-19: GPU on screen, hands-off testing, battery, modem
+
+All on the `display-usb` branch, each tested through `tools/phonetest.sh` (see `docs/TESTING.md`).
+
+### GPU
+- **0128/0136/0137, stages 2b-4.** The GMU runs through the Adreno SMMU (EL1 can program it), with legacy HFI v1. GX powers on through the GMU. The phone's own `a630_sqe.fw` loads, and CP_MEM_WRITE lands in memory. The PDC gfx address is cmd-db's `gfx.lvl` 0x30050; the 0x30080 that Linux hard-codes is `xo.lvl` here.
+- **0144 zap.** TrustZone PAS id 13 loads the zap into `0x8c415000`; then `CP_SET_SECURE_MODE 0`. Before this, the GPU ran in secure mode: every fence landed but no pixels changed. 0138's CP_BLIT fills now draw.
+- **0147 resident GPU (`bluegpu=8`).** The GPU stays up and presents iOS: a 2D-engine bilinear blit of the 1125x2436 surface to 997x2160, centred. At 257 MHz the blit takes 6-7 ms, plus about 2 ms of CPU, mostly the cache clean.
+- **0151 interrupts, recovery, clocks.**
+  - Fences wake on GPU INTID 332.
+  - A forced hang (a garbage packet) is caught by RBBM hang detect and recovered by a soft reset plus CP re-init in 1.3 ms; presents carry on, and the home screen is reachable afterwards.
+  - `bluegpu_mhz=710` measures 709 MHz, and the blit drops to 1.4 ms.
+  - DCVS (`bluegpu_dcvs=1`) and clean mode 2 are not yet tested.
+- **Frame rate.** iOS itself renders on the CPU at most about 21 fps. Speeding up the copy doesn't change that; only CoreAnimation on the GPU (stage 6f) will.
+- **0153 user client (6d).** IOService `BlueGPU` speaks the msm ABI 1.9; selectors equal the ioctl's low byte. A 32 MiB pool at pa 0xc0000000 maps at GPU VA 0x80000000 (imports at 0xc0000000), with page tables in WCOMB memory. The self-test passes 32/32. Two fixes on the way: a 256 MiB pool doesn't fit the 64 MiB io_map, and the SMMU needs TCR2.SEP=7, or VA bit 31 selects the disabled TTBR1 (a translation fault at 0x80410000).
+- **Mesa (6e).** Mesa 26.3.1 freedreno builds for iOS as `bluegl.dylib` (18 MB). Run with `FD_MESA_DEBUG=noubwc,sysmem`. `gles-triangle` passes: FD630, ES 3.2, 0 wrong pixels.
+- **EAGL shim (6f).** `blueeagl.dylib` injects into backboardd (`sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib cs_enforcement_disable=1`) and puts EAGL on top of bluegl. Kill switches: `blueeagl=0`, `/var/mobile/blueeagl.off`, and a crash counter that gives up after 3 starts. `eagl-test` passes every pixel check on the CA path. In backboardd, all 5 hooks take and CoreAnimation renders about 80 frames on the GPU (0.7-1.3 ms each), but the screen stays black and backboardd crashes (SIGSEGV near 0x18 in our dylibs); after 3 crashes it falls back to the software renderer. Debugging now.
+- **6f in backboardd works (boots eaglbb2-9).** Fixes: `CAEnableDeepFramebuffer=NO` (the window server's framebuffers were 2-plane `'b3a8'`, which the shim can't render into: black screen); bluedrm falls back to USERPTR BOs of its own memory when the 32 MiB pool is full (Mesa crashed on a NULL BO); `BLUE_GPU_SUBMIT_BO_NOSYNC` makes the kernel clean those once instead of at every submit (48 MiB a frame). Frames drop from 30-57 ms to 16-31 ms; SpringBoard, the swipe to the App Library and labels draw on the GPU with no crashes. **0154** fixes the blank app icons: CoreAnimation's GL renderer asks for surfaces around memory it already holds, by selector 6 (refused by sailfish 0206) and by creates carrying `IOSurfaceAddress` (which got fresh zeroed memory). SweetSurface now wraps the caller's range (approach and request layout from HackiOS's MiniIOSurface, APSL); `bluesurf_wrap=0` turns it off.
+- **Zero-copy flip (0145, `bluedpu_flip=1`) works.** The display pipes scan out backboardd's surface directly (QSEED3 scales 1125x2436 to 997x2160). With 6f and `bluegpu_mhz=710`: 132 flips and 0 copies in 5 s of swiping, animations at 56 fps, clean 0.7 ms and latch about 7 ms per flip, no underruns or SMMU faults. Without the flip, the copy to the panel capped what you see at 14-22 fps however fast backboardd drew. **0155**: `bluesnap` samples the flipped surface through the same fit geometry, so screenshots show what the panel shows. **0156**: `blueui=1` stands for `bluegpu=8 bluegpu_mhz=710 bluedpu_flip=1 cs_enforcement_disable=1 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib` (explicit args still win); boot ui1 with just `blueui=1` plus the three dylib pushes: 55–61 fps, flipped snap with icons.
+
+Apps on the GPU path: Settings opens by a scripted tap, scrolls (blurred nav bar) and opens sub-pages, and the home gesture goes back, all drawn correctly (`docs/screenshots/`). Scrolling ran at 41–46 fps: each flip waited ~7.4 ms for the DPU latch, after ~15 ms of drawing. **0157**: a flip returns after the flush. backboardd alternates two pool buffers (slots 0/1, never 2), so its next frame would draw into the buffer still fetched. Instead, a GPU submit that writes an IOSurface waits for the pending latch (`blue_dpu_flip_settle`), overlapping CoreAnimation's CPU work. Waits fell to ~2.5 ms on average, scrolling now runs at 47–58 fps, and snaps show no tearing. `bluedpu_flip_sync=1` restores the old wait. **0158** makes the display hold IOSurface uses (`IOSurfaceIsInUse` reads a u64 at +0x18 of the state page), so 0157's GPU wait applies only to a surface still shown. It didn't change the buffer count. **0159** is the root fix. CoreAnimation (`IOMFBDisplay::can_update_`) polls `SwapWait` (IOMFB selector 6, flags bit 31 = poll) before reusing a swap's buffer and takes another buffer while it answers `0xe00002d5`. SwapWait returned success at once. Now, as in IOMFB, a swap is complete once a later swap's flip has latched. backboardd now cycles 3 pool buffers (slots 0→2→1), and the GPU waited for a latch once in a whole run (was ~70% of frames). Home screen runs at 57–62 fps. Scrolling Settings runs at 44–54 fps, now limited by drawing, not the display. A 10-minute hands-on demo (demo4) averaged 58.5 fps over 752 frames in motion (median run 59 fps), with no panics or flush faults.
+
+Workflow: ABL falls back to slot A after repeated RAM boots, and slot A's LineageOS recovery needed the Enable ADB tap. boot_a now carries the same `tools/recovery-adb.py` image as boot_b (the old boot_a, identical to `stock/boot.img`, is backed up outside git). Slot A recovery was checked: adb comes up with no tap.
+
+**0160**: blueeagl ended every frame with `glFinish`, so CoreAnimation's CPU work and the GPU's drawing ran in series. SwapEnd now queues the swap and returns at once. A kernel flip thread waits for the last GPU submit that wrote each layer surface (`gpuWriteFence`, set at submit), then flips. SwapWait keeps the swap pending until its flip latches. The display publishes `HakiosWaitsForGPU`, and blueeagl drops the `glFinish` when it sees it ("a frame is waited for by the display's driver, not here"). fthr1: every motion run, scroll included, ran at 56.5–60.7 fps. The GPU never waited for a latch, no GPU wait ran late, and the snaps are complete (Safari's start page, `docs/screenshots/`). `sweetfb_flipthread=0` restores the synchronous path.
+
+**Independent (2026-11-19).** The repo left GitHub's fork network and is maintained here on its own. `master` is the main line (display-usb merged as PR #1), and the GPU userland moved into the repo under `gpu/`. The README header credits the original port.
+
+**0161**: `bluetest=1` stands for phonetest's board arguments (battery, LMh, watchdog, framebuffer), the same way `blueui=1` does for the GPU set. That frees about 100 bytes of the 607-byte boot line for `bluetouchscript`.
+
+**Apps (apps1/apps2).** Settings and Safari open and scroll at 55–62 fps on the GPU path. backboardd adds a 4th frame buffer under load; the 3-buffer scanout pool then has none left ("scanout pool empty"), but the extra buffer was hardly used (0 panel copies). The 32 MiB GPU BO pool also fills up after a few apps, and new BOs then come from process memory; fps didn't change.
+
+**Photos** opened to a black screen on both the GPU and CPU paths. The sampler (`sweetsample=MobileSlideShow`) showed the main thread in `MCCopyCheckpointValue`, waiting on checkpointd. checkpointd (FairPlay code) was itself blocked in a MIG call to fairplayd, which restarts forever without a Secure Enclave. With fairplayd dropped from launchd (`iosroot-tweaks.py` DENY; tested by pushing a rebuilt `launchd.plist`), the call fails at once. Photos then throws `NSInternalInconsistencyException: assetsDataSourceManager.dataSource.numberOfSections == 1`: it finds no photo library and never contacts assetsd. The reason is still open. `tools/blueexc` (DYLD-inserted with `sweetenv`, output via `sweetnull`) logs every thrown ObjC exception with its reason and stack.
+
+**Hitches.** Frames of 100–160 ms when an app or effect first appears are shader compiles (frame 6: 101 ms handing 5 draws to Mesa). Mesa was built with `-Dshader-cache=disabled`. The disk cache is now on (`-Dshader-cache=enabled`, zlib; blueeagl sets `MESA_SHADER_CACHE_DIR=/var/mobile/Library/Caches/bluegl`). It barely helped: 8 frames over 30 ms with a warm cache, 10 without. Compiles were not the main hitch.
+
+**Wrapped images read in place.** `glslow=` showed `glBindTexture` taking 8.7 ms per frame for ~30 frames in a row. That was blueeagl hashing an 11 MB picture each frame to see whether it changed (`surface_changed`, until 120 unchanged looks). The picture was copied rather than shared because CoreAnimation wraps its own image memory (0154, rows of 4500 bytes), and Mesa and bluegl required 64-byte rows. The A6xx texture descriptor's PITCH is a plain byte count, so Mesa patch 0005 lets a one-level linear import keep its own pitch. bluegl also rounds the import size to the 4 KiB pages the kernel maps, because a wrapped picture ends at its last pixel. Surfaces used in place went from 12 to 60, copies from 112 to 79, with no faults and identical screenshots.
+
+**What's left of the hitches.** 7–9 frames per app script still take 30–100 ms, at app launches. In the worst of them no single GL call is over 4 ms: the time goes to CoreAnimation's CPU work. `glprof` (now dumping every 1000 samples) puts the GPU submit ioctl at 12–14% of the drawing thread. That submit time is CPU cache maintenance of imported surfaces. 0162 adds it to the 5 s GPU stats line (70–100 ms per 5 s). `bluegpu_lazyclean=1` (clean only on a seed change, and re-clean only wrapped surfaces) didn't change it measurably, so it stays off. GMEM rendering is still untried.
+
+**Home screen.** The "Waiting..." labels are two app placeholders whose install never finished, not widgets. The removable system apps (`/private/var/staged_system_apps`: Weather, Calendar, Maps, ...) are missing, and so is the wallpaper. Remigrated on 2026-11-19 with `remigrate.sh`, which now also applies the current DENY list (fairplayd) via `iosroot-tweaks.py --only launchd`. The 2 MB diff was flashed and the migration boot is `migr1`.
+
+**Why the apps never installed: clonefile.** `migr1` changed nothing. iOS's own log, read with the new `tools/phonelog.sh` (7-Zip pulls `/var/db/diagnostics` out of the image without sudo; mandiant's unifiedlog_iterator decodes it, because `log show` prints nothing for a log clock that starts at 1970), shows SystemAppMigrator starting all ~35 installs. Every one is cancelled: `MIInstallerErrorDomain Code=107 "Failed to stage ..."`, underneath `Code=4 "Failed to clonefile .../Wallet.app/Icon.png"`. installd's staging copies with `copyfile(COPYFILE_CLONE_FORCE)` (`-[MIFileManager _copyItemAtURL:...alwaysClone:...]` passes flags `0x020c800f`), and CLONE_FORCE has no copy fallback. APFS clones; our HFS+ root returns ENOTSUP. The migrator then hands each app to appstored, which can't install offline. The two "Waiting..." icons are left over from that. FairPlay was not involved. 0163 makes `clonefileat` copy instead where `VNOP_CLONEFILE` says ENOTSUP: regular files get a new file with the data copied in the kernel, symlinks are re-made. Remigrated again; the migration boot on 0163 is `migr2`.
+
+**Staged apps used up.** `migr2` gave FaceTime, Contacts, Files, Freeform and a Utilities folder, but only as App Store placeholders (cloud badges). The log has no clonefile errors now; instead "Did not have a staged app" for each. A migration moves each app out of `/private/var/staged_system_apps` into installd's staging, and `migr1`'s failed installs deleted them. `remigrate.sh` now puts the IPSW's 32 apps (305 MB, owner mobile) back from `work/OS.dmg`, extracted with 7-Zip. The migration boot with them is `migr3`.
+
+**migr3: past clonefile, now signatures and extension points.** With 0163 and the staged apps back, installd gets further: no clonefile errors. Contacts and Files show "Waiting..."; FaceTime and Freeform stay placeholders. Two new failures:
+- `MIInstallerErrorDomain Code=13 "Failed to verify code signature of .../Contacts.app : 0xe8008001"` (from `+[MICodeSigningVerifier _validateSignatureAndCopyInfoForURL:...]`, libmis), 104 times. Apple-signed system apps are normally trusted via the static trust cache; next is checking whether ours is loaded and what libmis asks the kernel/amfid.
+- `Code=59 "Appex bundle ... specifies a value (com.apple.usernotifications.content-extension) for NSExtensionPointIdentifier ... that does not correspond to a known extension point"`, from `Code=142 "Extension cache does not have an entry for ..."` (also `com.apple.intents-service`). installd's extension-point cache is missing entries.
+
+The PosterBoard assertion text still isn't in the log.
+
+**Signatures: 0164.** The removable system apps are ad-hoc signed (Calculator: `Signature=adhoc`, no certificate) and trusted only through the static trust cache. `tools/bluerun/mistest` runs installd's checks on the phone. `SecStaticCodeCheckValidity` returns -66996 ("signature is valid but signer is not trusted") for any ad-hoc code, Safari included, as on a real iPhone: Security only marks code trusted after a CMS certificate chain. libmis accepts that with `AllowAdHocSigning`, and with `TrustCacheOnly` it then asks the **AppleMobileFileIntegrity IOService** (selector 6, the cdhash as structure input; 0 = in a trust cache, kIOReturnNotFound = not). We had no such service, so every install failed with 0xe8008001. 0164 adds it (`BlueAMFI.cpp`) and also answers `__mac_syscall("AMFI", 0x5f)`, Security's own trust-cache query for code requirements. Both say yes: there is no trust cache, and every root binary already runs as a platform binary. mistest with installd's options now returns 0 for Calculator (signer type 1). lsd asks the service too; online-auth-agent asks selector 9 (unsupported).
+
+The remigrations had also dropped the test runner's launchd job; `remigrate.sh` now keeps it.
+
+**Extension points: same cause.** migr3's second failure ("Extension cache does not have an entry for com.apple.usernotifications.content-extension", Code=142/59) came from installd logging `Failed to read extension point cache ... Unable to find AMFI`. ExtensionFoundation reads `/System/Library/xpc/extensions.plist` (the 138 extension points the OS frameworks declare) only after checking `extensions.plist.sig` through the AppleMobileFileIntegrity service, selector 6. 0164 answers it. `tools/bluerun/miinstall` installs bundles through installd as the migration does, on a normal boot: on 0164, Calculator, Wallet (with its notification extension), Weather and Reminders all install.
+- **QuartzCore research.** QuartzCore 16.7.16 falls back to its GL renderer when Metal returns nil, and its GL function table matches HackiOS's 16.5 table exactly.
+
+### Display
+- **0140 display probe (`bluedpu`).** ABL leaves CTL_0 in command mode -> INTF_1/DSI0, with VIG0/VIG1 fed from the two 540-column halves of `0x9d400000` (stride 4320), DSC, and autorefresh on PP_0. The panel measures 60.9 Hz. FSR 0x400 is the format field, not a fault.
+- **`sweetfb_hz=60`** is now the default.
+- **0145 flip** (zero-copy scanout of iOS buffers) is drafted and untested.
+
+### Hands-off testing (no hands on the phone)
+- **0146 screenshots and scripted touches.** `bluesnap=sb+N,...` saves 540x1080 shots to userdata below the log ring; `phonetest.sh` pulls them as PNGs. `bluetouchscript=sb+60:swipe,540,2150,540,700,250` unlocks the phone. A swipe at sb+30 is too early to unlock.
+- **0148 watchdog** (APSS WDT, on by default): a hang bites into recovery.
+- **0152 push and run.** `phonetest.sh --push LOCAL:/path` copies files into the iOS root before launchd (`bluepush=1`, 3 files in 21 ms). `--run /path,args` runs a program after SpringBoard; its output lands in the log as `BLUERUN:` lines. Ad-hoc signed arm64 binaries run as platform binaries. The runner's launchd job was installed by pushing a modified `System/Library/xpc/launchd.plist`, with no image flash.
+- **`tools/patch-check.sh`** checks a draft patch in a clone of the built tree: apply, then compile with the build's own clang line. `docs/AGENTS.md` is the shared brief for drafting agents.
+- **Build fix.** A hand-fixed `patch-list.txt` had silently dropped the pinned sailfish patches 0200-0208 (sweetenv, AMFI dyld policy, IOSurface) from quick builds. `build-xnu.sh --quick` now always keeps them. A full rebuild takes 3 minutes.
+- **Workflow notes.**
+  - ABL counts each RAM boot as a failed slot-B boot, so `phonetest.sh` runs `fastboot --set-active=b` first.
+  - If fastboot can't see the phone for 60 s, it stops and asks for a replug.
+  - `bluereboot_after` takes only `gpu`, `springboard` or N seconds; add `bluereboot_delay=S` for a delay.
+
+### Other hardware
+- **Battery (0130 + 0141).** The MAX17201 gauge reports real numbers (99%, 4335 mV, 476 cycles, 2445/2944 mAh). Open: after unplugging, it still shows charging (PMI8998 USBIN stays 0x10). The plug test is deferred.
+- **0129 RTC.** The time is right. A wrong time before was iOS using the Cupertino time zone; set it in Settings.
+- **0139 CPU clocks / 0143 LMh.** Gold runs at 2649 MHz. TrustZone accepts every LMh call, so the hardware throttles on heat.
+- **0135 rotation.** A fake accelerometer: pressing both volume buttons together, or `bluefakeaccel_cycle`, rotates the screen; seen working in Safari.
+- **0150 brightness and haptics.**
+  - Brightness: DCS 0x51 writes work (a 17-step ramp, 0 failures). backboardd calls IOMFB selectors 50 and 68.
+  - Haptics: the vibrator is a Cirrus CS40L20, not the DRV2624. With `bluehaptic=2` its firmware (vendor `cs40l20.wmfw`/`.bin`, embedded in the ADT) loads, the DSP runs with 24 waveforms, and `/dev/bluehaptic` takes `click N` and `vibe MS`.
+  - The buzz itself hasn't been felt yet.
+- **0149 modem (Wi-Fi stage 2).** The phone's DTB says MBA self-auth, not PAS. Firmware is read only from `modem_b`. AOP and RPMh votes work, MP_ASSIGN works, the MBA boots, and the 64 MiB MPSS image authenticates. SMP2P reports READY. 40 s later the modem goes ERR-FATAL as expected: there is no rmtfs yet (stage 3). No partition is written.
+
+**migr4: the system apps install.** On the 0164 kernel the first-boot migration installed all 32 removable system apps, extensions included: Weather, Stocks, Find My, Home, Books, Contacts, Translate, Files, Shortcuts, Freeform, Tips, Wallet, Reminders and the rest, with their own icons (`docs/screenshots/2026-11-20-system-apps.png`). Still open: the wallpaper is black and the two default widgets show only their titles.
+
+**migr5: wallpaper.** The LaunchServices database was built on the very first boot, before 0164, when `extensions.plist` could not be read, so it had no records for the system's own extensions (lsd: "could not find extension record", 57 times). PosterBoard then found only Weather's poster extension and failed to set up the system providers (`com.apple.WallpaperKit.CollectionsPoster`, `com.apple.PaperBoard.LegacyPoster`: PBFPosterExtensionDataStoreErrorDomain -2220), so the wallpaper was black and the widgets were empty. Removing the database alone leaves SpringBoard at the Apple logo (lsd waits for a seed), so migr5 removed it and ran the migration again, with `tools/remigrate-push.sh` (no sudo, no flash: the apps go in over two short boots, the reset with the migration boot). Result: the stock iOS 16 wallpaper on the lock and home screens, the Weather and Photos widgets drawn, all apps installed and launching (`docs/screenshots/2026-11-20-home-wallpaper.png`).
+
+Still wrong (seen by hand): the App Library blurs the wallpaper and then shows black; Control Center's pull-down glitches; the lock screen's shortcut buttons don't draw; the Photos widget is black (empty library?); Weather has no data (no network). The first three all use wallpaper-derived materials. Thin black bars show at the left and right edges (1125-wide iOS scaled to the panel).
+

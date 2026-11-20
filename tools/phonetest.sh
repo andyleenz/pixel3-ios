@@ -3,6 +3,7 @@
 #
 #   tools/phonetest.sh [--quick] [--name NAME] [--grep REGEX] [--wait MIN]
 #                      [--push LOCAL:DEVPATH[:MODE[:UID:GID]]]... [--rm DEVPATH]...
+#                      [--mkdir DEVPATH[:MODE[:UID:GID]]]...
 #                      [--run 'DEVPATH[,ARG...]'] [--run-timeout S] [--end recovery|fastboot]
 #                      [BOOT-ARGS...]
 #
@@ -13,7 +14,8 @@
 #   --push    put a file (or a directory) into the iOS root before this boot,
 #             no image round trip (patch 0152; tools/iosfs-push.sh): written
 #             from recovery into userdata's payload area, applied by the kernel
-#             with bluepush=1 before launchd starts. Repeatable. --rm removes.
+#             with bluepush=1 before launchd starts. Repeatable. --rm removes;
+#             --mkdir makes a directory (or sets an existing one's owner).
 #   --run     run that program once SpringBoard is up (tools/bluerun, launchd
 #             job from tools/bluerun/setup.sh, once) with a timeout (default
 #             60 s); its stdout/stderr come out as "BLUERUN: ..." lines in the
@@ -55,6 +57,7 @@ while [ $# -gt 0 ]; do
 	--wait) wait=$2; shift 2 ;;
 	--push) pushes+=("$2"); shift 2 ;;
 	--rm) pushes+=(--rm "$2"); shift 2 ;;
+	--mkdir) pushes+=(--mkdir "$2"); shift 2 ;;
 	--run) run=$2; shift 2 ;;
 	--run-timeout) run_timeout=$2; shift 2 ;;
 	--end) end_in=$2; shift 2 ;;
@@ -75,9 +78,9 @@ if [ -n "$run" ]; then
 fi
 [ ${#pushes[@]} -gt 0 ] && extra="$extra bluepush=1" && : "${end_in:=recovery}"
 : "${end_in:=fastboot}"
-base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60'
+base='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1'
 # real time of day: work/rtc-offset = Mac time minus the raw PM8998 RTC count (see rtc*-rtc.txt)
-base="$base bluebatt=1 bluemax=2 bluelmh=1 bluewdt=30 bluewdt_recovery=1"
+base="$base bluetest=1"	# 0161: bluebatt=1 bluemax=2 bluelmh=1 bluewdt=30 bluewdt_recovery=1 sweetfb_noconsole=1 sweetfb_hz=60
 [ -s work/rtc-offset ] && base="$base bluertc=2 bluertc_offset=$(cat work/rtc-offset)"
 case " $extra " in *" bluereboot="*) : "${wait:=5}" ;; *) : "${wait:=30}" ;; esac
 out=work/test; mkdir -p "$out"

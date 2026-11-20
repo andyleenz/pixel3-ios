@@ -394,7 +394,12 @@ bluedrm_import_size(int fd, int surface_id)
 {
 	struct blue_gpu_iosurface s = { .surface = (uint32_t)surface_id };
 
-	return bluedrm_iosurface_describe(fd, &s) == 0 ? s.size : 0;
+	/*
+	 * The kernel maps a surface for the GPU in whole 4 KiB pages (bg_import_map), so all of the
+	 * last page can be read. A wrapped picture's memory ends at its last pixel, short of a whole
+	 * last row, and Mesa wants pitch x height: without this such pictures were copied instead.
+	 */
+	return bluedrm_iosurface_describe(fd, &s) == 0 ? (s.size + 0xfffull) & ~0xfffull : 0;
 }
 
 int

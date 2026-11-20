@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 19:00:00 +1100
+Subject: [PATCH] 0163: clonefile copies where the file system can't clone
+
+The iOS root is HFS+. installd stages each removable system app with
+copyfile(COPYFILE_CLONE_FORCE), which fails rather than copying, so
+data migration left every one of them uninstalled ("Failed to
+clonefile"). When VNOP_CLONEFILE says ENOTSUP, a regular file is
+created and its data copied, and a symlink is re-made.
+---
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -8576,6 +8576,95 @@
+ }
+ 
+ #define CLONE_SNAPSHOT_FALLBACKS_ENABLED 1
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0163: the iOS root is HFS+, which cannot clone. installd stages apps with
++ * copyfile(COPYFILE_CLONE_FORCE), which has no copy fallback, so every
++ * removable system app install failed ("Failed to clonefile"). Where the
++ * file system has no clonefile, make a copy instead: a new file with the
++ * source's data, or a new symlink to the same target. Directories still
++ * get ENOTSUP (copyfile walks them itself).
++ */
++static int
++sweet_clone_by_copy(vnode_t fvp, vnode_t tdvp, vnode_t *tvpp,
++    struct componentname *cnp, struct vnode_attr *nva, vfs_context_t ctx)
++{
++	const size_t bufsize = 1024 * 1024;
++	kauth_cred_t cred = vfs_context_ucred(ctx);
++	proc_t p = vfs_context_proc(ctx);
++	struct vnode_attr sva;
++	char *buf;
++	int error;
++
++	if (vnode_vtype(fvp) == VLNK) {
++		uio_t uio;
++		size_t len;
++
++		buf = kalloc_data(MAXPATHLEN + 1, Z_WAITOK | Z_ZERO);
++		if (buf == NULL) {
++			return ENOMEM;
++		}
++		uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), MAXPATHLEN);
++		error = VNOP_READLINK(fvp, uio, ctx);
++		len = MAXPATHLEN - (size_t)uio_resid(uio);
++		uio_free(uio);
++		if (!error) {
++			buf[len] = 0;
++			error = VNOP_SYMLINK(tdvp, tvpp, cnp, nva, buf, ctx);
++		}
++		kfree_data(buf, MAXPATHLEN + 1);
++		return error;
++	}
++	if (vnode_vtype(fvp) != VREG) {
++		return ENOTSUP;
++	}
++
++	VATTR_INIT(&sva);
++	VATTR_WANTED(&sva, va_data_size);
++	if ((error = vnode_getattr(fvp, &sva, ctx))) {
++		return error;
++	}
++	if ((error = VNOP_CREATE(tdvp, tvpp, cnp, nva, ctx))) {
++		return error;
++	}
++	if (*tvpp == NULLVP) {
++		return EIO;
++	}
++	buf = kalloc_data(bufsize, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	for (off_t off = 0; off < (off_t)sva.va_data_size && !error;) {
++		int len = (int)MIN((off_t)bufsize, (off_t)sva.va_data_size - off);
++		int resid = 0;
++
++		error = vn_rdwr(UIO_READ, fvp, buf, len, off, UIO_SYSSPACE,
++		    IO_NOAUTH, cred, &resid, p);
++		if (!error && resid == len) {
++			break;          /* the source got shorter */
++		}
++		if (!error) {
++			len -= resid;
++			error = vn_rdwr(UIO_WRITE, *tvpp, buf, len, off, UIO_SYSSPACE,
++			    IO_NOAUTH | IO_UNIT, cred, &resid, p);
++			if (!error && resid) {
++				error = EIO;
++			}
++			off += len;
++		}
++	}
++	kfree_data(buf, bufsize);
++	if (error) {
++		/* don't leave a short copy behind */
++		(void)VNOP_REMOVE(tdvp, *tvpp, cnp, 0, ctx);
++		vnode_put(*tvpp);
++		*tvpp = NULLVP;
++	}
++	return error;
++}
++#endif
+ 
+ /*
+  * Helper function for doing clones. The caller is expected to provide an
+@@ -8731,6 +8820,11 @@
+ #endif
+ 
+ 	error = VNOP_CLONEFILE(fvp, tdvp, &tvp, cnp, &nva, vnop_flags, ctx);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == ENOTSUP && tvp == NULLVP && v_type != VDIR) {
++		error = sweet_clone_by_copy(fvp, tdvp, &tvp, cnp, &nva, ctx);
++	}
++#endif
+ 
+ 	if (!error && tvp) {
+ 		int     update_flags = 0;

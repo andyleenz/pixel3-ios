@@ -3,6 +3,7 @@
 
   sudo tools/iosroot-tweaks.py MOUNTED_ROOT
   sudo tools/iosroot-tweaks.py --only bluerun MOUNTED_ROOT   (just that change)
+  sudo tools/iosroot-tweaks.py --only launchd MOUNTED_ROOT   (just the launchd jobs; remigrate.sh)
 
 Idempotent; run as root (files keep their owners). What each change is for
 (findings from ios-sweet's bring-up on the same iOS build, see their
@@ -47,7 +48,10 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'purplebuddy', 'restore', 'usb',
         'accessoryd', 'bird', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd',
-        'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # FairPlay needs the Secure Enclave: fairplayd restarts forever, and checkpointd's call
+        # to it never returns, which hangs Photos (and anything else that asks checkpointd).
+        'fairplayd')
 
 
 def read_plist(path):
@@ -177,7 +181,7 @@ def audio_media(root):
 def main():
     args = sys.argv[1:]
     only = None
-    if len(args) == 3 and args[0] == '--only' and args[1] in ('bluerun',):
+    if len(args) == 3 and args[0] == '--only' and args[1] in ('bluerun', 'launchd'):
         only, args = args[1], args[2:]
     if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -186,6 +190,9 @@ def main():
     root = args[0]
     if only == 'bluerun':
         bluerun_job(root)
+        return
+    if only == 'launchd':
+        launchd_jobs(root)
         return
     launchd_jobs(root)
     bluerun_job(root)

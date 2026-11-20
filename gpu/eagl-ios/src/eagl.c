@@ -356,6 +356,8 @@ struct eagl {
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
 	unsigned most_calls, most_triangles;
+	unsigned slow_frames;           /* frames over 30 ms (a hitch): mostly first-use shader compiles */
+	uint64_t slowest_us, slowest_handing_us;
 	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
 	bool fragment[256];             /* ... and which of the two kinds each is */
 	unsigned plain_said;
@@ -542,10 +544,12 @@ summary(struct eagl *e)
 	say("hakios-gl: after %u frames: %llu calls, %llu draws and %llu triangles a frame on average; the most in one: "
 	    "%u calls, %u triangles; %llu us a frame, of which %llu handing the commands on, %llu waiting for the picture "
 	    "to be drawn and %llu copying it out, and before each %llu making textures of IOSurfaces; %u IOSurfaces were "
-	    "the textures' memory, %u had to be copied; %u shaders, %u programs; biggest texture %u x %u; %u errors\n",
+	    "the textures' memory, %u had to be copied; %u shaders, %u programs; biggest texture %u x %u; %u errors; "
+	    "%u frames over 30 ms, the slowest %llu us (%llu handing on)\n",
 	    e->frames, e->all_calls / frames, e->all_draws / frames, e->all_triangles / frames, e->most_calls,
 	    e->most_triangles, e->frame_us / frames, e->flush_us / frames, e->wait_us / frames, e->readback_us / frames,
-	    e->attach_us / frames, e->shared, e->refused, e->shaders, e->programs, widest_texture, tallest_texture, e->errors);
+	    e->attach_us / frames, e->shared, e->refused, e->shaders, e->programs, widest_texture, tallest_texture, e->errors,
+	    e->slow_frames, e->slowest_us, e->slowest_handing_us);
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
 		say("hakios-gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
 		    formats[i].format, formats[i].type, formats[i].count, formats[i].widest, formats[i].tallest);
@@ -679,9 +683,10 @@ surface_shared(struct eagl *e, struct image *image)
 	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
 		/* why a surface is copied rather than its memory used: the first ones of a run, for the copies to be made fewer */
 		if (e->refused < 40) {
-			say("hakios-gl: surface %u ('%.4s' %zu x %zu) copied, not shared: %s%s%s%s%s%s\n", IOSurfaceGetID(surface),
-			    (const char *)&(uint32_t){ OSSwapInt32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetWidth(surface),
-			    IOSurfaceGetHeight(surface), !share_surfaces ? "sharing off; " : "", image->invert ? "turned over; " : "",
+			say("hakios-gl: surface %u ('%.4s' %zu x %zu, rows of %zu bytes, %zu planes) copied, not shared: %s%s%s%s%s%s\n",
+			    IOSurfaceGetID(surface), (const char *)&(uint32_t){ OSSwapInt32(IOSurfaceGetPixelFormat(surface)) },
+			    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface),
+			    IOSurfaceGetPlaneCount(surface), !share_surfaces ? "sharing off; " : "", image->invert ? "turned over; " : "",
 			    image->alpha_first ? "alpha first; " : "",
 			    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ? "not BGRA bytes; " : "",
 			    image->plane != 0 ? "a plane; " : "",
@@ -1052,7 +1057,7 @@ show_texture(struct eagl *e, struct image *image)
  * While the drawing thread is held (thread_suspend) nothing here allocates or takes a lock: it may hold malloc's.
  */
 #define PROF_SLOTS      8192
-#define PROF_DUMP       4000
+#define PROF_DUMP       1000
 #define PROF_SHOWN      30
 #define PROF_DEPTH      9                       /* the program counter, the link register, seven callers from the frame chain */
 static unsigned prof_us;                        /* 0: no profile */
@@ -1309,6 +1314,13 @@ frame_end(struct eagl *e, bool finished)
 	e->attach_us += e->attaching;
 	e->flush_us += e->flushing;
 	e->frame_us += after - e->began;
+	if (after - e->began > 30000) {
+		e->slow_frames++;
+		if (after - e->began > e->slowest_us) {
+			e->slowest_us = after - e->began;
+			e->slowest_handing_us = e->flushing;
+		}
+	}
 	if (e->calls > e->most_calls) {
 		e->most_calls = e->calls;
 	}

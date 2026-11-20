@@ -1,0 +1,465 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: Wi-Fi stage 3b, rmtfs (read only) and pd-mapper (bluewifi=4)
+
+Once IPCRTR is open (0165), the watcher announces two QMI services to
+the modem over QRTR:
+
+- rmtfs (service 14): the modem's EFS partitions (modemst1, modemst2,
+  fsg, fsc) on UFS LUN 5, served READ ONLY. Reads go through a new
+  sweet_ufs_read_lun (READ(10) only; the LUN is switched under the lock
+  and put back, so writes still only reach the root partition on LUN 0).
+  The modem's writes are answered as done and DROPPED, with a log line:
+  nothing is ever written to flash. The shared buffer is mainline's
+  rmtfs_mem (0xf2701000 + 2 MiB), given to HLOS + MSS once per boot.
+- pd-mapper (0x40): mainline qcom_pd_mapper.c's sdm845 table, and PD
+  failure reports logged.
+
+QMI framing after Linux qmi_encdec.c and ios-flame's qmi.c/rmtfs.c/
+pdmapper.c.
+
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -1276,14 +1276,370 @@
+ 		printf("BLUELINE WIFI: qrtr: < control %u from %u:%#x: %#x %#x %#x %#x\n", w[0], h.src_node, h.src_port, w[1], w[2],
+ 		    w[3], w[4]);
+ 		break;
++	}
++}
++
++/*
++ * ---- Stage 3b: QMI services the modem needs from us (rmtfs, pd-mapper) ----
++ *
++ * QMI over QRTR as Linux soc/qcom/qmi_encdec.c lays it out: a 7-byte header (type, txn, id, length) and TLVs.
++ *
++ * rmtfs (service 14, github.com/andersson/rmtfs): the modem's EFS is the modemst1/modemst2/fsg/fsc partitions,
++ * on UFS LUN 5. It is served READ ONLY: reads come from the partitions (sweet_ufs_read_lun, READ(10) only);
++ * writes are answered as done and dropped, with a log line. Nothing is ever written to flash. The shared buffer
++ * is mainline's rmtfs_mem (0xf2700000 + 0x202000, 4 KiB guards), given to HLOS + MSS once per boot.
++ *
++ * pd-mapper (service 0x40): which protection domains provide a service, from mainline qcom_pd_mapper.c's
++ * sdm845 table (the modem partition only has the root PD's .jsn).
++ */
++#define RMTFS_SERVICE		14u
++#define RMTFS_PORT		0x10u
++#define PDMAP_SERVICE		0x40u
++#define PDMAP_PORT		0x11u
++#define RMTFS_MEM_PA		0xf2701000u
++#define RMTFS_MEM_SIZE		0x200000u
++#define RMTFS_LUN		5u
++#define QMI_REQUEST		0
++#define QMI_RESPONSE		2
++
++extern int sweet_ufs_read_lun(unsigned lun, const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes);
++
++struct qmi_msg {
++	uint8_t type;
++	uint16_t txn, id, len;
++	const uint8_t *tlv;
++};
++struct qmi_buf {
++	uint8_t b[1024];
++	uint32_t n;
++};
++
++static void
++qmi_start(struct qmi_buf *q, uint8_t type, uint16_t txn, uint16_t id)
++{
++	q->b[0] = type;
++	memcpy(q->b + 1, &txn, 2);
++	memcpy(q->b + 3, &id, 2);
++	q->n = 7;
++}
++
++static void
++qmi_tlv(struct qmi_buf *q, uint8_t t, const void *v, uint16_t len)
++{
++	if (q->n + 3u + len > sizeof(q->b)) {
++		q->n = sizeof(q->b) + 1;
++		return;
+ 	}
++	q->b[q->n] = t;
++	memcpy(q->b + q->n + 1, &len, 2);
++	memcpy(q->b + q->n + 3, v, len);
++	q->n += 3u + len;
+ }
+ 
+ static void
++qmi_result(struct qmi_buf *q, uint16_t result, uint16_t error)
++{
++	uint16_t r[2] = { result, error };
++	qmi_tlv(q, 2, r, 4);
++}
++
++static bool
++qmi_parse(const uint8_t *d, uint32_t n, struct qmi_msg *m)
++{
++	if (n < 7) {
++		return false;
++	}
++	m->type = d[0];
++	memcpy(&m->txn, d + 1, 2);
++	memcpy(&m->id, d + 3, 2);
++	memcpy(&m->len, d + 5, 2);
++	m->len = (uint16_t)MIN(m->len, n - 7);
++	m->tlv = d + 7;
++	return true;
++}
++
++static const uint8_t *
++qmi_get(const struct qmi_msg *m, uint8_t t, uint16_t *len)
++{
++	for (uint32_t o = 0; o + 3 <= m->len;) {
++		uint16_t l;
++		memcpy(&l, m->tlv + o + 1, 2);
++		if (o + 3u + l > m->len) {
++			break;
++		}
++		if (m->tlv[o] == t) {
++			*len = l;
++			return m->tlv + o + 3;
++		}
++		o += 3u + l;
++	}
++	return NULL;
++}
++
++static uint32_t
++qmi_u32(const struct qmi_msg *m, uint8_t t, uint32_t dflt)
++{
++	uint16_t l = 0;
++	const uint8_t *p = qmi_get(m, t, &l);
++	uint32_t v = dflt;
++	if (p && l >= 4) {
++		memcpy(&v, p, 4);
++	} else if (p && l >= 1) {
++		v = p[0];
++	}
++	return v;
++}
++
++static void
++qmi_reply(const struct qrtr_hdr *h, uint32_t port, struct qmi_buf *q)
++{
++	if (q->n > sizeof(q->b)) {
++		printf("BLUELINE WIFI: qmi: reply on port %#x too big: dropped\n", port);
++		return;
++	}
++	uint16_t len = (uint16_t)(q->n - 7);
++	memcpy(q->b + 5, &len, 2);
++	(void)qrtr_send(Q_DATA, port, h->src_node, h->src_port, q->b, q->n);
++}
++
++static int
++qrtr_new_server(uint32_t service, uint32_t version, uint32_t instance, uint32_t port)
++{
++	uint32_t pkt[5] = { Q_NEW_SERVER, service, (version & 0xffu) | (instance << 8), QRTR_NODE_APPS, port };
++	return qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, 0, QRTR_PORT_CTRL, pkt, sizeof(pkt));
++}
++
++static const struct { const char *path, *part; } rmtfs_parts[] = {
++	{ "/boot/modem_fs1", "modemst1" },
++	{ "/boot/modem_fs2", "modemst2" },
++	{ "/boot/modem_fsg", "fsg" },
++	{ "/boot/modem_fsc", "fsc" },
++};
++#define RMTFS_NPARTS	(sizeof(rmtfs_parts) / sizeof(rmtfs_parts[0]))
++
++static struct {
++	vm_offset_t va;
++	uint32_t own;
++	bool up;
++	uint32_t reads, read_sectors, writes, write_sectors, said;
++} rf = { .own = OWN_HLOS };
++
++static void
++rmtfs_start(void)
++{
++	uint64_t bytes = 0;
++
++	for (unsigned i = 0; i < RMTFS_NPARTS; i++) {
++		uint32_t probe;
++		int err = sweet_ufs_read_lun(RMTFS_LUN, rmtfs_parts[i].part, 0, &probe, sizeof(probe), &bytes);
++		printf("BLUELINE WIFI: rmtfs: %s on LUN %u: %s, %llu KiB\n", rmtfs_parts[i].part, RMTFS_LUN, err ? "NOT READABLE" : "ok",
++		    bytes >> 10);
++	}
++	rf.va = ml_io_map_unmappable(RMTFS_MEM_PA, RMTFS_MEM_SIZE, VM_WIMG_WCOMB);
++	if (!rf.va) {
++		printf("BLUELINE WIFI: rmtfs: cannot map the buffer\n");
++		return;
++	}
++	if (assign("rmtfs", RMTFS_MEM_PA, RMTFS_MEM_SIZE, &rf.own, true, true)) {
++		printf("BLUELINE WIFI: rmtfs: buffer not shared with the modem: not serving\n");
++		return;
++	}
++	rf.up = true;
++	if (qrtr_new_server(RMTFS_SERVICE, 1, 0, RMTFS_PORT) || qrtr_new_server(PDMAP_SERVICE, 1, 1, PDMAP_PORT)) {
++		printf("BLUELINE WIFI: qrtr: announcing our servers failed\n");
++		return;
++	}
++	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x\n",
++	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT);
++}
++
++/* One RW_IOVEC: reads from the partition into the buffer; writes dropped. false on a bad request. */
++static bool
++rmtfs_iovec(uint32_t caller, uint8_t dir, const uint8_t *v, uint16_t len)
++{
++	if (caller < 1 || caller > RMTFS_NPARTS || len < 1) {
++		return false;
++	}
++	/* the array's count is 1, 2 or 4 bytes long depending on the IDL: what makes the rest whole entries */
++	uint32_t hdr = (len % 12 == 1) ? 1 : (len % 12 == 2) ? 2 : 4, n = (len - hdr) / 12;
++	const char *part = rmtfs_parts[caller - 1].part;
++
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t e[3];	/* sector_addr, phys_offset, num_sector */
++		memcpy(e, v + hdr + 12 * i, 12);
++		uint64_t off = (uint64_t)e[0] * 512, bytes = (uint64_t)e[2] * 512;
++		/* phys_offset: an address in the buffer, or an offset into it */
++		uint64_t bo = e[1] >= RMTFS_MEM_PA ? (uint64_t)e[1] - RMTFS_MEM_PA : e[1];
++		if (bo > RMTFS_MEM_SIZE || bytes > RMTFS_MEM_SIZE - bo) {
++			printf("BLUELINE WIFI: rmtfs: iovec outside the buffer (%#x %#x %#x)\n", e[0], e[1], e[2]);
++			return false;
++		}
++		if (dir) {
++			rf.writes++;
++			rf.write_sectors += e[2];
++			if (rf.said++ < 24) {
++				printf("BLUELINE WIFI: rmtfs: write %s sectors %u+%u DROPPED (not written to flash)\n", part, e[0], e[2]);
++			}
++			continue;
++		}
++		uint64_t pbytes = 0;
++		int err = sweet_ufs_read_lun(RMTFS_LUN, part, 0, (void *)rf.va, 0, &pbytes);
++		uint64_t have = err || off >= pbytes ? 0 : MIN(bytes, pbytes - off);
++		if (have) {
++			err = sweet_ufs_read_lun(RMTFS_LUN, part, off, (void *)(rf.va + bo), (uint32_t)have, NULL);
++		}
++		for (uint64_t z = have; z < bytes; z++) {
++			*(volatile uint8_t *)(rf.va + bo + z) = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		rf.reads++;
++		rf.read_sectors += e[2];
++		if (rf.said++ < 24) {
++			printf("BLUELINE WIFI: rmtfs: read %s sectors %u+%u%s\n", part, e[0], e[2], err ? " FAILED (zeros)" : "");
++		}
++	}
++	return true;
++}
++
++static void
++rmtfs_handle(const struct qrtr_hdr *h, const struct qmi_msg *m)
++{
++	struct qmi_buf q;
++	uint32_t caller = qmi_u32(m, 1, 0);
++	uint16_t l = 0;
++
++	qmi_start(&q, QMI_RESPONSE, m->txn, m->id);
++	switch (m->id) {
++	case 1: {	/* OPEN */
++		const uint8_t *p = qmi_get(m, 1, &l);
++		char path[64] = { 0 };
++		unsigned i;
++		if (p) {
++			memcpy(path, p, MIN(l, (uint16_t)63));
++		}
++		for (i = 0; i < RMTFS_NPARTS && strcmp(path, rmtfs_parts[i].path) != 0; i++) {
++		}
++		printf("BLUELINE WIFI: rmtfs: open \"%s\" -> %d\n", path, i < RMTFS_NPARTS ? (int)i + 1 : -1);
++		if (i < RMTFS_NPARTS) {
++			uint32_t id = i + 1;
++			qmi_result(&q, 0, 0);
++			qmi_tlv(&q, 0x10, &id, 4);
++		} else {
++			qmi_result(&q, 1, 3);
++		}
++		break;
++	}
++	case 2:		/* CLOSE */
++		printf("BLUELINE WIFI: rmtfs: close %u\n", caller);
++		qmi_result(&q, 0, 0);
++		break;
++	case 3: {	/* RW_IOVEC */
++		const uint8_t *v = qmi_get(m, 3, &l);
++		bool ok = v && rmtfs_iovec(caller, (uint8_t)qmi_u32(m, 2, 0), v, l);
++		qmi_result(&q, ok ? 0 : 1, ok ? 0 : 3);
++		break;
++	}
++	case 4: {	/* ALLOC_BUFF */
++		uint32_t size = qmi_u32(m, 2, 0);
++		uint64_t pa = RMTFS_MEM_PA;
++		printf("BLUELINE WIFI: rmtfs: alloc %u bytes for %u -> %#llx\n", size, caller, pa);
++		if (size <= RMTFS_MEM_SIZE) {
++			qmi_result(&q, 0, 0);
++			qmi_tlv(&q, 0x10, &pa, 8);
++		} else {
++			qmi_result(&q, 1, 3);
++		}
++		break;
++	}
++	case 5: {	/* GET_DEV_ERROR */
++		uint8_t none = 0;
++		qmi_result(&q, 0, 0);
++		qmi_tlv(&q, 0x10, &none, 1);
++		break;
++	}
++	default:
++		printf("BLUELINE WIFI: rmtfs: request %#x not handled\n", m->id);
++		qmi_result(&q, 1, 0x47);	/* QMI_ERR_NOT_SUPPORTED */
++		break;
++	}
++	qmi_reply(h, RMTFS_PORT, &q);
++}
++
++static void
++pdmap_handle(const struct qrtr_hdr *h, const struct qmi_msg *m)
++{
++	static const struct { const char *service, *domain; uint32_t instance; } db[] = {
++		{ "tms/servreg", "msm/modem/root_pd", 180 },
++		{ "gps/gps_service", "msm/modem/root_pd", 180 },
++		{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
++		{ "tms/servreg", "msm/modem/wlan_pd", 180 },
++		{ "wlan/fw", "msm/modem/wlan_pd", 180 },
++	};
++	struct qmi_buf q;
++	uint16_t l = 0, l2 = 0;
++	const uint8_t *p = qmi_get(m, 1, &l);
++
++	qmi_start(&q, QMI_RESPONSE, m->txn, m->id);
++	if (m->id == 0x24) {	/* a protection domain failed: its service and why */
++		const uint8_t *why = qmi_get(m, 2, &l2);
++		printf("BLUELINE WIFI: pd-mapper: PD FAILURE \"%.*s\": %.*s\n", p ? l : 0, p ? (const char *)p : "", why ? l2 : 0,
++		    why ? (const char *)why : "");
++		qmi_result(&q, 0, 0);
++	} else if (m->id != 0x21) {
++		printf("BLUELINE WIFI: pd-mapper: request %#x not handled\n", m->id);
++		qmi_result(&q, 1, 0x47);
++	} else {
++		/* GET_DOMAIN_LIST: u8 count, then { u8 length + name, u32 instance, u8 valid, u32 data } */
++		char name[80] = { 0 };
++		uint8_t list[512];
++		uint32_t o = 1, offset = qmi_u32(m, 0x10, 0);
++		uint16_t total = 0, rev = 1;
++		if (p) {
++			memcpy(name, p, MIN(l, (uint16_t)79));
++		}
++		list[0] = 0;
++		for (unsigned i = 0; i < sizeof(db) / sizeof(db[0]); i++) {
++			if (strcmp(db[i].service, name) != 0 || total++ < offset) {
++				continue;
++			}
++			uint8_t nl = (uint8_t)strlen(db[i].domain);
++			list[o++] = nl;
++			memcpy(list + o, db[i].domain, nl);
++			o += nl;
++			memcpy(list + o, &db[i].instance, 4);
++			o += 4;
++			list[o++] = 0;
++			bzero(list + o, 4);
++			o += 4;
++			list[0]++;
++		}
++		printf("BLUELINE WIFI: pd-mapper: \"%s\" -> %u domain(s)\n", name, total);
++		qmi_result(&q, 0, 0);
++		qmi_tlv(&q, 0x10, &total, 2);
++		qmi_tlv(&q, 0x11, &rev, 2);
++		qmi_tlv(&q, 0x12, list, (uint16_t)o);
++	}
++	qmi_reply(h, PDMAP_PORT, &q);
++}
++
++static void
+ qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ {
+-	(void)d;
+-	printf("BLUELINE WIFI: qrtr: < DATA %u:%#x -> port %#x, %u bytes\n", h->src_node, h->src_port, h->dst_port, n);
++	struct qmi_msg m;
++
++	if (!qmi_parse(d, n, &m) || m.type != QMI_REQUEST) {
++		printf("BLUELINE WIFI: qrtr: < DATA %u:%#x -> port %#x, %u bytes (not a request)\n", h->src_node, h->src_port,
++		    h->dst_port, n);
++		return;
++	}
++	if (h->dst_port == RMTFS_PORT && rf.up) {
++		rmtfs_handle(h, &m);
++	} else if (h->dst_port == PDMAP_PORT) {
++		pdmap_handle(h, &m);
++	} else {
++		printf("BLUELINE WIFI: qrtr: < request %#x for port %#x from %u:%#x: no such service\n", m.id, h->dst_port,
++		    h->src_node, h->src_port);
++	}
+ }
+ 
+ /* The modem is ready: GLINK version, IPCRTR open both ways, 5 s at most. */
+@@ -1314,6 +1670,7 @@
+ 	printf("BLUELINE WIFI: glink: IPCRTR open (rcid %u) after %u ms, %d intents from the modem\n", gl.rcid, ms_since(t0),
+ 	    gl.nri);
+ 	gl.up = true;
++	rmtfs_start();
+ 	return true;
+ }
+ 
+@@ -1361,6 +1718,8 @@
+ 	}
+ 	if (gl.up) {
+ 		printf("BLUELINE WIFI: glink: %u servers announced, %d modem intents\n", gl.servers, gl.nri);
++		printf("BLUELINE WIFI: rmtfs: %u reads (%u sectors), %u writes dropped (%u sectors)\n", rf.reads, rf.read_sectors,
++		    rf.writes, rf.write_sectors);
+ 	}
+ 	printf("BLUELINE WIFI: watcher done: last state %#x, rmb mba_status %d\n", last, (int32_t)rd(w2.rmb + RMB_MBA_STATUS));
+ }
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -358,24 +358,41 @@
+  * alone. *part_bytes, if given, gets the partition size. 0 or an errno.
+  */
+ int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes);
++int sweet_ufs_read_lun(unsigned lun, const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes);
+ int
+ sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes)
++{
++	return sweet_ufs_read_lun(0, name, off, buf, len, part_bytes);
++}
++
++/*
++ * The same on another LUN (the modem's EFS partitions are on LUN 5, patch 0166). The LUN is switched only
++ * under the lock, for READ(10)s, and put back before it is let go: ufs_write_blocks only ever sees the root's
++ * LUN and stays inside the root partition's bounds.
++ */
++int
++sweet_ufs_read_lun(unsigned lun, const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *part_bytes)
+ {
+ 	static char cname[37];			/* last partition looked up, under sweet_ufs_lock */
++	static unsigned clun;
+ 	static uint64_t cfirst, cblocks;
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	uint8_t *out = buf;
+ 	int error = 0;
+ 
+-	if (!su.ready || !name || strlen(name) >= sizeof(cname)) {
++	if (!su.ready || !name || strlen(name) >= sizeof(cname) || lun > 7) {
+ 		return ENXIO;
+ 	}
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	if (strcmp(cname, name) != 0) {
++	uint8_t root_lun = su.lun;
++	su.lun = (uint8_t)lun;
++	if (strcmp(cname, name) != 0 || clun != lun) {
+ 		uint64_t f = 0, n = 0;
++		cname[0] = 0;
+ 		error = ufs_gpt_lookup(name, &f, &n);
+ 		if (!error) {
+ 			strlcpy(cname, name, sizeof(cname));
++			clun = lun;
+ 			cfirst = f;
+ 			cblocks = n;
+ 		}
+@@ -399,6 +416,7 @@
+ 			len -= take;
+ 		}
+ 	}
++	su.lun = root_lun;
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	return error;
+ }

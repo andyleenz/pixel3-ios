@@ -64,14 +64,14 @@ iosurface_resource(struct pipe_screen *screen, uint32_t surface)
 
 	if (gpu_fd < 0 || bluedrm_iosurface_describe(gpu_fd, &s) != 0)
 		return NULL;
-	if (s.pixel_format != 0x42475241 /* 'BGRA' */ || s.planes != 0 || (s.row_bytes & 63) != 0)
+	if (s.pixel_format != 0x42475241 /* 'BGRA' */ || s.planes != 0 || (s.row_bytes & 3) != 0)
 		return NULL;    /* (the EAGL shim copies through a staging texture instead) */
 	templ.width0 = s.width;
 	templ.height0 = s.height;
 	handle.handle = surface;        /* drmPrimeFDToHandle() imports by IOSurface ID */
 	handle.stride = s.row_bytes;
 	handle.offset = s.offset;
-	handle.size = s.size;
+	handle.size = (s.size + 0xfffull) & ~0xfffull;     /* (whole 4 KiB pages: bluedrm_import_size) */
 	handle.modifier = 0;            /* DRM_FORMAT_MOD_LINEAR */
 	return screen->resource_from_handle(screen, &templ, &handle, 0);
 }
@@ -186,5 +186,5 @@ bluegl_iosurface_importable(uint32_t iosurface_id)
 	struct blue_gpu_iosurface s = { .surface = iosurface_id };
 
 	return bluegl_init() == 0 && bluedrm_iosurface_describe(gpu_fd, &s) == 0 &&
-	       s.pixel_format == 0x42475241 && s.planes == 0 && (s.row_bytes & 63) == 0;
+	       s.pixel_format == 0x42475241 && s.planes == 0 && (s.row_bytes & 3) == 0;   /* (any pitch: patch 0005) */
 }
