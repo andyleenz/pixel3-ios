@@ -1,0 +1,563 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] blueline: Wi-Fi stage 3a, GLINK and QRTR to the modem (bluewifi=4)
+
+Once the modem says ready (stage 2), the watcher thread brings up GLINK
+over SMEM with it (items 478/479/480, APCS IPC bit 12), opens the IPCRTR
+channel both ways, answers QRTR HELLO and logs every server the modem
+announces. Polled; nothing is served yet (rmtfs, pd-mapper, WLFW come
+next). After Linux qcom_glink_smem.c, qcom_glink_native.c and net/qrtr,
+and ios-flame's userland glink.c/link.c.
+
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -400,6 +400,7 @@
+ 
+ static struct {
+ 	int step;
++	int level;			/* bluewifi */
+ 	char part[16];
+ 	uint32_t watch_s;
+ 	vm_offset_t gcc, qdsp6, rmb, aoss, pdc, halt_q6, halt_nc, halt_modem, apcs, qmp, mutex, smem, gicd;
+@@ -820,6 +821,500 @@
+ 	}
+ 	msg[n] = 0;
+ 	printf("BLUELINE WIFI: smem crash reason (421, %u bytes): \"%s\"\n", sz, msg);
++}
++
++/*
++ * ---- Stage 3 (bluewifi=4): GLINK over SMEM and QRTR to the modem ----
++ *
++ * Linux qcom_glink_smem.c + qcom_glink_native.c and net/qrtr, after ios-flame's userland glink.c/link.c:
++ * one channel, IPCRTR, polled from the watcher thread. Our FIFO is SMEM item 479 (16 KiB), the modem's
++ * is 480 and the four indexes are item 478: [0] our tail... as Linux, tx tail/head then rx tail/head.
++ * The doorbell is APCS IPC bit 12. QRTR: the modem is node 0, we are node 1.
++ */
++#define GLINK_DESC_ITEM		478u
++#define GLINK_TX_ITEM		479u
++#define GLINK_RX_ITEM		480u
++#define GLINK_TX_SIZE		16384u
++#define IPC_GLINK		12u
++#define GLINK_LCID		1u
++#define GLINK_INTENTS		8u
++#define GLINK_INTENT_SIZE	4096u
++#define GLINK_FEAT_REUSE	1u
++
++enum { G_VERSION = 0, G_VERSION_ACK, G_OPEN, G_CLOSE, G_OPEN_ACK, G_INTENT, G_RX_DONE, G_INTENT_REQ, G_INTENT_REQ_ACK,
++       G_TX_DATA, G_CLOSE_ACK = 11, G_TX_DATA_CONT, G_READ_NOTIF, G_RX_DONE_REUSE, G_SIGNALS };
++enum { Q_DATA = 1, Q_HELLO, Q_BYE, Q_NEW_SERVER, Q_DEL_SERVER, Q_DEL_CLIENT, Q_RESUME_TX, Q_EXIT, Q_PING, Q_NEW_LOOKUP,
++       Q_DEL_LOOKUP };
++#define QRTR_NODE_APPS		1u
++#define QRTR_PORT_CTRL		0xfffffffeu
++
++struct qrtr_hdr {
++	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
++};
++
++static struct {
++	vm_offset_t desc, tx, rx;
++	uint32_t tx_len, rx_len, rcid, rxoff, next_iid, servers, unknown;
++	bool open_tx, open_acked, remote_open, version_done, req_acked, up;
++	struct { uint32_t size, iid; bool busy; } ri[64];
++	int nri;
++} gl;
++static uint8_t gl_rxbuf[65536];
++static uint8_t gl_txbuf[16 + 8192 + 16];
++
++#define TX_TAIL	(gl.desc + 0)
++#define TX_HEAD	(gl.desc + 4)
++#define RX_TAIL	(gl.desc + 8)
++#define RX_HEAD	(gl.desc + 12)
++
++static void qrtr_rx(const uint8_t *d, uint32_t n);
++
++static bool
++glink_init(void)
++{
++	uint32_t sz = 0, off;
++
++	if (!(off = smem_alloc_modem(GLINK_DESC_ITEM, 32))) {
++		return false;
++	}
++	gl.desc = w2.smem + off;
++	if (!(off = smem_alloc_modem(GLINK_TX_ITEM, GLINK_TX_SIZE)) ||
++	    !smem_find(w2.pm_off, w2.pm_size, w2.pm_cl, GLINK_TX_ITEM, &sz)) {
++		return false;
++	}
++	gl.tx = w2.smem + off;
++	gl.tx_len = sz & ~7u;
++	if (!(off = smem_find(w2.pm_off, w2.pm_size, w2.pm_cl, GLINK_RX_ITEM, &sz))) {
++		printf("BLUELINE WIFI: glink: the modem has no FIFO (smem item 480) yet\n");
++		return false;
++	}
++	gl.rx = w2.smem + off;
++	gl.rx_len = sz & ~7u;
++	/* as qcom_glink_smem_register: our ends of both pipes start over */
++	wr(RX_TAIL, 0);
++	wr(TX_HEAD, 0);
++	gl.next_iid = 100;
++	printf("BLUELINE WIFI: glink: fifos tx %#lx (%u) rx %#lx (%u); tx tail/head %u/%u rx tail/head %u/%u\n",
++	    (unsigned long)(SMEM_PA + (gl.tx - w2.smem)), gl.tx_len, (unsigned long)(SMEM_PA + (gl.rx - w2.smem)), gl.rx_len,
++	    rd(TX_TAIL), rd(TX_HEAD), rd(RX_TAIL), rd(RX_HEAD));
++	return true;
++}
++
++/* One command (8-byte header + data, padded to 8) into our FIFO, and the doorbell. Non-zero if full. */
++static int
++glink_send(uint16_t cmd, uint16_t p1, uint32_t p2, const void *data, uint32_t len)
++{
++	uint32_t n = 8 + len, padded = (n + 7) & ~7u;
++
++	if (padded > sizeof(gl_txbuf)) {
++		return -1;
++	}
++	bzero(gl_txbuf, padded);
++	memcpy(gl_txbuf, &cmd, 2);
++	memcpy(gl_txbuf + 2, &p1, 2);
++	memcpy(gl_txbuf + 4, &p2, 4);
++	if (len) {
++		memcpy(gl_txbuf + 8, data, len);
++	}
++	uint32_t head = rd(TX_HEAD), tail = rd(TX_TAIL);
++	if (head >= gl.tx_len || tail >= gl.tx_len) {
++		return -1;
++	}
++	uint32_t avail = tail <= head ? gl.tx_len - head + tail : tail - head;
++	if (avail < padded + 16) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < padded; i += 4) {
++		uint32_t w;
++		memcpy(&w, gl_txbuf + i, 4);
++		wr(gl.tx + head, w);
++		head += 4;
++		if (head >= gl.tx_len) {
++			head -= gl.tx_len;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(TX_HEAD, head);
++	kick(IPC_GLINK);
++	return 0;
++}
++
++static uint32_t
++glink_rx_avail(void)
++{
++	uint32_t head = rd(RX_HEAD), tail = rd(RX_TAIL);
++	if (head >= gl.rx_len || tail >= gl.rx_len) {
++		return 0;
++	}
++	return head < tail ? gl.rx_len - tail + head : head - tail;
++}
++
++static void
++glink_rx_peek(void *buf, uint32_t off, uint32_t len)
++{
++	uint32_t t = rd(RX_TAIL) + off;
++	uint8_t *b = buf;
++
++	while (t >= gl.rx_len) {
++		t -= gl.rx_len;
++	}
++	for (uint32_t i = 0; i < len; i++) {
++		b[i] = (uint8_t)(rd(gl.rx + (t & ~3u)) >> (8 * (t & 3u)));
++		if (++t >= gl.rx_len) {
++			t = 0;
++		}
++	}
++}
++
++static void
++glink_rx_advance(uint32_t len)
++{
++	uint32_t t = rd(RX_TAIL) + len;
++	while (t >= gl.rx_len) {
++		t -= gl.rx_len;
++	}
++	wr(RX_TAIL, t);
++}
++
++static void
++glink_open(void)
++{
++	static const char name[] = "IPCRTR";
++	(void)glink_send(G_OPEN, GLINK_LCID, sizeof(name), name, sizeof(name));
++	gl.open_tx = true;
++}
++
++/* One command from the modem's FIFO; false if there is none, or not all of it yet. */
++static bool
++glink_rx_one(void)
++{
++	uint32_t avail = glink_rx_avail(), adv = 8, p2;
++	uint16_t cmd, p1;
++	uint8_t h[16];
++
++	if (avail < 8) {
++		return false;
++	}
++	glink_rx_peek(h, 0, 8);
++	memcpy(&cmd, h, 2);
++	memcpy(&p1, h + 2, 2);
++	memcpy(&p2, h + 4, 4);
++	switch (cmd) {
++	case G_VERSION:
++		printf("BLUELINE WIFI: glink: < VERSION %u features %#x\n", p1, p2);
++		(void)glink_send(G_VERSION_ACK, 1, p2 & GLINK_FEAT_REUSE, NULL, 0);
++		if (!gl.version_done) {
++			(void)glink_send(G_VERSION, 1, GLINK_FEAT_REUSE, NULL, 0);
++		}
++		break;
++	case G_VERSION_ACK:
++		printf("BLUELINE WIFI: glink: < VERSION_ACK %u features %#x\n", p1, p2);
++		gl.version_done = true;
++		break;
++	case G_OPEN: {
++		uint32_t nl = (p2 + 7) & ~7u;
++		char name[33] = { 0 };
++		if (avail < 8 + nl) {
++			return false;
++		}
++		glink_rx_peek(name, 8, MIN(p2, 32u));
++		adv += nl;
++		printf("BLUELINE WIFI: glink: < OPEN rcid %u \"%s\"\n", p1, name);
++		(void)glink_send(G_OPEN_ACK, p1, 0, NULL, 0);	/* Linux acks every remote open */
++		if (strcmp(name, "IPCRTR") == 0) {
++			gl.rcid = p1;
++			gl.remote_open = true;
++			if (!gl.open_tx) {
++				glink_open();
++			}
++		}
++		break;
++	}
++	case G_OPEN_ACK:
++		printf("BLUELINE WIFI: glink: < OPEN_ACK lcid %u\n", p1);
++		if (p1 == GLINK_LCID && !gl.open_acked) {
++			uint32_t p[GLINK_INTENTS * 2];
++			gl.open_acked = true;
++			for (uint32_t i = 0; i < GLINK_INTENTS; i++) {
++				p[2 * i] = GLINK_INTENT_SIZE;
++				p[2 * i + 1] = i + 1;
++			}
++			(void)glink_send(G_INTENT, GLINK_LCID, GLINK_INTENTS, p, sizeof(p));
++		}
++		break;
++	case G_CLOSE:
++		printf("BLUELINE WIFI: glink: < CLOSE rcid %u\n", p1);
++		(void)glink_send(G_CLOSE_ACK, p1, 0, NULL, 0);
++		break;
++	case G_CLOSE_ACK:
++		break;
++	case G_INTENT: {
++		uint32_t len = 8 + p2 * 8;
++		if (p2 > 256) {
++			adv = avail;
++			break;
++		}
++		if (avail < len) {
++			return false;
++		}
++		for (uint32_t i = 0; i < p2; i++) {
++			uint32_t pr[2];
++			glink_rx_peek(pr, 8 + i * 8, 8);
++			if (p1 == gl.rcid && gl.remote_open && gl.nri < (int)(sizeof(gl.ri) / sizeof(gl.ri[0]))) {
++				gl.ri[gl.nri].size = pr[0];
++				gl.ri[gl.nri].iid = pr[1];
++				gl.ri[gl.nri].busy = false;
++				gl.nri++;
++			}
++		}
++		adv = (len + 7) & ~7u;
++		break;
++	}
++	case G_RX_DONE:
++	case G_RX_DONE_REUSE:
++		if (p1 == gl.rcid) {
++			for (int i = 0; i < gl.nri; i++) {
++				if (gl.ri[i].iid == p2) {
++					if (cmd == G_RX_DONE) {
++						gl.ri[i] = gl.ri[--gl.nri];
++					} else {
++						gl.ri[i].busy = false;
++					}
++					break;
++				}
++			}
++		}
++		break;
++	case G_INTENT_REQ:
++		/* data is taken in place, so every request is granted with a fresh intent id */
++		if (p1 == gl.rcid) {
++			uint32_t p[2] = { MAX(p2, GLINK_INTENT_SIZE), gl.next_iid++ };
++			(void)glink_send(G_INTENT, GLINK_LCID, 1, p, sizeof(p));
++			(void)glink_send(G_INTENT_REQ_ACK, GLINK_LCID, 1, NULL, 0);
++		} else {
++			(void)glink_send(G_INTENT_REQ_ACK, 0, 0, NULL, 0);
++		}
++		break;
++	case G_INTENT_REQ_ACK:
++		gl.req_acked = true;
++		break;
++	case G_TX_DATA:
++	case G_TX_DATA_CONT: {
++		uint32_t chunk, left;
++		if (avail < 16) {
++			return false;
++		}
++		glink_rx_peek(h, 0, 16);
++		memcpy(&chunk, h + 8, 4);
++		memcpy(&left, h + 12, 4);
++		if (chunk > gl.rx_len) {
++			adv = avail;
++			break;
++		}
++		if (avail < 16 + chunk) {
++			return false;
++		}
++		if (gl.rxoff + chunk <= sizeof(gl_rxbuf)) {
++			glink_rx_peek(gl_rxbuf + gl.rxoff, 16, chunk);
++		}
++		gl.rxoff += chunk;
++		adv = (16 + chunk + 7) & ~7u;
++		if (p1 != gl.rcid) {
++			gl.rxoff = 0;
++			break;
++		}
++		if (!left) {
++			uint32_t n = MIN(gl.rxoff, (uint32_t)sizeof(gl_rxbuf));
++			glink_rx_advance(adv);
++			gl.rxoff = 0;
++			(void)glink_send(G_RX_DONE_REUSE, GLINK_LCID, p2, NULL, 0);
++			qrtr_rx(gl_rxbuf, n);
++			return true;
++		}
++		break;
++	}
++	case G_READ_NOTIF:
++		kick(IPC_GLINK);
++		break;
++	case G_SIGNALS:
++		printf("BLUELINE WIFI: glink: < SIGNALS %#x\n", p2);
++		break;
++	default:
++		if (gl.unknown++ < 4) {
++			printf("BLUELINE WIFI: glink: < unknown command %u (%u %#x): dropping what is in the FIFO\n", cmd, p1, p2);
++		}
++		adv = avail;
++		break;
++	}
++	glink_rx_advance(adv);
++	return true;
++}
++
++static void
++link_poll(void)
++{
++	for (int n = 0; n < 64 && glink_rx_one(); n++) {
++	}
++}
++
++/* One packet into one of the modem's intents (asked for if none fits), in chunks of 8 KiB as Linux does. */
++static int
++link_send(const void *data, uint32_t len)
++{
++	uint64_t t0 = mach_absolute_time();
++	int best = -1, asked = 0;
++
++	for (;;) {
++		best = -1;
++		for (int i = 0; i < gl.nri; i++) {
++			if (!gl.ri[i].busy && gl.ri[i].size >= len && (best < 0 || gl.ri[i].size < gl.ri[best].size)) {
++				best = i;
++			}
++		}
++		if (best >= 0) {
++			break;
++		}
++		if (!asked || gl.req_acked) {
++			if (asked > 3) {
++				goto fail;
++			}
++			gl.req_acked = false;
++			(void)glink_send(G_INTENT_REQ, GLINK_LCID, len, NULL, 0);
++			asked++;
++		}
++		if (ms_since(t0) > 3000) {
++			goto fail;
++		}
++		link_poll();
++		delay(1000);
++	}
++	gl.ri[best].busy = true;
++	for (uint32_t off = 0; off < len;) {
++		uint32_t chunk = MIN(len - off, 8192u), hdr[2] = { chunk, len - off - chunk };
++		static uint8_t b[8 + 8192];
++		memcpy(b, hdr, 8);
++		memcpy(b + 8, (const uint8_t *)data + off, chunk);
++		while (glink_send(off ? G_TX_DATA_CONT : G_TX_DATA, GLINK_LCID, gl.ri[best].iid, b, 8 + chunk)) {
++			if (ms_since(t0) > 3000) {
++				goto fail;
++			}
++			link_poll();
++			delay(1000);
++		}
++		off += chunk;
++	}
++	return 0;
++fail:
++	printf("BLUELINE WIFI: glink: cannot send %u bytes (%d intents)\n", len, gl.nri);
++	return -1;
++}
++
++static int
++qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
++{
++	static uint8_t b[sizeof(struct qrtr_hdr) + 8192];
++	struct qrtr_hdr hd = {
++		.version = 1, .type = type, .src_node = QRTR_NODE_APPS, .src_port = src_port,
++		.confirm_rx = 0, .size = len, .dst_node = dst_node, .dst_port = dst_port,
++	};
++	uint32_t padded = (len + 3) & ~3u;
++
++	if (sizeof(hd) + padded > sizeof(b)) {
++		return -1;
++	}
++	memcpy(b, &hd, sizeof(hd));
++	memcpy(b + sizeof(hd), payload, len);
++	bzero(b + sizeof(hd) + len, padded - len);
++	return link_send(b, (uint32_t)sizeof(hd) + padded);
++}
++
++/* Data for one of our ports (stage 3b on: rmtfs, pd-mapper, WLFW, TFTP). */
++static void qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);
++
++static void
++qrtr_rx(const uint8_t *d, uint32_t n)
++{
++	struct qrtr_hdr h;
++	uint32_t w[5] = { 0 };
++
++	if (n < sizeof(h)) {
++		return;
++	}
++	memcpy(&h, d, sizeof(h));
++	if (h.version != 1) {
++		printf("BLUELINE WIFI: qrtr: version %u packet\n", h.version);
++		return;
++	}
++	d += sizeof(h);
++	n = MIN(n - (uint32_t)sizeof(h), h.size);
++	if (h.type == Q_DATA) {
++		if (h.confirm_rx) {
++			/* struct qrtr_ctrl_pkt: cmd, then client { node, port } */
++			uint32_t pkt[5] = { Q_RESUME_TX, h.dst_node, h.dst_port, 0, 0 };
++			(void)qrtr_send(Q_RESUME_TX, h.dst_port, h.src_node, h.src_port, pkt, sizeof(pkt));
++		}
++		qrtr_data(&h, d, n);
++		return;
++	}
++	memcpy(w, d, MIN(n, (uint32_t)sizeof(w)));
++	switch (w[0]) {
++	case Q_HELLO: {
++		uint32_t hello[5] = { Q_HELLO, 0, 0, 0, 0 };
++		printf("BLUELINE WIFI: qrtr: < HELLO from node %u: saying hello back\n", h.src_node);
++		(void)qrtr_send(Q_HELLO, QRTR_PORT_CTRL, h.src_node, QRTR_PORT_CTRL, hello, sizeof(hello));
++		break;
++	}
++	case Q_NEW_SERVER:
++		gl.servers++;
++		printf("BLUELINE WIFI: qrtr: server: service %u (%#x) version %u instance %u at %u:%#x\n", w[1], w[1], w[2] & 0xffu,
++		    w[2] >> 8, w[3], w[4]);
++		break;
++	case Q_DEL_SERVER:
++		printf("BLUELINE WIFI: qrtr: server gone: service %u instance %u at %u:%#x\n", w[1], w[2] >> 8, w[3], w[4]);
++		break;
++	default:
++		printf("BLUELINE WIFI: qrtr: < control %u from %u:%#x: %#x %#x %#x %#x\n", w[0], h.src_node, h.src_port, w[1], w[2],
++		    w[3], w[4]);
++		break;
++	}
++}
++
++static void
++qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	(void)d;
++	printf("BLUELINE WIFI: qrtr: < DATA %u:%#x -> port %#x, %u bytes\n", h->src_node, h->src_port, h->dst_port, n);
++}
++
++/* The modem is ready: GLINK version, IPCRTR open both ways, 5 s at most. */
++static bool
++link_up(void)
++{
++	uint64_t t0 = mach_absolute_time();
++
++	while (!glink_init()) {
++		if (ms_since(t0) > 3000) {
++			return false;
++		}
++		delay(100000);
++	}
++	(void)glink_send(G_VERSION, 1, GLINK_FEAT_REUSE, NULL, 0);
++	while (ms_since(t0) < 5000 && !(gl.open_acked && gl.remote_open)) {
++		link_poll();
++		if (gl.version_done && !gl.open_tx) {
++			glink_open();	/* (Linux opens its side once the versions agree) */
++		}
++		delay(2000);
++	}
++	if (!(gl.open_acked && gl.remote_open)) {
++		printf("BLUELINE WIFI: glink: IPCRTR not open after %u ms (version %d, remote open %d, ack %d)\n", ms_since(t0),
++		    gl.version_done, gl.remote_open, gl.open_acked);
++		return false;
++	}
++	printf("BLUELINE WIFI: glink: IPCRTR open (rcid %u) after %u ms, %d intents from the modem\n", gl.rcid, ms_since(t0),
++	    gl.nri);
++	gl.up = true;
++	return true;
+ }
+ 
+ static bool
+@@ -833,7 +1328,7 @@
+ {
+ 	uint64_t t0 = mach_absolute_time();
+ 	uint32_t last = 0xffffffffu, v, fl, ver;
+-	bool wd = false, crashed = false;
++	bool wd = false, crashed = false, link_tried = false;
+ 
+ 	printf("BLUELINE WIFI: watcher: following the modem for %u s\n", w2.watch_s);
+ 	while (ms_since(t0) < w2.watch_s * 1000u) {
+@@ -850,13 +1345,23 @@
+ 				crash_reason();
+ 			}
+ 		}
++		if (w2.level >= 4 && !gl.up && !crashed && last != 0xffffffffu && (last & MODEM_READY) && !link_tried) {
++			link_tried = true;
++			(void)link_up();
++		}
++		if (gl.up) {
++			link_poll();
++		}
+ 		if (!wd && wdog_pending()) {
+ 			wd = true;
+ 			printf("BLUELINE WIFI: [+%u ms] modem watchdog (SPI 266) pending\n", ms_since(t0));
+ 			crash_reason();
+ 		}
+-		delay(100000);
++		delay(gl.up ? 5000 : 100000);
+ 	}
++	if (gl.up) {
++		printf("BLUELINE WIFI: glink: %u servers announced, %d modem intents\n", gl.servers, gl.nri);
++	}
+ 	printf("BLUELINE WIFI: watcher done: last state %#x, rmb mba_status %d\n", last, (int32_t)rd(w2.rmb + RMB_MBA_STATUS));
+ }
+ 
+@@ -1824,6 +2329,7 @@
+ 	if (level <= 0) {
+ 		return;
+ 	}
++	w2.level = level;
+ 	if (level >= 3) {
+ 		printf("BLUELINE WIFI: stage 2 (bluewifi=%d): SCM queries, then the modem boot steps\n", level);
+ 		scm_probe();
