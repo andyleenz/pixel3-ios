@@ -756,7 +756,17 @@ surface_changed(struct eagl *e, struct image *image)
 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t sum = size, word;
+	uint64_t sum, word;
+
+	/*
+	 * Never past the surface's memory: a texture can be described bigger than its surface (more rows, or more
+	 * bytes a pixel than the surface has: Safari's pictures), and reading to the described end took backboardd
+	 * down (signal 11 here, 2026-11-20).
+	 */
+	if (size > IOSurfaceGetAllocSize(surface)) {
+		size = IOSurfaceGetAllocSize(surface);
+	}
+	sum = size;
 
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
@@ -799,9 +809,18 @@ surface_to_texture(struct eagl *e, struct image *image)
 		return;
 	}
 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+	/* (as surface_changed(): never past the surface's memory -- a texture described bigger gets what there is, the
+	 * rest of it from a cleared copy) */
+	size_t have = planar ? (size_t)-1 : IOSurfaceGetAllocSize(surface), need = row * (size_t)(image->height - 1) +
+	    (size_t)image->width * pixel;
+	uint8_t *padded = NULL;
 	if ((image->invert || alpha_first) && (flipped = calloc(row, (size_t)image->height)) != NULL) {
 		for (GLsizei y = 0; y < image->height; y++) {
-			const uint8_t *from = base + row * (size_t)(image->invert ? image->height - 1 - y : y);
+			size_t src = row * (size_t)(image->invert ? image->height - 1 - y : y);
+			if (src + (size_t)image->width * pixel > have) {
+				continue;                       /* (beyond the surface: left cleared) */
+			}
+			const uint8_t *from = base + src;
 			uint8_t *to = flipped + row * (size_t)y;
 			size_t used = (size_t)image->width * pixel;     /* (the last row may end where its pixels do) */
 
@@ -819,12 +838,17 @@ surface_to_texture(struct eagl *e, struct image *image)
 		}
 		base = flipped;
 	}
+	if (!planar && flipped == NULL && need > have && (padded = calloc(1, need)) != NULL) {
+		memcpy(padded, base, have);
+		base = padded;
+	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
 	    image->format, image->type, base);
+	free(padded);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
 	static unsigned format0_said;   /* the icons ('' surfaces, 180 x 180): their first fills, to see what they hold */
