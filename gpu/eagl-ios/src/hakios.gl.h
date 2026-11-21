@@ -19,6 +19,8 @@ const char *hakios_gl_library(void);                           /* for the log */
  * done; the texture is to be filled and read back with OpenGL ES calls.
  */
 int hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface);
+extern const char *hakios_gl_why;        /* why it last said no (pixel3-ios), NULL after a yes */
+extern unsigned hakios_gl_error;         /* the GL error with it */
 
 /*
  * CoreAnimation draws a layer's pixels with one of ninety "functions" (a fragment shader each); these

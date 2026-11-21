@@ -25,6 +25,10 @@
 extern const unsigned char *glGetString(unsigned name);
 extern unsigned glGetError(void);
 
+/* why the last hakios_gl_surface_texture() said no (NULL when it said yes), and its GL error */
+const char *hakios_gl_why;
+unsigned hakios_gl_error;
+
 struct hakios_gl {
 	bluegl_context *context;
 };
@@ -87,11 +91,18 @@ hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface)
 		image_target = (void (*)(unsigned, void *))bluegl_get_proc_address("glEGLImageTargetTexture2DOES");
 		never = copy != NULL && *copy != 0 && *copy != '0';
 	}
-	if (image_target == NULL || never || !bluegl_iosurface_importable(surface)) {
+	if (image_target == NULL || never) {
+		hakios_gl_why = image_target == NULL ? "no glEGLImageTargetTexture2DOES" : "BLUEEAGL_COPY";
+		return 0;
+	}
+	if (!bluegl_iosurface_importable(surface)) {
+		hakios_gl_why = "the kernel did not describe it as importable";
 		return 0;
 	}
 	while (glGetError() != 0) {
 	}
 	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
-	return glGetError() == 0;
+	hakios_gl_error = glGetError();
+	hakios_gl_why = hakios_gl_error != 0 ? "glEGLImageTargetTexture2DOES failed" : NULL;
+	return hakios_gl_error == 0;
 }

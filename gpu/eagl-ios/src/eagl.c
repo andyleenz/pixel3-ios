@@ -285,6 +285,9 @@ struct image {
 	uint32_t plane, seed;
 	GLsizei width, height;
 	bool pool;                      /* one of the display's buffers (the first three of its size): see target_carry() */
+	/* (gldirect=1, pool buffers only) boxes x0, y0, x1, y1 in the framebuffer's pixels; empty when x0 >= x1 */
+	GLint stale[4];                 /* where the texture may differ from the last picture sent out (pool_sent()) */
+	GLint damage[4];                /* what this frame has drawn into it so far (damage_drawn()) */
 };
 
 struct eagl {
@@ -300,6 +303,8 @@ struct eagl {
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint carry_from;              /* the display buffer's texture last sent out (target_carry()) */
 	unsigned pool_attached;         /* display buffers attached so far */
+	unsigned carry_n, carry_whole;  /* carries made, and how many of them were the whole picture (summary()) */
+	uint64_t carry_px;              /* ... and the pixels they copied */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
@@ -351,6 +356,7 @@ struct eagl {
 		unsigned solid_spans, blended_spans;    /* line draws into it with blending off and on (glyphs' spans) */
 		unsigned solid_ends, blended_ends;      /* ... and their lines' ends */
 		unsigned other_spans, other_ends;       /* line draws into other targets */
+		GLint carry[4];         /* the box target_carry() copied this frame (x0, y0, x1, y1) */
 	} line;
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
@@ -399,6 +405,17 @@ static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
  * Boot-arg glblit=0: the surface's memory, as before.
  */
 static int blit_targets = 1;
+/*
+ * Boot-arg gldirect=1: the display's buffers (the pool, target_carry()) are drawn into in place after all, not
+ * through a mirror. Their memory is already a GPU buffer (the mirror is an import of it, and the frame's copy is
+ * a draw into it), and what went wrong drawing in place -- modules missing every other frame -- is what
+ * target_carry() answers: CoreAnimation redraws only its damage, into a buffer that is not the last picture sent.
+ * So each frame copies none of the screen at its end, and at its first draw only what changed since the buffer
+ * last went out: the boxes of the frames drawn into the other buffers since (pool_sent(), damage_drawn()), from
+ * the buffer sent last. Boot-arg gldamage=0 (with gldirect=1): the whole picture is carried, as with mirrors.
+ */
+static int direct_targets;              /* boot-arg gldirect=1 */
+static int damage_carry = 1;            /* boot-arg gldamage=0 */
 /*
  * A frame that is handed to the display must have been drawn. The display's driver waits for
  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
@@ -553,6 +570,11 @@ summary(struct eagl *e)
 	    e->most_triangles, e->frame_us / frames, e->flush_us / frames, e->wait_us / frames, e->readback_us / frames,
 	    e->attach_us / frames, e->shared, e->refused, e->shaders, e->programs, widest_texture, tallest_texture, e->errors,
 	    e->slow_frames, e->slowest_us, e->slowest_handing_us);
+	if (e->carry_n != 0) {
+		/* (target_carry(): with gldirect=1 a carry is the damage since the buffer last went out, else the whole) */
+		say("hakios-gl:   carries: %u, %u of them whole; %llu kpx in all, %llu kpx a frame\n", e->carry_n, e->carry_whole,
+		    e->carry_px / 1000, e->carry_px / 1000 / frames);
+	}
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
 		say("hakios-gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
 		    formats[i].format, formats[i].type, formats[i].count, formats[i].widest, formats[i].tallest);
@@ -601,6 +623,20 @@ pool_leave(struct eagl *e, struct image *image, const char *how)
 		say("hakios-gl: display texture %u (surface %u) %s: %u in the pool\n", image->texture,
 		    IOSurfaceGetID(image->surface), how, e->pool_attached);
 	}
+}
+
+/* Another texture here that stands for the same IOSurface (gldirect=1: my_attachImage(), my_texImageIOSurface()). */
+static struct image *
+surface_elsewhere(struct eagl *e, const struct image *image)
+{
+	uint32_t id = IOSurfaceGetID(image->surface);
+
+	for (unsigned i = 0; i < e->image_count; i++) {
+		if (&e->images[i] != image && IOSurfaceGetID(e->images[i].surface) == id) {
+			return &e->images[i];
+		}
+	}
+	return NULL;
 }
 
 static struct image *
@@ -740,7 +776,7 @@ surface_shared(struct eagl *e, struct image *image)
 	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
 		/* why a surface is copied rather than its memory used: the first ones of a run, for the copies to be made fewer */
 		if (e->refused < 40) {
-			say("hakios-gl: surface %u ('%.4s' %zu x %zu, rows of %zu bytes, %zu planes) copied, not shared: %s%s%s%s%s%s\n",
+			say("hakios-gl: surface %u ('%.4s' %zu x %zu, rows of %zu bytes, %zu planes) copied, not shared: %s%s%s%s%s%s%s (0x%x; %zu bytes allocated, base +0x%lx in its page)\n",
 			    IOSurfaceGetID(surface), (const char *)&(uint32_t){ OSSwapInt32(IOSurfaceGetPixelFormat(surface)) },
 			    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface),
 			    IOSurfaceGetPlaneCount(surface), !share_surfaces ? "sharing off; " : "", image->invert ? "turned over; " : "",
@@ -748,7 +784,8 @@ surface_shared(struct eagl *e, struct image *image)
 			    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ? "not BGRA bytes; " : "",
 			    image->plane != 0 ? "a plane; " : "",
 			    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface) ?
-			    "a part of it; " : "(the library refused)");
+			    "a part of it; " : "(the library refused) ", hakios_gl_why != NULL ? hakios_gl_why : "", hakios_gl_error,
+			    IOSurfaceGetAllocSize(surface), (unsigned long)((uintptr_t)IOSurfaceGetBaseAddress(surface) & 0x3fff));
 		}
 		e->refused++;
 		return false;
@@ -913,6 +950,111 @@ surface_to_texture(struct eagl *e, struct image *image)
 	e->upload_bytes += row * (size_t)image->height;
 }
 
+/* ---- boxes of the display's buffers (gldirect=1): x0, y0, x1, y1, empty when x0 >= x1 ---------------------- */
+
+static void
+box_whole(GLint *box, const struct image *image)
+{
+	box[0] = box[1] = 0;
+	box[2] = image->width;
+	box[3] = image->height;
+}
+
+static bool
+box_empty(const GLint *box)
+{
+	return box[0] >= box[2] || box[1] >= box[3];
+}
+
+static bool
+box_is_whole(const GLint *box, const struct image *image)
+{
+	return box[0] <= 0 && box[1] <= 0 && box[2] >= image->width && box[3] >= image->height;
+}
+
+/* box becomes the smallest box that holds it and x0,y0 - x1,y1 (within the image) */
+static void
+box_add(GLint *box, const struct image *image, GLint x0, GLint y0, GLint x1, GLint y1)
+{
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > image->width ? image->width : x1;
+	y1 = y1 > image->height ? image->height : y1;
+	if (x0 >= x1 || y0 >= y1) {
+		return;
+	}
+	if (box_empty(box)) {
+		box[0] = x0;
+		box[1] = y0;
+		box[2] = x1;
+		box[3] = y1;
+		return;
+	}
+	box[0] = x0 < box[0] ? x0 : box[0];
+	box[1] = y0 < box[1] ? y0 : box[1];
+	box[2] = x1 > box[2] ? x1 : box[2];
+	box[3] = y1 > box[3] ? y1 : box[3];
+}
+
+/*
+ * A draw or clear into a display buffer (drawing()): what it can reach, the scissor box, goes into the frame's
+ * damage; with no scissor, the whole picture. Draws of ours into it (vibrant, plain, group draws) keep
+ * CoreAnimation's scissor; group_flatten() and uploads into it say so themselves (damage_texture()).
+ */
+static void
+damage_drawn(struct image *image)
+{
+	GLint box[4];
+
+	if (box_is_whole(image->damage, image)) {
+		return;
+	}
+	if (!glIsEnabled(GL_SCISSOR_TEST)) {
+		box_whole(image->damage, image);
+		return;
+	}
+	glGetIntegerv(GL_SCISSOR_BOX, box);
+	box_add(image->damage, image, box[0], box[1], box[0] + box[2], box[1] + box[3]);
+}
+
+/* Written other than by a draw (an upload, a copy, a group made flat): the whole picture is damage. */
+static void
+damage_texture(struct eagl *e, GLuint texture)
+{
+	struct image *image;
+
+	if (direct_targets && texture != 0 && (image = image_of(e, texture)) != NULL && image->pool) {
+		box_whole(image->damage, image);
+	}
+}
+
+/*
+ * A display buffer's frame has gone out (target_to_surface()): the next frame starts from it (target_carry()). Every
+ * other buffer now differs from it where it differed from the last one, and where this frame drew, and where this
+ * buffer was not carried into (no picture to carry from).
+ */
+static void
+pool_sent(struct eagl *e, struct image *sent)
+{
+	GLint changed[4];
+
+	e->carry_from = sent->texture;
+	if (!direct_targets) {
+		return;
+	}
+	memcpy(changed, sent->stale, sizeof(changed));
+	box_add(changed, sent, sent->damage[0], sent->damage[1], sent->damage[2], sent->damage[3]);
+	for (unsigned i = 0; i < e->image_count; i++) {
+		struct image *other = &e->images[i];
+
+		if (other != sent && other->pool) {
+			box_add(other->stale, other, changed[0], changed[1], changed[2], changed[3]);
+		}
+	}
+	memset(sent->stale, 0, sizeof(sent->stale));
+	memset(sent->damage, 0, sizeof(sent->damage));
+}
+
 /*
  * A surface drawn into through a texture of the library's own (a mirror: the display's pictures) is copied into
  * whole at the end of each frame, and CoreAnimation draws only what has changed since it last drew into that surface.
@@ -960,6 +1102,9 @@ target_resync(struct eagl *e, struct image *image)
 		glEnable(GL_SCISSOR_TEST);
 	}
 	image->seed = seed;
+	if (image->pool) {
+		box_whole(image->stale, image);         /* (what it holds now is nobody's picture: carried whole) */
+	}
 }
 
 /*
@@ -970,6 +1115,7 @@ target_resync(struct eagl *e, struct image *image)
  * first draw of a frame into a display buffer's texture starts from the last picture sent out, whichever buffer that
  * was: what has changed since then is inside what CoreAnimation redraws in any case, so the result is right whatever
  * the buffer held. One copy of the screen by the GPU a frame. Boot-arg glcarry=0: not.
+ * With gldirect=1 only the part of it that may differ is copied (image->stale, pool_sent()).
  */
 static int target_carry_on = 1;
 static unsigned carries;
@@ -977,7 +1123,7 @@ static void
 target_carry(struct eagl *e, struct image *image)
 {
 	struct image *from;
-	GLint read = 0, draw = 0;
+	GLint read = 0, draw = 0, box[4];
 	GLboolean scissored;
 
 	if (!target_carry_on || !image->pool || e->carry_from == 0 || e->carry_from == image->texture ||
@@ -985,9 +1131,23 @@ target_carry(struct eagl *e, struct image *image)
 	    from->height != image->height) {
 		return;
 	}
+	if (direct_targets && damage_carry) {
+		memcpy(box, image->stale, sizeof(box));
+	} else {
+		box_whole(box, image);
+	}
+	memset(image->stale, 0, sizeof(image->stale));  /* (after this, it is the last picture sent) */
+	if (box_empty(box)) {
+		return;
+	}
+	e->carry_n++;
+	e->carry_whole += box_is_whole(box, image);
+	e->carry_px += (uint64_t)(box[2] - box[0]) * (uint64_t)(box[3] - box[1]);
+	memcpy(e->line.carry, box, sizeof(box));
 	if (carries++ < 6) {
-		say("hakios-gl: frame %u: display texture %u (surface %u) starts from texture %u (surface %u), the last sent out\n",
-		    e->frames + 1, image->texture, IOSurfaceGetID(image->surface), from->texture, IOSurfaceGetID(from->surface));
+		say("hakios-gl: frame %u: display texture %u (surface %u) starts from texture %u (surface %u), the last sent out: "
+		    "%d,%d %dx%d\n", e->frames + 1, image->texture, IOSurfaceGetID(image->surface), from->texture,
+		    IOSurfaceGetID(from->surface), box[0], box[1], box[2] - box[0], box[3] - box[1]);
 	}
 	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
@@ -1003,7 +1163,7 @@ target_carry(struct eagl *e, struct image *image)
 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, from->texture, 0);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
 	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-	glBlitFramebuffer(0, 0, image->width, image->height, 0, 0, image->width, image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBlitFramebuffer(box[0], box[1], box[2], box[3], box[0], box[1], box[2], box[3], GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
 	if (scissored) {
@@ -1045,7 +1205,7 @@ target_to_surface(struct eagl *e, struct image *image)
 		}
 		image->seed = IOSurfaceGetSeed(surface);        /* (what target_resync() compares with) */
 		if (image->pool) {
-			e->carry_from = image->texture;         /* (what target_carry() starts the next one from) */
+			pool_sent(e, image);                    /* (what target_carry() starts the next one from) */
 		}
 		return;
 	}
@@ -1053,6 +1213,9 @@ target_to_surface(struct eagl *e, struct image *image)
 		/* whoever looks at the surface's seed is to see that it has changed */
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
+		}
+		if (image->pool) {
+			pool_sent(e, image);                    /* (gldirect=1: drawn in place) */
 		}
 		return;
 	}
@@ -1476,10 +1639,11 @@ frame_end(struct eagl *e, bool finished)
 		 * rest of the surface as it was --; and the draws of the blur whose radius varies.
 		 */
 		say("hakios-gl: f %u at %llu.%03llu s: %u draws, %u clears; display surface %u, %u draws into it, box %s %d,%d %dx%d; "
-		    "vrd %u vrb %u; %u in place, %u copied; spans %u solid %u blended, ends %u %u; other %u %u\n", e->frames,
+		    "vrd %u vrb %u; %u in place, %u copied; spans %u solid %u blended, ends %u %u; other %u %u; carry %d,%d %dx%d\n", e->frames,
 		    after / 1000000, after / 1000 % 1000, e->draws, e->clears, e->line.surface, e->line.into_display, e->line.boxed ? "on" : "off", e->line.box[0], e->line.box[1],
 		    e->line.box[2], e->line.box[3], e->line.vrd, e->line.vrb, in_place, copied, e->line.solid_spans, e->line.blended_spans,
-		    e->line.solid_ends, e->line.blended_ends, e->line.other_spans, e->line.other_ends);
+		    e->line.solid_ends, e->line.blended_ends, e->line.other_spans, e->line.other_ends, e->line.carry[0], e->line.carry[1],
+		    e->line.carry[2] - e->line.carry[0], e->line.carry[3] - e->line.carry[1]);
 		bzero(&e->line, sizeof(e->line));
 		frame_functions(e);
 	}
@@ -1606,6 +1770,9 @@ drawing(struct eagl *e)
 			target_carry(e, image);
 		}
 		image->drawn = image->painted = true;
+		if (direct_targets && image->pool) {
+			damage_drawn(image);
+		}
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
 			e->line.into_display++;
@@ -3040,6 +3207,7 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 
 	g->state = GROUP_NONE;
 	group_flattened++;
+	damage_texture(e, texture);     /* (drawn whole, unscissored) */
 	flat[3] = alpha;
 	for (int i = 0; i < 3; i++) {
 		flat[i] = clamp01(g->colours[16 + i] * alpha);
@@ -3782,6 +3950,9 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		group_read(e, e->bound[e->unit]);
 		group_forget(e, e->bound[e->unit]);
 	}
+	if (target == GL_TEXTURE_2D && e->unit < 8) {
+		damage_texture(e, e->bound[e->unit]);
+	}
 	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
 	EAGL_LEAVE(e, 0x9a0);
 }
@@ -3804,6 +3975,9 @@ my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint x0, GLin
 			group_read(e, e->bound[e->unit]);
 			group_forget(e, e->bound[e->unit]);
 		}
+	}
+	if (target == GL_TEXTURE_2D && e->unit < 8) {
+		damage_texture(e, e->bound[e->unit]);
 	}
 	glCopyTexSubImage2D(target, level, x0, y0, x, y, width, height);
 	EAGL_LEAVE(e, 0x1c8);
@@ -4373,9 +4547,9 @@ static BOOL
 my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
     GLsizei width, GLsizei height, unsigned long format, unsigned long type, uint32_t plane, BOOL invert)
 {
-	static unsigned shown;
+	static unsigned shown, aliased;
 	struct eagl *e = context_of(self);
-	struct image *image;
+	struct image *image, *other;
 	GLint texture = 0;
 	uint64_t began;
 
@@ -4407,6 +4581,11 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 		    height, plane, invert ? ", inverted" : "");
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
+	if (direct_targets && (other = surface_elsewhere(e, image)) != NULL && other->pool && other->shared && aliased++ < 8) {
+		/* (gldirect=1: a display buffer drawn in place, read through a second import the library does not order with it) */
+		say("hakios-gl: display surface %u, drawn in place as texture %u, is shown as texture %d too\n",
+		    IOSurfaceGetID(surface), other->texture, texture);
+	}
 	began = now_us();
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
@@ -4427,6 +4606,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	GLint texture = 0;
 	uint32_t pixels;
 	uint64_t began;
+	bool direct;
 
 	(void)selector;
 	if (e == NULL || surface == NULL) {
@@ -4468,19 +4648,28 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
 	began = now_us();
-	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
+	/*
+	 * gldirect=1: a display buffer is drawn into in place, its texture its memory (no mirror, nothing copied at the
+	 * frame's end, and no upload of the surface now). Not a surface another texture here stands for already: two
+	 * imports of one memory are two resources to the library, which would not order one's draws before the other's reads.
+	 */
+	direct = direct_targets && image->width >= 1000 && image->height >= 2000 && e->pool_attached < 3 &&
+	    !surface_elsewhere(e, image) && surface_shared(e, image);
+	if (!direct && (surface_mirrored(e, image) || !surface_shared(e, image))) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
 	e->attaching += now_us() - began;
-	if (image->mirror != 0 && image->width >= 1000 && image->height >= 2000) {
+	if ((image->mirror != 0 || direct) && image->width >= 1000 && image->height >= 2000) {
 		if (e->pool_attached < 3) {
 			image->pool = true;             /* the display's buffers come first (surfaces 2, 4 and 22, say) */
 			e->pool_attached++;
+			box_whole(image->stale, image); /* (whatever it holds: carried whole the first time) */
 		}
 		if (pool_said++ < 40) {
-			say("hakios-gl: display-sized texture %u (surface %u) attached: %s, %u in the pool\n", texture,
-			    IOSurfaceGetID(surface), image->pool ? "in the pool" : "NOT in the pool", e->pool_attached);
+			say("hakios-gl: display-sized texture %u (surface %u) attached: %s%s, %u in the pool\n", texture,
+			    IOSurfaceGetID(surface), image->pool ? "in the pool" : "NOT in the pool",
+			    direct ? ", drawn in place" : "", e->pool_attached);
 		}
 	}
 	if (attached++ < 24) {
@@ -4655,6 +4844,12 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+		direct_targets = strstr(arguments, "gldirect=1") != NULL;
+		damage_carry = strstr(arguments, "gldamage=0") == NULL;
+		say("hakios-gl: the display's buffers are drawn %s\n", direct_targets ? (damage_carry ?
+		    "in place, each frame starting from what changed (gldirect=1)" :
+		    "in place, each frame starting from the whole last picture (gldirect=1 gldamage=0)") :
+		    "through mirrors, copied out at each frame's end");
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
