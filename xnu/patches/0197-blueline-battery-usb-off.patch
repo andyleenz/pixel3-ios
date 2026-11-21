@@ -1,0 +1,114 @@
+0197: run from the battery with the cable in (bluebatt_usb_off=N)
+
+For power measurements on a phone that stays on USB: BlueBattery sets
+PMI8998 USBIN_CMD_IL (0x1340) bit 0, USBIN_SUSPEND (smb-reg.h), at start
+and clears it after N seconds (10..7200), so the MAX1720x current is the
+phone's own draw. blueline_keys.c gains blueline_spmi_write_sid() for
+apps-owned PMIC peripherals.
+
+diff -ruN a/bsd/dev/blueline_keys.c b/bsd/dev/blueline_keys.c
+diff -ruN a/bsd/dev/blueline_keys.c b/bsd/dev/blueline_keys.c
+--- a/bsd/dev/blueline_keys.c
++++ b/bsd/dev/blueline_keys.c
+@@ -251,6 +251,38 @@
+ 	return ok ? 0 : EIO;
+ }
+ 
++/*
++ * 0197: write one register of PMIC slave sid through the peripheral's own channel. Only peripherals
++ * the apps EE owns (arb_write checks); the caller decides what is safe to write. 0, EINVAL, ENXIO, EPERM.
++ */
++int blueline_spmi_write_sid(uint8_t sid, uint16_t addr, uint8_t val);
++
++int
++blueline_spmi_write_sid(uint8_t sid, uint16_t addr, uint8_t val)
++{
++	if (sid > 0xfu) {
++		return EINVAL;
++	}
++	if (!arb_setup()) {
++		return ENXIO;
++	}
++	uint16_t ppid = (uint16_t)(((unsigned)sid << 8) | (addr >> 8));
++	lck_mtx_lock(&blueline_arb_lock);
++	uint16_t apid = arb_apid(ppid, arb_count);
++	bool ok = false;
++	static uint16_t map_apid = NO_APID;	/* one channel mapping kept (no ml_io_unmap here) */
++	static vm_offset_t map_ch;
++	if (apid != NO_APID) {
++		if (apid != map_apid) {
++			map_ch = ml_io_map(ARB_CHNLS_PA + 0x10000u * apid, 0x1000);
++			map_apid = map_ch ? apid : NO_APID;
++		}
++		ok = map_ch && arb_write(map_ch, apid, addr, val);
++	}
++	lck_mtx_unlock(&blueline_arb_lock);
++	return apid == NO_APID ? ENXIO : ok ? 0 : EPERM;
++}
++
+ int
+ blueline_spmi_read(uint16_t addr, uint8_t *buf, unsigned len)
+ {
+diff -ruN a/iokit/Kernel/arm/BlueBattery.cpp b/iokit/Kernel/arm/BlueBattery.cpp
+--- a/iokit/Kernel/arm/BlueBattery.cpp	2026-11-21 20:38:42
++++ b/iokit/Kernel/arm/BlueBattery.cpp	2026-11-21 20:38:50
+@@ -55,7 +55,47 @@
+ /* bsd/dev/blueline_keys.c (0129 observer-channel reads; SID argument from 0130) */
+ extern "C" int blueline_spmi_read_sid(uint8_t sid, uint16_t addr, uint8_t *buf, unsigned len);
+ extern "C" int blueline_spmi_apid(uint8_t sid, uint8_t periph, uint16_t *apid, uint8_t *owner);
++extern "C" int blueline_spmi_write_sid(uint8_t sid, uint16_t addr, uint8_t val);	/* 0197 */
+ 
++/*
++ * 0197: bluebatt_usb_off=N (seconds, 10..7200): run from the battery with the cable still in, so
++ * the gauge's current is the phone's own draw. PMI8998 USBIN_CMD_IL (0x1340) bit 0 USBIN_SUSPEND
++ * (smb-reg.h; Linux's charger driver votes the same bit), set at start and cleared after N seconds.
++ * Recovery's charger driver writes the bit again on its own start.
++ */
++#define PMI_USBIN_CMD_IL	0x1340u
++static thread_call_t usbOffCall;
++static void
++usbOffEnd(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint8_t v = 0;
++	int e = blueline_spmi_read_sid(2, PMI_USBIN_CMD_IL, &v, 1);
++	int w = e ? e : blueline_spmi_write_sid(2, PMI_USBIN_CMD_IL, (uint8_t)(v & ~1u));
++	(void)blueline_spmi_read_sid(2, PMI_USBIN_CMD_IL, &v, 1);
++	IOLog("BLUELINE BATTERY: USB input back on (err %d, CMD_IL now %#x)\n", w, v);
++}
++
++static void
++usbOffStart(int secs)
++{
++	uint8_t v = 0;
++	if (blueline_spmi_read_sid(2, PMI_USBIN_CMD_IL, &v, 1)) {
++		IOLog("BLUELINE BATTERY: bluebatt_usb_off: CMD_IL read failed\n");
++		return;
++	}
++	usbOffCall = thread_call_allocate(usbOffEnd, NULL);
++	if (!usbOffCall) {
++		return;
++	}
++	int w = blueline_spmi_write_sid(2, PMI_USBIN_CMD_IL, (uint8_t)(v | 1u));
++	uint8_t now = 0;
++	(void)blueline_spmi_read_sid(2, PMI_USBIN_CMD_IL, &now, 1);
++	IOLog("BLUELINE BATTERY: USB input suspended for %d s: on battery (err %d, CMD_IL %#x -> %#x)\n", secs, w, v, now);
++	uint64_t dl;
++	clock_interval_to_deadline((uint32_t)secs, NSEC_PER_SEC, &dl);
++	thread_call_enter_delayed(usbOffCall, dl);
++}
++
+ /* PMI8998 peripherals, PPID = (SID 2 << 8) | peripheral */
+ #define PMI_REVID		0x201u	/* REVISION4 0x03, TYPE 0x04, SUBTYPE 0x05 */
+ #define PMI_CHGR		0x210u	/* BATTERY_CHARGER_STATUS_1 0x06, _2 0x07 */
+@@ -698,6 +738,11 @@
+ 		IOLog("BLUELINE BATTERY: bluebatt=1: PMI8998 fuel gauge every %u s%s\n", refreshSecs,
+ 		    dry ? ", dry run" : "");
+ 		if (pmicSetup()) {
++			int usbOff = 0;
++			(void)PE_parse_boot_argn("bluebatt_usb_off", &usbOff, sizeof(usbOff));
++			if (usbOff > 0) {
++				usbOffStart(usbOff < 10 ? 10 : usbOff > 7200 ? 7200 : usbOff);
++			}
+ 			refreshCall = thread_call_allocate_with_priority(refreshCallout, this,
+ 			    THREAD_CALL_PRIORITY_LOW);
+ 			live = refreshCall != NULL;
