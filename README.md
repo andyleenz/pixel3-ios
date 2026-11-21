@@ -26,7 +26,7 @@
 - **USB live channel.** With `sweetusb=2` the phone is a USB network adapter: the kernel log streams to the
   Mac live, and `tools/bluesh.py` runs programs and swaps files on the running phone (a userland change takes
   seconds instead of a reboot).
-- The UI is drawn by the Adreno 630 at about 60 fps (`blueui=1`). CoreAnimation runs over Mesa freedreno
+- The UI is drawn by the Adreno 630 at about 60 fps (the default; `blueui=0` falls back to the CPU). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
 - The first-boot migration installs all the stock apps (Weather, Wallet, Contacts, Files, Shortcuts...),
@@ -56,18 +56,19 @@ partition.
 | Boot | Google ABL (unlocked) starts our shim, which loads XNU with an Apple device tree. Test kernels go in with `fastboot boot`; a kernel flashed to `boot_a` starts at power-on, while slot B keeps LineageOS and its recovery |
 | CPU | All 8 cores (4x Kryo 385 Silver at 1.77 GHz, 4x Gold at 2.65 GHz), PSCI |
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
-| Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X 1125 pixels wide at the panel's 2:1 (1125x2250, scaled by 0.96 to fill the panel; 0184), with the X's status bar (why it was a red bar: [docs/ios16-red-status-bar.md](docs/ios16-red-status-bar.md)). With `blueui=1` the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; without it, a CPU copy at 30 Hz. Brightness works |
+| Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X 1125 pixels wide at the panel's 2:1 (1125x2250, scaled by 0.96 to fill the panel; 0184), with the X's status bar (why it was a red bar: [docs/ios16-red-status-bar.md](docs/ios16-red-status-bar.md)). By default the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; with `blueui=0`, a CPU copy at 30 Hz. Brightness works |
 | GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames |
 | iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. the App Library and Control Center blurs, Control Center's glyphs and brightness slider. Photos crashes (no photo library yet), and parts of Control Center blink while it animates |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
 | Wi-Fi | **Works in iOS on 2.4 GHz.** The WCN3990's firmware runs in the modem's WLAN domain (copy engines, HTC/WMI/HTT). Settings lists the networks nearby; joining a WPA2 network with the password typed on the phone associates, does the 4-way handshake in the kernel, gets a DHCP address, and Safari loads pages. `en0` and Apple80211 (ported from ios-topaz/HackiOS) serve Apple's own wifid and configd. 5 GHz scans don't start yet |
+| Audio | **iOS plays through the speaker** (startup sound, ringtone previews). HackiOS's RedwoodAudio HAL plug-in writes to `/dev/redwood-audio`; the kernel feeds the ADSP (ASM → ADM → AFE quaternary TDM) and the two CS35L36 amps, with iOS's volume as a gain. On by default (`bluesnd=0` turns it off). No microphone or headset yet |
 | Other | Haptics, modem boot (no cellular data yet) |
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
 
-**Not working yet:** Metal, 5 GHz Wi-Fi, audio from iOS (a kernel test tone plays, `bluesnd=3`), camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal, 5 GHz Wi-Fi, microphone, camera, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
@@ -85,13 +86,11 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   from Control Center without a stall.
 
 **Next**
-- Make the GPU path (`blueui=1`) the default boot.
 - Photos: find out why it sees no photo library (assetsd never starts).
 - GPU memory: a larger BO pool than 32 MiB, and a 4th scanout buffer.
 - Widgets ("Waiting..."), GPU clock scaling (DCVS).
 
 **Later**
-- Audio from iOS: `/dev/redwood-audio` and HackiOS's HAL plug-in on top of the kernel speaker path (a test tone plays, see LOG).
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).

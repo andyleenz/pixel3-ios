@@ -16,8 +16,11 @@ NOTES.md; the code here is our own):
   containers      /private/var/containers/... exist (normally the data volume)
   migration       recorded as done for this build, datamigrator not loaded
                   (as HackiOS does; lsd builds its database from /Applications)
-  audio/media     VirtualAudio HAL plug-in moved aside; MediaToolbox does not
-                  start the recorder server (both crash without audio/GPU)
+  audio/media     RedwoodAudio.driver (audio/redwood-hal, built with its
+                  build.sh) installed in System/Library/Audio/Plug-Ins/HAL;
+                  VirtualAudio kept (mediaserverd needs it), and put back if
+                  an older run moved it aside; MediaToolbox does not start
+                  the recorder server (no microphone yet)
   SpringBoard     no watchdogs (CPU rendering is slow), launch watchdogs x20,
                   no cloud-config UI, battery percentage shown
   Setup           marked done, mini-buddies off
@@ -166,12 +169,21 @@ def migration_done(root):
 
 
 def audio_media(root):
-    plugin = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
-    if os.path.exists(plugin):
-        aside = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-        os.makedirs(aside, exist_ok=True)
-        shutil.move(plugin, aside)
-        print('VirtualAudio.plugin moved aside')
+    hal = os.path.join(root, 'Library/Audio/Plug-Ins/HAL')
+    aside = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin')
+    if os.path.exists(aside) and not os.path.exists(os.path.join(hal, 'VirtualAudio.plugin')):
+        os.makedirs(hal, exist_ok=True)
+        shutil.move(aside, hal)
+        print('VirtualAudio.plugin put back')
+    driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../audio/redwood-hal/out/RedwoodAudio.driver')
+    if os.path.isdir(driver):
+        dest = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver')
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(driver, dest)
+        print('RedwoodAudio.driver installed')
+    else:
+        print('RedwoodAudio.driver not built (audio/redwood-hal/build.sh): no sound from iOS')
     for conf in glob.glob(os.path.join(
             root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')):
         rewrite(conf, lambda d: d.__setitem__('StartRecorderServer', False), plistlib.FMT_XML)

@@ -1,0 +1,441 @@
+0190: blueline speaker stage 4: /dev/redwood-audio for iOS (bluesnd=4)
+
+bluesnd=4 boots the ADSP and APR as bluesnd=3 does, configures the amps
+(powered down) and makes /dev/redwood-audio, the node HackiOS's
+RedwoodAudio.driver HAL plug-in (audio/redwood-hal) writes iOS's mixed
+output to: whole frames of 48 kHz 16-bit stereo, never blocking. Frames go
+into a 500 ms ring (capped at 200 ms behind, oldest dropped). A kernel
+thread starts the path (QUAT TDM, amps powered, ASM stream) when there is
+something to play, hands the DSP 20 ms regions with up to 6 in flight,
+pads with silence only to keep it from running dry, and stops the path
+after 2 s without a write. Amp error registers are read once a second; on
+an error both amps are powered down.
+
+Volume: ioctl _IOW('r', 1, {below, muted}) (eighths of a dB under the top)
+plus a fixed headroom, bluesnd_below (default 144 = 18 dB), both applied
+to the samples. A 5 s stats line counts frames in, dropped, padded and
+DSP writes.
+
+diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
+--- a/bsd/dev/blueline_audio.c
++++ b/bsd/dev/blueline_audio.c
+@@ -49,6 +49,12 @@
+ #include <libkern/OSAtomic.h>
+ #include "blueline_scm.h"
+ #include "blueline_audio_apr.h"
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/sched_prim.h>
+ 
+ extern void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);	/* blueline_touch.c */
+ extern int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
+@@ -1804,12 +1810,406 @@
+ 	printf("BLUE SOUND: tdm stop -> %d\n", bsnd_apr_tdm_stop());
+ }
+ 
++/*
++ * ---- 0190: /dev/redwood-audio (bluesnd=4) ----
++ *
++ * iOS's output: HackiOS's RedwoodAudio.driver (audio/redwood-hal), loaded by mediaserverd, writes
++ * what the audio server has mixed for "Speaker" here, whole frames of 48 kHz 16-bit stereo, from
++ * its real-time thread; write() never waits and what does not fit is dropped. The samples go into
++ * a ring; this thread starts the speaker path (QUAT TDM, amps powered, ASM stream: as the tone,
++ * 0187) when there is something to play, hands the DSP 20 ms buffers (the 16 regions of the
++ * shared memory, at most SRV_QUEUE in flight), pads with silence when the ring runs short and
++ * stops the path again after SRV_IDLE_MS without a write.
++ *
++ * Volume: ioctl REDWOOD_AUDIO_SET_VOLUME {below (eighths of a dB), muted}, as iOS sets it on the
++ * plug-in's volume control, plus a fixed headroom (bluesnd_below, eighths of a dB, default 144 =
++ * 18 dB): the amps run at up to 10 V boost and nothing here protects the speaker the way the
++ * phone's own tuning does. Both are applied to the samples.
++ */
++#define SRV_FRAMES		960u		/* 20 ms a region */
++#define SRV_REGION		4096u
++#define SRV_REGIONS		16u
++#define SRV_QUEUE		6u		/* 120 ms with the DSP */
++#define SRV_RING_FRAMES		(48000u / 2)	/* 500 ms */
++#define SRV_RING_MAX		(48000u / 5)	/* more than 200 ms behind: the oldest are dropped */
++#define SRV_IDLE_MS		2000u
++struct srv_volume { uint32_t below; uint32_t muted; };	/* sys/redwood_audio.h's struct redwood_audio_volume */
++#define RW_SET_VOLUME		_IOW('r', 1, struct srv_volume)
++
++static LCK_GRP_DECLARE(srv_grp, "blueline_audio_dev");
++static LCK_MTX_DECLARE(srv_lock, &srv_grp);
++static int16_t srv_ring[SRV_RING_FRAMES * 2];
++static uint32_t srv_rd, srv_wr;			/* frames, mod SRV_RING_FRAMES; srv_have frames between */
++static uint32_t srv_have;
++static uint64_t srv_last_write;			/* mach_absolute_time() */
++static volatile uint32_t srv_free;		/* bit n: region n is back from the DSP */
++static uint32_t srv_headroom = 144, srv_below, srv_muted, srv_gain = 0;	/* gain Q15 */
++static uint64_t srv_in, srv_dropped, srv_padded, srv_writes, srv_bad;
++static uint32_t srv_calls, srv_min_call = ~0u, srv_max_call, srv_max_gap_us, srv_late, srv_pause_ms;	/* late: gaps over 30 ms; pause: the longest over 1 s */	/* write() calls since the last stats line */
++static uint64_t srv_prev_call;
++static uint64_t srv_t0, srv_sent;		/* the path's start (mach time) and the frames handed to the DSP since */
++static uint32_t srv_peak, srv_loud;		/* since the path started: largest |sample| written; frames over 1/64 of full scale */
++static int srv_event;
++
++static uint32_t
++srv_gain_of(uint32_t eighths)
++{
++	uint64_t g = 32768;
++	for (uint32_t i = 0; i < eighths / 8 && g; i++) {
++		g = g * 29205 / 32768;			/* -1 dB */
++	}
++	for (uint32_t i = 0; i < eighths % 8; i++) {
++		g = g * 32301 / 32768;			/* -1/8 dB */
++	}
++	return (uint32_t)g;
++}
++
+ static void
++srv_done(uint32_t off, uint32_t len __unused, uint32_t status)
++{
++	if (status && srv_bad++ < 4) {
++		printf("BLUE SOUND: dev: write at %#x came back with status %u\n", off, status);
++	}
++	OSBitOrAtomic(1u << (off / SRV_REGION), &srv_free);
++}
++
++static int
++srv_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	printf("BLUE SOUND: dev: opened by %s\n", name);
++	return 0;
++}
++
++static int
++srv_close(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	return 0;
++}
++
++static int
++srv_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
++{
++	int16_t buf[512 * 2];
++	bool woke = false;
++	uint64_t t = mach_absolute_time();
++	uint32_t call = (uint32_t)(uio_resid(uio) / 4);
++
++	lck_mtx_lock(&srv_lock);
++	if (srv_prev_call != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(t - srv_prev_call, &ns);
++		if (ns < 1000000000ull) {
++			srv_max_gap_us = MAX(srv_max_gap_us, (uint32_t)(ns / 1000));
++		} else {
++			srv_pause_ms = MAX(srv_pause_ms, (uint32_t)MIN(ns / 1000000, 999999ull));
++		}
++		srv_late += ns > 30000000ull;
++	}
++	srv_prev_call = t;
++	srv_calls++;
++	srv_min_call = MIN(srv_min_call, call);
++	srv_max_call = MAX(srv_max_call, call);
++	lck_mtx_unlock(&srv_lock);
++
++	while (uio_resid(uio) >= 4) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf)) & ~(user_ssize_t)3;
++		int err = uiomove((char *)buf, (int)n, uio);
++		if (err) {
++			return err;
++		}
++		uint32_t frames = (uint32_t)n / 4;
++		lck_mtx_lock(&srv_lock);
++		srv_in += frames;
++		if (srv_have + frames > SRV_RING_MAX) {	/* behind: drop the oldest */
++			uint32_t drop = MIN(srv_have, srv_have + frames - SRV_RING_MAX);
++			srv_rd = (srv_rd + drop) % SRV_RING_FRAMES;
++			srv_have -= drop;
++			srv_dropped += drop;
++		}
++		for (uint32_t f = 0; f < frames; f++) {
++			int32_t l = buf[2 * f] < 0 ? -(int32_t)buf[2 * f] : buf[2 * f];
++			int32_t r = buf[2 * f + 1] < 0 ? -(int32_t)buf[2 * f + 1] : buf[2 * f + 1];
++			uint32_t m = (uint32_t)MAX(l, r);
++			srv_peak = MAX(srv_peak, m);
++			srv_loud += m > 512;
++			srv_ring[2 * srv_wr] = buf[2 * f];
++			srv_ring[2 * srv_wr + 1] = buf[2 * f + 1];
++			srv_wr = (srv_wr + 1) % SRV_RING_FRAMES;
++		}
++		srv_have += frames;
++		srv_last_write = mach_absolute_time();
++		lck_mtx_unlock(&srv_lock);
++		woke = true;
++	}
++	uio_setresid(uio, 0);
++	if (woke) {
++		thread_wakeup(&srv_event);
++	}
++	return 0;
++}
++
++static int
++srv_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int fflag __unused, struct proc *p __unused)
++{
++	if (cmd != RW_SET_VOLUME) {
++		return ENOTTY;
++	}
++	const struct srv_volume *vol = (const struct srv_volume *)(void *)data;
++	lck_mtx_lock(&srv_lock);
++	srv_below = MIN(vol->below, 8u * 96u);
++	srv_muted = vol->muted != 0;
++	srv_gain = srv_muted ? 0 : srv_gain_of(srv_headroom + srv_below);
++	lck_mtx_unlock(&srv_lock);
++	printf("BLUE SOUND: dev: volume %u.%u dB under the top%s (gain %u/32768 with %u dB headroom)\n",
++	    srv_below / 8, (srv_below % 8) * 125 / 10, srv_muted ? ", muted" : "", srv_gain, srv_headroom / 8);
++	return 0;
++}
++
++static const struct cdevsw srv_cdevsw = {
++	.d_open = srv_open, .d_close = srv_close,
++	.d_read = eno_rdwrt, .d_write = srv_write, .d_ioctl = srv_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++/* The latched faults amp_dump() returns, without its register listing: read once a second while playing. */
++static uint32_t
++srv_amp_faults(const struct amp *a)
++{
++	uint32_t st1 = 0, st3 = 0;
++	amp_rd(a, R_INT1_STATUS, &st1);
++	amp_rd(a, R_INT1_STATUS + 8u, &st3);
++	return (st1 & (INT1_BST_OVP | INT1_BST_DCM_UVP | INT1_BST_SHORT | INT1_TEMP_WARN | INT1_TEMP_ERR)) |
++	       ((st3 & INT3_AMP_SHORT) ? 1u : 0);
++}
++
++/* One region from the ring (silence where it runs short), at the gain. */
++static void
++srv_fill(uint32_t region)
++{
++	volatile int16_t *d = (volatile int16_t *)(bsnd_shm_va + region * SRV_REGION);
++	lck_mtx_lock(&srv_lock);
++	uint32_t take = MIN(srv_have, SRV_FRAMES), g = srv_gain;
++	for (uint32_t f = 0; f < take; f++) {
++		d[2 * f] = (int16_t)(((int32_t)srv_ring[2 * srv_rd] * (int32_t)g) >> 15);
++		d[2 * f + 1] = (int16_t)(((int32_t)srv_ring[2 * srv_rd + 1] * (int32_t)g) >> 15);
++		srv_rd = (srv_rd + 1) % SRV_RING_FRAMES;
++	}
++	srv_have -= take;
++	srv_padded += SRV_FRAMES - take;
++	lck_mtx_unlock(&srv_lock);
++	for (uint32_t f = take; f < SRV_FRAMES; f++) {
++		d[2 * f] = 0;
++		d[2 * f + 1] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++srv_path(bool on, bool amps_ok)
++{
++	int r;
++	if (!on) {
++		uint32_t errs = 0;
++		for (int i = 0; amps_ok && i < 2; i++) {
++			errs |= srv_amp_faults(&amps[i]);
++		}
++		r = bsnd_apr_stream_close();
++		for (int i = 0; amps_ok && i < 2; i++) {
++			(void)amp_power(&amps[i], 0);
++		}
++		printf("BLUE SOUND: dev: stopped (stream close %d, tdm stop %d, amp errors %#x)\n", r, bsnd_apr_tdm_stop(), errs);
++		return false;
++	}
++	r = bsnd_apr_tdm_start();
++	if (r) {
++		printf("BLUE SOUND: dev: tdm start -> %d\n", r);
++		return false;
++	}
++	for (int i = 0; amps_ok && i < 2; i++) {
++		int e = amp_power(&amps[i], 1);
++		if (e) {
++			printf("BLUE SOUND: dev: %s amp power -> %d\n", amps[i].name, e);
++		}
++	}
++	bsnd_apr_set_write_done(srv_done);
++	r = bsnd_apr_stream_open();
++	if (r) {
++		printf("BLUE SOUND: dev: stream open -> %d\n", r);
++		for (int i = 0; amps_ok && i < 2; i++) {
++			(void)amp_power(&amps[i], 0);
++		}
++		(void)bsnd_apr_tdm_stop();
++		return false;
++	}
++	srv_free = (1u << SRV_REGIONS) - 1;
++	srv_t0 = mach_absolute_time();
++	srv_sent = 0;
++	printf("BLUE SOUND: dev: playing\n");
++	return true;
++}
++
++static void
++snd_serve(void)
++{
++	PE_parse_boot_argn("bluesnd_below", &srv_headroom, sizeof(srv_headroom));
++	srv_headroom = MIN(srv_headroom, 8u * 60u);
++	srv_gain = srv_gain_of(srv_headroom);
++
++	if (!lg_up()) {
++		return;
++	}
++	int r = bsnd_apr_core_ready(5000);
++	if (r) {
++		printf("BLUE SOUND: dev: apr core not ready (%d)\n", r);
++		return;
++	}
++	if (!blueline_smmu_identity(SND_SID, 0, "audio")) {
++		printf("BLUE SOUND: dev: no SMMU bank for stream %#x\n", SND_SID);
++		return;
++	}
++	bsnd_shm_va = (uint8_t *)ml_io_map_unmappable((vm_offset_t)SND_SHM_PA, SND_SHM_SIZE, VM_WIMG_WCOMB);
++	bsnd_shm_size = SND_SHM_SIZE;
++	bsnd_shm_pa = SND_SHM_PA | (uint64_t)(SND_SID & 0xfu) << 32;
++	if (!bsnd_shm_va) {
++		return;
++	}
++	snd_bus = blueline_bbi2c_open(TLMM_NORTH_PA, AMP_SDA, AMP_SCL);
++	bool amps_ok = snd_bus != NULL;
++	for (int i = 0; i < 2 && amps_ok; i++) {
++		amps_ok = amp_reset(&amps[i]) && amp_boot(&amps[i]) == 0 && amp_config(&amps[i], i == 0 ? 1u : 0u) == 0;
++	}
++	tdm_pins();
++
++	int major = cdevsw_add(-1, &srv_cdevsw);
++	if (major >= 0) {
++		devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
++	}
++	printf("BLUE SOUND: dev: /dev/redwood-audio %s, amps %s, headroom %u dB\n", major >= 0 ? "made" : "NOT made",
++	    amps_ok ? "configured" : "NOT configured", srv_headroom / 8);
++	if (major < 0) {
++		return;
++	}
++
++	bool playing = false;
++	uint64_t next_stat = 0, next_check = 0;
++	for (;;) {
++		if (!playing) {
++			lck_mtx_lock(&srv_lock);
++			bool have = srv_have >= SRV_FRAMES;
++			lck_mtx_unlock(&srv_lock);
++			if (!have) {
++				assert_wait_timeout((event_t)&srv_event, THREAD_UNINT, 500, 1000 * NSEC_PER_USEC);
++				thread_block(THREAD_CONTINUE_NULL);
++				continue;
++			}
++			playing = srv_path(true, amps_ok);
++			if (!playing) {
++				IOSleep(1000);		/* (and what was written meanwhile is dropped by the ring's cap) */
++				continue;
++			}
++			next_stat = mach_absolute_time() + ms_abs(5000);
++			next_check = mach_absolute_time() + ms_abs(1000);
++		}
++		/*
++		 * Paced by time, not by WRITE_DONE: the DSP gives a buffer back once it has taken it in, before
++		 * it has played (0190, au8: padding by in-flight count filled 5% of a ringtone with silence).
++		 * ahead = frames handed over - frames the TDM port has played since the start (48 a ms). Real
++		 * frames go while ahead < SRV_QUEUE regions; silence only when the ring is short and ahead has
++		 * fallen under two regions (40 ms).
++		 */
++		for (uint32_t n = 0; n < SRV_REGIONS; n++) {
++			if (!(srv_free & (1u << n))) {
++				continue;
++			}
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - srv_t0, &ns);
++			int64_t ahead = (int64_t)srv_sent - (int64_t)(ns * 48 / 1000000);
++			if (ahead >= (int64_t)(SRV_QUEUE * SRV_FRAMES)) {
++				break;
++			}
++			lck_mtx_lock(&srv_lock);
++			bool enough = srv_have >= SRV_FRAMES;
++			lck_mtx_unlock(&srv_lock);
++			if (!enough && ahead >= (int64_t)(2 * SRV_FRAMES)) {
++				break;
++			}
++			if (ahead < -(int64_t)(4 * SRV_FRAMES)) {
++				srv_sent += (uint64_t)(-ahead);	/* (it ran dry: start counting again from now) */
++			}
++			OSBitAndAtomic(~(1u << n), &srv_free);
++			srv_fill(n);
++			if (bsnd_apr_write(n * SRV_REGION, SRV_FRAMES * 4u) == 0) {
++				srv_writes++;
++				srv_sent += SRV_FRAMES;
++			} else {
++				OSBitOrAtomic(1u << n, &srv_free);
++				break;
++			}
++		}
++		uint64_t now = mach_absolute_time();
++		if (now >= next_check && amps_ok) {
++			next_check = now + ms_abs(1000);
++			for (int i = 0; i < 2; i++) {
++				uint32_t errs = srv_amp_faults(&amps[i]);
++				if (errs) {
++					(void)amp_dump(&amps[i]);
++					printf("BLUE SOUND: dev: %s amp errors %#x: stopping\n", amps[i].name, errs);
++					amps_ok = false;
++				}
++			}
++			if (!amps_ok) {
++				for (int i = 0; i < 2; i++) {
++					(void)amp_power(&amps[i], 0);
++				}
++			}
++		}
++		if (now >= next_stat) {
++			next_stat = now + ms_abs(5000);
++			printf("BLUE SOUND: dev 5s: %llu frames in, %llu dropped, %llu padded, %llu writes, %u in flight; peak %u, %u frames audible; "
++			    "%u write() calls of %u-%u frames, longest gap %u us, %u over 30 ms, longest pause %u ms\n",
++			    srv_in, srv_dropped, srv_padded, srv_writes, bsnd_apr_writes_in_flight(), srv_peak, srv_loud,
++			    srv_calls, srv_calls ? srv_min_call : 0, srv_max_call, srv_max_gap_us, srv_late, srv_pause_ms);
++			lck_mtx_lock(&srv_lock);
++			srv_calls = 0;
++			srv_min_call = ~0u;
++			srv_max_call = 0;
++			srv_max_gap_us = 0;
++			srv_late = 0;
++			srv_pause_ms = 0;
++			lck_mtx_unlock(&srv_lock);
++		}
++		lck_mtx_lock(&srv_lock);
++		bool idle = srv_have == 0 && now - srv_last_write >= ms_abs(SRV_IDLE_MS);
++		lck_mtx_unlock(&srv_lock);
++		if (idle) {
++			for (int w = 0; w < 50 && bsnd_apr_writes_in_flight() > 0; w++) {
++				IOSleep(10);
++			}
++			playing = srv_path(false, amps_ok);
++			printf("BLUE SOUND: dev: so far %llu frames in, %llu dropped, %llu padded, %llu writes; this time peak %u (of 32767), %u frames audible\n",
++			    srv_in, srv_dropped, srv_padded, srv_writes, srv_peak, srv_loud);
++			srv_peak = 0;
++			srv_loud = 0;
++			continue;
++		}
++		IOSleep(5);
++	}
++}
++
++static void
+ snd_thread(void *arg __unused, wait_result_t w __unused)
+ {
+ 	if (snd_mode >= 2) {
+ 		bool up = adsp_boot();
+ 		printf("BLUE SOUND: adsp %s\n", up ? "up" : "NOT up");
++		if (up && snd_mode >= 4) {
++			snd_serve();
++			return;
++		}
+ 		if (up && snd_mode >= 3) {
+ 			snd_tone();
+ 			lg.stop = true;	/* nothing answers the ADSP after the test; stop polling SMEM */

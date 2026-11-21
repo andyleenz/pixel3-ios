@@ -1,0 +1,63 @@
+0191: AOP QMP without Wi-Fi, so the ADSP boots without bluewifi
+
+blueline_qmp_send() (blueline_wifi.c, used by the ADSP boot in 0186)
+returned EAGAIN until the Wi-Fi driver had linked QMP at its step 2, so
+with no bluewifi the audio path waited 1200 tries and never booted the
+ADSP (au2). Now the first caller maps the APCS IPC and AOP QMP blocks and
+links QMP itself, once, under a flag; Wi-Fi's own step 2 linking again
+later finds the link already up. If linking fails it says so and further
+calls return EIO at once.
+
+diff -ruN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c
++++ b/bsd/dev/blueline_wifi.c
+@@ -5493,14 +5493,46 @@
+ 	return ok;
+ }
+ 
+-/* For blueline_audio.c (0186): an AOP message once this driver has linked QMP (step 2). 0, EAGAIN or EIO. */
++/*
++ * For blueline_audio.c (0186): an AOP message. 0, EAGAIN or EIO.
++ * 0191: when this driver has not linked QMP itself (no bluewifi, or not yet at step 2) the first caller maps
++ * the APCS IPC and QMP blocks and links it, once; step 2 linking again later finds the link already up.
++ */
+ int blueline_qmp_send(const char *msg);
+ 
++static volatile SInt32 qmp_link_flag;
++static volatile bool qmp_link_failed;
++
++static bool
++qmp_standalone(void)
++{
++	while (!OSCompareAndSwap(0, 1, &qmp_link_flag)) {
++		delay(1000);
++	}
++	if (!qmp_up && !qmp_link_failed) {
++		if (!w2.apcs) {
++			w2.apcs = map_block("APCS IPC", APCS_PA, 0x1000);
++		}
++		if (!w2.qmp) {
++			w2.qmp = map_block("AOP QMP", QMP_PA, 0x400);
++		}
++		if (w2.apcs && w2.qmp && qmp_open() && qmp_link()) {
++			qmp_up = true;
++			printf("BLUELINE WIFI: qmp linked for another driver (0191)\n");
++		} else {
++			qmp_link_failed = true;
++			printf("BLUELINE WIFI: qmp could not be linked for another driver (0191)\n");
++		}
++	}
++	OSCompareAndSwap(1, 0, &qmp_link_flag);
++	return qmp_up;
++}
++
+ int
+ blueline_qmp_send(const char *msg)
+ {
+-	if (!qmp_up) {
+-		return EAGAIN;
++	if (!qmp_up && !qmp_standalone()) {
++		return EIO;
+ 	}
+ 	return qmp_send(msg) ? 0 : EIO;
+ }
