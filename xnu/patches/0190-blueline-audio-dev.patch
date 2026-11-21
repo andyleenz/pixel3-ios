@@ -32,7 +32,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
  
  extern void *blueline_bbi2c_open(uint32_t tlmm_pa, int sda, int scl);	/* blueline_touch.c */
  extern int blueline_bbi2c_xfer(void *bus, uint8_t addr, const uint8_t *w, uint32_t wlen, uint8_t *r,
-@@ -1804,12 +1810,348 @@
+@@ -1804,12 +1810,406 @@
  	printf("BLUE SOUND: tdm stop -> %d\n", bsnd_apr_tdm_stop());
  }
  
@@ -71,6 +71,10 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +static volatile uint32_t srv_free;		/* bit n: region n is back from the DSP */
 +static uint32_t srv_headroom = 144, srv_below, srv_muted, srv_gain = 0;	/* gain Q15 */
 +static uint64_t srv_in, srv_dropped, srv_padded, srv_writes, srv_bad;
++static uint32_t srv_calls, srv_min_call = ~0u, srv_max_call, srv_max_gap_us, srv_late, srv_pause_ms;	/* late: gaps over 30 ms; pause: the longest over 1 s */	/* write() calls since the last stats line */
++static uint64_t srv_prev_call;
++static uint64_t srv_t0, srv_sent;		/* the path's start (mach time) and the frames handed to the DSP since */
++static uint32_t srv_peak, srv_loud;		/* since the path started: largest |sample| written; frames over 1/64 of full scale */
 +static int srv_event;
 +
 +static uint32_t
@@ -115,6 +119,25 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +{
 +	int16_t buf[512 * 2];
 +	bool woke = false;
++	uint64_t t = mach_absolute_time();
++	uint32_t call = (uint32_t)(uio_resid(uio) / 4);
++
++	lck_mtx_lock(&srv_lock);
++	if (srv_prev_call != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(t - srv_prev_call, &ns);
++		if (ns < 1000000000ull) {
++			srv_max_gap_us = MAX(srv_max_gap_us, (uint32_t)(ns / 1000));
++		} else {
++			srv_pause_ms = MAX(srv_pause_ms, (uint32_t)MIN(ns / 1000000, 999999ull));
++		}
++		srv_late += ns > 30000000ull;
++	}
++	srv_prev_call = t;
++	srv_calls++;
++	srv_min_call = MIN(srv_min_call, call);
++	srv_max_call = MAX(srv_max_call, call);
++	lck_mtx_unlock(&srv_lock);
 +
 +	while (uio_resid(uio) >= 4) {
 +		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf)) & ~(user_ssize_t)3;
@@ -132,6 +155,11 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +			srv_dropped += drop;
 +		}
 +		for (uint32_t f = 0; f < frames; f++) {
++			int32_t l = buf[2 * f] < 0 ? -(int32_t)buf[2 * f] : buf[2 * f];
++			int32_t r = buf[2 * f + 1] < 0 ? -(int32_t)buf[2 * f + 1] : buf[2 * f + 1];
++			uint32_t m = (uint32_t)MAX(l, r);
++			srv_peak = MAX(srv_peak, m);
++			srv_loud += m > 512;
 +			srv_ring[2 * srv_wr] = buf[2 * f];
 +			srv_ring[2 * srv_wr + 1] = buf[2 * f + 1];
 +			srv_wr = (srv_wr + 1) % SRV_RING_FRAMES;
@@ -244,6 +272,8 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +		return false;
 +	}
 +	srv_free = (1u << SRV_REGIONS) - 1;
++	srv_t0 = mach_absolute_time();
++	srv_sent = 0;
 +	printf("BLUE SOUND: dev: playing\n");
 +	return true;
 +}
@@ -310,21 +340,37 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +			next_stat = mach_absolute_time() + ms_abs(5000);
 +			next_check = mach_absolute_time() + ms_abs(1000);
 +		}
-+		/* hand the DSP what is free, up to SRV_QUEUE in flight; pad only to keep it from running dry */
++		/*
++		 * Paced by time, not by WRITE_DONE: the DSP gives a buffer back once it has taken it in, before
++		 * it has played (0190, au8: padding by in-flight count filled 5% of a ringtone with silence).
++		 * ahead = frames handed over - frames the TDM port has played since the start (48 a ms). Real
++		 * frames go while ahead < SRV_QUEUE regions; silence only when the ring is short and ahead has
++		 * fallen under two regions (40 ms).
++		 */
 +		for (uint32_t n = 0; n < SRV_REGIONS; n++) {
-+			if (!(srv_free & (1u << n)) || bsnd_apr_writes_in_flight() >= SRV_QUEUE) {
++			if (!(srv_free & (1u << n))) {
 +				continue;
++			}
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - srv_t0, &ns);
++			int64_t ahead = (int64_t)srv_sent - (int64_t)(ns * 48 / 1000000);
++			if (ahead >= (int64_t)(SRV_QUEUE * SRV_FRAMES)) {
++				break;
 +			}
 +			lck_mtx_lock(&srv_lock);
 +			bool enough = srv_have >= SRV_FRAMES;
 +			lck_mtx_unlock(&srv_lock);
-+			if (!enough && bsnd_apr_writes_in_flight() >= 2) {
++			if (!enough && ahead >= (int64_t)(2 * SRV_FRAMES)) {
 +				break;
++			}
++			if (ahead < -(int64_t)(4 * SRV_FRAMES)) {
++				srv_sent += (uint64_t)(-ahead);	/* (it ran dry: start counting again from now) */
 +			}
 +			OSBitAndAtomic(~(1u << n), &srv_free);
 +			srv_fill(n);
 +			if (bsnd_apr_write(n * SRV_REGION, SRV_FRAMES * 4u) == 0) {
 +				srv_writes++;
++				srv_sent += SRV_FRAMES;
 +			} else {
 +				OSBitOrAtomic(1u << n, &srv_free);
 +				break;
@@ -349,8 +395,18 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +		}
 +		if (now >= next_stat) {
 +			next_stat = now + ms_abs(5000);
-+			printf("BLUE SOUND: dev 5s: %llu frames in, %llu dropped, %llu padded, %llu writes, %u in flight\n",
-+			    srv_in, srv_dropped, srv_padded, srv_writes, bsnd_apr_writes_in_flight());
++			printf("BLUE SOUND: dev 5s: %llu frames in, %llu dropped, %llu padded, %llu writes, %u in flight; peak %u, %u frames audible; "
++			    "%u write() calls of %u-%u frames, longest gap %u us, %u over 30 ms, longest pause %u ms\n",
++			    srv_in, srv_dropped, srv_padded, srv_writes, bsnd_apr_writes_in_flight(), srv_peak, srv_loud,
++			    srv_calls, srv_calls ? srv_min_call : 0, srv_max_call, srv_max_gap_us, srv_late, srv_pause_ms);
++			lck_mtx_lock(&srv_lock);
++			srv_calls = 0;
++			srv_min_call = ~0u;
++			srv_max_call = 0;
++			srv_max_gap_us = 0;
++			srv_late = 0;
++			srv_pause_ms = 0;
++			lck_mtx_unlock(&srv_lock);
 +		}
 +		lck_mtx_lock(&srv_lock);
 +		bool idle = srv_have == 0 && now - srv_last_write >= ms_abs(SRV_IDLE_MS);
@@ -360,8 +416,10 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +				IOSleep(10);
 +			}
 +			playing = srv_path(false, amps_ok);
-+			printf("BLUE SOUND: dev: so far %llu frames in, %llu dropped, %llu padded, %llu writes\n",
-+			    srv_in, srv_dropped, srv_padded, srv_writes);
++			printf("BLUE SOUND: dev: so far %llu frames in, %llu dropped, %llu padded, %llu writes; this time peak %u (of 32767), %u frames audible\n",
++			    srv_in, srv_dropped, srv_padded, srv_writes, srv_peak, srv_loud);
++			srv_peak = 0;
++			srv_loud = 0;
 +			continue;
 +		}
 +		IOSleep(5);
