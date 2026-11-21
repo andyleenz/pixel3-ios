@@ -91,7 +91,6 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 
 **Later**
 - Audio from iOS: `/dev/redwood-audio` and HackiOS's HAL plug-in on top of the kernel speaker path (a test tone plays, see LOG).
-- Panel sleep on lock (`bluefb_dcs=2`) by default.
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
 - Metal: a much larger project (no Apple GPU driver to stand on).

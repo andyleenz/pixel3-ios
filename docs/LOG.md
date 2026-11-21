@@ -902,3 +902,15 @@ The speaker path is QUAT TDM RX (48 kHz, 8 slots of 32 bits, 12.288 MHz bit cloc
 | Front IMX355 (wide) | 0x1a | 0x0355 |
 
 Before MCLK runs the sensors NACK. The MCLK branches (CBCR) only start with the TITAN_TOP GDSC on, as in the stock order. No CSI PHY, CCI block or capture pipeline yet.
+
+### GL call timing, safety fixes, panel sleep by default (2026-11-21)
+
+**Per-call timing (`glslow=4000`, slow1).** Every GL call over 4 ms, with its frame. During scripted Safari scrolls and home-page swipes (62 s): `glFlush` median 8.4 ms, max 41 ms (it includes eagl's copy out of the frame, ~6.5 ms); `glBindTexture` 5.5 ms (eagl hashing a large picture to see if it changed, `surface_changed`); `glTexImage2D` 8.1 ms, max 34 ms (133 ms once). One draw call over 4 ms in the whole window. The hitches are the flush/copy-out path and texture uploads, not shader work, so the copy-free path (`gldirect`) is worth more than estimated.
+
+**The idle lock screen keeps drawing.** For 20 minutes untouched (slow1): 10 frames a second, each the same 126 calls / 23 draws, one full copy out (~7-10 ms CPU); the display log shows 50 flips per 5 s and auto-lock never turned the panel off. In fix2 the lock screen was still (0 flips) until a power-key off/on; after waking, flips rose from 50 to 300 per 5 s (60 fps) with nothing touched. Open: what animates, and why auto-lock does not fire.
+
+**Fixes from a review of 0187/0188 (fix1, fix2).** 0187: `bluesnd_secs` limited to 1-30 s (was unbounded with 10 V boost on); no tone without the SMMU bank; the GLINK poll thread stops after the test; the CS35L36 test key is relocked on every failed write. 0188: a TITAN_TOP power-on that times out is collapsed again; an MCLK RCG switch that never completes gets the old CFG back; power-down is the reverse of power-up (XCLR low, MCLK off, DOVDD, AVDD). fix1: all three sensors read as before and power down cleanly. fix2: tone 159 writes (3.18 s), amps report no errors. The ADSP boot needs the Wi-Fi driver's QMP link (`bluewifi=`); without it `bluesnd=` waits up to 120 s.
+
+**Panel sleep on lock is the default** (0123: `bluefb_dcs=2` unless set; `bluefb_dcs=0` turns it off). fix2, no `bluefb_dcs` given: power key -> "panel display off, sleep in"; power key -> "panel sleep out, display on".
+
+`tools/patch-recount.py` recounts hunk headers after a patch is edited by hand.
