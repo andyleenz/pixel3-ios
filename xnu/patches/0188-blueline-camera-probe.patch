@@ -22,7 +22,7 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
 diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
 --- a/bsd/dev/blueline_camera_probe.c	1970-01-01 10:00:00
 +++ b/bsd/dev/blueline_camera_probe.c	2026-11-21 09:03:15
-@@ -0,0 +1,738 @@
+@@ -0,0 +1,747 @@
 +/*
 + * Pixel 3 (blueline) cameras, read-only chip-ID probe: power one camera
 + * group up in the stock order, read the Sony model ID over the camera
@@ -484,6 +484,11 @@ diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
 +	wr32(g, v & ~GDSC_SW_COLLAPSE);
 +	bool up = poll32(g + GDSC_CFG, GDSC_UP_DONE, GDSC_UP_DONE, 2000) && poll32(g, GDSC_PWR_ON, GDSC_PWR_ON, 100);
 +	printf("BLUE CAM: TITAN_TOP on: %s (GDSCR 0x%x CFG 0x%x)\n", up ? "ok" : "TIMED OUT", rd32(g), rd32(g + GDSC_CFG));
++	if (!up) {
++		wr32(g, v);	/* collapse it again rather than leave it half on */
++		(void)poll32(g + GDSC_CFG, GDSC_DOWN_DONE, GDSC_DOWN_DONE, 2000);
++		printf("BLUE CAM: TITAN_TOP collapsed again (GDSCR 0x%x)\n", rd32(g));
++	}
 +	return up ? 1 : -1;
 +}
 +
@@ -522,7 +527,10 @@ diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
 +		wr32(r, rd32(r) | RCG_CMD_UPDATE);
 +		s->rcg_written = true;
 +		if (!poll32(r, RCG_CMD_UPDATE, 0, 500)) {
-+			printf("BLUE CAM: %s RCG did not take XO (cmd 0x%x): old source off?\n", name, rd32(r));
++			/* The switch stays pending until the old source runs: make what it latches the old setting. */
++			wr32(r + RCG_CFG, s->cfg);
++			s->rcg_written = false;
++			printf("BLUE CAM: %s RCG did not take XO (cmd 0x%x): old source off? old cfg put back\n", name, rd32(r));
 +			return false;
 +		}
 +		printf("BLUE CAM: %s RCG now XO/1 (cfg 0x%x)\n", name, rd32(r + RCG_CFG));
@@ -686,17 +694,18 @@ diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
 +	}
 +
 +clock_down:
-+	mclk_off(c, &ms);
-+	IOSleep(1);
++	/* Reverse of power-up: XCLR low before INCK stops, then DOVDD, then AVDD. */
 +	for (int i = 0; i < c->npwr; i++) {
 +		pin_out(&c->rst[i], 0);
 +	}
 +	IOSleep(1);
++	mclk_off(c, &ms);
++	IOSleep(1);
 +rails_down:
++	(void)vio_set(0);
 +	for (int i = 0; i < c->npwr; i++) {
 +		pin_out(&c->vana[i], 0);
 +	}
-+	(void)vio_set(0);
 +	for (int i = 0; i < np; i++) {
 +		pin_restore(pins[i]);
 +	}

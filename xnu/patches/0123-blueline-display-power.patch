@@ -14,8 +14,8 @@ dims the panel memory, blacks it on the next vsync, stops copying frames;
 on wake the latest frame is copied again. The Pixel 3 panel (LG SW43408)
 is an AMOLED, so black is pixels off. bluefb_power=0 ignores the call.
 
-Experimental, off unless asked for: bluefb_dcs=1 logs the DSI0 and
-PINGPONG_0..3 registers ABL left (read-only); bluefb_dcs=2 also puts the
+bluefb_dcs=2 (the default since 2026-11-21; 0 turns it off, 1 only logs
+the DSI0 and PINGPONG_0..3 registers ABL left, read-only) also puts the
 panel into display off + sleep in once black (DCS 0x28, 0x10, as Linux
 panel-lg-sw43408 unprepare) and back with 0x11, 135 ms, 0x29 (its
 prepare), from the DSI0 command FIFO (downstream
@@ -149,7 +149,7 @@ the DCS path off for the rest of the boot.
 + * and the frame in flight drained, as upstream
 + * dpu_hw_pp_disable_autorefresh(); it is restored after wake.
 + *   bluefb_dcs=1  only log the DSI0 / pingpong registers (read-only)
-+ *   bluefb_dcs=2  also send the DCS commands
++ *   bluefb_dcs=2  also send the DCS commands (default; 0 = off)
 + * Any command that does not complete turns the DCS path off for the boot
 + * (the fade still works) after putting autorefresh back.
 + *
@@ -191,7 +191,7 @@ the DCS path off for the rest of the boot.
 +{
 +	fPowerMode = 1;
 +	PE_parse_boot_argn("bluefb_power", &fPowerMode, sizeof(fPowerMode));
-+	fDcsMode = 0;
++	fDcsMode = 2;
 +	PE_parse_boot_argn("bluefb_dcs", &fDcsMode, sizeof(fDcsMode));
 +	if (fPowerMode == 0 || fDcsMode == 0) {
 +		fDcsMode = 0;

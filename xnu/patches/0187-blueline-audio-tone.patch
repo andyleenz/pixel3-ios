@@ -71,7 +71,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
  };
  
  static int snd_mode;
-@@ -126,7 +136,632 @@
+@@ -126,7 +136,637 @@
  	return err;
  }
  
@@ -329,6 +329,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +	if (amp_wr(a, R_PAC_CTL1, 0) || amp_wr(a, R_PAC_CTL3, 1) ||
 +	    amp_wr(a, R_PAC_PMEM0, 0x00dd0102) || amp_wr(a, R_PAC_CTL3, 0) ||
 +	    amp_wr(a, R_PAC_CTL1, 1)) {
++		(void)amp_testkey(a, 0);
 +		return EIO;
 +	}
 +	IOSleep(10);
@@ -403,6 +404,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +		break;
 +	}
 +	if (err) {
++		(void)amp_testkey(a, 0);	/* a chain stops at its first failed write, maybe still unlocked */
 +		printf("BLUE SOUND: %s amp: rev 0x%x errata FAILED (%d)\n", a->name, a->rev, err);
 +		return EIO;
 +	}
@@ -477,6 +479,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +		    amp_upd(a, R_BST_VCTRL2, 1u << 2, 1u << 2) ||
 +		    amp_upd(a, R_BST_VCTRL1, 0xffu, 0x96u) || amp_testkey(a, 0);
 +		if (err) {
++			(void)amp_testkey(a, 0);
 +			return EIO;
 +		}
 +	}
@@ -530,6 +533,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +		err = amp_testkey(a, 1) || amp_wr(a, R_DCO_CTRL, 0x00036da8) ||
 +		    amp_wr(a, R_MISC_CTRL, 0x0100ee0e) || amp_testkey(a, 0);
 +		if (err) {
++			(void)amp_testkey(a, 0);
 +			return EIO;
 +		}
 +	}
@@ -537,6 +541,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +	/* [ML]: SCLK > 6 MHz: FS1 = 16 (bits 10:0), FS2 = 36 (<< 12, inside mask 0x00FFF800). */
 +	err = amp_testkey(a, 1) || amp_upd(a, R_TST_FS_MON0, 0x00ffffffu, 16u | (36u << 12)) || amp_testkey(a, 0);
 +	if (err) {
++		(void)amp_testkey(a, 0);
 +		return EIO;
 +	}
 +#endif
@@ -704,7 +709,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
  amp_probe(struct amp *a)
  {
  	a->rst_va = pin_map(a->rst_tile, a->rst);
-@@ -599,11 +1234,575 @@
+@@ -599,11 +1239,581 @@
  	return true;
  }
  
@@ -1189,6 +1194,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +	PE_parse_boot_argn("bluesnd_amp", &amp, sizeof(amp));
 +	PE_parse_boot_argn("bluesnd_sid", &sid, sizeof(sid));
 +	amp = MAX(0, MIN(amp, 8000));
++	secs = MAX(1, MIN(secs, 30));	/* the amps run at up to 10 V boost for this long */
 +
 +	if (!lg_up()) {
 +		return;
@@ -1201,6 +1207,10 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +
 +	/* The PCM buffer: identity SMMU bank for the ADSP's stream, the stream id's low bits above bit 32. */
 +	bool smmu = blueline_smmu_identity(SND_SID, 0, "audio");
++	if (!smmu) {
++		printf("BLUE SOUND: no SMMU bank for stream %#x: no tone (the ADSP would DMA through an unknown context)\n", SND_SID);
++		return;
++	}
 +	bsnd_shm_va = (uint8_t *)ml_io_map_unmappable((vm_offset_t)SND_SHM_PA, SND_SHM_SIZE, VM_WIMG_WCOMB);
 +	bsnd_shm_size = SND_SHM_SIZE;
 +	bsnd_shm_pa = SND_SHM_PA | (sid ? (uint64_t)(SND_SID & 0xfu) << 32 : 0);
@@ -1277,6 +1287,7 @@ diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
 +		printf("BLUE SOUND: adsp %s\n", up ? "up" : "NOT up");
 +		if (up && snd_mode >= 3) {
 +			snd_tone();
++			lg.stop = true;	/* nothing answers the ADSP after the test; stop polling SMEM */
 +		}
  		return;
  	}
