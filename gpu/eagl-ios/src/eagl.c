@@ -414,7 +414,7 @@ static int blit_targets = 1;
  * last went out: the boxes of the frames drawn into the other buffers since (pool_sent(), damage_drawn()), from
  * the buffer sent last. Boot-arg gldamage=0 (with gldirect=1): the whole picture is carried, as with mirrors.
  */
-static int direct_targets;              /* boot-arg gldirect=1 */
+static int direct_targets;              /* on unless boot-arg gldirect=0 (2026-11-21) */
 static int damage_carry = 1;            /* boot-arg gldamage=0 */
 /*
  * A frame that is handed to the display must have been drawn. The display's driver waits for
@@ -4852,11 +4852,11 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
-		direct_targets = strstr(arguments, "gldirect=1") != NULL;
+		direct_targets = strstr(arguments, "gldirect=0") == NULL;
 		damage_carry = strstr(arguments, "gldamage=0") == NULL;
 		say("hakios-gl: the display's buffers are drawn %s\n", direct_targets ? (damage_carry ?
-		    "in place, each frame starting from what changed (gldirect=1)" :
-		    "in place, each frame starting from the whole last picture (gldirect=1 gldamage=0)") :
+		    "in place, each frame starting from what changed (gldirect=0 turns it off)" :
+		    "in place, each frame starting from the whole last picture (gldamage=0)") :
 		    "through mirrors, copied out at each frame's end");
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {

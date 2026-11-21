@@ -224,7 +224,7 @@ var t='dark';try{t=localStorage.getItem('p3theme')||t}catch(e){}document.documen
 <div class="grid">
  <div class="card"><span class="st ok">✓ Works</span><h3>Boot</h3><p>Google's bootloader (unlocked) starts a shim that loads XNU with an Apple device tree. Android stays in slot B.</p></div>
  <div class="card"><span class="st ok">✓ Works</span><h3>Display</h3><p>1080x2160 panel. iOS sees an iPhone X width at 2:1 (1125x2250, scaled 0.96). Triple-buffered scan-out at 60 Hz.</p></div>
- <div class="card"><span class="st ok">✓ Works</span><h3>GPU</h3><p>Adreno 630 under Mesa freedreno (GLES 3.2). CoreAnimation draws through an EAGL shim. No Metal.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>GPU</h3><p>Adreno 630 under Mesa freedreno (GLES 3.2). CoreAnimation draws through an EAGL shim, straight into the display's buffers. No Metal.</p></div>
  <div class="card"><span class="st ok">✓ Works</span><h3>Touch and buttons</h3><p>ST FTM5 touch with edge gestures; power and volume keys.</p></div>
  <div class="card"><span class="st part">◐ 2.4 GHz</span><h3>Wi-Fi</h3><p>WCN3990, WPA2, DHCP, joins at boot; Apple's wifid and configd. 5 GHz not yet.</p></div>
  <div class="card"><span class="st ok">✓ Works</span><h3>CPU and storage</h3><p>All 8 cores with frequency and thermal limits. UFS; the iOS root is an HFS+ image on <code>userdata</code>.</p></div>

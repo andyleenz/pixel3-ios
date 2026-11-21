@@ -914,3 +914,24 @@ Before MCLK runs the sensors NACK. The MCLK branches (CBCR) only start with the 
 **Panel sleep on lock is the default** (0123: `bluefb_dcs=2` unless set; `bluefb_dcs=0` turns it off). fix2, no `bluefb_dcs` given: power key -> "panel display off, sleep in"; power key -> "panel sleep out, display on".
 
 `tools/patch-recount.py` recounts hunk headers after a patch is edited by hand.
+
+### GPU draws into the display's buffers in place (2026-11-21)
+
+**Root cause of the CPU copy.** Since the full-width canvas (0184, 2026-11-20) every import of the 1125x2250 display buffers failed in Mesa: A6xx pads a render target's height to a multiple of 4 rows (2252), so the layout wanted 10377216 bytes against 10371072 allocated (`layout_resource_for_handle`: size > BO size). eagl fell back to drawing elsewhere and copying each frame out on the CPU (median 5.5 ms a frame, slow1). Found with `caenv=FD_MESA_DEBUG=layout` and eagl's refusal reason, now logged.
+
+**0189.** SweetSurface allocates single-plane surfaces with room for whole groups of 4 rows (`bluesurf_rowpad=0` turns it off); the DPU scanout pool (0145) is sized the same way. eagl draws the display's buffers in place, carrying forward only what changed since a buffer last went out. Now the default; `gldirect=0` restores the copy.
+
+**Cache cleans.** With the buffers imported, every submit cleaned ~10 MB per buffer (0153), and `glFlush` rose to ~7 ms. 0162's `bluegpu_lazyclean` (clean only when the seed changes) is now on by default; `bluegpu_lazyclean=0` cleans every submit.
+
+**Hashing big copied pictures.** Pictures over 2 MB that cannot be read in place (Safari's images) drop to a check every 8th frame after 12 unchanged frames, not 120.
+
+Same script each run (unlock, page swipe, Safari on apple.com, two scrolls; Wi-Fi on), frames after the first 40:
+
+| Run | Setup | Frames | Gap median | Gap p90 | Gaps > 33 ms |
+|---|---|---|---|---|---|
+| abA | copy (`gldirect=0 bluegpu_lazyclean=0`) | 507 | 24.8 ms | 50.8 ms | 161 |
+| abB | in place + lazy clean | 530 | 21.1 ms | 52.0 ms | 136 |
+| abC | + hashing change | 651 | 17.7 ms | 37.6 ms | 83 |
+| def1 | defaults, no flags | 630 | 18.2 ms | 35.5 ms | 82 |
+
+No panics. Screenshots correct: home, apple.com loaded and scrolled, Control Center (val1). Still seen: ~210 cache cleans (2 GB) in some 5 s windows, cause not yet known; the DPU's per-flip clean averages 715 us.

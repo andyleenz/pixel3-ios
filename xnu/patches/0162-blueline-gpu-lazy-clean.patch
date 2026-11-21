@@ -77,10 +77,11 @@ how long they took.
  	IOLockUnlock(g.lock);
  }
  
-@@ -1745,6 +1766,7 @@
+@@ -1745,6 +1766,8 @@
  		g.hang_ms = 1000;
  	}
  	(void)PE_parse_boot_argn("bluegpu_uapi_test", &g.test, sizeof(g.test));
++	g.lazy_clean = 1;               /* on by default since 0189 (2026-11-21): bluegpu_lazyclean=0 cleans every submit */
 +	(void)PE_parse_boot_argn("bluegpu_lazyclean", &g.lazy_clean, sizeof(g.lazy_clean));
  	if (!on || !blue_gpu_core_ready()) {
  		printf("BLUEGPU UAPI: %s: no BlueGPU service\n", on ? "GPU not resident" : "off (bluegpu_uapi=0)");
