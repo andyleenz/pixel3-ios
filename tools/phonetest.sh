@@ -97,7 +97,7 @@ kernel=work/kbuild/out/kernel.development.sweet
 fw=(); [ -f work/fw/a630_gmu.bin ] && fw=(--gpu-fw work/fw/a630_gmu.bin)
 [ -f work/fw/vendor/cs40l20.wmfw ] && [ -f work/fw/vendor/cs40l20.bin ] && fw+=(--haptic-fw work/fw/vendor)	# 0150
 [ -f work/fw/wlan/wlanmdsp.mbn ] && [ -f work/fw/wlan/bdwlan-blueline.bin ] && fw+=(--wlan-fw work/fw/wlan)	# 0167
-case " $base $extra " in *" bluesnd=2"*|*" bluesnd=3"*) [ -f work/fw/audio/adsp.mdt ] && fw+=(--adsp-fw work/fw/audio) ;; esac	# 0186
+case " $base $extra " in *" bluesnd=2"*|*" bluesnd=3"*|*" bluesnd=4"*) [ -f work/fw/audio/adsp.mdt ] && fw+=(--adsp-fw work/fw/audio) ;; esac	# 0186, 0190
 case " $base $extra " in *" sweetfb_native=1 "*) fw+=(--canvas 1080x2160) ;; esac	# iOS draws the panel's own size
 python3 tools/mkadt.py --ufs --cpus 8 --iphone work/DeviceTree.d22ap.im4p "${fw[@]}" "$out/$name.adt" > /dev/null
 python3 tools/mkpayload.py "$kernel" "$out/$name.adt" "$out/$name-payload.bin" --cmdline "$base $extra" > /dev/null
