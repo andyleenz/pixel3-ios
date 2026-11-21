@@ -935,3 +935,11 @@ Same script each run (unlock, page swipe, Safari on apple.com, two scrolls; Wi-F
 | def1 | defaults, no flags | 630 | 18.2 ms | 35.5 ms | 82 |
 
 No panics. Screenshots correct: home, apple.com loaded and scrolled, Control Center (val1). Still seen: ~210 cache cleans (2 GB) in some 5 s windows, cause not yet known; the DPU's per-flip clean averages 715 us.
+
+### iOS plays through the speaker; GPU and audio on by default (2026-11-21)
+
+- **0190 `/dev/redwood-audio`.** mediaserverd loads HackiOS's RedwoodAudio.driver (MIT, `audio/redwood-hal/`, built ad-hoc signed) and writes 48 kHz s16 stereo to the node; volume comes in through an ioctl as dB below the top and is applied as a Q15 gain with 18 dB headroom (`bluesnd_below`). A kernel thread starts the path on the first write (ASM stream → ADM COPP → AFE QUAT_TDM_RX_0 → both CS35L36 amps) and stops it after 2 s of silence. VirtualAudio.plugin has to stay in place; `iosroot-tweaks.py` used to move it aside and now installs RedwoodAudio.driver too.
+- **Pacing.** The DSP answers WRITE_DONE when it takes a buffer, not when it has played, so counting buffers in flight let the queue run dry. The feed now compares frames sent with 48 per ms since the start and stays 40-120 ms ahead.
+- **au7-au11, def2.** Startup sound (peak 3569/32767) and two ringtone previews in Settings (~5.6 s audible, peak 11879). iOS writes 1024 frames every 21.3 ms; no gap inside a sound over 25 ms, 0 dropped, no amp faults. Each play starts with ~0.5 s of padding (open).
+- **0191: no Wi-Fi needed.** The ADSP boot's AOP `load_state` message went through QMP, which only the Wi-Fi driver linked. The first caller now links it; Wi-Fi's own step 2 finds it up (def2: both, in either order).
+- **Defaults (0161).** The `blueui` set (GPU, DPU flip, blueeagl) is on unless `blueui=0`, and includes `bluesnd=4`. def2, a boot with neither flag: in-place GPU drawing, sound, Wi-Fi.

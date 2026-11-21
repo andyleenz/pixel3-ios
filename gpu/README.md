@@ -9,9 +9,9 @@ together with the kernel's BlueGPU user client (`xnu/patches/0153`, `0157`–`01
 | `eagl-ios/` | the EAGLContext shim that backboardd's GL renderer uses (a port of HakiOS's MIT `eagl.c`) | `/usr/lib/blueeagl.dylib`, `/usr/lib/blueeagl-gl.dylib` |
 
 Build `mesa-ios` first (`./build-mesa-ios.sh`), then `eagl-ios` (`./build.sh`).
-Each folder's README has the details. Then boot with `blueui=1` and push the three
+Each folder's README has the details. Then boot (the GPU set, `blueui`, is on by default) and push the three
 dylibs, for example:
 
     tools/phonetest.sh --push gpu/mesa-ios/out/bluegl.dylib:/usr/lib/bluegl.dylib \
       --push gpu/eagl-ios/out/blueeagl.dylib:/usr/lib/blueeagl.dylib \
-      --push gpu/eagl-ios/out/blueeagl-gl.dylib:/usr/lib/blueeagl-gl.dylib blueui=1 ...
+      --push gpu/eagl-ios/out/blueeagl-gl.dylib:/usr/lib/blueeagl-gl.dylib ...
