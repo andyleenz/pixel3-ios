@@ -1,0 +1,313 @@
+0196: the rear IMX363 through the same capture (bluecam=1 bluecam_stream=3)
+
+The receiver path takes the CSIPHY as a parameter: CSIPHY0 for the rear
+(stock dtbo csiphy-sd-index 0; camcc csiphy0 0x5020, csi0phytimer RCG
+0x5004 / branch 0x501c), CSIPHY2 for the front. IMX363 settings from the
+sdm670-mainline imx363.c (24 MHz, 4032x3024), retimed for the 19.2 MHz
+MCLK (pre-divider 2, VT x131, OP x139) and 2x2-binned to 2016x1512 (3.8
+MB in a 4 MiB buffer). Analog gain bluecam_rear_gain (code, 384 = 4x).
+The rear saves only the colour snap (1008x756).
+
+diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c
++++ b/bsd/dev/blueline_camera_probe.c
+@@ -664,7 +664,7 @@
+  * lane table), camss-csid-gen2.c (CSID reset, RX and RDI setup). The front normal IMX355 is on CSIPHY2,
+  * 4 data lanes on PHY lanes 0-3 (Linux sdm845-google-common.dtsi, 2026 camera series).
+  */
+-#define CSIPHY2_PA		0x0ac67000u
++#define CSIPHY0_PA		0x0ac65000u	/* CSIPHY n at + n * 0x1000 */
+ #define CSID_LITE_PA		0x0acc8000u
+ #define CAMCC_PLL3		0x3000u
+ #define PLL_MODE_OUTCTRL	(1u << 0)
+@@ -674,7 +674,7 @@
+ #define CAMCC_CSI2PHYTIMER_RCGR	0x504cu
+ #define CAMCC_LITE_CSID_RCGR	0xb024u
+ 
+-static const struct {
++static struct {
+ 	uint32_t off;
+ 	const char *name;
+ } rx_branches[] = {
+@@ -682,6 +682,19 @@
+ 	{ 0xb044, "ife_lite_cphy_rx" }, { 0xb03c, "ife_lite_csid" }, { 0xb01c, "ife_lite" },
+ };
+ static bool rx_turned[sizeof(rx_branches) / sizeof(rx_branches[0])];
++
++/* 0196: which CSIPHY: 2 for the front normal IMX355, 0 for the rear IMX363 (stock dtbo csiphy-sd-index) */
++static uint32_t rx_phy = 2, rx_timer_rcgr = CAMCC_CSI2PHYTIMER_RCGR;
++static void
++rx_select(uint32_t phy)
++{
++	rx_phy = phy;
++	rx_timer_rcgr = phy == 0 ? 0x5004u : CAMCC_CSI2PHYTIMER_RCGR;
++	rx_branches[2].off = phy == 0 ? 0x5020u : 0x5068u;
++	rx_branches[2].name = phy == 0 ? "csiphy0" : "csiphy2";
++	rx_branches[3].off = phy == 0 ? 0x501cu : 0x5064u;
++	rx_branches[3].name = phy == 0 ? "csi0phytimer" : "csi2phytimer";
++}
+ static bool pll3_started;
+ 
+ /* SDM845 CSIPHY lane settings: data lanes at 0x000/0x200/0x400/0x600, clock lane at 0x700; ~0 = settle count */
+@@ -750,7 +763,7 @@
+ 	}
+ 	/* parent 5 = PLL3 out_even; hid = 2 * div - 1 */
+ 	if (!rcg_to(CAMCC_CPHY_RX_RCGR, 5u << 8 | 1, "cphy_rx 384 MHz") ||
+-	    !rcg_to(CAMCC_CSI2PHYTIMER_RCGR, 5u << 8 | 3, "csi2phytimer 192 MHz") ||
++	    !rcg_to(rx_timer_rcgr, 5u << 8 | 3, "PHY timer 192 MHz") ||
+ 	    !rcg_to(CAMCC_LITE_CSID_RCGR, 5u << 8 | 1, "ife_lite_csid 384 MHz")) {
+ 		return false;
+ 	}
+@@ -862,8 +875,8 @@
+ 	wr32(c + 0x22c, 0);
+ 	wr32(c + 0x208, 0);
+ 	wr32(c + CSID_RDI0_CFG0, rd32(c + CSID_RDI0_CFG0) | 1u << 31);
+-	/* RX: 4 lanes, lanes 0-3 in order, PHY 2, D-PHY; ECC correction, MISR */
+-	wr32(c + 0x100, 3u | 0x3210u << 4 | 2u << 20);
++	/* RX: 4 lanes, lanes 0-3 in order, PHY rx_phy, D-PHY; ECC correction, MISR */
++	wr32(c + 0x100, 3u | 0x3210u << 4 | rx_phy << 20);
+ 	wr32(c + 0x104, 1u << 0 | 1u << 6);
+ 	wr32(c + 0x208, 1);			/* resume at frame boundary */
+ 	wr32(c + CSID_RX_MASK, ~0u);
+@@ -955,14 +968,14 @@
+  * (frame increment 0); after the stream stops, the last frame is in it.
+  */
+ #define VFE_LITE_PA		0x0acc4000u
+-#define CAP_BYTES		(2u << 20)
+-#define CAP_W			820u
+-#define CAP_H			616u
++/* 0196: per sensor: front 820x616 in 2 MiB, rear binned 2016x1512 in 4 MiB */
++static uint32_t cap_w = 820, cap_h = 616, cap_bytes = 2u << 20;
+ extern bool blueline_smmu_identity(uint32_t sid, uint32_t mask, const char *who);	/* blueline_wifi.c */
+ extern int bluesnap_put(const char *why, const void *bgra, uint32_t w, uint32_t h);	/* sweet_ufs.c */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ static vm_offset_t cap_buf;
++static uint32_t cap_alloc;
+ static uint64_t cap_pa;
+ static bool cap_axi_set, cap_noc_set;
+ 
+@@ -980,15 +993,20 @@
+ 			return false;
+ 		}
+ 	}
+-	if (!cap_buf && kmem_alloc_contig(kernel_map, &cap_buf, CAP_BYTES, PAGE_MASK, 0xfffff, 0, KMA_DATA,
++	if (cap_buf && cap_alloc < cap_bytes) {
++		kmem_free(kernel_map, cap_buf, cap_alloc);
++		cap_buf = 0;
++	}
++	cap_alloc = cap_bytes;
++	if (!cap_buf && kmem_alloc_contig(kernel_map, &cap_buf, cap_bytes, PAGE_MASK, 0xfffff, 0, KMA_DATA,
+ 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		cap_buf = 0;
+-		printf("BLUE CAM: cap: no 2 MiB below 4 GiB\n");
++		printf("BLUE CAM: cap: no %u MiB below 4 GiB\n", cap_bytes >> 20);
+ 		return false;
+ 	}
+ 	cap_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)cap_buf));
+-	memset((void *)cap_buf, 0xa5, CAP_BYTES);
+-	flush_dcache64((addr64_t)cap_pa, CAP_BYTES, TRUE);
++	memset((void *)cap_buf, 0xa5, cap_bytes);
++	flush_dcache64((addr64_t)cap_pa, cap_bytes, TRUE);
+ 
+ 	printf("BLUE CAM: cap: IFE-lite version 0x%x; buffer at 0x%llx\n", rd32(vfe), cap_pa);
+ 	wr32(vfe + 0x05c, 1u << 31);
+@@ -1069,10 +1087,10 @@
+ 	wr32(vfe + 0x04ac, 1u << 1);
+ 	IOSleep(20);
+ 	cap_status(vfe, "after stop");
+-	flush_dcache64((addr64_t)cap_pa, CAP_BYTES, TRUE);
++	flush_dcache64((addr64_t)cap_pa, cap_bytes, TRUE);
+ 	const uint8_t *b = (const uint8_t *)cap_buf;
+ 	uint32_t changed = 0, last = 0;
+-	for (uint32_t i = 0; i < CAP_BYTES; i++) {
++	for (uint32_t i = 0; i < cap_bytes; i++) {
+ 		if (b[i] != 0xa5) {
+ 			changed++;
+ 			last = i;
+@@ -1080,21 +1098,21 @@
+ 	}
+ 	printf("BLUE CAM: cap: %u bytes written, last at %u; first bytes %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 	    changed, last, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]);
+-	if (changed < CAP_W * CAP_H) {
++	if (changed < cap_w * cap_h) {
+ 		return;
+ 	}
+ 	/* line stride from the extent: the packed line is 1025 bytes; the IFE may pad it */
+-	uint32_t stride = (last + CAP_H) / CAP_H;
+-	printf("BLUE CAM: cap: stride %u bytes per line (%u written / %u lines)\n", stride, last + 1, CAP_H);
+-	if (stride < CAP_W * 5 / 4) {
++	uint32_t stride = (last + cap_h) / cap_h;
++	printf("BLUE CAM: cap: stride %u bytes per line (%u written / %u lines)\n", stride, last + 1, cap_h);
++	if (stride < cap_w * 5 / 4) {
+ 		return;
+ 	}
+ 	cap_gamma_init();
+ 	static uint32_t fine[1024];
+ 	uint32_t hist[16] = { 0 }, maxv = 0;
+ 	bzero(fine, sizeof(fine));
+-	for (uint32_t y = 0; y < CAP_H; y++) {
+-		for (uint32_t x = 0; x < CAP_W; x++) {
++	for (uint32_t y = 0; y < cap_h; y++) {
++		for (uint32_t x = 0; x < cap_w; x++) {
+ 			uint32_t v = raw10(b + y * stride, x);
+ 			hist[v >> 6]++;
+ 			fine[v]++;
+@@ -1107,7 +1125,7 @@
+ 	}
+ 	printf("; max %u\n", maxv);
+ 	/* scale so the 99.5th percentile is white */
+-	uint32_t total = CAP_W * CAP_H, acc = 0, top = 1023;
++	uint32_t total = cap_w * cap_h, acc = 0, top = 1023;
+ 	for (int i = 1023; i >= 0; i--) {
+ 		acc += fine[i];
+ 		if (acc > total / 200) {
+@@ -1117,22 +1135,24 @@
+ 	}
+ 	printf("BLUE CAM: cap: white at %u\n", top);
+ 	vm_offset_t img = 0;
+-	if (kmem_alloc(kernel_map, &img, round_page(CAP_W * CAP_H * 4), KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	if (kmem_alloc(kernel_map, &img, round_page(cap_w * cap_h * 4), KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return;
+ 	}
+ 	uint8_t *o = (uint8_t *)img;
+-	for (uint32_t y = 0; y < CAP_H; y++) {
+-		for (uint32_t x = 0; x < CAP_W; x++, o += 4) {
++	for (uint32_t y = 0; y < cap_h; y++) {
++		for (uint32_t x = 0; x < cap_w; x++, o += 4) {
+ 			o[0] = o[1] = o[2] = cap_out(raw10(b + y * stride, x), 256, top);
+ 			o[3] = 0xff;
+ 		}
+ 	}
+-	(void)bluesnap_put("camera raw", (const void *)img, CAP_W, CAP_H);
++	if (cap_w <= 1024) {
++		(void)bluesnap_put("camera raw", (const void *)img, cap_w, cap_h);
++	}
+ 	/* RGGB, 2x2 per pixel; grey-world white balance: R and B gains to the green mean */
+ 	uint64_t sr = 0, sg = 0, sb = 0;
+-	for (uint32_t y = 0; y < CAP_H; y += 2) {
++	for (uint32_t y = 0; y < cap_h; y += 2) {
+ 		const uint8_t *r0 = b + y * stride, *r1 = r0 + stride;
+-		for (uint32_t x = 0; x < CAP_W; x += 2) {
++		for (uint32_t x = 0; x < cap_w; x += 2) {
+ 			sr += raw10(r0, x);
+ 			sg += raw10(r0, x + 1) + raw10(r1, x);
+ 			sb += raw10(r1, x + 1);
+@@ -1141,12 +1161,12 @@
+ 	sg /= 2;
+ 	uint32_t gr = sr ? (uint32_t)MIN(sg * 256 / sr, 2048ull) : 256, gb = sb ? (uint32_t)MIN(sg * 256 / sb, 2048ull) : 256;
+ 	printf("BLUE CAM: cap: means R %llu G %llu B %llu (of %u); white balance R x%u.%02u B x%u.%02u\n",
+-	    sr / (CAP_W * CAP_H / 4), sg / (CAP_W * CAP_H / 4), sb / (CAP_W * CAP_H / 4), 1023 - CAP_BLACK,
++	    sr / (cap_w * cap_h / 4), sg / (cap_w * cap_h / 4), sb / (cap_w * cap_h / 4), 1023 - CAP_BLACK,
+ 	    gr >> 8, (gr & 255) * 100 / 256, gb >> 8, (gb & 255) * 100 / 256);
+ 	o = (uint8_t *)img;
+-	for (uint32_t y = 0; y < CAP_H / 2; y++) {
++	for (uint32_t y = 0; y < cap_h / 2; y++) {
+ 		const uint8_t *r0 = b + 2 * y * stride, *r1 = r0 + stride;
+-		for (uint32_t x = 0; x < CAP_W / 2; x++, o += 4) {
++		for (uint32_t x = 0; x < cap_w / 2; x++, o += 4) {
+ 			uint32_t r = raw10(r0, 2 * x), g = (raw10(r0, 2 * x + 1) + raw10(r1, 2 * x)) / 2, bl = raw10(r1, 2 * x + 1);
+ 			o[0] = cap_out(bl, gb, top);
+ 			o[1] = cap_out(g, 256, top);
+@@ -1154,14 +1174,66 @@
+ 			o[3] = 0xff;
+ 		}
+ 	}
+-	(void)bluesnap_put("camera colour", (const void *)img, CAP_W / 2, CAP_H / 2);
+-	kmem_free(kernel_map, img, round_page(CAP_W * CAP_H * 4));
++	(void)bluesnap_put("camera colour", (const void *)img, cap_w / 2, cap_h / 2);
++	kmem_free(kernel_map, img, round_page(cap_w * cap_h * 4));
+ }
+ 
++
++/*
++ * ---- 0196: the rear IMX363 ----
++ * Register values from the sdm670-mainline imx363.c (GPL-2.0, from Android's downstream logs, 24 MHz
++ * INCK, 4032x3024), retimed for the 19.2 MHz MCLK used here: pre-divider 2 (9.6 MHz), VT multiplier 131
++ * (1257.6 MHz, was 1260), OP multiplier 139 (1334 MHz, was 1338). 2x2 binning (0x0900/0x0901) to
++ * 2016x1512 to keep the frame at 3.8 MB; 4 lanes, RAW10, CSIPHY0 (stock dtbo csiphy-sd-index 0).
++ */
++static const uint16_t imx363_global[][2] = {
++	{ 0x0136, 0x13 }, { 0x0137, 0x33 }, { 0x31a3, 0x00 }, { 0x64d4, 0x01 }, { 0x64d5, 0xaa }, { 0x64d6, 0x01 },
++	{ 0x64d7, 0xa9 }, { 0x64d8, 0x01 }, { 0x64d9, 0xa5 }, { 0x64da, 0x01 }, { 0x64db, 0xa1 }, { 0x720a, 0x24 },
++	{ 0x720b, 0x89 }, { 0x720c, 0x85 }, { 0x720d, 0xa1 }, { 0x720e, 0x6e }, { 0x729c, 0x59 }, { 0x817c, 0xff },
++	{ 0x817d, 0x80 }, { 0x9348, 0x96 }, { 0x934b, 0x8c }, { 0x934c, 0x82 }, { 0x9353, 0xaa }, { 0x9354, 0xaa },
++	{ 0x4073, 0x30 },
++};
++static const uint16_t imx363_2016x1512[][2] = {
++	{ 0x0112, 0x0a }, { 0x0113, 0x0a }, { 0x0114, 0x03 }, { 0x0220, 0x00 }, { 0x0221, 0x11 },
++	{ 0x0340, 0x0c }, { 0x0341, 0x62 }, { 0x0342, 0x22 }, { 0x0343, 0x80 },
++	{ 0x0381, 0x01 }, { 0x0383, 0x01 }, { 0x0385, 0x01 }, { 0x0387, 0x01 },
++	{ 0x0900, 0x01 }, { 0x0901, 0x22 },
++	{ 0x30f4, 0x02 }, { 0x30f5, 0x80 }, { 0x30f6, 0x00 }, { 0x30f7, 0xc8 }, { 0x31a0, 0x00 }, { 0x31a5, 0x00 },
++	{ 0x31a6, 0x00 }, { 0x560f, 0xbe }, { 0x5856, 0x08 }, { 0x58d0, 0x10 }, { 0x734a, 0x01 }, { 0x734f, 0x2b },
++	{ 0x7441, 0x55 }, { 0x7914, 0x03 }, { 0x7928, 0x04 }, { 0x7929, 0x04 }, { 0x793f, 0x03 }, { 0xbc7b, 0x18 },
++	{ 0x0344, 0x00 }, { 0x0345, 0x00 }, { 0x0346, 0x00 }, { 0x0347, 0x00 },
++	{ 0x0348, 0x0f }, { 0x0349, 0xbf }, { 0x034a, 0x0b }, { 0x034b, 0xcf },
++	{ 0x034c, 0x07 }, { 0x034d, 0xe0 }, { 0x034e, 0x05 }, { 0x034f, 0xe8 },
++	{ 0x0408, 0x00 }, { 0x0409, 0x00 }, { 0x040a, 0x00 }, { 0x040b, 0x00 },
++	{ 0x040c, 0x07 }, { 0x040d, 0xe0 }, { 0x040e, 0x05 }, { 0x040f, 0xe8 },
++	{ 0x0301, 0x03 }, { 0x0303, 0x02 }, { 0x0305, 0x02 }, { 0x0306, 0x00 }, { 0x0307, 0x83 },
++	{ 0x0309, 0x0a }, { 0x030b, 0x01 }, { 0x030d, 0x02 }, { 0x030e, 0x00 }, { 0x030f, 0x8b }, { 0x0310, 0x01 },
++	{ 0x0202, 0x0c }, { 0x0203, 0x52 }, { 0x0224, 0x06 }, { 0x0225, 0x29 },
++	{ 0x0216, 0x00 }, { 0x0217, 0x00 }, { 0x020e, 0x01 }, { 0x020f, 0x00 }, { 0x0226, 0x01 }, { 0x0227, 0x00 },
++};
++static int cam_rear_gain = 384;	/* IMX363 analog gain code, gain = 512 / (512 - code): 384 = 4x */
++
+ /* Settings, stream on, read the sensor's own frame counter (0x0005) for 1 s, stream off. */
+ static void
+-stream_test(const struct cam_bus *b, uint8_t addr)
++stream_test(const struct cam_bus *b, uint8_t addr, bool rear)
+ {
++	rx_select(rear ? 0 : 2);
++	if (rear) {
++		cap_w = 2016;
++		cap_h = 1512;
++		cap_bytes = 4u << 20;
++		if (!write_list(b, addr, imx363_global, sizeof(imx363_global) / sizeof(imx363_global[0]), "IMX363 global") ||
++		    !write_list(b, addr, imx363_2016x1512, sizeof(imx363_2016x1512) / sizeof(imx363_2016x1512[0]),
++		    "IMX363 2016x1512")) {
++			return;
++		}
++		(void)bus_write(b, addr, 0x0204, (uint8_t)(cam_rear_gain >> 8));
++		(void)bus_write(b, addr, 0x0205, (uint8_t)cam_rear_gain);
++		goto sensor_set;
++	}
++	cap_w = 820;
++	cap_h = 616;
++	cap_bytes = 2u << 20;
+ 	if (!write_list(b, addr, imx355_global, sizeof(imx355_global) / sizeof(imx355_global[0]), "global") ||
+ 	    !write_list(b, addr, imx355_820x616, sizeof(imx355_820x616) / sizeof(imx355_820x616[0]), "820x616")) {
+ 		return;
+@@ -1176,10 +1248,11 @@
+ 	(void)bus_write(b, addr, 0x0204, (uint8_t)(cam_gain >> 8));
+ 	(void)bus_write(b, addr, 0x0205, (uint8_t)cam_gain);
+ 
++sensor_set:;
+ 	vm_offset_t phy = 0, csid = 0, vfe = 0;
+ 	bool rx = false, cap = false;
+ 	if (cam_stream >= 2) {
+-		phy = ml_io_map(CSIPHY2_PA, 0x1000);
++		phy = ml_io_map(CSIPHY0_PA + rx_phy * 0x1000u, 0x1000);
+ 		csid = ml_io_map(CSID_LITE_PA, 0x1000);
+ 		/* timer 192 MHz: settle = (85 ns + 6 UI) / 5.21 ns - 6 = 11 (camss-csiphy-3ph-1-0.c) */
+ 		rx = phy && csid && rx_clocks_on();
+@@ -1348,8 +1421,8 @@
+ 			(void)read_ids(c, &bus, "SDA/SCL swapped");
+ 		}
+ 	}
+-	if (cam_stream && c == &groups[1]) {
+-		stream_test(&bus, c->sensor[0].addr);
++	if (cam_stream) {
++		stream_test(&bus, c->sensor[0].addr, c == &groups[0]);
+ 	}
+ 
+ clock_down:
+@@ -1422,6 +1495,7 @@
+ 	PE_parse_boot_argn("bluecam_stream", &cam_stream, sizeof(cam_stream));
+ 	PE_parse_boot_argn("bluecam_settle", &cam_settle, sizeof(cam_settle));
+ 	PE_parse_boot_argn("bluecam_gain", &cam_gain, sizeof(cam_gain));
++	PE_parse_boot_argn("bluecam_rear_gain", &cam_rear_gain, sizeof(cam_rear_gain));
+ 	PE_parse_boot_argn("bluecam_fll", &cam_fll, sizeof(cam_fll));
+ 	thread_t th;
+ 	if (kernel_thread_start(cam_thread, NULL, &th) != KERN_SUCCESS) {
