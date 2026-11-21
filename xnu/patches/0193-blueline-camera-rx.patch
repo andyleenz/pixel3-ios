@@ -1,0 +1,386 @@
+0193: the front camera's frames reach the CSID (bluecam_stream=2)
+
+camcc PLL3 at 384 MHz; cphy_rx and the IFE-lite CSID clock from it, the
+CSIPHY2 timer at 192 MHz (PLL3/2); L1A and L26A voted on (the PHY's
+supplies, shared with the display PHY, left on); CSIPHY2 with Linux's
+SDM845 lane table (4 data lanes, settle count 11, bluecam_settle=N); the
+IFE-lite CSID reset, RX on PHY 2 with 4 lanes, RDI0 for RAW10. Before the
+sensor starts, the CSID's own test pattern runs for 300 ms as a check.
+While the sensor streams, the CSID's RX and RDI0 interrupt status is
+polled for 1 s and counted per bit (no interrupt handler, no IFE output
+yet). Everything but the two rails is put back after.
+
+diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c
++++ b/bsd/dev/blueline_camera_probe.c
+@@ -572,6 +572,7 @@
+ /* ---- 0192: stream the front IMX355 (bluecam_stream=1) ---- */
+ 
+ static int cam_stream;
++static int cam_settle = 11;
+ 
+ /* Sony write: S addr+W reg[15:8] reg[7:0] data P. 0, or the stage not acknowledged (1-3, 4 data). */
+ static int
+@@ -651,6 +652,296 @@
+ 	return v;
+ }
+ 
++
++/*
++ * ---- 0193: receive the stream (bluecam_stream=2): CSIPHY2 and the IFE-lite CSID ----
++ * Register values as in Linux: camcc-sdm845.c (PLL3, RCGs, branches), camss-csiphy-3ph-1-0.c (the SDM845
++ * lane table), camss-csid-gen2.c (CSID reset, RX and RDI setup). The front normal IMX355 is on CSIPHY2,
++ * 4 data lanes on PHY lanes 0-3 (Linux sdm845-google-common.dtsi, 2026 camera series).
++ */
++#define CSIPHY2_PA		0x0ac67000u
++#define CSID_LITE_PA		0x0acc8000u
++#define CAMCC_PLL3		0x3000u
++#define PLL_MODE_OUTCTRL	(1u << 0)
++#define PLL_MODE_RESET_N	(1u << 2)
++#define PLL_MODE_LOCK_DET	(1u << 31)
++#define CAMCC_CPHY_RX_RCGR	0x9060u
++#define CAMCC_CSI2PHYTIMER_RCGR	0x504cu
++#define CAMCC_LITE_CSID_RCGR	0xb024u
++
++static const struct {
++	uint32_t off;
++	const char *name;
++} rx_branches[] = {
++	{ 0xb13c, "soc_ahb" }, { 0xb11c, "cpas_ahb" }, { 0x5068, "csiphy2" }, { 0x5064, "csi2phytimer" },
++	{ 0xb044, "ife_lite_cphy_rx" }, { 0xb03c, "ife_lite_csid" }, { 0xb01c, "ife_lite" },
++};
++static bool rx_turned[sizeof(rx_branches) / sizeof(rx_branches[0])];
++static bool pll3_started;
++
++/* SDM845 CSIPHY lane settings: data lanes at 0x000/0x200/0x400/0x600, clock lane at 0x700; ~0 = settle count */
++static const uint16_t csiphy_lane[5][14][2] = {
++#define LN(b, clk) { { b + 0x04, 0x0c }, { b + 0x2c, 0x01 }, { b + 0x34, 0x0f }, { b + 0x1c, 0x0a }, \
++	{ b + 0x14, 0x60 }, { b + 0x3c, 0xb8 }, { b + 0x00, clk ? 0x80 : 0x91 }, { b + 0x08, 0xffff }, \
++	{ b + 0x10, 0x52 }, { b + 0x38, clk ? 0x1f : 0xfe }, { b + 0x60, 0x00 }, { b + 0x64, 0x7f }, \
++	{ clk ? b + 0x28 : b + 0x60, clk ? 0x04 : 0x00 }, { clk ? b + 0x0c : b + 0x64, clk ? 0xa5 : 0x7f } }
++	LN(0x000, 0), LN(0x700, 1), LN(0x200, 0), LN(0x400, 0), LN(0x600, 0),
++#undef LN
++};
++
++static bool
++rcg_to(uint32_t off, uint32_t cfg, const char *name)
++{
++	vm_offset_t r = camcc + off;
++	wr32(r + RCG_CFG, (rd32(r + RCG_CFG) & ~RCG_CFG_MASK) | cfg);
++	wr32(r, rd32(r) | RCG_CMD_UPDATE);
++	bool ok = poll32(r, RCG_CMD_UPDATE, 0, 500);
++	printf("BLUE CAM: rx: %s RCG cfg 0x%x%s\n", name, rd32(r + RCG_CFG), ok ? "" : " (update pending)");
++	return ok;
++}
++
++/* The PHY's supplies (Linux: vdda-phy L1A 0.875 V, vdda-pll L26A 1.2 V; also the display PHY's): voted on, left on. */
++static void
++rx_rails_on(void)
++{
++	static const char *const ldo[2] = { "ldoa1", "ldoa26" };
++	for (int i = 0; i < 2; i++) {
++		uint32_t a = blueline_cmddb_addr(ldo[i]);
++		if (!a) {
++			printf("BLUE CAM: rx: no %s in cmd-db\n", ldo[i]);
++			continue;
++		}
++		const uint32_t addr[1] = { a + RPMH_REG_ENABLE };
++		const uint32_t data[1] = { 1 };
++		printf("BLUE CAM: rx: RPMh %s (0x%x) enable: err=%d\n", ldo[i], a, blueline_rpmh_write(addr, data, 1));
++	}
++}
++
++static bool
++rx_clocks_on(void)
++{
++	vm_offset_t p = camcc + CAMCC_PLL3;
++	uint32_t mode = rd32(p);
++
++	rx_rails_on();
++
++	if (!(mode & PLL_MODE_LOCK_DET) || !(mode & PLL_MODE_OUTCTRL)) {
++		wr32(p + 0x04, 0x14);			/* L: 20 x 19.2 = 384 MHz */
++		wr32(p, rd32(p) & ~PLL_MODE_OUTCTRL);
++		wr32(p + 0x2c, 0);			/* OPMODE standby */
++		wr32(p, rd32(p) | PLL_MODE_RESET_N);
++		wr32(p + 0x2c, 1);			/* OPMODE run */
++		bool lock = poll32(p, PLL_MODE_LOCK_DET, PLL_MODE_LOCK_DET, 2000);
++		wr32(p + 0x0c, rd32(p + 0x0c) | 0x3);	/* main and even outputs, even post-div 1 */
++		wr32(p, rd32(p) | PLL_MODE_OUTCTRL);
++		pll3_started = true;
++		printf("BLUE CAM: rx: PLL3 %s (mode 0x%x, L 0x%x, user 0x%x)\n", lock ? "locked" : "NOT locked", rd32(p),
++		    rd32(p + 0x04), rd32(p + 0x0c));
++		if (!lock) {
++			return false;
++		}
++	} else {
++		printf("BLUE CAM: rx: PLL3 already running (mode 0x%x)\n", mode);
++	}
++	/* parent 5 = PLL3 out_even; hid = 2 * div - 1 */
++	if (!rcg_to(CAMCC_CPHY_RX_RCGR, 5u << 8 | 1, "cphy_rx 384 MHz") ||
++	    !rcg_to(CAMCC_CSI2PHYTIMER_RCGR, 5u << 8 | 3, "csi2phytimer 192 MHz") ||
++	    !rcg_to(CAMCC_LITE_CSID_RCGR, 5u << 8 | 1, "ife_lite_csid 384 MHz")) {
++		return false;
++	}
++	bool all = true;
++	for (size_t i = 0; i < sizeof(rx_branches) / sizeof(rx_branches[0]); i++) {
++		bool running = false;
++		rx_turned[i] = branch_on(camcc + rx_branches[i].off, rx_branches[i].name, &running);
++		all = all && running;
++	}
++	return all;
++}
++
++static void
++rx_clocks_off(void)
++{
++	for (size_t i = sizeof(rx_branches) / sizeof(rx_branches[0]); i-- > 0;) {
++		if (rx_turned[i]) {
++			branch_off(camcc + rx_branches[i].off, rx_branches[i].name);
++			rx_turned[i] = false;
++		}
++	}
++	(void)rcg_to(CAMCC_LITE_CSID_RCGR, RCG_CFG_XO_19M2, "ife_lite_csid back to XO");
++	(void)rcg_to(CAMCC_CSI2PHYTIMER_RCGR, RCG_CFG_XO_19M2, "csi2phytimer back to XO");
++	(void)rcg_to(CAMCC_CPHY_RX_RCGR, RCG_CFG_XO_19M2, "cphy_rx back to XO");
++	if (pll3_started) {
++		vm_offset_t p = camcc + CAMCC_PLL3;
++		wr32(p, rd32(p) & ~PLL_MODE_OUTCTRL);
++		wr32(p + 0x0c, rd32(p + 0x0c) & ~0x3u);
++		wr32(p, rd32(p) & ~PLL_MODE_RESET_N);
++		wr32(p + 0x2c, 0);
++		pll3_started = false;
++		printf("BLUE CAM: rx: PLL3 off again (mode 0x%x)\n", rd32(p));
++	}
++}
++
++#define PHY_CTRL(n)	(0x800u + 4u * (n))
++#define PHY_STATUS(n)	(0x8b0u + 4u * (n))
++
++static void
++csiphy_on(vm_offset_t phy, uint8_t settle)
++{
++	wr32(phy + PHY_CTRL(6), 1u << 1);	/* show revision */
++	printf("BLUE CAM: rx: CSIPHY2 revision %02x %02x %02x %02x\n", rd32(phy + PHY_STATUS(12)) & 0xff,
++	    rd32(phy + PHY_STATUS(13)) & 0xff, rd32(phy + PHY_STATUS(14)) & 0xff, rd32(phy + PHY_STATUS(15)) & 0xff);
++	wr32(phy + PHY_CTRL(0), 1);
++	IOSleep(6);
++	wr32(phy + PHY_CTRL(0), 0);
++	wr32(phy + PHY_CTRL(5), 0x80 | 0x55);	/* clock lane, data lanes 0-3 */
++	wr32(phy + PHY_CTRL(6), 1);		/* common power-down off */
++	wr32(phy + PHY_CTRL(7), 0x02);
++	wr32(phy + PHY_CTRL(0), 0);
++	for (int l = 0; l < 5; l++) {
++		for (int i = 0; i < 14; i++) {
++			uint16_t v = csiphy_lane[l][i][1];
++			wr32(phy + csiphy_lane[l][i][0], v == 0xffff ? settle : v);
++		}
++	}
++	for (int i = 11; i < 22; i++) {
++		wr32(phy + PHY_CTRL(i), 0);
++	}
++}
++
++static void
++csiphy_off(vm_offset_t phy)
++{
++	wr32(phy + PHY_CTRL(5), 0);
++	wr32(phy + PHY_CTRL(6), 0);
++}
++
++/* IFE-lite CSID: RDI0 at 0x200, its IRQ status at 0x30 */
++#define CSID_RX_STATUS		0x20u
++#define CSID_RX_MASK		0x24u
++#define CSID_RX_CLEAR		0x28u
++#define CSID_RDI0_STATUS	0x30u
++#define CSID_RDI0_MASK		0x34u
++#define CSID_RDI0_CLEAR		0x38u
++#define CSID_TOP_STATUS		0x70u
++#define CSID_TOP_MASK		0x74u
++#define CSID_TOP_CLEAR		0x78u
++#define CSID_IRQ_CMD		0x80u
++#define CSID_RDI0_CFG0		0x200u
++
++static bool
++csid_on(vm_offset_t c)
++{
++	printf("BLUE CAM: rx: CSID-lite version 0x%x\n", rd32(c));
++	wr32(c + CSID_TOP_CLEAR, 1);
++	wr32(c + CSID_IRQ_CMD, 1);
++	wr32(c + CSID_TOP_MASK, 1);
++	wr32(c + CSID_IRQ_CMD, 1);
++	wr32(c + 0x10, 0x1e);			/* reset, registers kept */
++	bool ok = poll32(c + CSID_TOP_STATUS, 1, 1, 100000);
++	wr32(c + CSID_TOP_CLEAR, 1);
++	wr32(c + CSID_IRQ_CMD, 1);
++	printf("BLUE CAM: rx: CSID reset %s\n", ok ? "done" : "TIMED OUT");
++	if (!ok) {
++		return false;
++	}
++	/* RDI0: byte counter, format measure, timestamp; payload only; RAW10 (0x2b); VC 0 */
++	wr32(c + CSID_RDI0_CFG0, 1u << 0 | 1u << 1 | 1u << 2 | 0xfu << 12 | 0x2bu << 16);
++	wr32(c + 0x204, 2);
++	wr32(c + 0x210, 1);
++	wr32(c + 0x20c, 0);
++	wr32(c + 0x218, 1);
++	wr32(c + 0x214, 0);
++	wr32(c + 0x228, 1);
++	wr32(c + 0x224, 0);
++	wr32(c + 0x230, 1);
++	wr32(c + 0x22c, 0);
++	wr32(c + 0x208, 0);
++	wr32(c + CSID_RDI0_CFG0, rd32(c + CSID_RDI0_CFG0) | 1u << 31);
++	/* RX: 4 lanes, lanes 0-3 in order, PHY 2, D-PHY; ECC correction, MISR */
++	wr32(c + 0x100, 3u | 0x3210u << 4 | 2u << 20);
++	wr32(c + 0x104, 1u << 0 | 1u << 6);
++	wr32(c + 0x208, 1);			/* resume at frame boundary */
++	wr32(c + CSID_RX_MASK, ~0u);
++	wr32(c + CSID_RDI0_MASK, ~0u);
++	return true;
++}
++
++static void
++csid_off(vm_offset_t c)
++{
++	wr32(c + 0x208, 0);			/* halt at frame boundary */
++	IOSleep(20);
++	wr32(c + CSID_RDI0_CFG0, rd32(c + CSID_RDI0_CFG0) & ~(1u << 31));
++	wr32(c + CSID_RX_MASK, 0);
++	wr32(c + CSID_RDI0_MASK, 0);
++}
++
++static void csid_watch(vm_offset_t c, unsigned ms);
++
++/* The CSID's own test pattern (camss-csid-gen2.c __csid_configure_testgen): 820x616 RAW10 for ms ms. */
++static void
++csid_tpg(vm_offset_t c, unsigned ms)
++{
++	wr32(c + 0x604, 1u << 10);				/* VC 0, one-shot interleaving, endless */
++	wr32(c + 0x608, 0x740u | 0x3ffu << 12);			/* blanking */
++	wr32(c + 0x60c, 0x12345678);
++	wr32(c + 0x610, 616u | 820u << 16);
++	wr32(c + 0x614, 0x2b);
++	wr32(c + 0x618, 0u << 0 | 0xbeu << 4 | 1u << 16);	/* incrementing, RAW10 */
++	wr32(c + 0x640, 0);
++	wr32(c + 0x644, 0);
++	wr32(c + 0x600, 1u | 1u << 1 | 1u << 2 | 3u << 4 | 0x64u << 8 | 0xau << 20);
++	printf("BLUE CAM: rx: CSID test pattern on\n");
++	csid_watch(c, ms);
++	wr32(c + 0x600, 0);
++	IOSleep(5);
++	printf("BLUE CAM: rx: CSID test pattern off\n");
++}
++
++static void
++phy_status(vm_offset_t phy, const char *when)
++{
++	printf("BLUE CAM: rx: CSIPHY2 status %s:", when);
++	for (int i = 0; i < 16; i++) {
++		printf(" %x", rd32(phy + PHY_STATUS(i)) & 0xff);
++	}
++	printf("\n");
++}
++
++/* Poll the CSID's status for ms milliseconds: per-bit counts of RX and RDI0 events. */
++static void
++csid_watch(vm_offset_t c, unsigned ms)
++{
++	uint32_t rx_or = 0, rdi_or = 0, rdi_n[32] = { 0 }, rx_n[32] = { 0 };
++
++	for (unsigned t = 0; t < ms * 4; t++) {
++		uint32_t rx = rd32(c + CSID_RX_STATUS), rdi = rd32(c + CSID_RDI0_STATUS);
++		if (rx || rdi) {
++			wr32(c + CSID_RX_CLEAR, rx);
++			wr32(c + CSID_RDI0_CLEAR, rdi);
++			wr32(c + CSID_IRQ_CMD, 1);
++			rx_or |= rx;
++			rdi_or |= rdi;
++			for (int b = 0; b < 32; b++) {
++				rx_n[b] += rx >> b & 1;
++				rdi_n[b] += rdi >> b & 1;
++			}
++		}
++		delay(250);
++	}
++	printf("BLUE CAM: rx: %u ms: RX status bits 0x%08x, RDI0 bits 0x%08x\n", ms, rx_or, rdi_or);
++	for (int b = 0; b < 32; b++) {
++		if (rx_n[b] || rdi_n[b]) {
++			printf("BLUE CAM: rx:   bit %2d: RX %u, RDI0 %u\n", b, rx_n[b], rdi_n[b]);
++		}
++	}
++	printf("BLUE CAM: rx: RDI0 regs 0x240-0x27c:");
++	for (uint32_t o = 0x240; o < 0x280; o += 4) {
++		printf(" %x", rd32(c + o));
++	}
++	printf("\n");
++}
++
+ /* Settings, stream on, read the sensor's own frame counter (0x0005) for 1 s, stream off. */
+ static void
+ stream_test(const struct cam_bus *b, uint8_t addr)
+@@ -660,14 +951,40 @@
+ 		return;
+ 	}
+ 	(void)bus_write(b, addr, 0x3070, 1);	/* digital gain for all colours */
++
++	vm_offset_t phy = 0, csid = 0;
++	bool rx = false;
++	if (cam_stream >= 2) {
++		phy = ml_io_map(CSIPHY2_PA, 0x1000);
++		csid = ml_io_map(CSID_LITE_PA, 0x1000);
++		/* timer 192 MHz: settle = (85 ns + 6 UI) / 5.21 ns - 6 = 11 (camss-csiphy-3ph-1-0.c) */
++		rx = phy && csid && rx_clocks_on();
++		if (rx) {
++			csiphy_on(phy, (uint8_t)cam_settle);
++			rx = csid_on(csid);
++		}
++		if (rx) {
++			csid_watch(csid, 200);			/* nothing expected before the sensor runs */
++			csid_tpg(csid, 300);
++			rx = csid_on(csid);
++			phy_status(phy, "before stream on");
++		}
++		printf("BLUE CAM: rx: receiver %s\n", rx ? "ready" : "NOT ready, sensor only");
++	}
+ 	uint8_t f0 = rd8(b, addr, 0x0005);
+ 	printf("BLUE CAM: stream: frame count %u, mode 0x%02x; streaming on\n", f0, rd8(b, addr, 0x0100));
+ 	if (bus_write(b, addr, 0x0100, 1)) {
+ 		printf("BLUE CAM: stream: stream-on NACK\n");
+ 		return;
+ 	}
++	if (rx) {
++		IOSleep(50);
++		phy_status(phy, "streaming");
++		csid_watch(csid, 1000);
++		phy_status(phy, "after 1 s");
++	}
+ 	uint64_t t0 = mach_absolute_time();
+-	for (int i = 0; i < 10; i++) {
++	for (int i = 0; i < (rx ? 2 : 10); i++) {
+ 		IOSleep(100);
+ 		uint64_t ns;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+@@ -677,6 +994,15 @@
+ 	(void)bus_write(b, addr, 0x0100, 0);
+ 	IOSleep(50);
+ 	printf("BLUE CAM: stream: off, mode 0x%02x\n", rd8(b, addr, 0x0100));
++	if (cam_stream >= 2) {
++		if (csid) {
++			csid_off(csid);
++		}
++		if (phy) {
++			csiphy_off(phy);
++		}
++		rx_clocks_off();
++	}
+ }
+ 
+ /* Read the model ID of every sensor in the group; returns how many answered. */
+@@ -850,6 +1176,7 @@
+ 	}
+ 	PE_parse_boot_argn("bluecam_gdsc", &gdsc_mode, sizeof(gdsc_mode));
+ 	PE_parse_boot_argn("bluecam_stream", &cam_stream, sizeof(cam_stream));
++	PE_parse_boot_argn("bluecam_settle", &cam_settle, sizeof(cam_settle));
+ 	thread_t th;
+ 	if (kernel_thread_start(cam_thread, NULL, &th) != KERN_SUCCESS) {
+ 		printf("BLUE CAM: no thread\n");
