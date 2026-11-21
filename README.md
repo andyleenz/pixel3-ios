@@ -64,7 +64,7 @@ partition.
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
 | Wi-Fi | **Works in iOS on 2.4 GHz.** The WCN3990's firmware runs in the modem's WLAN domain (copy engines, HTC/WMI/HTT). Settings lists the networks nearby; joining a WPA2 network with the password typed on the phone associates, does the 4-way handshake in the kernel, gets a DHCP address, and Safari loads pages. `en0` and Apple80211 (ported from ios-topaz/HackiOS) serve Apple's own wifid and configd. 5 GHz scans don't start yet |
 | Audio | **iOS plays through the speaker** (startup sound, ringtone previews). HackiOS's RedwoodAudio HAL plug-in writes to `/dev/redwood-audio`; the kernel feeds the ADSP (ASM → ADM → AFE quaternary TDM) and the two CS35L36 amps, with iOS's volume as a gain. On by default (`bluesnd=0` turns it off). No microphone or headset yet |
-| Camera | **The front camera takes a picture in the kernel** (test boots only, `bluecam_stream=3`): the IMX355 streams 820x616 RAW10 over 4-lane CSI-2, the CSIPHY and CSID receive it, the IFE-lite writes a frame to memory, and the kernel saves it as a colour snap. Not available to iOS yet; rear camera not started |
+| Camera | **Both cameras take a picture in the kernel** (test boots only, `bluecam=1` rear / `2` front, `bluecam_stream=3`): the sensor streams RAW10 over 4-lane CSI-2 (front IMX355 820x616 on CSIPHY2, rear IMX363 2x2-binned 2016x1512 on CSIPHY0), the CSID and IFE-lite write a frame to memory, and the kernel saves it as a colour snap. No rear focus yet; not available to iOS |
 | Other | Haptics, modem boot (no cellular data yet) |
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
@@ -86,8 +86,14 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - 5 GHz scans and joins; make the radio part of the default boot; WPA3 and open networks; Wi-Fi off/on
   from Control Center without a stall.
 
-**In progress: camera**
-- Continuous frames from the front IMX355 into iOS as a camera device; then the rear IMX363 (full IFE).
+**In progress: battery life**
+- Measured (0197, on battery with the cable in): ~530 mA with the screen off, ~850 mA on (3.5-5.5 h).
+  CPUs at fixed top clocks (~70 mA), the GPU always up at 710 MHz (~195 mA), and cores that only WFI
+  (no power collapse, so the SoC rails never drop). Next: CPU DVFS, GPU idle/slumber, the IPI rate,
+  then PSCI CPU_SUSPEND. Then a flashed standalone boot (slot A) and a soak test.
+
+**Parked: camera**
+- Rear focus (LC898219XI), continuous frames, then a path into iOS.
 
 **Next**
 - Photos: find out why it sees no photo library (assetsd never starts).

@@ -951,3 +951,17 @@ No panics. Screenshots correct: home, apple.com loaded and scrolled, Control Cen
 - **0194: IFE-lite to memory.** The IFE's four SMMU streams (0x808, 0x810/8, 0xc08, 0xc10/8) in bypass, gcc camera AXI and CAMNOC AXI on, ife_lite at 384 MHz. Reset, then write master 0 for RDI0 in MIPI raw mode to a 2 MiB contiguous buffer, frame increment 0 (camss-vfe-17x.c's `vfe_wm_start`). One frame: 640,640 bytes, a line stride of 1040 (1025 packed, padded to 16). `bluesnap_put()` in sweet_ufs.c stores any BGRA picture in the snap area; the camera saves the raw Bayer as grey and an RGGB 2x2 colour image.
 - **0195.** The first frame was nearly black at 94 fps (exposure 642 lines). Frame length 2608 lines (`bluecam_fll`, 24 fps), analog gain 4x (`bluecam_gain=768`), black level 64 subtracted, white at the 99.5th percentile, grey-world white balance, gamma 2. cam9, pointed at a room: correct colours (RGGB order confirmed), rotated 90 degrees as the sensor is mounted, fixed focus.
 - **Next.** Continuous frames (ping-pong buffers, buf-done IRQ) and a path into iOS.
+
+### The rear camera, and where the battery goes (2026-11-21)
+
+- **0196: rear IMX363.** The receiver takes the CSIPHY as a parameter; the rear is on CSIPHY0 (stock dtbo `csiphy-sd-index` 0). Settings from the sdm670-mainline imx363.c (24 MHz, 4032x3024), retimed for the 19.2 MHz MCLK (pre-divider 2, VT x131, OP x139) and 2x2-binned to 2016x1512. rear1: 36 fps at the CSID, a full 3.8 MB frame (stride 2528), colour snap of a close, out-of-focus surface (the focus actuator, LC898219XI per the stock module, is not driven). The CSID's RX bit 22 fires ~53 times per rear frame and once per front frame while the images are clean; probably packets of other data types (PDAF, embedded lines) that RDI0 does not take.
+- **0197: power measurement.** `bluebatt_usb_off=N` sets PMI8998 USBIN_SUSPEND (0x1340 bit 0) for N seconds, so the MAX1720x current is the phone's own draw with the cable in. Screen off/on by scripted power-button presses; the panel sleeps and the DPU unflips as it should.
+
+| Boot | Screen off | Screen on |
+|---|---|---|
+| pwr1, default | ~530 mA | ~850 mA |
+| pwr2, CPUs at their lowest OSM level | ~460 mA | ~690 mA |
+| pwr3, also `blueui=0` (no GPU, no sound) | ~265 mA | ~500 mA |
+
+The CPUs sit at fixed top levels (no DVFS), the GPU stays up at 710 MHz, and idle cores only WFI: no PSCI power collapse, so the shared rails and DDR never reach their sleep levels. Each core takes 600-1000 IPIs and 100-300 timer interrupts a second at idle. Order of work: CPU DVFS, GPU idle/slumber, the IPI rate, PSCI CPU_SUSPEND.
+
