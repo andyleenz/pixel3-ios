@@ -811,6 +811,13 @@ surface_shared(struct eagl *e, struct image *image)
  */
 #define STILL_LOOKS     120
 #define STILL_EVERY     8
+/*
+ * A big picture (over 2 MB: Safari's decoded images, Wallet's card art, rows not a multiple of 256 bytes so never read in
+ * place) is still after STILL_LOOKS_BIG looks: hashing a 9 MB one every frame for its first two seconds was a fifth of the
+ * drawing thread while browsing (glprof). A change is still seen at most STILL_EVERY frames late.
+ */
+#define STILL_LOOKS_BIG 12
+#define STILL_BIG_BYTES (2u << 20)
 static int still_seldom = 1;                    /* boot-arg glstill=0: every surface looked at every frame (for comparing) */
 static bool
 surface_changed(struct eagl *e, struct image *image)
@@ -834,7 +841,8 @@ surface_changed(struct eagl *e, struct image *image)
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
-	if (still_seldom && image->unchanged >= STILL_LOOKS && (e->frames + IOSurfaceGetID(surface)) % STILL_EVERY != 0) {
+	unsigned still = size > STILL_BIG_BYTES ? STILL_LOOKS_BIG : STILL_LOOKS;
+	if (still_seldom && image->unchanged >= still && (e->frames + IOSurfaceGetID(surface)) % STILL_EVERY != 0) {
 		return false;
 	}
 	image->looked = e->frames + 1;
@@ -844,7 +852,7 @@ surface_changed(struct eagl *e, struct image *image)
 		sum ^= sum >> 29;
 	}
 	if (sum == image->sum) {
-		image->unchanged += image->unchanged < STILL_LOOKS;
+		image->unchanged += image->unchanged < still;
 		return false;
 	}
 	image->sum = sum;
