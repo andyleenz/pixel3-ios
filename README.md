@@ -14,6 +14,7 @@
 <img src="docs/screenshots/2026-11-21-lock.png" width="150" alt="Lock screen">
 <img src="docs/screenshots/2026-11-21-home1.png" width="150" alt="Home screen">
 <img src="docs/screenshots/2026-11-21-home2.png" width="150" alt="Second home page: the stock apps">
+<img src="docs/screenshots/2026-11-21-control-center.png" width="150" alt="Control Center, GPU-drawn blur">
 <img src="docs/screenshots/2026-11-21-settings.png" width="150" alt="Settings, scrolled">
 <img src="docs/screenshots/2026-11-21-safari.png" width="150" alt="Safari over Wi-Fi">
 </p>
