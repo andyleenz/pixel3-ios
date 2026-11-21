@@ -20,5 +20,6 @@ showing; 540x1080, half the panel's resolution, RGB565). Newest first.
 | 2026-11-21-lock.png | Lock screen at the full-width canvas, after a lock/wake cycle with the panel asleep (`bluefb_dcs=2`) |
 | 2026-11-21-home1.png | Home screen, settled, full width |
 | 2026-11-21-home2.png | Second home page (stock apps), full width |
+| 2026-11-21-control-center.png | Control Center, drawn by the GPU in place into the display buffer (val1) |
 | 2026-11-21-settings.png | Settings scrolled past the Wi-Fi row |
 | 2026-11-21-safari.png | Safari on apple.com over Wi-Fi |

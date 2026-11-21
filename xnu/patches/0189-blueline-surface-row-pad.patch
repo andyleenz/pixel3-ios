@@ -1,0 +1,37 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] 0189: SweetSurface: room for 4-row groups, so the GPU can draw into the display's buffers
+
+Mesa's A6xx layout pads a render target's height to a multiple of 4 rows
+and checks the imported memory covers it. The display's buffers on the
+full-width canvas (1125 x 2250, rows of 4608) were allocated for exactly
+2250 rows: 10371072 bytes against the 10377216 Mesa wants, so every import
+of them failed (GL_INVALID_VALUE) and eagl copied each frame out by CPU.
+A surface of one plane now gets room for whole groups of 4 rows (here 2252
+rows, one more 16K page); the DPU's scanout pool is sized the same (0145).
+Wrapped surfaces (0154) keep the caller's size. bluesurf_rowpad=0 turns
+the padding off.
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -383,6 +383,21 @@
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
++	/*
++	 * 0189: room for whole groups of 4 rows. Mesa's A6xx layout pads a render target's
++	 * height to a multiple of 4 and refuses an import whose memory is shorter: the display's
++	 * buffers (1125 x 2250, rows of 4608) were 6144 bytes short and always copied out.
++	 */
++	{
++		uint32_t rowpad = 1;
++		PE_parse_boot_argn("bluesurf_rowpad", &rowpad, sizeof(rowpad));
++		uint64_t padded = (uint64_t)s->offset + (uint64_t)s->bytesPerRow *
++		    ((sweet_div_up(s->height, s->elementHeight) + 3ull) & ~3ull);
++		if (rowpad && s->planeCount == 0 && padded > end) {
++			end = padded;
++		}
++	}
++
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;

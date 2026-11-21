@@ -14,6 +14,7 @@
 <img src="docs/screenshots/2026-11-21-lock.png" width="150" alt="Lock screen">
 <img src="docs/screenshots/2026-11-21-home1.png" width="150" alt="Home screen">
 <img src="docs/screenshots/2026-11-21-home2.png" width="150" alt="Second home page: the stock apps">
+<img src="docs/screenshots/2026-11-21-control-center.png" width="150" alt="Control Center, GPU-drawn blur">
 <img src="docs/screenshots/2026-11-21-settings.png" width="150" alt="Settings, scrolled">
 <img src="docs/screenshots/2026-11-21-safari.png" width="150" alt="Safari over Wi-Fi">
 </p>
@@ -56,7 +57,7 @@ partition.
 | CPU | All 8 cores (4x Kryo 385 Silver at 1.77 GHz, 4x Gold at 2.65 GHz), PSCI |
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
 | Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X 1125 pixels wide at the panel's 2:1 (1125x2250, scaled by 0.96 to fill the panel; 0184), with the X's status bar (why it was a red bar: [docs/ios16-red-status-bar.md](docs/ios16-red-status-bar.md)). With `blueui=1` the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; without it, a CPU copy at 30 Hz. Brightness works |
-| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim. Settings and Safari scroll at 55-62 fps |
+| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames |
 | iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. the App Library and Control Center blurs, Control Center's glyphs and brightness slider. Photos crashes (no photo library yet), and parts of Control Center blink while it animates |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
@@ -75,8 +76,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 
 **In progress: smoothness**
 - Remove the remaining hitches (frames of 30-120 ms when a screen or app first appears). Measured causes:
-  IOSurfaces whose rows aren't 64-byte aligned are copied by the CPU instead of read by the GPU in place
-  (up to 9 ms per full-screen copy); texture uploads; first-use shader compiles (now cached on disk).
+  pictures whose rows aren't a multiple of 256 bytes are copied by the CPU instead of read by the GPU in
+  place (Safari's images); texture uploads; first-use shader compiles (now cached on disk).
 - GMEM (on-chip tile) rendering instead of sysmem, for the blur-heavy screens (dock, Control Center).
 
 **In progress: Wi-Fi**

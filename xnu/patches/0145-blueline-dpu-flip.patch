@@ -738,7 +738,7 @@ index 0d2a9e3..66dfcb1 100644
 +	}
 +	bd_fplan_stride = stride;
 +	bd_plan_log(bd_fit ? "flip plan (fit)" : "flip plan (crop)", &bd_fplan);
-+	bd_pool_size = round_page((uint64_t)stride * bd_lh);
++	bd_pool_size = round_page((uint64_t)stride * ((bd_lh + 3) & ~3u));	/* (0189: whole groups of 4 rows, as SweetSurface allocates) */
 +	for (int i = 0; i < bufs; i++) {
 +		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
 +		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous |
