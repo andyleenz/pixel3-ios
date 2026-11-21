@@ -1,0 +1,155 @@
+0192: stream the front IMX355 and watch its frame counter (bluecam_stream=1)
+
+With bluecam=2 bluecam_stream=1, after the chip-ID read the front normal
+IMX355 (0x10) gets Linux imx355.c's global setting and its 820x616 mode
+(19.2 MHz INCK, 4 lanes at 360 MHz), digital gain for all colours, then
+stream on for 1 s while the sensor's frame counter (0x0005) is read every
+100 ms, then stream off and the usual power-down. No CSI receiver yet:
+this only shows that the sensor runs.
+
+diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c
++++ b/bsd/dev/blueline_camera_probe.c
+@@ -58,6 +58,7 @@
+ #include <sys/errno.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+@@ -568,6 +569,116 @@
+ 
+ static const char *const nack_stage[5] = { "", "address", "register high", "register low", "read address" };
+ 
++/* ---- 0192: stream the front IMX355 (bluecam_stream=1) ---- */
++
++static int cam_stream;
++
++/* Sony write: S addr+W reg[15:8] reg[7:0] data P. 0, or the stage not acknowledged (1-3, 4 data). */
++static int
++bus_write(const struct cam_bus *b, uint8_t addr, uint16_t reg, uint8_t v)
++{
++	boolean_t intr = ml_set_interrupts_enabled(FALSE);
++	int stage = 0;
++
++	bus_start(b);
++	if (bus_wbyte(b, (uint8_t)(addr << 1))) {
++		stage = 1;
++	} else if (bus_wbyte(b, (uint8_t)(reg >> 8))) {
++		stage = 2;
++	} else if (bus_wbyte(b, (uint8_t)reg)) {
++		stage = 3;
++	} else if (bus_wbyte(b, v)) {
++		stage = 4;
++	}
++	bus_stop(b);
++	ml_set_interrupts_enabled(intr);
++	return stage;
++}
++
++/*
++ * IMX355 register values for a 19.2 MHz INCK, 4 lanes at 360 MHz, as in Linux's
++ * drivers/media/i2c/imx355.c: its global setting and its 820x616 mode.
++ */
++static const uint16_t imx355_global[][2] = {
++	{ 0x0136, 0x13 }, { 0x0137, 0x33 }, { 0x304e, 0x03 }, { 0x4348, 0x16 },
++	{ 0x4350, 0x19 }, { 0x4408, 0x0a }, { 0x440c, 0x0b }, { 0x4411, 0x5f },
++	{ 0x4412, 0x2c }, { 0x4623, 0x00 }, { 0x462c, 0x0f }, { 0x462d, 0x00 },
++	{ 0x462e, 0x00 }, { 0x4684, 0x54 }, { 0x480a, 0x07 }, { 0x4908, 0x07 },
++	{ 0x4909, 0x07 }, { 0x490d, 0x0a }, { 0x491e, 0x0f }, { 0x4921, 0x06 },
++	{ 0x4923, 0x28 }, { 0x4924, 0x28 }, { 0x4925, 0x29 }, { 0x4926, 0x29 },
++	{ 0x4927, 0x1f }, { 0x4928, 0x20 }, { 0x4929, 0x20 }, { 0x492a, 0x20 },
++	{ 0x492c, 0x05 }, { 0x492d, 0x06 }, { 0x492e, 0x06 }, { 0x492f, 0x06 },
++	{ 0x4930, 0x03 }, { 0x4931, 0x04 }, { 0x4932, 0x04 }, { 0x4933, 0x05 },
++	{ 0x595e, 0x01 }, { 0x5963, 0x01 }, { 0x3030, 0x01 }, { 0x3031, 0x01 },
++	{ 0x3045, 0x01 }, { 0x4010, 0x00 }, { 0x4011, 0x00 }, { 0x4012, 0x00 },
++	{ 0x4013, 0x01 }, { 0x68a8, 0xfe }, { 0x68a9, 0xff }, { 0x6888, 0x00 },
++	{ 0x6889, 0x00 }, { 0x68b0, 0x00 }, { 0x3058, 0x00 }, { 0x305a, 0x00 },
++};
++static const uint16_t imx355_820x616[][2] = {
++	{ 0x0112, 0x0a }, { 0x0113, 0x0a }, { 0x0114, 0x03 }, { 0x0342, 0x0e },
++	{ 0x0343, 0x58 }, { 0x0340, 0x02 }, { 0x0341, 0x8c }, { 0x0344, 0x00 },
++	{ 0x0345, 0x00 }, { 0x0346, 0x00 }, { 0x0347, 0x00 }, { 0x0348, 0x0c },
++	{ 0x0349, 0xcf }, { 0x034a, 0x09 }, { 0x034b, 0x9f }, { 0x0220, 0x00 },
++	{ 0x0222, 0x01 }, { 0x0900, 0x01 }, { 0x0901, 0x44 }, { 0x0902, 0x00 },
++	{ 0x034c, 0x03 }, { 0x034d, 0x34 }, { 0x034e, 0x02 }, { 0x034f, 0x68 },
++	{ 0x0301, 0x05 }, { 0x0303, 0x01 }, { 0x0305, 0x02 }, { 0x0306, 0x00 },
++	{ 0x0307, 0x78 }, { 0x030b, 0x01 }, { 0x030d, 0x02 }, { 0x030e, 0x00 },
++	{ 0x030f, 0x4b }, { 0x0310, 0x00 }, { 0x0700, 0x02 }, { 0x0701, 0x78 },
++	{ 0x0820, 0x0b }, { 0x0821, 0x40 }, { 0x3088, 0x04 }, { 0x6813, 0x02 },
++	{ 0x6835, 0x07 }, { 0x6836, 0x01 }, { 0x6837, 0x04 }, { 0x684d, 0x07 },
++	{ 0x684e, 0x01 }, { 0x684f, 0x04 },
++};
++
++static bool
++write_list(const struct cam_bus *b, uint8_t addr, const uint16_t (*t)[2], size_t n, const char *what)
++{
++	for (size_t i = 0; i < n; i++) {
++		int e = bus_write(b, addr, t[i][0], (uint8_t)t[i][1]);
++		if (e) {
++			printf("BLUE CAM: stream: %s entry %zu (0x%04x) NACK at stage %d\n", what, i, t[i][0], e);
++			return false;
++		}
++	}
++	printf("BLUE CAM: stream: %s written (%zu registers)\n", what, n);
++	return true;
++}
++
++static uint8_t
++rd8(const struct cam_bus *b, uint8_t addr, uint16_t reg)
++{
++	uint8_t v = 0xee;
++	(void)bus_read(b, addr, reg, &v, 1);
++	return v;
++}
++
++/* Settings, stream on, read the sensor's own frame counter (0x0005) for 1 s, stream off. */
++static void
++stream_test(const struct cam_bus *b, uint8_t addr)
++{
++	if (!write_list(b, addr, imx355_global, sizeof(imx355_global) / sizeof(imx355_global[0]), "global") ||
++	    !write_list(b, addr, imx355_820x616, sizeof(imx355_820x616) / sizeof(imx355_820x616[0]), "820x616")) {
++		return;
++	}
++	(void)bus_write(b, addr, 0x3070, 1);	/* digital gain for all colours */
++	uint8_t f0 = rd8(b, addr, 0x0005);
++	printf("BLUE CAM: stream: frame count %u, mode 0x%02x; streaming on\n", f0, rd8(b, addr, 0x0100));
++	if (bus_write(b, addr, 0x0100, 1)) {
++		printf("BLUE CAM: stream: stream-on NACK\n");
++		return;
++	}
++	uint64_t t0 = mach_absolute_time();
++	for (int i = 0; i < 10; i++) {
++		IOSleep(100);
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		printf("BLUE CAM: stream: +%llu ms frame count %u, mode 0x%02x\n", ns / 1000000, rd8(b, addr, 0x0005),
++		    rd8(b, addr, 0x0100));
++	}
++	(void)bus_write(b, addr, 0x0100, 0);
++	IOSleep(50);
++	printf("BLUE CAM: stream: off, mode 0x%02x\n", rd8(b, addr, 0x0100));
++}
++
+ /* Read the model ID of every sensor in the group; returns how many answered. */
+ static int
+ read_ids(struct cam_group *c, const struct cam_bus *b, const char *when)
+@@ -667,6 +778,9 @@
+ 			(void)read_ids(c, &bus, "SDA/SCL swapped");
+ 		}
+ 	}
++	if (cam_stream && c == &groups[1]) {
++		stream_test(&bus, c->sensor[0].addr);
++	}
+ 
+ clock_down:
+ 	/* Reverse of power-up: XCLR low before INCK stops, then DOVDD, then AVDD. */
+@@ -735,6 +849,7 @@
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("bluecam_gdsc", &gdsc_mode, sizeof(gdsc_mode));
++	PE_parse_boot_argn("bluecam_stream", &cam_stream, sizeof(cam_stream));
+ 	thread_t th;
+ 	if (kernel_thread_start(cam_thread, NULL, &th) != KERN_SUCCESS) {
+ 		printf("BLUE CAM: no thread\n");
