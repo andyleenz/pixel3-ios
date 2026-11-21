@@ -12,7 +12,7 @@ command line still wins.
 ---
 --- a/pexpert/gen/bootargs.c
 +++ b/pexpert/gen/bootargs.c
-@@ -193,34 +193,42 @@
+@@ -193,34 +193,45 @@
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  /*
   * 0156: blueui=1 stands for the GPU-rendered UI set (stage 6f), so test and
@@ -38,6 +38,7 @@ command line still wins.
 +	{ "blueui", "bluedpu_flip", 1, NULL },
 +	{ "blueui", "cs_enforcement_disable", 1, NULL },
 +	{ "blueui", "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib" },
++	{ "blueui", "bluesnd", 4, NULL },		/* 0190/0191: the speaker for iOS */
 +	{ "bluetest", "bluebatt", 1, NULL },
 +	{ "bluetest", "bluemax", 2, NULL },
 +	{ "bluetest", "bluelmh", 1, NULL },
@@ -57,12 +58,14 @@ command line still wins.
 -		return FALSE;
 -	}
  	for (size_t i = 0; i < sizeof(blue_ui_set) / sizeof(blue_ui_set[0]); i++) {
-+		int on = 0;
++		/* 2026-11-21: the GPU set (blueui) is on unless blueui=0; the others only when asked for */
++		int on = strcmp(blue_ui_set[i].set, "blueui") == 0;
 +
  		if (strcmp(arg_string, blue_ui_set[i].name) != 0) {
  			continue;
  		}
-+		if (!PE_parse_boot_argn_internal(PE_boot_args(), blue_ui_set[i].set, &on, sizeof(on), FALSE) || on == 0) {
++		(void)PE_parse_boot_argn_internal(PE_boot_args(), blue_ui_set[i].set, &on, sizeof(on), FALSE);
++		if (on == 0) {
 +			continue;
 +		}
  		if (blue_ui_set[i].str != NULL) {
