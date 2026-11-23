@@ -1032,4 +1032,4 @@ Backtraces symbolised with `ipsw dyld a2s` against the SystemOS cryptex's cache 
 
 The IPI rate (stage 4 of the battery plan) was mostly this loop. In dvfs2, Silver spends ~75% of idle time at 300 MHz and Gold ~95% at 825 MHz.
 
-**Frame timing.** The screen now locks ~40 s after boot, so the touch script presses power at SpringBoard +50 s before swiping (`work/test/smruns.sh`). Same script, one boot each: dv6 (DVFS) median 22.4 ms, p90 46.3 ms, 97 gaps over 33 ms; fx4 (`bluecpu_dvfs=0`) 22.8 / 48.7 / 95. No visible cost. fx6 (`bluecpu_dvfs=0`) never reached SpringBoard's reboot and the phone dropped off USB; open.
+**Frame timing.** The screen now locks ~40 s after boot, so the touch script presses power at SpringBoard +50 s before swiping (`work/test/smruns.sh`). Same script, one boot each: dv6 (DVFS) median 22.4 ms, p90 46.3 ms, 97 gaps over 33 ms; fx4 (`bluecpu_dvfs=0`) 22.8 / 48.7 / 95. No visible cost. After fx6 (`bluecpu_dvfs=0`, a normal boot and reboot) slot B's recovery came up without adb and waited for the Enable ADB tap, though that recovery is meant to be tap-free; seen once.
