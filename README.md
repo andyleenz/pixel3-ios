@@ -87,12 +87,13 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   from Control Center without a stall.
 
 **In progress: battery life**
-- Measured (0197, on battery with the cable in; `tools/pwr.sh`): with the GPU clock following the load
-  (0198: DCVS with an input boost) and CommCenter back so the screen locks itself, ~320 mA with the
-  screen off and ~600-680 mA on; it was ~700 / ~870 mA at a fixed 710 MHz. Still: CPUs at fixed top
-  clocks (~70 mA), CommCenter restarting every ~17 s (it still expects a baseband), 12-17k IPIs a second
-  across the cores, and cores that only WFI (no power collapse, so the SoC rails never drop). Next:
-  CommCenter's crashes, CPU DVFS, the IPI rate, GPU slumber, then PSCI CPU_SUSPEND. Then a flashed standalone boot (slot A) and a soak test.
+- Measured (0197, on battery with the cable in; `tools/pwr.sh`): GPU clock following the load (0198),
+  CommCenter back so the screen locks itself, CPU clocks following the load (0200) and the Bluetooth
+  audio plugin out of mediaserverd (it was looping on the missing bluetoothd, ~1.2 cores at idle):
+  ~210 mA with the screen off, down from ~530 mA. ~700 IPIs a second with the screen off, down from
+  12-17k. Still: CommCenter restarting every ~17 s (it still expects a baseband, ~15% of a core), and
+  cores that only WFI (no power collapse, so the SoC rails never drop). Next: GPU slumber, PSCI
+  CPU_SUSPEND, CommCenter's restarts. Then a flashed standalone boot (slot A) and a soak test.
 
 **Parked: camera**
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.
