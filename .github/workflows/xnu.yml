@@ -77,7 +77,7 @@ jobs:
           git init -q sailfish
           git -C sailfish fetch -q --depth 1 "$SAILFISH_REPO" "$SAILFISH_SHA"
           git -C sailfish checkout -q FETCH_HEAD
-          i=200
+          i=900  # after our patches (0100-0899)
           for n in $SAILFISH_PATCHES; do
             f=$(ls sailfish/xnu/patches/$n-*.patch)
             dst="0${i}-sf-$(basename "$f")"
