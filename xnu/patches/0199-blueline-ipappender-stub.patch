@@ -1,0 +1,168 @@
+0199: AppleIPAppender stand-in for CommCenter (bluepdp)
+
+CommCenter (no-baseband job, kept since 2026-11-23) makes an
+ApplePDPHelperInterface; without an AppleIPAppender service its first
+callStructMethod locks a mutex through NULL and CommCenter dies (SIGSEGV),
+about half of its restarts. iokit/Kernel/arm/MiniIPAppender.cpp publishes
+AppleIPAppender under IOResources with a user client that refuses every
+method (kIOReturnUnsupported). The SIGSEGVs stop (0 in 10 min, cc5);
+CommCenter still aborts every ~17 s on its baseband path (std::runtime_error
+"Unable to communicate with AppleBaseband driver"), open. Started from bsd_init after the payload
+install; bluepdp=0 leaves it out.
+
+diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c	2026-11-23 13:45:59
++++ b/bsd/kern/bsd_init.c	2026-11-23 13:46:28
+@@ -959,6 +959,11 @@
+ 		extern void blueline_payload_install(void);
+ 		blueline_payload_install();
+ 	}
++	{
++		/* 0199: AppleIPAppender stand-in for CommCenter (iokit/Kernel/arm/MiniIPAppender.cpp) */
++		extern void MiniIPAppenderStart(void);
++		MiniIPAppenderStart();
++	}
+ #endif
+ 
+ #if CONFIG_NETBOOT
+diff -ruN a/iokit/Kernel/arm/MiniIPAppender.cpp b/iokit/Kernel/arm/MiniIPAppender.cpp
+--- a/iokit/Kernel/arm/MiniIPAppender.cpp	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/MiniIPAppender.cpp	2026-11-23 14:36:15
+@@ -0,0 +1,126 @@
++/*
++ * MiniIPAppender: a stand-in for AppleIPAppender, the cellular packet-data (PDP) driver that
++ * CommCenter reaches through ApplePDPHelper.framework.
++ *
++ * CommCenter runs in its no-baseband form (the job Wi-Fi-only iPads run; tools/iosroot-tweaks.py
++ * KEEP_KEYS), but still makes an ApplePDPHelperInterface. Without an AppleIPAppender service the
++ * interface stays half made ("Could not find %s service"), and its first callStructMethod locks
++ * a mutex through a NULL pointer: CommCenter dies with SIGSEGV and launchd starts it again,
++ * every few seconds.
++ *
++ * So: the service, a user client that can be opened, and a refusal of every method
++ * (kIOReturnUnsupported: "ApplePDPHelper: Performing '...' failed"). bluepdp=0 leaves it out.
++ * CommCenter still aborts later, on its baseband path ("Unable to communicate with AppleBaseband
++ * driver"); this only removes the SIGSEGV.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++extern "C" void MiniIPAppenderStart(void);
++
++class AppleIPAppender : public IOService
++{
++	OSDeclareDefaultStructors(AppleIPAppender);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleIPAppender, IOService);
++
++bool
++AppleIPAppender::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleIPAppenderUserClient");
++	registerService();
++	return true;
++}
++
++class AppleIPAppenderUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * arguments,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, IOUserClient);
++
++static unsigned gIPAOpens, gIPACalls;
++
++bool
++AppleIPAppenderUserClient::start(IOService * provider)
++{
++	char who[32] = "?";
++
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	if (gIPAOpens++ < 4) {
++		proc_selfname(who, sizeof(who));
++		IOLog("BLUE PDP: AppleIPAppender opened by %s\n", who);
++	}
++	return true;
++}
++
++IOReturn
++AppleIPAppenderUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleIPAppenderUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * arguments,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	IOReturn ret = kIOReturnUnsupported;
++
++	if (gIPACalls++ < 16) {
++		IOLog("BLUE PDP: method %u (scalars in %u, struct in %u, out %u): %s\n", selector,
++		    arguments ? arguments->scalarInputCount : 0,
++		    arguments ? arguments->structureInputSize : 0, arguments ? arguments->structureOutputSize : 0,
++		    "unsupported");
++	}
++	return ret;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++void
++MiniIPAppenderStart(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("bluepdp", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	IOService * resources = IOService::getResourceService();
++	AppleIPAppender * ipa = OSTypeAlloc(AppleIPAppender);
++
++	if (resources == NULL || ipa == NULL || !ipa->init() || !ipa->attach(resources)) {
++		OSSafeReleaseNULL(ipa);
++		IOLog("BLUE PDP: cannot create AppleIPAppender\n");
++		return;
++	}
++	if (!ipa->start(resources)) {
++		ipa->detach(resources);
++	} else {
++		IOLog("BLUE PDP: AppleIPAppender published (every method unsupported; bluepdp=0 leaves it out)\n");
++	}
++	ipa->release();
++}
+diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-23 13:45:59
++++ b/iokit/conf/files.arm64	2026-11-23 13:46:28
+@@ -23,6 +23,7 @@
+ iokit/Kernel/arm/BlueGPUPresent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/BlueGPUUserClient.cpp                           optional iokitcpp
+ iokit/Kernel/arm/BlueAMFI.cpp                                    optional iokitcpp
++iokit/Kernel/arm/MiniIPAppender.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
