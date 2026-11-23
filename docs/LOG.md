@@ -965,3 +965,32 @@ No panics. Screenshots correct: home, apple.com loaded and scrolled, Control Cen
 
 The CPUs sit at fixed top levels (no DVFS), the GPU stays up at 710 MHz, and idle cores only WFI: no PSCI power collapse, so the shared rails and DDR never reach their sleep levels. Each core takes 600-1000 IPIs and 100-300 timer interrupts a second at idle. Order of work: CPU DVFS, GPU idle/slumber, the IPI rate, PSCI CPU_SUSPEND.
 
+
+### GPU clock follows the load (2026-11-23)
+
+**Measuring (tools/pwr.sh).** One command per power run: USB input suspended (0197), two minutes on SpringBoard, a scripted power press, five minutes off, a press, two minutes on, then `tools/pwrsum.py` prints battery mA, DPU flips/s and timer/IPI rates per phase. Phases follow the display; minutes with input the script did not send are kept apart (in base1 someone used the phone during the off phase). `tools/framegaps.py` gives the frame-timing numbers of the table above from eagl's timeline lines (`touch_lat=1`).
+
+**DCVS never ran.** 0151's DCVS ticked at the end of a kernel present. Since 0189 iOS draws through its own submits (0153), so there were no presents and the GPU stayed at 710 MHz all boot.
+
+**0198.** A kernel thread ticks DCVS every 100 ms with the ring lock (rs_recover takes it too). With only that (dcvs1), the GPU spends 99% of idle time at 257 MHz, but animations started by a touch begin at 257 MHz: p90 frame gaps 44-60 ms in three of four runs, against 37 ms at 710 MHz. Input boost: SweetHID calls `blue_gpu_core_input()` on every touch event and key; for 1 s (`bluegpu_dcvs_boost_ms`) the level is at least 520 MHz (`bluegpu_dcvs_boost`), and the thread is woken at once. Busy target 50% (was 65). On by default in the `blueui` set (`bluegpu_dcvs=0` restores the fixed clock).
+
+| Run | Setup | Screen on, idle | Screen off | After wake |
+|---|---|---|---|---|
+| base1 | fixed 710 MHz | 872 mA | 700 mA | 860 mA |
+| dcvs1 | DCVS, target 65 | 596 mA | 444 mA | 672 mA |
+| dcvs2 | defaults (DCVS, boost, target 50) | 681 mA | 506 mA | 588 mA |
+
+Runs differ by up to ~80 mA with the same setup. Frame gaps, def1 script (gap median / p90 / gaps over 33 ms):
+
+| Run | Setup | Wi-Fi | Median | p90 | > 33 ms |
+|---|---|---|---|---|---|
+| off1 | `bluegpu_dcvs=0` | no | 19.5 ms | 34.9 ms | 54 |
+| off2 | `bluegpu_dcvs=0` | yes | 19.1 ms | 35.4 ms | 74 |
+| bst1 | defaults | no | 20.3 ms | 44.8 ms | 68 |
+| bst2 | defaults | yes | 20.0 ms | 35.4 ms | 97 |
+| bst3 | defaults | no | 20.5 ms | 36.2 ms | 59 |
+| bst4 | defaults | yes | 16.9 ms | 32.8 ms | 84 |
+
+**Wi-Fi joins on every other boot.** Over 16 boots in a row (sm0-sm9, bst1-off2-bst4), the join failed ("join: failed (60) in state 2") on every second one, without exception. Open; the previous boot's teardown is the suspect. Safari runs without Wi-Fi draw fewer frames, so frame-gap runs are only compared within the same Wi-Fi state.
+
+**Still drawing after a wake.** In every power run the lock screen is still before the first press (0.4 flips/s) and draws ~45 frames/s after the wake press with nothing touched: a steady 17-draw, 90-triangle frame. Next: what animates.

@@ -87,10 +87,12 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   from Control Center without a stall.
 
 **In progress: battery life**
-- Measured (0197, on battery with the cable in): ~530 mA with the screen off, ~850 mA on (3.5-5.5 h).
-  CPUs at fixed top clocks (~70 mA), the GPU always up at 710 MHz (~195 mA), and cores that only WFI
-  (no power collapse, so the SoC rails never drop). Next: CPU DVFS, GPU idle/slumber, the IPI rate,
-  then PSCI CPU_SUSPEND. Then a flashed standalone boot (slot A) and a soak test.
+- Measured (0197, on battery with the cable in; `tools/pwr.sh`): with the GPU clock following the load
+  (0198: DCVS with an input boost), ~450-500 mA with the screen off and ~600-680 mA on; it was
+  ~700 / ~870 mA at a fixed 710 MHz. Still: CPUs at fixed top clocks (~70 mA), the lock screen
+  drawing ~45 frames/s after a wake, 12-20k IPIs a second across the cores, and cores that only WFI
+  (no power collapse, so the SoC rails never drop). Next: the wake drawing, CPU DVFS, the IPI rate,
+  GPU slumber, then PSCI CPU_SUSPEND. Then a flashed standalone boot (slot A) and a soak test.
 
 **Parked: camera**
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.
@@ -98,7 +100,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 **Next**
 - Photos: find out why it sees no photo library (assetsd never starts).
 - GPU memory: a larger BO pool than 32 MiB, and a 4th scanout buffer.
-- Widgets ("Waiting..."), GPU clock scaling (DCVS).
+- Widgets ("Waiting...").
+- Wi-Fi joins only on every other boot.
 
 **Later**
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
