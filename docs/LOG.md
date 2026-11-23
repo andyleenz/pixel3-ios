@@ -1054,3 +1054,11 @@ Wi-Fi and the modem are not started in these runs (`bluewifi` defaults to 0). Th
 | idle5 | `bluecpu_idle=2`: 0x400000f4 (cluster) when >= 10 ms | 212 mA | 52-101%, ~4.5k cluster requests / 10 s |
 
 No errors, no CPU_SUSPEND returns, and no hangs over 4 runs (~10 min each). The cores and the cluster are not where the ~210 mA goes. Next to look at: what ABL leaves on (the display pipeline's clocks and DSI PHY while the panel sleeps, its bandwidth votes, PMIC regulators), measured the same way.
+
+**Bus votes and a regulator census, screen off (0211, 2026-11-24).** `bluebw_park=1` sets the apps RSC's votes for MC0, SH0 and MM0-3 to Linux's keepalive (x 1, y 1) once the panel sleeps, and restores them before it wakes. Votes accepted (err 0), wake is normal, draw unchanged: bw1 208 mA. `bluecensus=15` dumps the PMICs over SPMI and the main GDSCs 15 s after the panel sleeps (census1):
+
+- PM8998 (SID 1): 18 of 28 LDOs on, all in normal (high-power) mode, at their usual voltages: L1 0.88, L2 1.2, L4 0.824, L5 0.8, L7 1.8, L9 1.808, L11 1.0, L12 1.8, L13 3.3, L14 1.88, L15 1.8, L17 1.304, L19 3.3, L20 2.96, L21 2.96, L24 3.088, L25 3.104, L26 1.2, L27 0.872, L28 3.008 V. Off: L3, L6, L8, L10, L16, L18, L22, L23. Bucks in auto mode.
+- PMI8998 (SID 3): BOB on at 3.556 V. PM8005 (SID 5): all four bucks on (the GFX rail at 0.752 V).
+- GDSCs powered: ufs_phy, ufs_card (no card slot on this phone), usb30_prim (the test cable), all seven MMU TBU votes, dispcc mdss, gpucc cx and gx. Off: pcie_0, pcie_1, usb30_sec.
+
+Nothing left on here explains ~200 mA. An LDO's own loss in normal mode is well under a milliamp, and the GPU (gx on) was already measured at ~5 mA (nogpu1). What the census can't show is CX/MX/DDR. The apps RSC only drops its votes when the subsystem goes to sleep, and its sleep and wake command sets are never written. ABL's active votes therefore hold the SoC rails and the DDR at active levels, whatever the cores do. Next: write RSC sleep/wake sets (as Linux's `rpmh_flush`) with keepalive BCM votes and retention ARC levels, then check whether the last core's cluster request ever reaches the AOSS.
