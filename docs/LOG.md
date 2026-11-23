@@ -1017,3 +1017,19 @@ Backtraces symbolised with `ipsw dyld a2s` against the SystemOS cryptex's cache 
 **0199: AppleIPAppender stand-in.** The PDP helper looks up the `AppleIPAppender` service (strings in ApplePDPHelper.framework). `iokit/Kernel/arm/MiniIPAppender.cpp` publishes one under IOResources with a user client that refuses every method; `bluepdp=0` leaves it out. SIGSEGVs 20 -> 0 in 10 min (cc5).
 
 **The abort is the baseband path.** CommCenter started by hand under bluesh prints it: `libc++abi: terminating due to uncaught exception of type std::runtime_error: Unable to communicate with AppleBaseband driver`, after `overrides_D22.plist` is picked as the device's signature plist. Not the PDP helper: making method 16 ("Block PDP traffic", called about four times before each abort) succeed changed nothing (cc6), and neither did leaving `baseband-chipset` out of `/product` (cc8). Still 35 restarts in 10 min; the screen locks itself regardless. Next, if worth it: what makes CommCenter choose its baseband path on a D22 (MobileGestalt answers, the overrides plist); else a small stand-in daemon for the CommCenter services.
+
+### CPU clocks follow the load; a Bluetooth plugin was eating a core (2026-11-23)
+
+**0200: CPU DVFS.** Silver sat at 1766 MHz and Gold at 2649 MHz all boot (0106/0139). A kernel thread now ticks every 20 ms (`bluecpu_dvfs`, on by default). Each core's idle time comes from recount (`blue_cpu_idle_abs`, osfmk/kern/recount.c). Each cluster takes its busiest core and asks OSM for the lowest level at or above current kHz x busy / 80%. At 90% busy it jumps to a "hispeed" level (1228 / 1459 MHz), and from there to the top. It goes up at once and down only after 60 ms of lower wants. Touches and keys hold at least 1228 / 1459 MHz for 1 s (`blue_cpu_input` from SweetHID). Every 10 s it logs average busy, busy per core, changes and time per level. `bluecpu_dvfs=0` keeps the fixed top levels. Our patch numbers reached 0200, so the pinned sailfish patches now start at 0900 (build-xnu.sh, CI).
+
+**Idle wasn't idle.** With the governor on (dvfs1), Silver stayed ~60% busy with the screen off: cores 0-2 ~40% each, Gold ~5%. `tools/bluerun/blueps.c` (per-process CPU over N seconds; iOS has no ps) showed launchd at 73% and mediaserverd at 48% of a core. mediaserverd's log had about 2000 lines a second of `Starting BTAudioPlugin` / `Register audio plugin connection with bluetoothd` / `XPC server error: Connection invalid`. `BTAudioHALPlugin.driver` reconnects to bluetoothd (not run here, DENY list) in a tight loop, and every try goes through launchd. The plugin is now moved to `HAL.disabled` (`tools/iosroot-tweaks.py`; on this phone, an `Info.plist` with no plug-in factories was pushed). All processes together at idle: 162% -> 45% of one core. The largest one left is CommCenter's restart loop, ~15%.
+
+| Run | Screen off, median | Timer/s | IPIs/s, screen off | Silver busy, idle |
+|---|---|---|---|---|
+| cc4 (before) | 317 mA | 1.3k | 12.4k | - |
+| dvfs1 (0200) | 241 mA | 1.3k | 6.2k | ~60% |
+| dvfs2 (0200, no BT plugin) | 211 mA | 1.3k | 0.7k | ~12% |
+
+The IPI rate (stage 4 of the battery plan) was mostly this loop. In dvfs2, Silver spends ~75% of idle time at 300 MHz and Gold ~95% at 825 MHz.
+
+**Frame timing.** The screen now locks ~40 s after boot, so the touch script presses power at SpringBoard +50 s before swiping (`work/test/smruns.sh`). Same script, one boot each: dv6 (DVFS) median 22.4 ms, p90 46.3 ms, 97 gaps over 33 ms; fx4 (`bluecpu_dvfs=0`) 22.8 / 48.7 / 95. No visible cost. fx6 (`bluecpu_dvfs=0`) never reached SpringBoard's reboot and the phone dropped off USB; open.
