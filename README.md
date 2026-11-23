@@ -91,9 +91,11 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   CommCenter back so the screen locks itself, CPU clocks following the load (0200) and the Bluetooth
   audio plugin out of mediaserverd (it was looping on the missing bluetoothd, ~1.2 cores at idle):
   ~210 mA with the screen off, down from ~530 mA. ~700 IPIs a second with the screen off, down from
-  12-17k. Still: CommCenter restarting every ~17 s (it still expects a baseband, ~15% of a core), and
-  cores that only WFI (no power collapse, so the SoC rails never drop). Next: GPU slumber, PSCI
-  CPU_SUSPEND, CommCenter's restarts. Then a flashed standalone boot (slot A) and a soak test.
+  12-17k. Idle cores can power down with PSCI CPU_SUSPEND (0210, `bluecpu_idle=1`), but that, the
+  GPU, the L3 clock, sound and touch each change the screen-off draw by under 5 mA. Still: CommCenter
+  restarting every ~17 s (it still expects a baseband, ~15% of a core). Next: what the bootloader
+  leaves powered (display pipeline, bus votes, regulators). Then a flashed standalone boot (slot A)
+  and a soak test.
 
 **Parked: camera**
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.

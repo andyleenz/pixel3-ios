@@ -1043,4 +1043,14 @@ The IPI rate (stage 4 of the battery plan) was mostly this loop. In dvfs2, Silve
 | nosnd1 | `bluesnd=0` (speaker amps and audio path off) | 212 mA |
 | notouch1 | `bluetouch=0` (touch controller never powered) | 214 mA |
 
-Wi-Fi and the modem are not started in these runs (`bluewifi` defaults to 0). The GPU idling at 257 MHz costs ~5 mA, so GPU slumber is not worth a full GPU restart path yet. L3 following is in 0200 but off by default. What is left is the SoC: cores that only WFI, clusters and L3 that never collapse, and the CX/MX/DDR rails held at active levels because the apps subsystem never enters its RPMh sleep state. Next: PSCI CPU_SUSPEND. XNU already has the wake path for a core that lost power in idle (`resume_idle_cpu` -> `arm_init_idle_cpu` -> `cpu_idle_exit(TRUE)`). Still needed: a wake timer while the core's own timer is off (the MMIO timer frames at 0x17c90000), and the GIC CPU interface restored on each wake.
+Wi-Fi and the modem are not started in these runs (`bluewifi` defaults to 0). The GPU idling at 257 MHz costs ~5 mA, so GPU slumber is not worth a full GPU restart path yet. L3 following is in 0200 but off by default. What is left is the SoC: cores that only WFI, clusters and L3 that never collapse, and the CX/MX/DDR rails held at active levels because the apps subsystem never enters its RPMh sleep state. 
+**Idle cores power down; the draw does not move (2026-11-23).** 0210 (`bluecpu_idle=1|2`, off by default) calls PSCI CPU_SUSPEND in place of WFI when a core's next timer is at least 2 ms away. The core wakes through XNU's own path for a core that lost its state in idle (`sweet_secondary_entry` -> `resume_idle_cpu` -> `arm_init_idle_cpu`), plus the GIC CPU interface and the timer deadline. Deadlines of cores that are down go into timer frame 0 at 0x17ca0000. Its physical timer (SPI 8, INTID 40) fires but never reaches the non-secure side, since it reads as group 0. The virtual one (SPI 6, INTID 38) works. The frame's interrupt IPIs the cores whose deadlines have passed. Firmware: PSCI 1.1, CPU_SUSPEND with extended state ids and OS-initiated mode offered; all seven frames are non-secure (CNTACR 0x3f).
+
+| Run | Change | Screen off, median | Cores powered down |
+|---|---|---|---|
+| cpus4 | `cpus=4` (Gold never started) | 210 mA | - |
+| cpus1 | `cpus=1` | 256 mA | - |
+| idle4 | `bluecpu_idle=1`: 0x40000003, core power-down | 212 mA | 63-96% of the time |
+| idle5 | `bluecpu_idle=2`: 0x400000f4 (cluster) when >= 10 ms | 212 mA | 52-101%, ~4.5k cluster requests / 10 s |
+
+No errors, no CPU_SUSPEND returns, and no hangs over 4 runs (~10 min each). The cores and the cluster are not where the ~210 mA goes. Next to look at: what ABL leaves on (the display pipeline's clocks and DSI PHY while the panel sleeps, its bandwidth votes, PMIC regulators), measured the same way.

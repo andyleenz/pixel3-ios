@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 22:00:00 +1100
+Subject: [PATCH] 0210: blueline idle cores power down with PSCI CPU_SUSPEND
+ (bluecpu_idle=1, off by default)
+
+cpu_idle calls blue_idle_enter() in place of WFI: if the next timer is at
+least bluecpu_idle_us (2000) away, the core's deadline goes into the
+memory-mapped timer frame 0 (0x17ca0000) and the core calls CPU_SUSPEND
+(power_state bluecpu_idle_ps, 0x40000003 as Linux sdm845.dtsi's CPU
+power-down; entry sweet_secondary_entry). It wakes through XNU's
+resume_idle_cpu -> arm_init_idle_cpu path, where blue_idle_resumed()
+restores the GIC CPU interface (pe_init_fiq) and the timer deadline. The
+frame's interrupt IPIs each powered-down core whose deadline has passed.
+See osfmk/arm64/blueline_idle.c.
+
+diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-23 19:20:04
++++ b/bsd/dev/sweet_ufs.c	2026-11-23 19:45:57
+@@ -55,6 +55,7 @@
+ extern void blueline_keys_init(void);
+ extern void blueline_touch_init(void);
+ extern void blueline_cpufreq_init(void);
++extern void blue_idle_init(void);	/* osfmk/arm64/blueline_idle.c (patch 0210) */
+ extern void blueline_wifi_probe(void);
+ extern void blueline_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+@@ -727,6 +728,7 @@
+ 	sweet_sample_start();
+ 	/* Pixel 3 hardware keys (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	blueline_cpufreq_init();
++	blue_idle_init();
+ 	blueline_keys_init();
+ 	blueline_touch_init();
+ 	/* bluetouchscript= (patch 0146, blueline_touch.c) */
+diff -ruN a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c	2026-11-23 19:20:04
++++ b/osfmk/arm/arm_init.c	2026-11-23 19:45:57
+@@ -839,5 +839,11 @@
+ 
+ 	fiq_context_init(FALSE);
+ 
++#if defined(SWEET)
++	/* blueline_idle.c: the GIC CPU interface and the timer deadline, lost with the power */
++	extern void blue_idle_resumed(int cpu);
++	blue_idle_resumed(cpu_data_ptr->cpu_number);
++#endif
++
+ 	cpu_idle_exit(TRUE);
+ }
+diff -ruN a/osfmk/arm64/blueline_idle.c b/osfmk/arm64/blueline_idle.c
+--- a/osfmk/arm64/blueline_idle.c	1970-01-01 10:00:00
++++ b/osfmk/arm64/blueline_idle.c	2026-11-23 19:45:57
+@@ -0,0 +1,396 @@
++/*
++ * Pixel 3 (blueline): idle cores power down with PSCI CPU_SUSPEND instead of
++ * WFI (boot-arg bluecpu_idle=1, off by default).
++ *
++ * Why: WFI only clock-gates a core. The SDM845's eight cores share one
++ * DynamIQ cluster (L3, the DSU), which can collapse only when all eight
++ * are powered down, and the rails and DDR can drop only after that. Booting
++ * with cpus=4 (Gold never powered) drew the same 210 mA as all eight cores
++ * in WFI, so a powered-down core alone saves little; the cluster is the
++ * goal.
++ *
++ * Entering: cpu_idle (osfmk/arm64/cpu.c) calls blue_idle_enter() in place of
++ * WFI. If the core's next timer deadline (rtcPop) is at least
++ * bluecpu_idle_us (2000) away, the deadline goes into the broadcast timer
++ * and the core calls CPU_SUSPEND with power_state bluecpu_idle_ps
++ * (0x40000003, Linux sdm845.dtsi LITTLE/BIG_CPU_SLEEP_0 "power-down";
++ * 0x400000f4 is its CLUSTER_SLEEP_0, platform-coordinated) and entry
++ * sweet_secondary_entry, the CPU_ON entry. bluecpu_idle=2 asks for
++ * bluecpu_idle_cps (0x400000f4) instead when the gap is at least
++ * bluecpu_idle_cluster_us (10000; Linux's min-residency 9987 us).
++ *
++ * Waking: the firmware resumes the core at sweet_secondary_entry ->
++ * LowResetVectorBase -> cpu_reset_handler, which is resume_idle_cpu (set by
++ * cpu_machine_idle_init) -> arm_init_idle_cpu, XNU's path for a core that
++ * lost its state in idle. That restores the MMU, stacks, the current thread,
++ * the virtual timer control and the event stream; blue_idle_resumed() adds
++ * what it does not: the GIC CPU interface (pe_init_fiq: ICC_* and
++ * GICR_WAKER) and the timer deadline (ClearIdlePop). If CPU_SUSPEND returns
++ * instead (a wake-up was already pending, or the firmware refused), the core
++ * goes on as after WFI.
++ *
++ * The broadcast timer: a core's own timer stops while it is powered down
++ * (sdm845.dtsi marks these states local-timer-stop), so its deadline is
++ * kept by the memory-mapped timer frame 0 (CNTBase0 at 0x17ca0000, Linux
++ * arm,armv7-timer-mem: physical timer SPI 8, virtual SPI 6), programmed to
++ * the earliest deadline of the cores that are down. Its interrupt wakes the
++ * core it is routed to (the GIC wakes a powered-down core); the handler
++ * sends an IPI to every core whose deadline has passed and re-arms the
++ * frame for the rest.
++ *
++ * Every 10 s: "BLUELINE IDLE: 10s:" with suspends, returns, resumes,
++ * broadcast interrupts and IPIs, and the time each core spent powered down.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++#include <kern/thread.h>
++#include <kern/cpu_number.h>
++#include <kern/misc_protos.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <arm/cpu_data.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>
++#include <arm/machine_routines.h>
++#include <arm/rtclock.h>
++#include <machine/atomic.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++#define TAG "BLUELINE IDLE: "
++#define NCPU 8
++
++#define CNTCTL_PA	0x17c90000u
++#define CNTBASE0_PA	0x17ca0000u
++#define CNTTIDR		0x008u
++#define CNTACR(n)	(0x040u + 4u * (n))
++#define CNTFRQ_F	0x010u
++#define CNTP_TVAL	0x028u
++#define CNTP_CTL	0x02cu
++#define CNTV_TVAL	0x038u
++#define CNTV_CTL	0x03cu
++#define CTL_ENABLE	1u
++#define CTL_IMASK	2u
++#define ACR_RWVT	(1u << 4)
++#define ACR_RWPT	(1u << 5)
++#define GICD_PA		0x17a00000u
++#define INTID_PHYS	(32u + 8u)
++#define INTID_VIRT	(32u + 6u)
++
++#define PSCI_VERSION		0x84000000ULL
++#define PSCI_FEATURES		0x8400000aULL
++#define PSCI_CPU_SUSPEND	0xc4000001ULL
++
++#define SLEEPING_NO_DEADLINE	UINT64_MAX
++
++extern void sweet_secondary_entry(void);
++extern void pe_init_fiq(void);
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++bool blue_idle_enter(int cpu, uint64_t deadline);
++void blue_idle_resumed(int cpu);
++void blue_idle_init(void);
++
++static struct {
++	bool on;
++	uint32_t ps;			/* CPU_SUSPEND power_state */
++	uint32_t cps;			/* ... when the gap is long enough for the cluster */
++	uint64_t min_ticks;		/* shortest gap worth powering down for */
++	uint64_t cluster_ticks;		/* shortest gap worth asking for the cluster state */
++	uint64_t entry_pa;
++	vm_offset_t frame;		/* CNTBase0 */
++	uint32_t tval, ctl;		/* physical or virtual timer registers */
++	uint32_t lock;
++	uint64_t dl[NCPU];		/* 0: awake; else the deadline of a powered-down core */
++	uint64_t t_in[NCPU];		/* when it went down */
++	/* counters, read and cleared by the report */
++	uint32_t calls[NCPU], returns[NCPU], resumes[NCPU], cluster_calls, errors;
++	uint32_t irqs, ipis;
++	uint64_t down_abs[NCPU];
++	int32_t last_rc;
++} bi;
++
++static inline void
++bi_lock(void)
++{
++	while (os_atomic_xchg(&bi.lock, 1u, acquire)) {
++		while (os_atomic_load(&bi.lock, relaxed)) {
++			__builtin_arm_yield();
++		}
++	}
++}
++
++static inline void
++bi_unlock(void)
++{
++	os_atomic_store(&bi.lock, 0u, release);
++}
++
++static inline uint32_t
++frame_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(bi.frame + off);
++}
++
++static inline void
++frame_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(bi.frame + off) = v;
++}
++
++/* SMCCC 1.0: x0 is the signed result; x1-x17 may be clobbered. */
++static int64_t
++psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int64_t)x0;
++}
++
++/* What the GIC distributor says about an SPI (non-secure view: a secure one reads as group 0). */
++static void
++gicd_show(vm_offset_t d, uint32_t id)
++{
++	uint32_t w = id / 32, b = 1u << (id % 32);
++	printf(TAG "INTID %u: group1 %d, grpmod %d, enabled %d, pending %d, active %d, prio %#x, route %#llx, cfg %#x\n",
++	    id, !!(*(volatile uint32_t *)(d + 0x080 + 4 * w) & b), !!(*(volatile uint32_t *)(d + 0xd00 + 4 * w) & b),
++	    !!(*(volatile uint32_t *)(d + 0x100 + 4 * w) & b), !!(*(volatile uint32_t *)(d + 0x200 + 4 * w) & b),
++	    !!(*(volatile uint32_t *)(d + 0x300 + 4 * w) & b), *(volatile uint8_t *)(d + 0x400 + id),
++	    *(volatile uint64_t *)(d + 0x6000 + 8 * id), (*(volatile uint32_t *)(d + 0xc00 + 4 * (id / 16)) >> (2 * (id % 16))) & 3);
++}
++
++/* Fire the frame's timer in 1 ms; true if bc_irq saw it within 20 ms. */
++static bool
++bc_selftest(vm_offset_t gicd, uint32_t intid)
++{
++	uint32_t st = 0;
++	bi.irqs = 0;
++	frame_wr(bi.tval, 19200);
++	frame_wr(bi.ctl, CTL_ENABLE);
++	uint64_t t0 = mach_absolute_time();
++	while (bi.irqs == 0 && mach_absolute_time() - t0 < 19200 * 20) {
++		st |= frame_rd(bi.ctl);
++	}
++	bool ok = bi.irqs != 0;
++	printf(TAG "broadcast self-test, INTID %u: %s after %llu us (CTL seen %#x), interrupts %s\n", intid,
++	    ok ? "interrupt arrived" : "NO interrupt", (mach_absolute_time() - t0) / 19, st,
++	    ml_get_interrupts_enabled() ? "enabled" : "DISABLED");
++	if (!ok) {
++		gicd_show(gicd, intid);
++	}
++	frame_wr(bi.ctl, CTL_IMASK);
++	bi.irqs = 0;
++	return ok;
++}
++
++/* Under bi.lock: program the frame for the earliest deadline at or after now, or stop it. */
++static void
++bc_program(uint64_t now)
++{
++	uint64_t min = UINT64_MAX;
++
++	for (int c = 0; c < NCPU; c++) {
++		uint64_t d = bi.dl[c];
++		if (d != 0 && d != SLEEPING_NO_DEADLINE && d < min) {
++			min = d;
++		}
++	}
++	if (min == UINT64_MAX) {
++		frame_wr(bi.ctl, CTL_IMASK);
++		return;
++	}
++	uint64_t delta = min > now ? min - now : 1;
++	if (delta > 0x7fffffffULL) {
++		delta = 0x7fffffffULL;
++	}
++	frame_wr(bi.tval, (uint32_t)delta);
++	frame_wr(bi.ctl, CTL_ENABLE);
++}
++
++/* The frame's interrupt: wake every powered-down core whose deadline has passed. */
++static void
++bc_irq(void *arg __unused)
++{
++	uint32_t wake = 0;
++	uint64_t now = mach_absolute_time();
++
++	bi_lock();
++	frame_wr(bi.ctl, CTL_IMASK);
++	for (int c = 0; c < NCPU; c++) {
++		uint64_t d = bi.dl[c];
++		if (d != 0 && d != SLEEPING_NO_DEADLINE && d <= now) {
++			bi.dl[c] = 0;
++			wake |= 1u << c;
++		}
++	}
++	bc_program(now);
++	bi_unlock();
++	bi.irqs++;
++
++	int self = cpu_number();
++	for (int c = 0; c < NCPU; c++) {
++		if ((wake & (1u << c)) && c != self && cpu_datap(c) != NULL) {
++			cpu_signal(cpu_datap(c), SIGPnop, NULL, NULL);
++			bi.ipis++;
++		}
++	}
++}
++
++/* From cpu_idle, interrupts off. false: not worth it (or off), WFI as before. */
++bool
++blue_idle_enter(int cpu, uint64_t deadline)
++{
++	if (!bi.on || cpu < 0 || cpu >= NCPU) {
++		return false;
++	}
++	uint64_t now = mach_absolute_time();
++	if (deadline != EndOfAllTime && (deadline <= now || deadline - now < bi.min_ticks)) {
++		return false;
++	}
++	uint32_t ps = bi.ps;
++	if (bi.cps && (deadline == EndOfAllTime || deadline - now >= bi.cluster_ticks)) {
++		ps = bi.cps;	/* platform-coordinated: the cluster goes when its last core asks too */
++		bi.cluster_calls++;
++	}
++
++	bi_lock();
++	bi.dl[cpu] = deadline == EndOfAllTime ? SLEEPING_NO_DEADLINE : deadline;
++	bc_program(now);
++	bi_unlock();
++	bi.t_in[cpu] = now;
++	bi.calls[cpu]++;
++
++	__builtin_arm_dsb(DSB_SY);
++	int64_t rc = psci_call(PSCI_CPU_SUSPEND, ps, bi.entry_pa, 0);
++
++	/* Returned: woken before the power went (or refused); carry on as after WFI. */
++	bi_lock();
++	bi.dl[cpu] = 0;
++	bi_unlock();
++	bi.returns[cpu]++;
++	if (rc != 0) {
++		bi.last_rc = (int32_t)rc;
++		if (++bi.errors >= 100) {
++			bi.on = false;
++		}
++	}
++	return true;
++}
++
++/* From arm_init_idle_cpu, before cpu_idle_exit(TRUE): the core lost its state. */
++void
++blue_idle_resumed(int cpu)
++{
++	pe_init_fiq();
++	if (cpu >= 0 && cpu < NCPU) {
++		bi_lock();
++		bi.dl[cpu] = 0;
++		bi_unlock();
++		bi.resumes[cpu]++;
++		bi.down_abs[cpu] += mach_absolute_time() - bi.t_in[cpu];
++	}
++	ClearIdlePop(FALSE);
++}
++
++static void
++report_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static uint32_t dummy;
++	uint64_t ten_s;
++
++	nanoseconds_to_absolutetime(10ULL * NSEC_PER_SEC, &ten_s);
++	for (;;) {
++		assert_wait_timeout(&dummy, THREAD_UNINT, 10000, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		uint32_t calls = 0, rets = 0, res = 0;
++		char down[NCPU * 5 + 1];
++		int n = 0;
++		for (int c = 0; c < NCPU; c++) {
++			calls += bi.calls[c];
++			rets += bi.returns[c];
++			res += bi.resumes[c];
++			uint64_t pct = bi.down_abs[c] * 100 / ten_s;
++			n += snprintf(down + n, sizeof(down) - n, " %llu", pct > 999 ? 999 : pct);
++			bi.calls[c] = bi.returns[c] = bi.resumes[c] = 0;
++			bi.down_abs[c] = 0;
++		}
++		printf(TAG "10s: %s, %u suspends (%u for the cluster), %u returned, %u resumed, %u broadcast irqs,"
++		    " %u ipis, %u errors (last rc %d); %% down per core:%s\n", bi.on ? "on" : "OFF",
++		    calls, bi.cluster_calls, rets, res, bi.irqs, bi.ipis, bi.errors, bi.last_rc, down);
++		bi.irqs = bi.ipis = bi.cluster_calls = 0;
++	}
++}
++
++void
++blue_idle_init(void)
++{
++	int mode = 0, us = 2000, cus = 10000;
++	uint32_t ps = 0x40000003u, cps = 0x400000f4u;
++
++	(void)PE_parse_boot_argn("bluecpu_idle", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("bluecpu_idle_us", &us, sizeof(us));
++	(void)PE_parse_boot_argn("bluecpu_idle_ps", &ps, sizeof(ps));
++	(void)PE_parse_boot_argn("bluecpu_idle_cluster_us", &cus, sizeof(cus));
++	(void)PE_parse_boot_argn("bluecpu_idle_cps", &cps, sizeof(cps));
++
++	int64_t ver = psci_call(PSCI_VERSION, 0, 0, 0);
++	int64_t feat = psci_call(PSCI_FEATURES, PSCI_CPU_SUSPEND, 0, 0);
++	vm_offset_t ctl = ml_io_map(CNTCTL_PA, 0x1000);
++	uint32_t tidr = *(volatile uint32_t *)(ctl + CNTTIDR);
++	uint32_t acr0 = *(volatile uint32_t *)(ctl + CNTACR(0));
++	printf(TAG "PSCI %lld.%lld, CPU_SUSPEND features %#llx (bit 1 extended state ids, bit 0 OS-initiated);"
++	    " CNTTIDR %#x, CNTACR0 %#x\n", ver >> 16, ver & 0xffff, (uint64_t)feat, tidr, acr0);
++	if (mode <= 0) {
++		printf(TAG "off (bluecpu_idle=1 to power idle cores down)\n");
++		return;
++	}
++	if (feat < 0) {
++		printf(TAG "CPU_SUSPEND not offered (%lld): off\n", feat);
++		return;
++	}
++
++	bi.frame = ml_io_map(CNTBASE0_PA, 0x1000);
++	vm_offset_t gicd = ml_io_map(GICD_PA, 0x10000);
++	for (int n = 1; n < 7; n++) {
++		printf(TAG "frame %d: CNTACR %#x\n", n, *(volatile uint32_t *)(ctl + CNTACR(n)));
++	}
++	gicd_show(gicd, INTID_PHYS);
++	gicd_show(gicd, INTID_VIRT);
++	bool ok = false;
++	if (acr0 & ACR_RWPT) {
++		bi.tval = CNTP_TVAL;
++		bi.ctl = CNTP_CTL;
++		frame_wr(CNTV_CTL, CTL_IMASK);
++		ok = sweet_spi_attach(INTID_PHYS, false, bc_irq, NULL) && bc_selftest(gicd, INTID_PHYS);
++		frame_wr(CNTP_CTL, CTL_IMASK);
++	}
++	if (!ok && (acr0 & ACR_RWVT)) {
++		bi.tval = CNTV_TVAL;
++		bi.ctl = CNTV_CTL;
++		ok = sweet_spi_attach(INTID_VIRT, false, bc_irq, NULL) && bc_selftest(gicd, INTID_VIRT);
++	}
++	if (!ok) {
++		printf(TAG "no broadcast timer: off\n");
++		return;
++	}
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &bi.min_ticks);
++	nanoseconds_to_absolutetime((uint64_t)cus * NSEC_PER_USEC, &bi.cluster_ticks);
++	bi.ps = ps;
++	bi.cps = mode >= 2 ? cps : 0;
++	bi.entry_pa = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	thread_t th;
++	if (kernel_thread_start(report_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	__builtin_arm_dmb(DMB_ISH);
++	bi.on = true;
++	printf(TAG "on: CPU_SUSPEND power_state %#x when the next timer is >= %d us away, %#x when >= %d us"
++	    " (bluecpu_idle=2), entry %#llx\n", ps, us, bi.cps, cus, bi.entry_pa);
++}
++#endif /* SWEET */
+diff -ruN a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+--- a/osfmk/arm64/cpu.c	2026-11-23 19:20:04
++++ b/osfmk/arm64/cpu.c	2026-11-23 19:45:57
+@@ -482,6 +482,11 @@
+  *	Routine:	cpu_idle
+  *	Function:
+  */
++#if defined(SWEET)
++/* blueline_idle.c: PSCI CPU_SUSPEND in place of WFI (bluecpu_idle=1) */
++extern bool blue_idle_enter(int cpu, uint64_t deadline);
++#endif
++
+ void __attribute__((noreturn))
+ cpu_idle(void)
+ {
+@@ -595,6 +600,10 @@
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+ #else
++#if defined(SWEET)
++		/* Powered down instead (if the core lost its state, it wakes in arm_init_idle_cpu). */
++		if (!blue_idle_enter(cpu_data_ptr->cpu_number, cpu_data_ptr->rtcPop))
++#endif
+ 		__builtin_arm_wfi();
+ #endif
+ 
+diff -ruN a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+--- a/osfmk/conf/files.arm64	2026-11-23 19:20:04
++++ b/osfmk/conf/files.arm64	2026-11-23 19:45:57
+@@ -41,6 +41,7 @@
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/blueline_idle.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
