@@ -13,8 +13,8 @@ bluecpu_dvfs=0 keeps the fixed top levels.
 
 diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 --- a/bsd/dev/blueline_cpufreq.c	2026-11-23 16:34:27
-+++ b/bsd/dev/blueline_cpufreq.c	2026-11-23 16:48:16
-@@ -47,6 +47,18 @@
++++ b/bsd/dev/blueline_cpufreq.c	2026-11-23 18:33:25
+@@ -47,6 +47,21 @@
   *                   change; default 0xf (all, as Linux on sdm845).
   *   bluelmh_trips=0 skip the ARM/HI/LOW thermal threshold calls.
   *   bluelmh_dump=1  also dump the whole 1 KiB LMh blocks (not +0x8, write only).
@@ -29,11 +29,14 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 + *   or key (SweetHID, blue_cpu_input) holds at least bluecpu_boost_silver /
 + *   _gold MHz (1228 / 1459) for bluecpu_dvfs_boost_ms (1000). Range: level 0
 + *   to 0106's top (bluecpu_max_silver / _gold MHz lower it). Every 10 s one
-+ *   line: average busy, changes, boosts and time per level. L3 is left as is.
++ *   line: average busy, changes, boosts and time per level. L3 follows: the
++ *   lowest L3 level at or above Silver's clock and bluecpu_l3_gold (60) % of
++ *   Gold's, below 1478 MHz (MX TURBO), with bluecpu_l3_follow=1 (default off:
++ *   no measurable gain).
   * Software guard (0143), independent of LMh:
   *   bluecpu_guard=1 every second read the CPU TSENS sensors (tsens0 s1-s4,
   *                   s7-s10); at or above bluecpu_guard_hi (80 C) put Gold on
-@@ -839,6 +851,21 @@
+@@ -839,6 +854,25 @@
  	tsens_dump("after LMh");
  }
  
@@ -49,13 +52,17 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 +	uint64_t lvl_ns[G_DOMS][LUT_ROWS];
 +	uint64_t busy_acc[G_DOMS], busy_n, core_acc[8];
 +	uint32_t changes[G_DOMS], boosts;
++	bool l3;
++	uint32_t l3_cur, l3_max, l3_changes;
++	int l3_gold_pct;
++	uint64_t l3_ns[LUT_ROWS];
 +	uint64_t input_t;
 +} gov;
 +
  /* ---- software guard: TSENS -> Gold level (bluecpu_guard=1) ---- */
  
  static const uint32_t guard_sensor[] = { 1, 2, 3, 4, 7, 8, 9, 10 };	/* tsens0: cpu0-3, cpu4-7 */
-@@ -856,6 +883,11 @@
+@@ -856,6 +890,11 @@
  guard_set(uint32_t idx)
  {
  	struct osm_dom *d = &doms[D_GOLD];
@@ -67,7 +74,7 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
  	for (uint32_t i = 0; i < (d->per_core ? 4u : 1u); i++) {
  		wr(d->base, REG_PERF_STATE + 4 * i, idx);
  	}
-@@ -915,6 +947,11 @@
+@@ -915,6 +954,11 @@
  				printf(TAG "guard: %d.%d C (tsens0 s%u) >= %d C: Gold already at level %u, "
  				    "left\n", a / 10, a % 10, ms, gd.hi / 10, cur);
  			}
@@ -79,7 +86,7 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
  		} else if (gd.dropped && max < gd.lo) {
  			gd.dropped = false;
  			if (cur == gd.low_idx && gd.saved > gd.low_idx) {
-@@ -986,7 +1023,251 @@
+@@ -986,7 +1030,300 @@
  	(void)thread_call_enter_delayed(gd.tc, deadline);
  }
  
@@ -120,6 +127,7 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 +		for (uint32_t di = 0; di < G_DOMS; di++) {
 +			gov.lvl_ns[di][gov.cur[di]] += ns;
 +		}
++		gov.l3_ns[gov.l3_cur] += ns;
 +	}
 +	gov.lvl_t = now;
 +}
@@ -186,6 +194,20 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 +			}
 +		}
 +	}
++	if (gov.l3) {
++		/* L3 follows the clusters: at least Silver's clock, and bluecpu_l3_gold % of Gold's */
++		uint32_t sk = doms[D_SILVER].lut[gov.cur[D_SILVER]].khz, gk = doms[D_GOLD].lut[gov.cur[D_GOLD]].khz;
++		uint32_t want_khz = (uint32_t)((uint64_t)gk * (uint32_t)gov.l3_gold_pct / 100u);
++		if (sk > want_khz) {
++			want_khz = sk;
++		}
++		uint32_t l = gov_level_at(&doms[D_L3], want_khz, gov.l3_max);
++		if (l != gov.l3_cur) {
++			wr(doms[D_L3].base, REG_PERF_STATE, l);
++			gov.l3_cur = l;
++			gov.l3_changes++;
++		}
++	}
 +}
 +
 +static void
@@ -212,6 +234,20 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 +		    doms[di].lut[gov.cur[di]].khz / 1000u, gov.changes[di], line);
 +		gov.busy_acc[di] = 0;
 +		gov.changes[di] = 0;
++	}
++	if (gov.l3) {
++		char line[200];
++		int o = 0;
++		for (uint32_t l = 0; l < doms[D_L3].rows && o < (int)sizeof(line) - 16; l++) {
++			uint64_t pct = gov.l3_ns[l] * 100 / ns;
++			if (pct) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " %u:%llu%%", doms[D_L3].lut[l].khz / 1000u, pct);
++			}
++			gov.l3_ns[l] = 0;
++		}
++		printf(TAG "DVFS 10s: L3 now %u MHz, %u changes; MHz:time%s\n", doms[D_L3].lut[gov.l3_cur].khz / 1000u,
++		    gov.l3_changes, line);
++		gov.l3_changes = 0;
 +	}
 +	uint64_t n = gov.busy_n ? gov.busy_n : 1, *ca = gov.core_acc;
 +	printf(TAG "DVFS 10s: busy per core %llu %llu %llu %llu | %llu %llu %llu %llu %%, %u input boosts\n",
@@ -304,6 +340,26 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
 +		uint32_t ps = rd(d->base, REG_PERF_STATE);
 +		gov.cur[di] = ps < d->rows ? ps : top;
 +	}
++	int l3 = 0;	/* no measurable gain (l3a: 212 mA screen off, 211 without) */
++	gov.l3_gold_pct = 60;
++	(void)PE_parse_boot_argn("bluecpu_l3_follow", &l3, sizeof(l3));
++	(void)PE_parse_boot_argn("bluecpu_l3_gold", &gov.l3_gold_pct, sizeof(gov.l3_gold_pct));
++	struct osm_dom *l3d = &doms[D_L3];
++	if (l3 && osm_probe(l3d, false) && l3d->enabled && l3d->rows) {
++		/* top: below the MX TURBO level (downstream votes MX for it; we do not) */
++		gov.l3_max = 0;
++		for (uint32_t i = 0; i < l3d->rows; i++) {
++			if (l3d->lut[i].khz < l3d->mx_turbo_khz) {
++				gov.l3_max = i;
++			}
++		}
++		uint32_t ps = rd(l3d->base, REG_PERF_STATE);
++		gov.l3_cur = ps < l3d->rows ? ps : gov.l3_max;
++		gov.l3 = true;
++		printf(TAG "DVFS: L3 follows the clusters (Silver's clock, %d%% of Gold's), %u-%u MHz, now %u MHz"
++		    " (bluecpu_l3_follow=1)\n", gov.l3_gold_pct, l3d->lut[0].khz / 1000u,
++		    l3d->lut[gov.l3_max].khz / 1000u, l3d->lut[gov.l3_cur].khz / 1000u);
++	}
 +	unsigned ncpu = ml_get_cpu_count() < 8 ? ml_get_cpu_count() : 8;
 +	for (unsigned c = 0; c < ncpu; c++) {
 +		gov.idle_prev[c] = blue_cpu_idle_abs((int)c);
@@ -331,7 +387,7 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
  cpufreq_levels(void)
  {
  	int mode = 0;
-@@ -1003,6 +1284,7 @@
+@@ -1003,6 +1340,7 @@
  	}
  	cpufreq_legacy(0, D_SILVER);
  	cpufreq_legacy(1, D_GOLD);
@@ -341,7 +397,7 @@ diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
  void
 diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-23 16:34:27
-+++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-23 16:48:16
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-23 18:33:25
 @@ -25,6 +25,7 @@
  #include "IOHIDEventService.h"
  
@@ -368,7 +424,7 @@ diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cp
  		gSweetButtons->key(usages[key], down != 0);
 diff -ruN a/osfmk/kern/recount.c b/osfmk/kern/recount.c
 --- a/osfmk/kern/recount.c	2026-11-23 16:34:27
-+++ b/osfmk/kern/recount.c	2026-11-23 16:48:16
++++ b/osfmk/kern/recount.c	2026-11-23 18:33:25
 @@ -1002,6 +1002,37 @@
  	*idle_time_out = idle_time;
  }

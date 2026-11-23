@@ -1033,3 +1033,14 @@ Backtraces symbolised with `ipsw dyld a2s` against the SystemOS cryptex's cache 
 The IPI rate (stage 4 of the battery plan) was mostly this loop. In dvfs2, Silver spends ~75% of idle time at 300 MHz and Gold ~95% at 825 MHz.
 
 **Frame timing.** The screen now locks ~40 s after boot, so the touch script presses power at SpringBoard +50 s before swiping (`work/test/smruns.sh`). Same script, one boot each: dv6 (DVFS) median 22.4 ms, p90 46.3 ms, 97 gaps over 33 ms; fx4 (`bluecpu_dvfs=0`) 22.8 / 48.7 / 95. No visible cost. After fx6 (`bluecpu_dvfs=0`, a normal boot and reboot) slot B's recovery came up without adb and waited for the Enable ADB tap, though that recovery is meant to be tap-free; seen once.
+
+**Where the remaining ~210 mA goes (screen off).** One power run per change, each against dvfs2's 211 mA:
+
+| Run | Change | Screen off, median |
+|---|---|---|
+| nogpu1 | `blueui=0` (no GPU, no GPU DDR vote, no sound) | 206 mA |
+| l3a | L3 follows the clusters (0200, `bluecpu_l3_follow=1`) | 212 mA |
+| nosnd1 | `bluesnd=0` (speaker amps and audio path off) | 212 mA |
+| notouch1 | `bluetouch=0` (touch controller never powered) | 214 mA |
+
+Wi-Fi and the modem are not started in these runs (`bluewifi` defaults to 0). The GPU idling at 257 MHz costs ~5 mA, so GPU slumber is not worth a full GPU restart path yet. L3 following is in 0200 but off by default. What is left is the SoC: cores that only WFI, clusters and L3 that never collapse, and the CX/MX/DDR rails held at active levels because the apps subsystem never enters its RPMh sleep state. Next: PSCI CPU_SUSPEND. XNU already has the wake path for a core that lost power in idle (`resume_idle_cpu` -> `arm_init_idle_cpu` -> `cpu_idle_exit(TRUE)`). Still needed: a wake timer while the core's own timer is off (the MMIO timer frames at 0x17c90000), and the GIC CPU interface restored on each wake.
