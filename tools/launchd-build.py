@@ -32,7 +32,7 @@ def main():
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
     gone = [k for k, j in jobs.items()
-            if j.get('Label') not in keep and any(w in j.get('Label', '') for w in tweaks.DENY)]
+            if j.get('Label') not in keep and tweaks.denied(k, j)]
     for k in gone:
         del jobs[k]
     jobs[tweaks.BLUERUN_KEY] = dict(tweaks.BLUERUN_JOB)

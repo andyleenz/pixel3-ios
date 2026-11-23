@@ -994,3 +994,22 @@ Runs differ by up to ~80 mA with the same setup. Frame gaps, def1 script (gap me
 **Wi-Fi joins on every other boot.** Over 16 boots in a row (sm0-sm9, bst1-off2-bst4), the join failed ("join: failed (60) in state 2") on every second one, without exception. Open; the previous boot's teardown is the suspect. Safari runs without Wi-Fi draw fewer frames, so frame-gap runs are only compared within the same Wi-Fi state.
 
 **Still drawing after a wake.** In every power run the lock screen is still before the first press (0.4 flips/s) and draws ~45 frames/s after the wake press with nothing touched: a steady 17-draw, 90-triangle frame. Next: what animates.
+
+### The screen locks itself: CommCenter back (2026-11-23)
+
+**Why the screen never went off.** After a wake the lock screen pulsed "Swipe up to open" at ~45 frames/s and the display stayed on until the next press; after boot it stayed on too. SpringBoard's settings were right (lock screen 6 s, auto-lock 60 s), but its log showed `SBIdleTimerGlobalCoordinator - updateIdleTimerForReason:"IdleTimerReset"` every ~19 ms, each next to `CTServerConnection returned error: (2, 5). Destroying connection` and launchd's `failed lookup: name = com.apple.commcenter.xpc ... No such process`: about 100 failed CoreTelephony connections a second after each SpringBoard start and wake, each resetting the idle timer. CommCenter had been removed with the rest of the DENY list ("no baseband").
+
+**Fix.** iOS has a CommCenter job for devices without a baseband, `com.apple.CommCenter-noncellular` (`_LimitLoadFromDeviceTree = baseband`: loaded when the device tree has no `baseband` node; ours has only the product's `baseband-chipset` property). That job and the root/mobile helpers are now kept (`KEEP_KEYS` in `tools/iosroot-tweaks.py`, also used by `launchd-build.py` and `remigrate-push.sh`); the cellular job stays out. iOS still sees a phone, so a later cellular/eSIM path goes through the same daemon. On the phone with `launchd-build.py OUT com.apple.wifid` and `--push`.
+
+| Run | Screen on after a wake | Screen on after boot | Screen off, median | IPIs/s, screen off |
+|---|---|---|---|---|
+| dcvs2 (no CommCenter) | until the next press | until the press | 506 mA | 17.3k |
+| cc1 (CommCenter back) | ~10 s | ~40 s | 349 mA | 12.5k |
+| cc4 (same, final plist) | ~10 s | ~40 s | 317 mA | 12.4k |
+
+pwr.sh's phases assume the presses turn the screen off and on; now the first press wakes a screen that already went off, so "off" is most of the run and on2 is empty.
+
+**Open: CommCenter restarts every ~15 s** (41 crashes in 10 min), two ways, about half each:
+- SIGSEGV in `ApplePDPHelperInterface::callStructMethod` (`std::mutex::lock` on a null object): the packet-data helper's kernel service does not exist here.
+- SIGABRT: an uncaught C++ exception escaping a dispatch block (`std::terminate` from `_dispatch_client_callout`). The message is not on stderr (`StandardErrorPath` stays empty), and CommCenter's own lines never reach the persistent log.
+Backtraces symbolised with `ipsw dyld a2s` against the SystemOS cryptex's cache (address minus the CRASH line's slide).

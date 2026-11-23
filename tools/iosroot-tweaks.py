@@ -56,6 +56,21 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # to it never returns, which hangs Photos (and anything else that asks checkpointd).
         'fairplayd')
 
+# Jobs kept although a DENY word is in their label. CommCenter in its no-baseband
+# form (the job Wi-Fi-only iPads run; launchd loads it when the device tree has
+# no baseband node) and its helpers: without them SpringBoard retries the
+# CoreTelephony connection every frame, and every failed try resets the idle
+# timer, so the screen never locks by itself (LOG.md 2026-11-23). The cellular
+# CommCenter job (same label, needs a baseband node) stays out.
+KEEP_KEYS = ('/System/Library/LaunchDaemons/com.apple.CommCenter-noncellular.plist',
+             '/System/Library/LaunchDaemons/com.apple.CommCenterRootHelper.plist',
+             '/System/Library/LaunchDaemons/com.apple.CommCenterMobileHelper.plist')
+
+
+def denied(key, job):
+    """Whether launchd job KEY is removed: a DENY word in its label, not in KEEP_KEYS."""
+    return key not in KEEP_KEYS and any(w in job.get('Label', '') for w in DENY)
+
 
 def read_plist(path):
     with open(path, 'rb') as f:
@@ -94,7 +109,7 @@ def launchd_jobs(root):
             if '_PanicOnCrash' in job:
                 job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
                 n += 1
-        gone = sorted(k for k, j in jobs.items() if any(w in j.get('Label', '') for w in DENY))
+        gone = sorted(k for k, j in jobs.items() if denied(k, j))
         for k in gone:
             del jobs[k]
         print('launchd.plist: %d _PanicOnCrash renamed, %d jobs removed:' % (n, len(gone)))
