@@ -19,8 +19,11 @@ NOTES.md; the code here is our own):
   audio/media     RedwoodAudio.driver (audio/redwood-hal, built with its
                   build.sh) installed in System/Library/Audio/Plug-Ins/HAL;
                   VirtualAudio kept (mediaserverd needs it), and put back if
-                  an older run moved it aside; MediaToolbox does not start
-                  the recorder server (no microphone yet)
+                  an older run moved it aside; BTAudioHALPlugin.driver moved
+                  to HAL.disabled (bluetoothd is not run: the plugin retried
+                  its connection in a tight loop, ~1.2 cores of mediaserverd
+                  and launchd at idle, LOG.md 2026-11-23); MediaToolbox does
+                  not start the recorder server (no microphone yet)
   SpringBoard     no watchdogs (CPU rendering is slow), launch watchdogs x20,
                   no cloud-config UI, battery percentage shown
   Setup           marked done, mini-buddies off
@@ -190,6 +193,12 @@ def audio_media(root):
         os.makedirs(hal, exist_ok=True)
         shutil.move(aside, hal)
         print('VirtualAudio.plugin put back')
+    bt = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver')
+    if os.path.isdir(bt):
+        bt_aside = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL.disabled')
+        os.makedirs(bt_aside, exist_ok=True)
+        shutil.move(bt, bt_aside)
+        print('BTAudioHALPlugin.driver moved aside (no bluetoothd)')
     driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../audio/redwood-hal/out/RedwoodAudio.driver')
     if os.path.isdir(driver):
         dest = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver')
