@@ -1148,6 +1148,26 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: a translated QuartzCore pipeline draws on the phone
+
+`vk-draw` (`gpu/mesa-ios/test/`) draws QuartzCore's `stroke_line_vert_lpf` + `stroke_line_frag_lpf` (iOS 16.7 `default.metallib`) through Turnip. metal2vulkan translates them for the `turnip-a630` profile (`gpu/metal/qc-spv.sh`; the `.spv` files are derived from Apple's shaders and stay out of git). The pipeline strokes a polyline with antialiased edges, one instance per segment. Its interface (`--emit-meta`): no descriptor sets, and 64 bytes of vertex push constants holding Metal buffer slots as device addresses less 2^31 (points, a transform, the style), plus a zero buffer for out-of-bounds loads and slot 0's bounds.
+
+The test strokes a square and a diagonal (premultiplied orange, half width 4 px) into a 256x256 B8G8R8A8 target and reads it back (`work/test/draw1`):
+
+```
+BLUERUN: vk-draw: device "Turnip Adreno (TM) 630", Vulkan 1.3.363
+BLUERUN: vk-draw: pipeline stroke_line_vert_lpf + stroke_line_frag_lpf created
+BLUERUN: vk-draw: (128, 48) ffff8000 ok   top edge, centre of the stroke
+BLUERUN: vk-draw: (128,128) ffff8000 ok   diagonal, centre
+BLUERUN: vk-draw: 6770 lit pixels, 5174 full orange, hash 98f3a750374e0000
+BLUERUN: vk-draw: DRAW ok
+BLUERUN: exit 0 after 1.48 s
+```
+
+MoltenVK on the Mac (the reference: `vk-draw libMoltenVK.dylib ...` with `VK_DRAW_PORTABILITY=1`) gives the same counts, 6770 lit and 5174 full. Only the hash differs, so the difference is in edge antialiasing rounding. It worked on the first run.
+
+Not every QuartzCore pipeline is this simple. The layer compositor's `fixed_frag_lph_cpf`, translated without its function constants, has no inputs and no colour output. The constants probably select its paths (not checked yet), so the compositor would need the values CoreAnimation sets. Next: find those values for one compositor pipeline, then the Metal frontend.
+
 ## 2026-11-24: a self-signed app installs and runs
 
 ![Hello.app on the phone](screenshots/2026-11-24-hello-app.png)

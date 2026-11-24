@@ -2,13 +2,14 @@
 
 Route: Metal frontend (AdrenoMetal, MIT, to be adapted to iOS 16), then metal2vulkan (translates
 AIR to SPIR-V), then Turnip (`gpu/mesa-ios`, `VK=1`, out/bluevk.dylib), then bluedrm, then BlueGPU.
-Nothing here runs on the phone yet.
+The frontend doesn't exist yet. Translated QuartzCore pipelines are drawn by `gpu/mesa-ios/test/vk-draw.c`.
 
 | File | What |
 |---|---|
 | `turnip-a630.json` | metal2vulkan device profile (Khronos profiles 0.8, `VP_M2V_turnip-a630`) of our Turnip on the A630 |
 | `turnip-a630-vulkaninfo.json`, `turnip-a630-formats.json` | its sources: `vulkaninfo --json` and `corpus-vulkan --capture-formats` |
 | `m2v-regen-turnip-a630.patch` | the `SOURCES` entry for metal2vulkan's `scripts/regen-device-profiles` (metal2vulkan 0d4d572, GPL-2.0-or-later) |
+| `qc-spv.sh` | translates the QuartzCore pipelines the tests draw, from the mounted iOS root, into `out/qc` (not in git: derived from Apple's shaders) |
 | `m2vbatch.py` | translates every function of a metallib: `M2V_PROFILE=turnip-a630 python3 m2vbatch.py SCRATCH LIB TAG` |
 
 The captures come from the Mac: the host build of the same Turnip (`VK=1 HOST=1`) over the fake BlueGPU,

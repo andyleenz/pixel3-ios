@@ -104,8 +104,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 
 **Next, in order**
 1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
-   translated to SPIR-V by metal2vulkan. Turnip runs GPU work on the phone (a buffer fill, 2026-11-24);
-   next a translated QuartzCore pipeline, then the frontend.
+   translated to SPIR-V by metal2vulkan. QuartzCore's stroke_line pipeline, translated, draws through
+   Turnip on the phone (`vk-draw`, 2026-11-24). Next: the layer compositor (`fixed_*`), then the frontend.
 2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
    with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
    better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their

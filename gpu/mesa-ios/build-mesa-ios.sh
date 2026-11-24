@@ -12,7 +12,7 @@
 #                                  gles-triangle there: exercises bluedrm, the uapi and Mesa's
 #                                  compiler + command-stream building on the Mac
 #   VK=1 ./build-mesa-ios.sh       also build Turnip (Vulkan 1.3, msm over bluedrm) as
-#                                  out/bluevk.dylib + out/vk-smoke; with HOST=1 also a macOS
+#                                  out/bluevk.dylib + out/vk-smoke + out/vk-draw; with HOST=1 also a macOS
 #                                  copy with the fake BlueGPU, and run vk-smoke there
 #
 # Outputs in mesa-ios/out/: bluegl.dylib (stripped, ad-hoc signed, install name
@@ -213,6 +213,8 @@ build_vk_for() {
 	codesign -f -s - "$OD/bluevk.dylib" 2>/dev/null
 	"${CC[@]}" -O2 -Wall -I"$M/include" "$H/test/vk-smoke.c" -o "$OD/vk-smoke"
 	codesign -f -s - "$OD/vk-smoke" 2>/dev/null
+	"${CC[@]}" -O2 -Wall -I"$M/include" "$H/test/vk-draw.c" -o "$OD/vk-draw"
+	codesign -f -s - "$OD/vk-draw" 2>/dev/null
 }
 
 build_for ios
