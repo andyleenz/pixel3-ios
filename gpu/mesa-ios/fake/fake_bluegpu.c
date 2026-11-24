@@ -43,6 +43,10 @@ static struct bo bos[MAX_BOS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t next_iova = BLUE_GPU_VA_START_DEFAULT;
 static uint32_t fence_seq, queue_seq;
+/* as the kernel (0153 bg_wait_fence): one last-issued fence per queue, 0 = default queue */
+#define QUEUES 64u
+static uint32_t queue_last[QUEUES];
+static bool queue_used[QUEUES] = { true };
 static unsigned long n_calls, n_errors, n_submits, n_ibs, n_pkts, n_bo_new, n_maps, n_drawstate;
 static uint64_t bytes_alloc, bytes_peak;
 static int verbose = -1;
@@ -246,7 +250,12 @@ do_submit(struct blue_gpu_submit *s)
 		    walk_ib(bo->iova + sc[i].submit_offset, sc[i].size / 4, 0))
 			return kIOReturnBadArgument;
 	}
+	if (s->queueid >= QUEUES || !queue_used[s->queueid]) {
+		BAD("submit on unknown queue %u\n", s->queueid);
+		return kIOReturnNotFound;
+	}
 	s->fence = ++fence_seq;
+	queue_last[s->queueid] = s->fence;
 	for (uint32_t i = 0; i < s->nr_bos; i++)
 		bo_of(sb[i].handle)->last_fence = s->fence;
 	n_submits++;
@@ -349,7 +358,14 @@ dispatch(uint32_t sel, void *in, size_t insz)
 	case BLUE_GPU_SEL_WAIT_FENCE: {
 		struct blue_gpu_wait_fence *r = in;
 		NEED(*r);
-		return (int32_t)(r->fence - fence_seq) <= 0 ? kIOReturnSuccess : kIOReturnBadArgument;
+		if (r->queueid >= QUEUES || !queue_used[r->queueid])
+			return kIOReturnNotFound;
+		if ((int32_t)(r->fence - queue_last[r->queueid]) > 0) {
+			BAD("wait for fence %u, never issued on queue %u (its last %u)\n", r->fence, r->queueid,
+			    queue_last[r->queueid]);
+			return kIOReturnBadArgument;
+		}
+		return kIOReturnSuccess;
 	}
 	case BLUE_GPU_SEL_GEM_MADVISE: {
 		struct blue_gpu_gem_madvise *r = in;
@@ -362,12 +378,23 @@ dispatch(uint32_t sel, void *in, size_t insz)
 		NEED(*r);
 		if (r->flags & ~1u)
 			return kIOReturnBadArgument;
-		r->id = ++queue_seq;
+		r->id = 0;
+		for (uint32_t i = 1; i < QUEUES; i++)
+			if (!queue_used[i]) {
+				queue_used[i] = true, queue_last[i] = 0, r->id = i;
+				break;
+			}
+		queue_seq++;
+		return r->id != 0 ? kIOReturnSuccess : kIOReturnNoResources;
+	}
+	case BLUE_GPU_SEL_SUBMITQUEUE_CLOSE: {
+		NEED(uint32_t);
+		uint32_t id = *(uint32_t *)in;
+		if (id == 0 || id >= QUEUES || !queue_used[id])
+			return kIOReturnNotFound;
+		queue_used[id] = false;
 		return kIOReturnSuccess;
 	}
-	case BLUE_GPU_SEL_SUBMITQUEUE_CLOSE:
-		NEED(uint32_t);
-		return kIOReturnSuccess;
 	case BLUE_GPU_SEL_SUBMITQUEUE_QUERY: {
 		struct blue_gpu_submitqueue_query *r = in;
 		NEED(*r);

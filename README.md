@@ -103,8 +103,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.
 
 **Next, in order**
-1. Metal: our own `MTLDevice` on Mesa freedreno, with Apple's shader IR (AIR) translated to NIR for
-   the ir3 compiler. Staged: device and buffers, then a triangle, then compute, then the apps that use it.
+1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
+   translated to SPIR-V by metal2vulkan. Turnip runs GPU work on the phone (a buffer fill, 2026-11-24);
+   next a translated QuartzCore pipeline, then the frontend.
 2. Installing apps: unencrypted and self-signed apps, and a better stand-in for the Secure Enclave.
    FairPlay-encrypted App Store apps are out of reach (their keys live in a real SEP).
 3. Wi-Fi (5 GHz, joins on every boot), Photos (assetsd never starts), widgets ("Waiting..."),

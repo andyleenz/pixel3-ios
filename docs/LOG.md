@@ -1120,6 +1120,30 @@ Plan (route A): Metal frontend (AdrenoMetal, MIT, adapted to iOS 16) -> metal2vu
 
 Next:
 
-1. `vk-smoke` on the phone with the 0153 fix. The fill must read `0xb10e0630`.
+1. ~~`vk-smoke` on the phone~~: done, below.
 2. Draw one translated QuartzCore pipeline through Turnip on the phone.
 3. The frontend.
+
+## 2026-11-24: Turnip on the phone
+
+`vk-smoke` (`gpu/mesa-ios/test/`) on the phone, with `bluevk.dylib` at `/usr/lib` and no Vulkan loader. It creates an instance, a device and a 64 KiB host-visible buffer, then submits one `vkCmdFillBuffer` and waits on a fence:
+
+```
+vk-smoke: device "Turnip Adreno (TM) 630", Vulkan 1.3.363, driver 0x6803001, max image 2D 16384
+vk-smoke: FILL ok: 16384 of 16384 words = 0xb10e0630 (first 0xb10e0630, last 0xb10e0630)
+vk-smoke: all calls succeeded
+BLUERUN: exit 0 after 1.19 s
+```
+
+This is the first GPU work on the phone that does not come from gallium freedreno. Three runs (`work/test/vk1..3.txt`):
+
+| Run | Result | Cause | Fix (bluedrm.c) |
+|---|---|---|---|
+| vk1 | `vkWaitForFences` -> -13 (VK_ERROR_UNKNOWN) | `drmSyncobj*` returned -errno; libdrm returns -1 and sets errno, and Mesa checks `errno == ETIME` | -1 plus errno at the public entry points |
+| vk1 | (also) | Mesa's absolute deadlines are on `CLOCK_MONOTONIC` (c11 `TIME_MONOTONIC`); the kernel's on `CLOCK_MONOTONIC_RAW` | move the deadline across clocks (`to_kernel_deadline`) |
+| vk2 | `vkWaitForFences` -> 2 (VK_TIMEOUT) | `WAIT_FENCE` was always sent with queue 0. Turnip submits on its own queue (1), and the kernel rejects a fence never issued on the given queue (as Linux) | keep the queue with each pending fence |
+| vk3 | FILL ok | | |
+
+The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so the host test (`VK=1 HOST=1 ./build-mesa-ios.sh`) catches it. `BLUEDRM_DEBUG=1` now also logs each submit's queue and fence.
+
+Next: draw one translated QuartzCore pipeline through Turnip on the phone.
