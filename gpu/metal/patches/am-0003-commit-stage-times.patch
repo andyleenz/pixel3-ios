@@ -1,6 +1,8 @@
-NATIVE_METAL_STAGES=1: per commit, where the time from commit to completion goes (the wait for the encoding
-thread, the surface flush, the runtime's commit, its scheduling, the GPU), to standard error at completion for
-the first 400 render commits. pixel3-ios: backboardd frame time.
+Frame-time diagnostics. NATIVE_METAL_STAGES=1: per render commit, where the time from commit to completion goes
+(the wait for the encoding thread, the surface flush, the runtime's commit, its scheduling, the GPU), to standard
+error at completion for the first 400; and the encoding thread's time per encoder call site (nmb-enc, top 16).
+NATIVE_METAL_SAMPLE=1 (with STAGES): the encoding thread sampled every millisecond, its hottest stack addresses
+(nmb-pc, image and offset for atos). pixel3-ios: backboardd frame time.
 
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
@@ -24,7 +26,127 @@ the first 400 render commits. pixel3-ios: backboardd frame time.
   if(!diagOn())return;
   uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
   TraceRec rec={};rec.type=15;rec.t0=nowUs();rec.t1=command;rec.t2=commit;rec.t3=tEncodeBatchId;
-@@ -3600,6 +3612,7 @@
+@@ -2343,7 +2355,68 @@
+  int policy=SCHED_OTHER;sched_param param{};
+  if(pthread_getschedparam(reference,&policy,&param) || policy==SCHED_OTHER)return;
+  (void)pthread_setschedparam(pthread_self(),policy,&param);
++}
++// NATIVE_METAL_SAMPLE=1 (pixel3-ios): a thread samples the encoding thread every millisecond (its pc and up to 15 callers by
++// the frame chain) and, with the stage lines, prints the 60 addresses most often on the stack (inclusive) and the 30 most
++// often the pc (nmb-pc lines: image, offset in it, count), for atos on the host.
++static std::atomic<mach_port_t> gEncodeMach{0};
++static std::atomic<pthread_t> gEncodePthread{nullptr};
++struct PcCount {std::atomic<uint64_t> pc{0};std::atomic<uint32_t> n{0};};
++static PcCount gPcIncl[8192],gPcLeaf[2048];
++static std::atomic<uint64_t> gPcSamples{0};
++static void pcAdd(PcCount *table,uint32_t size,uint64_t pc) {
++ const uint32_t h=(uint32_t)((pc>>2)*2654435761u)%size;
++ for(uint32_t i=0;i<64;i++) {
++  PcCount &c=table[(h+i)%size];uint64_t seen=c.pc.load();
++  if(!seen){uint64_t none=0;if(c.pc.compare_exchange_strong(none,pc))seen=pc;else seen=c.pc.load();}
++  if(seen==pc){c.n++;return;}
++ }
++}
++static void *samplerMain(void *) {
++ pthread_setname_np("nmb-sampler");
++ for(;;) {
++  usleep(1000);
++  const mach_port_t t=gEncodeMach.load();const pthread_t pt=gEncodePthread.load();
++  if(!t || !pt)continue;
++  const uint64_t top=(uint64_t)pthread_get_stackaddr_np(pt),bottom=top-pthread_get_stacksize_np(pt);
++  if(thread_suspend(t)!=KERN_SUCCESS)continue;
++  arm_thread_state64_t st;mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
++  uint64_t frames[16];unsigned n=0;
++  if(thread_get_state(t,ARM_THREAD_STATE64,(thread_state_t)&st,&count)==KERN_SUCCESS) {
++   frames[n++]=arm_thread_state64_get_pc(st);
++   uint64_t fp=arm_thread_state64_get_fp(st);
++   const uint64_t lr=arm_thread_state64_get_lr(st);
++   if(lr)frames[n++]=lr;
++   while(n<16 && fp>=bottom && fp+16<=top && !(fp&7)) {
++    const uint64_t next=((uint64_t *)fp)[0],ret=((uint64_t *)fp)[1];
++    if(ret)frames[n++]=ret&0x0000ffffffffffffull;
++    if(next<=fp)break;fp=next;
++   }
++  }
++  thread_resume(t);
++  if(!n)continue;
++  // Is the thread idle (waiting for a batch)? Then the sample is not encoding time.
++  gPcSamples++;
++  pcAdd(gPcLeaf,2048,frames[0]);
++  for(unsigned i=0;i<n;i++){bool dup=false;for(unsigned j=0;j<i;j++)if(frames[j]==frames[i])dup=true;if(!dup)pcAdd(gPcIncl,8192,frames[i]);}
++ }
++ return nullptr;
+ }
++static void pcPrint(const char *kind,PcCount *table,uint32_t size,unsigned top) {
++ struct Row {uint64_t pc;uint32_t n;};std::vector<Row> rows;
++ for(uint32_t i=0;i<size;i++)if(table[i].pc.load())rows.push_back({table[i].pc.load(),table[i].n.load()});
++ std::sort(rows.begin(),rows.end(),[](const Row &a,const Row &b){return a.n>b.n;});
++ for(unsigned i=0;i<rows.size() && i<top;i++) {
++  Dl_info info{};const char *image="?";uint64_t base=0;
++  if(dladdr((void *)rows[i].pc,&info) && info.dli_fname){image=strrchr(info.dli_fname,'/')?strrchr(info.dli_fname,'/')+1:info.dli_fname;base=(uint64_t)info.dli_fbase;}
++  fprintf(stderr,"nmb-pc %s %s 0x%llx %u %.40s\n",kind,image,(unsigned long long)(rows[i].pc-base),rows[i].n,info.dli_sname?info.dli_sname:"");
++ }
++}
++static void samplesPrint() {
++ if(!getenv("NATIVE_METAL_SAMPLE"))return;
++ fprintf(stderr,"nmb-pc samples %llu\n",(unsigned long long)gPcSamples.load());
++ pcPrint("I",gPcIncl,8192,60);pcPrint("L",gPcLeaf,2048,30);
++}
+ static EncodeThread &encodeThread() {
+  static EncodeThread *thread=[]{
+   EncodeThread *t=new EncodeThread;
+@@ -2352,6 +2425,10 @@
+   pthread_create(&id,&attr,[](void *arg)->void * {
+    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
+    pthread_setname_np("native-metal-encode");traceThread(2);
++   if(getenv("NATIVE_METAL_SAMPLE")) {
++    gEncodePthread=pthread_self();gEncodeMach=pthread_mach_thread_np(pthread_self());
++    pthread_t sampler;if(!pthread_create(&sampler,nullptr,samplerMain,nullptr))pthread_detach(sampler);
++   }
+    std::unique_lock<std::mutex> lock(t.lock);
+    for(;;) {
+     t.work.wait(lock,[&]{return !t.batches.empty();});
+@@ -2416,9 +2493,39 @@
+   const uint64_t releasing=nowUs();work.reset();
+   const uint64_t released=nowUs();
+   if(released-releasing>=250)detailPoint(id,2,2,command,tEncodeBatchId,(uintptr_t)label,releasing,parent,queued,line,released);
++ }
++};
++// NATIVE_METAL_STAGES=1 (pixel3-ios): the encoding thread's time per encoder call site (function and line), the top 16 printed
++// after the 15th, 30th, 45th, 100th, 200th and 400th render commits (nmb-enc lines).
++struct EncodeSite {std::atomic<const char *> label{nullptr};std::atomic<uint32_t> line{0};std::atomic<uint64_t> n{0},us{0},max{0};};
++static EncodeSite gEncodeSites[128];
++static void encodeSiteAdd(const char *label,uint32_t line,uint64_t us) {
++ const uint32_t h=(uint32_t)(((uintptr_t)label>>3)*31+line)%128;
++ for(uint32_t i=0;i<128;i++) {
++  EncodeSite &e=gEncodeSites[(h+i)%128];
++  const char *seen=e.label.load();
++  if(!seen){const char *none=nullptr;if(e.label.compare_exchange_strong(none,label))e.line=line;seen=e.label.load();
++   if(seen==label)while(!e.line.load()){} }
++  if(seen==label && e.line.load()==line){e.n++;e.us+=us;uint64_t m=e.max.load();while(us>m && !e.max.compare_exchange_weak(m,us)){}return;}
+  }
++}
++static void encodeSitesPrint() {
++ struct Row {const char *label;uint32_t line;uint64_t n,us,max;};Row rows[128];unsigned count=0;
++ for(EncodeSite &e:gEncodeSites)if(e.label.load())rows[count++]={e.label.load(),e.line.load(),e.n.load(),e.us.load(),e.max.load()};
++ std::sort(rows,rows+count,[](const Row &a,const Row &b){return a.us>b.us;});
++ for(unsigned i=0;i<count && i<16;i++)
++  fprintf(stderr,"nmb-enc %s:%u n%llu total%llums avg%lluus max%lluus\n",rows[i].label,rows[i].line,(unsigned long long)rows[i].n,
++   (unsigned long long)(rows[i].us/1000),(unsigned long long)(rows[i].us/(rows[i].n?rows[i].n:1)),(unsigned long long)rows[i].max);
++}
++template<class F> struct TimedEncodeCall {
++ std::optional<F> work;const char *label;uint32_t line;
++ void operator()() {const uint64_t began=nowUs();(*work)();encodeSiteAdd(label,line,nowUs()-began);}
+ };
+ template<class F> static void encodeLater(F &&work,const char *label,uint32_t line,uint64_t command) {
++ if(stagesOn() && !diagOn()) {
++  using Closure=std::decay_t<F>;
++  encodeLaterRaw(TimedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line});return;
++ }
+  if(!diagOn()){encodeLaterRaw(std::forward<F>(work));return;}
+  using Closure=std::decay_t<F>;
+  encodeLaterRaw(TracedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line,
+@@ -3600,6 +3707,7 @@
  - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
  // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
  - (void)didSchedule {
@@ -32,7 +154,7 @@ the first 400 render commits. pixel3-ios: backboardd frame time.
   {
    const uint64_t took=nowUs()-self.committedUs;
    std::lock_guard<std::mutex> lock(gCommitLock);
-@@ -3802,6 +3815,18 @@
+@@ -3802,6 +3910,19 @@
  static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
  // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
  static void completed(void *context) {
@@ -46,6 +168,7 @@ the first 400 render commits. pixel3-ios: backboardd frame time.
 +   fprintf(stderr,"nmb-stage K%u rp%u dr%u kpx%llu q%lld flush%lld(%lluK) rt%lld sched%lld gpu%lld total%lld\n",k,b->encodedWork.passes,
 +    b->encodedWork.draws,(unsigned long long)(b->encodedWork.pixels>>10),d(2,3),d(4,5),(unsigned long long)(gStageFlushed[k%64]>>10),d(6,7),d(7,8),
 +    d(8,9),d(2,9));
++   {const unsigned p=printed.load();if(p==15||p==30||p==45||p==100||p==200||p==400){encodeSitesPrint();samplesPrint();}}
 +  }
 + }
   gCompleted++;

@@ -859,6 +859,10 @@ The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kern
 
 Surface flushes take 10-70 us. The time is split between the encoding thread (encoders are replayed there after `commit`, so `q` is this frame's Vulkan recording plus any backlog) and the GPU (15 ms for 5.5 Mpx of 4 passes; every pass renders in sysmem, `SA big 77 whole 77`, `tile pipelines 0`). 157 copies, 11 shadowed textures. Next: profile the encoding thread; GMEM for the IOSurface targets.
 
+**Encoding thread.** am-0003 now also times each deferred encoder call (`nmb-enc`) and, with `NATIVE_METAL_SAMPLE=1`, samples the encoding thread's stack every 1 ms (`nmb-pc`). `bbm14`, 25 commits: encoder creation 119 ms (23 calls, max 48 ms), `setRenderPipelineState` 74 ms (67), `commit` 71 ms (15), `endEncoding` 40 ms; draws are cheap. The most-sampled busy path (46 of ~170) is Turnip `tu_cs_reserve_space` -> `msm_bo_map` -> `bluedrm_map` -> `IOConnectMapMemory64`, from `tu_BeginCommandBuffer` and render-pass begin.
+
+A bluedrm cache that kept closed small BOs mapped for reuse did nothing (`bbm16`: same-shape frames 137 -> 136 ms encoding time vs `bbm14`): a boot creates only 39-61 BOs and closes 2-14 (`bbm14/16/17`). The map calls are repeat maps of existing BOs, not new ones. Pixels were unchanged (`cab24`). Not kept. Next: count `bluedrm_map` calls per handle.
+
 ## 2026-11-24: lock screen correct on Metal (Mesa 0009, 0005 GL-only)
 
 ![lock screen, backboardd on Metal](screenshots/2026-11-24-lockscreen-metal.png)
