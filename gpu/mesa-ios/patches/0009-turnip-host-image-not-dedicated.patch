@@ -1,0 +1,20 @@
+Turnip: no dedicated allocation for images over host allocations (VK_EXT_external_memory_host).
+The metal2vulkan runtime binds a linear image at the IOSurface's offset of its host-pointer import;
+with requiresDedicatedAllocation it shadowed every IOSurface texture (copy in, copy back).
+
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -1224,8 +1224,12 @@
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *req =
+             static_cast<VkMemoryDedicatedRequirements *>(ext);
++         /* pixel3-ios: an image over imported host pages binds at any offset of them
++          * (VK_EXT_external_memory_host, as RADV and ANV); dma-buf/opaque-fd images keep
++          * their dedicated allocation. */
+          req->requiresDedicatedAllocation =
+-            image->vk.external_handle_types != 0;
++            (image->vk.external_handle_types &
++             ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0;
+          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
+          break;
+       }

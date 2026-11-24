@@ -40,7 +40,7 @@ NULL. `kIOMainPortDefault` needs iOS 15 or later, which is fine for 16.7.16.
 dl/                     pinned tarball
 src/mesa-26.3.1/        pristine extract, only for regenerating patches (deletable, 413 MB; re-extract with tar)
 build/mesa-26.3.1/      patched tree (+ src/bluedrm copied in); build/out-ios, build/out-macos: meson dirs
-patches/                0001-0004 below, applied with patch -p1 to a fresh extract
+patches/                0001-0009 below, applied with patch -p1 to a fresh extract
 bluedrm/                libdrm stand-in: xf86drm.h + bluedrm.c (HakiOS port, MIT)
 blue_gpu_uapi.h         the user-client ABI (shared with the kernel, 6d)
 frontend/bluegl.[ch]    tiny surfaceless GL frontend (Mesa 25.1 removed OSMesa)
@@ -67,6 +67,9 @@ functions of `libglapi_bridge.a` plus `_bluegl_*`. A `_gl*` wildcard would also 
 | 0004 fd6-fbfetch-first-draw-barrier-hakios | HakiOS's fix ported to 26.3.1: before the first framebuffer-fetch draw after non-fetch draws, flush CCU colour and invalidate. CA's GL renderer needs it |
 | 0005 fd6-linear-import-any-pitch | A linear one-level import keeps its own pitch, so the GPU reads CoreAnimation's wrapped client images in place |
 | 0006 darwin-turnip-msm-over-bluedrm | Turnip on Darwin: the msm backend over bluedrm. Enumerates the user client by name (no `/dev/dri`), maps BOs with `bluedrm_map`, never placed maps or `SET_IOVA` (one shared VA space, kernel-chosen IOVAs), compiles `bluedrm.c` in, and backs `vk_drm_syncobj` with bluedrm's emulated syncobjs (`u_sync_provider.c` now built, `HAVE_BLUEDRM_SYNCOBJ`). No DRM WSI. From UniXNU's `turnip-darwin-kmd.patch` (MIT): constant `CTR_EL0` (an EL0 read traps on XNU), condvar on `CLOCK_REALTIME`, `-undefined dynamic_lookup` for the weak entrypoint tables |
+| 0007 turnip-export-vkGetInstanceProcAddr | Exports `vkGetInstanceProcAddr` from bluevk.dylib, the loader-free entry point metal2vulkan opens |
+| 0008 turnip-darwin-external-memory-host | `VK_EXT_external_memory_host` over BlueGPU USERPTR (16 KiB pages): how the runtime imports IOSurfaces and no-copy buffers |
+| 0009 turnip-host-image-not-dedicated | No `requiresDedicatedAllocation` for images over host allocations (as RADV/ANV), so IOSurface textures render in place instead of through a shadow copy (clear: 20 to 2.5 ms GPU) |
 
 HakiOS's other Mesa changes are not needed on 26.3.1. Its Mach-O build-id for the disk cache is now
 upstream (LC_UUID), freedreno no longer uses `sysinfo()`, and its OSMesa changes do not apply because

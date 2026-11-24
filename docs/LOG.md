@@ -1148,6 +1148,20 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: IOSurface render targets in place (Mesa 0009)
+
+A clear of a 1125x2250 IOSurface texture took 19-24 ms of GPU time, against 2.5 ms for a private or shared one, in every TU_DEBUG mode (`cab12`, `cab13`). `NATIVE_METAL_WARNINGS=1` prints the runtime's degrade notices. `metal2vulkan-degrade-shadowed-texture` said the texture is shadowed because the driver asks a dedicated allocation for a linear image over host allocations (`cab14`). The runtime binds that image at the surface's offset in its host-pointer import, so it copied the texels into a separate image before each use and back after each write.
+
+Turnip sets `requiresDedicatedAllocation` for any image with an external handle type. That is needed for dma-buf and opaque-fd exports, not for `VK_EXT_external_memory_host`, where RADV and ANV do not ask it. Mesa patch **0009** leaves host allocations out.
+
+| 1125x2250 clear, GPU time | before (cab12/13) | after (cab15) |
+|---|---|---|
+| private | 2.5 ms | 2.6 ms |
+| IOSurface | 19-24 ms | 2.5 ms |
+| shared | 1.2-2.6 ms | 2.5 ms |
+
+The IOSurface CA frame minimum goes from 31 to 18 ms (`cab15`). `cab16` (`ca-draw -iosurface`): no shadowed-texture notice, 0 of 256 rows differ, hash c49901bb89571983 as before.
+
 ## 2026-11-24: Metal frames 15-20x faster (0216)
 
 Every Metal command buffer took 40-60 ms, even an empty clear. `ca-draw -bench` (new) splits each one. In `cab4`/`cab6` the GPU ran for 2.5 ms (`GPUEndTime - GPUStartTime`), and the rest went between `commit` and `scheduled`. bluedrm now times the SUBMIT call: 31-34 ms each, with "2 own cleaned (128 MiB)" (`cab7`). metal2vulkan allocates two 64 MiB host-visible blocks. Neither fits the 32 MiB pool, so bluedrm placed them in the process's own (cacheable) memory, and the kernel cleaned both to PoC at every submit. `NOSYNC` (6f) does not cover them, because the runtime keeps them mapped. GPU clock, TU_DEBUG sysmem/gmem/nobin/nolrz (`cab3`), and the fence wait were not the cause.

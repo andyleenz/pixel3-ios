@@ -136,29 +136,10 @@ bench_one(id<MTLDevice> dev, int frames, int bw, int bh, int surface)
 	return 0;
 }
 
-static int
-bench(id<MTLDevice> dev, int frames)
+static void
+clear_bench(id<MTLCommandQueue> q, id<MTLTexture> t, const char *what, int frames)
 {
-	// the queue alone: an empty command buffer, committed and waited for
-	id<MTLCommandQueue> q = [dev newCommandQueue];
-	double sum = 0;
-	for (int i = 0; i < frames; i++) {
-		double t0 = now_ms();
-		id<MTLCommandBuffer> cb = [q commandBuffer];
-		[cb commit];
-		[cb waitUntilCompleted];
-		if (i >= 3)
-			sum += now_ms() - t0;
-	}
-	printf("ca-draw: bench empty command buffer: mean %.2f ms\n", sum / (frames - 3));
-	// a clear of a screen-sized private texture, one render pass, nothing drawn
-	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-	                                                                              width:1125 height:2250 mipmapped:NO];
-	td.usage = MTLTextureUsageRenderTarget;
-	td.storageMode = MTLStorageModePrivate;
-	id<MTLTexture> t = [dev newTextureWithDescriptor:td];
-	sum = 0;
-	double gpu = 0, kern = 0;
+	double sum = 0, gpu = 0, sched = 0;
 	for (int i = 0; i < frames; i++) {
 		double t0 = now_ms();
 		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -174,19 +155,48 @@ bench(id<MTLDevice> dev, int frames)
 		double ts = now_ms();
 		[cb waitUntilCompleted];
 		double td = now_ms();
-		if (i < 8)
-			printf("ca-draw: clear %d: encode %.2f, commit %.2f, scheduled +%.2f, completed +%.2f ms\n", i, te - t0, tc - te, ts - tc, td - ts);
-		if (i >= 3) {
-			sum += now_ms() - t0;
-			gpu += (cb.GPUEndTime - cb.GPUStartTime) * 1000;
-			kern += (cb.kernelEndTime - cb.kernelStartTime) * 1000;
-		}
-		if (i < 6)
-			printf("ca-draw: clear %d: %.2f ms, GPU %.3f ms (%.3f..%.3f s), kernel %.3f ms\n", i, now_ms() - t0,
-			    (cb.GPUEndTime - cb.GPUStartTime) * 1000, cb.GPUStartTime, cb.GPUEndTime, (cb.kernelEndTime - cb.kernelStartTime) * 1000);
+		double g = (cb.GPUEndTime - cb.GPUStartTime) * 1000;
+		if (i < 4)
+			printf("ca-draw: clear %s %d: encode %.2f, commit %.2f, scheduled +%.2f, completed +%.2f ms, GPU %.3f ms\n", what,
+			    i, te - t0, tc - te, ts - tc, td - ts, g);
+		if (i >= 3)
+			sum += td - t0, gpu += g, sched += ts - tc;
 	}
-	printf("ca-draw: bench clear 1125x2250 private: mean %.2f ms, GPU %.3f ms, kernel %.3f ms\n", sum / (frames - 3),
-	    gpu / (frames - 3), kern / (frames - 3));
+	printf("ca-draw: bench clear 1125x2250 %s: mean %.2f ms, GPU %.3f ms, commit to scheduled %.2f ms\n", what,
+	    sum / (frames - 3), gpu / (frames - 3), sched / (frames - 3));
+}
+
+static int
+bench(id<MTLDevice> dev, int frames)
+{
+	// the queue alone: an empty command buffer, committed and waited for
+	id<MTLCommandQueue> q = [dev newCommandQueue];
+	double sum = 0;
+	for (int i = 0; i < frames; i++) {
+		double t0 = now_ms();
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		[cb commit];
+		[cb waitUntilCompleted];
+		if (i >= 3)
+			sum += now_ms() - t0;
+	}
+	printf("ca-draw: bench empty command buffer: mean %.2f ms\n", sum / (frames - 3));
+	// a clear of a screen-sized texture, one render pass, nothing drawn: private, then an IOSurface (an import)
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                              width:1125 height:2250 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	clear_bench(q, [dev newTextureWithDescriptor:td], "private", frames);
+	IOSurfaceRef ios = IOSurfaceCreate((__bridge CFDictionaryRef) @{
+		(id)kIOSurfaceWidth : @1125, (id)kIOSurfaceHeight : @2250, (id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfaceBytesPerRow : @((1125 * 4 + 63) / 64 * 64), (id)kIOSurfacePixelFormat : @(0x42475241)
+	});
+	td.storageMode = MTLStorageModeShared;
+	id<MTLTexture> st = ios ? [dev newTextureWithDescriptor:td iosurface:ios plane:0] : nil;
+	if (st)
+		clear_bench(q, st, "IOSurface", frames);
+	td.storageMode = MTLStorageModeShared;  // linear, no IOSurface: the runtime's own memory
+	clear_bench(q, [dev newTextureWithDescriptor:td], "shared", frames);
 	return bench_one(dev, frames, 256, 256, 0) | bench_one(dev, frames, 1125, 2250, 0) | bench_one(dev, frames, 1125, 2250, 1);
 }
 
