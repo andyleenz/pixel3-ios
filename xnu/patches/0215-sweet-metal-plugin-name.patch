@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -374,6 +374,20 @@
+ 	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));
+ 	IOAcceleratorES *es = accel ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (es != NULL && es->init() && es->attach(this)) {
++		/*
++		 * Metal's MTLRegisterDevices (iOS 16.7) loads
++		 * /System/Library/Extensions/<MetalPluginName>.bundle for every
++		 * IOAcceleratorES and asks MetalPluginClassName for a device with
++		 * initWithAcceleratorPort:. BlueMetal (gpu/metal/plugin) answers nil
++		 * unless the process opted in, so CoreAnimation is unchanged.
++		 * Boot-arg sweetmetal=0 leaves the names out.
++		 */
++		int metal = 1;
++		PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
++		if (metal) {
++			es->setProperty("MetalPluginName", "BlueMetal");
++			es->setProperty("MetalPluginClassName", "BlueMetalDevice");
++		}
+ 		es->registerService();
+ 	}
+ 	OSSafeReleaseNULL(es);

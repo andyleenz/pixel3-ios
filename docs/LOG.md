@@ -1148,6 +1148,35 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: MTLCreateSystemDefaultDevice returns the A630
+
+`mtl-sys` (`mtl-draw.mm` built with `-DMTL_DRAW_SYSTEM`) takes its device from `MTLCreateSystemDefaultDevice()` and draws the same stroke_line test (`work/test/msys5`):
+
+```
+BLUERUN: mtl-sys: MetalPluginName BlueMetal, MetalPluginClassName BlueMetalDevice
+BLUERUN: mtl-sys: bundle /System/Library/Extensions/BlueMetal.bundle: found, load ok
+BLUERUN: mtl-sys: class BlueMetalDevice, subclass of _MTLDevice: yes
+BLUERUN: BlueMetal: mtl-sys: device ready
+BLUERUN: mtl-sys: MTLCreateSystemDefaultDevice: "Turnip Adreno (TM) 630" (NativeBridgeMetalDevice)
+BLUERUN: mtl-draw: 6770 lit pixels, 5174 full orange (vk-draw: 6770, 5174)
+BLUERUN: mtl-draw: DRAW ok
+```
+
+How iOS 16.7's Metal finds a device (from the shared cache): `MTLCreateSystemDefaultDevice` runs `MTLDeviceArrayInitialize` once, which ends in `MTLRegisterDevices`. That matches every `IOAcceleratorES` service. For each, `getMetalPluginClassForService` reads `MetalPluginName`, loads `/System/Library/Extensions/<name>.bundle` and takes the class `MetalPluginClassName` names (else the principal class). It keeps the class only if it is a subclass of `_MTLDevice`. Then `[[cls alloc] initWithAcceleratorPort:service]` goes to `MTLAddDevice`. IOGPU.framework's `+[IOGPUMetalDevice registerService:]` does the same but requires `IOGPUMetalDevice`; Metal's path doesn't use it.
+
+The pieces:
+
+- **Kernel 0215**: the IOAcceleratorES from 0107 now carries `MetalPluginName` `BlueMetal` and `MetalPluginClassName` `BlueMetalDevice`. Boot-arg `sweetmetal=0` leaves them out.
+- **`BlueMetal.bundle`** (`gpu/metal/plugin/BlueMetal.m`, 100 KB): `BlueMetalDevice : _MTLDevice`. Every process that touches Metal loads it, backboardd's CoreAnimation included, so the bundle stays small and answers nil unless the process opts in (`BLUE_METAL=1`, or its name in `/usr/local/etc/bluemetal.procs`). An opted-in process gets the frontend, from `/usr/lib/bluemetal.dylib` (31 MB: frontend + metal2vulkan runtime), over `/usr/lib/bluevk.dylib`.
+
+Three runs to get there:
+
+- `MTLCopyAllDevices` is macOS-only: weak-imported on iOS, it resolved to NULL and `mtl-sys` jumped to 0.
+- The first plugin class was an `NSObject`, so Metal skipped it silently. `mtl-sys` now prints each discovery step, and the missing `_MTLDevice` check turned up in `getMetalPluginClassForService`.
+- With the class accepted, init answering another object (or nil) made ARC release the allocated `BlueMetalDevice`. `-[_MTLDevice dealloc]` then ran on an instance `_MTLDevice`'s init never set up and crashed (`dispatch_release` of NULL). That happened in every Metal process: backboardd crash-looped 14 times in `msys4`. Now `+allocWithZone:` answers one placeholder kept in a static, so it is never deallocated. In `msys5` the crashes are the usual ones (CommCenter, assetsd), with none from backboardd.
+
+CoreAnimation is unchanged: backboardd doesn't opt in and keeps rendering through GL. Next: CoreAnimation's compositor on Metal, first in a test process (a `CAMetalLayer`, or `CARenderer` with a Metal device), then in backboardd.
+
 ## 2026-11-24: Metal draws on the phone
 
 `mtl-draw` (`gpu/metal/test/mtl-draw.mm`) creates a Metal device and draws through the Metal API: `newLibraryWithURL:` on QuartzCore's `default.metallib`, `newRenderPipelineStateWithDescriptor:` for `stroke_line_vert_lpf` + `stroke_line_frag_lpf`, a render pass into a private BGRA8 texture, `drawPrimitives:`, and a blit to a shared buffer for the readback. The device is UniXNU's AdrenoMetal frontend (`NativeBridgeMetalFrontend.mm`, MIT), which subclasses `_MTLDevice` and hands every call to the metal2vulkan runtime (Rust, `libadreno_metal_bridge.a`) running on our Turnip. The program opens it directly with `native_bridge_metal_open`. No plugin is involved yet, and iOS's own `MTLCreateSystemDefaultDevice` still returns nil.

@@ -2,7 +2,10 @@
 
 Route: Metal frontend (UniXNU's AdrenoMetal, MIT), then the metal2vulkan runtime (translates AIR to
 SPIR-V and runs it), then Turnip (`gpu/mesa-ios`, `VK=1`, out/bluevk.dylib), then bluedrm, then BlueGPU.
-The frontend runs in a test program, `mtl-draw` (not yet behind `MTLCreateSystemDefaultDevice`).
+Metal reaches it through its plugin discovery: the kernel's IOAcceleratorES carries `MetalPluginName`
+`BlueMetal` and `MetalPluginClassName` `BlueMetalDevice` (xnu patch 0215), and `plugin/BlueMetal.m` answers
+the frontend's device to processes that opt in (`BLUE_METAL=1`, or the process name on a line of
+`/usr/local/etc/bluemetal.procs`) and nil to the rest.
 Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/mesa-ios/test/vk-draw.c`.
 
 | File | What |
@@ -11,8 +14,9 @@ Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/m
 | `turnip-a630-vulkaninfo.json`, `turnip-a630-formats.json` | its sources: `vulkaninfo --json` and `corpus-vulkan --capture-formats` |
 | `m2v-regen-turnip-a630.patch` | the `SOURCES` entry for metal2vulkan's `scripts/regen-device-profiles` (metal2vulkan 0d4d572, GPL-2.0-or-later) |
 | `qc-spv.sh` | translates the QuartzCore pipelines the tests draw, from the mounted iOS root, into `out/qc` (not in git: derived from Apple's shaders) |
-| `build-mtl-draw.sh` | builds `out/mtl-draw` for iOS 16: the frontend and UniXNU's bridge library (the metal2vulkan runtime), from `work/ref/UniXNU` |
-| `test/mtl-draw.mm` | opens the frontend's `MTLDevice` over `bluevk.dylib` and draws QuartzCore's stroke_line through the Metal API; `MTL_DRAW_TRI=tri.metallib`: one full-screen triangle (`test/tri.metal`) |
+| `build-metal.sh` | builds into `out/`, from `work/ref/UniXNU`: `bluemetal.dylib` (frontend + metal2vulkan runtime), `BlueMetal.bundle`, `mtl-draw`, `mtl-sys`, `tri.metallib` |
+| `plugin/` | `BlueMetal.bundle`: Metal's plugin (`/System/Library/Extensions`), loads `/usr/lib/bluemetal.dylib` for processes that opt in |
+| `test/mtl-draw.mm` | opens the frontend's `MTLDevice` over `bluevk.dylib` and draws QuartzCore's stroke_line through the Metal API; `MTL_DRAW_TRI=tri.metallib`: one full-screen triangle (`test/tri.metal`). Built with `-DMTL_DRAW_SYSTEM` as `mtl-sys`: the device from `MTLCreateSystemDefaultDevice`, after printing each discovery step |
 | `patches/m2v-0001-*` | metal2vulkan runtime: `read_pages` fallback on iOS |
 | `patches/am-0001-*` | AdrenoMetal frontend: accept iOS 16's `_MTLDevice` (528 bytes; held to iPadOS 17's 536) |
 | `m2vbatch.py` | translates every function of a metallib: `M2V_PROFILE=turnip-a630 python3 m2vbatch.py SCRATCH LIB TAG` |
@@ -50,8 +54,13 @@ The failures on the A630:
 ## mtl-draw: Metal on the phone (2026-11-24)
 
 ```sh
-gpu/metal/build-mtl-draw.sh          # or --reuse-bridge after the first build (the bridge takes ~8 min)
+gpu/metal/build-metal.sh          # or --reuse-bridge after the first build (the bridge takes ~8 min)
 tools/phonetest.sh --name mtl --push gpu/metal/out/mtl-draw:/usr/local/bin/mtl-draw:755 --run /usr/local/bin/mtl-draw
+# through Metal's discovery (kernel with 0215):
+O=gpu/metal/out E=/System/Library/Extensions/BlueMetal.bundle
+tools/phonetest.sh --name msys --mkdir $E:755 --push $O/BlueMetal.bundle/Info.plist:$E/Info.plist:644 \
+    --push $O/BlueMetal.bundle/BlueMetal:$E/BlueMetal:755 --push $O/bluemetal.dylib:/usr/lib/bluemetal.dylib:755 \
+    --push $O/mtl-sys:/usr/local/bin/mtl-sys:755 --run /usr/local/bin/mtl-sys
 ```
 
 Turnip must export `vkGetInstanceProcAddr` (the runtime opens the "loader" with `ash::Entry::load_from`):

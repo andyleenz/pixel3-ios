@@ -1,8 +1,13 @@
 #!/bin/bash
-# build-mtl-draw.sh - the native Metal frontend (UniXNU's AdrenoMetal, MIT) for iOS 16 on our Turnip, as the test program
-# gpu/metal/out/mtl-draw (test/mtl-draw.mm).
+# build-metal.sh - Metal for iOS 16 on our Turnip: the native Metal frontend (UniXNU's AdrenoMetal, MIT) over the
+# metal2vulkan runtime, into gpu/metal/out:
+#   bluemetal.dylib     the frontend + runtime, /usr/lib/bluemetal.dylib on the phone
+#   BlueMetal.bundle    Metal's plugin (plugin/BlueMetal.m), /System/Library/Extensions/BlueMetal.bundle
+#   mtl-draw            test/mtl-draw.mm with the frontend linked in (opens the device itself)
+#   mtl-sys             test/mtl-draw.mm -DMTL_DRAW_SYSTEM (MTLCreateSystemDefaultDevice, through the plugin)
+#   tri.metallib        test/tri.metal
 #
-#   gpu/metal/build-mtl-draw.sh [--reuse-bridge]
+#   gpu/metal/build-metal.sh [--reuse-bridge]
 #
 # Needs, under work/ref (not in git):
 #   UniXNU/                                   github.com/UniXNU/UniXNU (its scripts and pins)
@@ -48,11 +53,22 @@ rm -rf "$SRC"; mkdir -p "$SRC"
 cp "$A"/*.h "$A"/*.mm "$SRC"/; mkdir -p "$SRC/bridge"; cp "$A"/bridge/*.h "$SRC/bridge/"
 for p in "$REPO"/gpu/metal/patches/am-*.patch; do patch -s -d "$SRC" -p1 < "$p"; done
 MI=$(ls -d "$REPO"/gpu/mesa-ios/build/mesa-*/include | head -1)
-xcrun clang++ -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -O2 -g -std=c++17 -fobjc-arc \
-	-Wno-deprecated-declarations -Wno-unguarded-availability-new -DNATIVE_METAL_BUILD_ID='"pixel3"' -DNMB_ANY_MTLDEVICE_SIZE \
-	-I "$SRC" -I "$U/drivers/Adreno740" -I "$U/kits/AdrenoPM4" -I "$MI" \
-	-x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" "$SRC/NativeBridgeMetalFrontend.mm" -x none "$BRIDGE" \
-	-Wl,-dead_strip -lobjc -framework Foundation -framework Metal -framework IOSurface -o "$OUT/mtl-draw"
-codesign -f -s - "$OUT/mtl-draw" 2>/dev/null
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+CC=(xcrun clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -std=c++17 -fobjc-arc -Wno-deprecated-declarations
+	-Wno-unguarded-availability-new -DNATIVE_METAL_BUILD_ID='"pixel3"' -DNMB_ANY_MTLDEVICE_SIZE
+	-I "$SRC" -I "$U/drivers/Adreno740" -I "$U/kits/AdrenoPM4" -I "$MI")
+FW=(-Wl,-dead_strip -lobjc -framework Foundation -framework Metal -framework IOSurface)
+
+# the frontend + runtime once, as an object every product links
+"${CC[@]}" -x objective-c++ -c "$SRC/NativeBridgeMetalFrontend.mm" -o "$OUT/frontend.o"
+"${CC[@]}" -dynamiclib -install_name /usr/lib/bluemetal.dylib "$OUT/frontend.o" "$BRIDGE" "${FW[@]}" -o "$OUT/bluemetal.dylib"
+"${CC[@]}" -x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" -x none "$OUT/frontend.o" "$BRIDGE" "${FW[@]}" -o "$OUT/mtl-draw"
+"${CC[@]}" -DMTL_DRAW_SYSTEM -x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" -framework Foundation -framework Metal -framework IOKit -o "$OUT/mtl-sys"
+B=$OUT/BlueMetal.bundle
+rm -rf "$B"; mkdir -p "$B"
+cp "$REPO/gpu/metal/plugin/Info.plist" "$B/"
+xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fobjc-arc -bundle "$REPO/gpu/metal/plugin/BlueMetal.m" \
+	-framework Foundation -framework Metal -framework IOKit -o "$B/BlueMetal"
+for f in bluemetal.dylib mtl-draw mtl-sys BlueMetal.bundle/BlueMetal; do codesign -f -s - "$OUT/$f" 2>/dev/null; done
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -mios-version-min=16.0 "$REPO/gpu/metal/test/tri.metal" -o "$OUT/tri.metallib"
-echo "built $OUT/mtl-draw ($(stat -f %z "$OUT/mtl-draw") bytes)"
+ls -la "$OUT/bluemetal.dylib" "$OUT/mtl-draw" "$OUT/mtl-sys" "$B/BlueMetal" | awk '{print $5, $9}'

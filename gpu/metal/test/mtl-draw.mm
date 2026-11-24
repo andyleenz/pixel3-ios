@@ -4,6 +4,10 @@
 // through Vulkan, and checks the same pixels.
 //
 //   mtl-draw [TURNIP] [QUARTZCORE.metallib] [PAIRS]
+//   mtl-sys [QUARTZCORE.metallib]
+//
+// mtl-sys (built with -DMTL_DRAW_SYSTEM) takes the device from MTLCreateSystemDefaultDevice instead: Metal's own
+// discovery, through the kernel's IOAcceleratorES and the BlueMetal plugin (gpu/metal/plugin), with BLUE_METAL=1 set.
 //
 // TURNIP defaults to /usr/lib/bluevk.dylib, the metallib to the system QuartzCore's. With PAIRS > 0 it then runs the
 // frontend's benchmark (native_bridge_metal_benchmark): the first PAIRS vertex/fragment pairs of the metallib made into
@@ -12,21 +16,26 @@
 // Copyright (c) 2026 pixel3-ios. MIT licence.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <objc/runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
+#ifndef MTL_DRAW_SYSTEM
 #include "NativeBridgeMetalFrontend.h"
+#endif
 
 #define W 256
 #define H 256
 
+#ifndef MTL_DRAW_SYSTEM
 static void
 missing(const char *cls, const char *sel)
 {
 	printf("mtl-draw: missing %s %s\n", cls, sel);
 }
+#endif
 
 static int
 draw(id<MTLDevice> dev, NSString *libpath)
@@ -141,6 +150,56 @@ draw(id<MTLDevice> dev, NSString *libpath)
 	return bad ? 3 : 0;
 }
 
+#ifdef MTL_DRAW_SYSTEM
+extern "C" {
+unsigned IOServiceGetMatchingService(unsigned, CFDictionaryRef);
+CFMutableDictionaryRef IOServiceMatching(const char *);
+CFTypeRef IORegistryEntryCreateCFProperty(unsigned, CFStringRef, CFAllocatorRef, uint32_t);
+}
+
+// Metal's discovery (MTLRegisterDevices, getMetalPluginClassForService) step by step, each step printed
+static void
+discovery(void)
+{
+	unsigned svc = IOServiceGetMatchingService(0, IOServiceMatching("IOAcceleratorES"));
+	printf("mtl-sys: IOAcceleratorES service %#x\n", svc);
+	if (!svc)
+		return;
+	NSString *name = CFBridgingRelease(IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginName"), NULL, 0));
+	NSString *cls = CFBridgingRelease(IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginClassName"), NULL, 0));
+	printf("mtl-sys: MetalPluginName %s, MetalPluginClassName %s\n", name.description.UTF8String, cls.description.UTF8String);
+	if (!name)
+		return;
+	NSString *path = [[@"/System/Library/Extensions" stringByAppendingPathComponent:name] stringByAppendingString:@".bundle"];
+	NSBundle *b = [NSBundle bundleWithPath:path];
+	NSError *err = nil;
+	BOOL loaded = [b loadAndReturnError:&err];
+	printf("mtl-sys: bundle %s: %s, load %s %s\n", path.UTF8String, b ? "found" : "MISSING", loaded ? "ok" : "FAILED",
+	    err ? err.description.UTF8String : "");
+	Class c = cls ? [b classNamed:cls] : b.principalClass;
+	printf("mtl-sys: class %s, subclass of _MTLDevice: %s\n", c ? class_getName(c) : "MISSING",
+	    c && [c isSubclassOfClass:objc_getClass("_MTLDevice")] ? "yes" : "NO (Metal skips it)");
+}
+
+int
+main(int argc, char **argv)
+{
+	@autoreleasepool {
+		NSString *qc = argc > 1 ? @(argv[1]) : @"/System/Library/Frameworks/QuartzCore.framework/default.metallib";
+		setenv("BLUE_METAL", "1", 0);
+		setenv("NMB_LOG_STDERR", "1", 0);
+		setvbuf(stdout, NULL, _IOLBF, 0);
+		discovery();
+		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+		if (!dev) {
+			printf("mtl-sys: MTLCreateSystemDefaultDevice: nil\n");
+			return 1;
+		}
+		printf("mtl-sys: MTLCreateSystemDefaultDevice: \"%s\" (%s)\n", dev.name.UTF8String, object_getClassName(dev));
+		return draw(dev, qc);
+	}
+}
+#else
 int
 main(int argc, char **argv)
 {
@@ -179,3 +238,4 @@ main(int argc, char **argv)
 		return r;
 	}
 }
+#endif
