@@ -26,6 +26,11 @@
 - **USB live channel.** With `sweetusb=2` the phone is a USB network adapter: the kernel log streams to the
   Mac live, and `tools/bluesh.py` runs programs and swaps files on the running phone (a userland change takes
   seconds instead of a reboot).
+- **Self-signed apps install and run.** An ad-hoc signed app installs through Apple's installd and
+  launches from FrontBoard (boot with `blueapps=1`; `tools/apps/bluemis`). App Store apps stay out of reach
+  (FairPlay needs a real Secure Enclave).
+- **Vulkan on the Adreno 630.** Mesa's Turnip runs on the phone over our kernel GPU driver, and a QuartzCore
+  Metal shader translated to SPIR-V (metal2vulkan) draws through it: the first step towards Metal.
 - The UI is drawn by the Adreno 630 at about 60 fps (the default; `blueui=0` falls back to the CPU). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
@@ -49,7 +54,7 @@ partition.
 > anything personal on it. No Apple software is stored in this repository: the iOS root is built on your own
 > Mac from Apple's IPSW. Not affiliated with or endorsed by Apple or Google.
 
-## What works (2026-11-20)
+## What works (2026-11-24)
 
 | Area | State |
 | --- | --- |
@@ -57,8 +62,9 @@ partition.
 | CPU | All 8 cores (4x Kryo 385 Silver at 1.77 GHz, 4x Gold at 2.65 GHz), PSCI |
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
 | Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X 1125 pixels wide at the panel's 2:1 (1125x2250, scaled by 0.96 to fill the panel; 0184), with the X's status bar (why it was a red bar: [docs/ios16-red-status-bar.md](docs/ios16-red-status-bar.md)). By default the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; with `blueui=0`, a CPU copy at 30 Hz. Brightness works |
-| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames |
+| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames. Vulkan 1.3 through Mesa Turnip (`gpu/mesa-ios`, `VK=1`): GPU work and a translated QuartzCore pipeline run on the phone (`vk-smoke`, `vk-draw`); nothing in iOS uses it yet |
 | iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. the App Library and Control Center blurs, Control Center's glyphs and brightness slider. Photos crashes (no photo library yet), and parts of Control Center blink while it animates |
+| Apps | Self-signed (ad-hoc) apps install through installd into the user domain and launch through FrontBoard (`blueapps=1`, `tools/apps/bluemis`, test: `tools/bluerun` `apptest`). Reinstalling over an installed copy and IPA files don't work yet |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
@@ -69,7 +75,7 @@ partition.
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
 
-**Not working yet:** Metal, 5 GHz Wi-Fi, microphone, the camera in iOS, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal (Vulkan works; the Metal frontend is not written), 5 GHz Wi-Fi, microphone, the camera in iOS, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
