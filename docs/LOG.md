@@ -1148,21 +1148,13 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
-## 2026-11-24: IOSurface render targets in place (Mesa 0009)
+## 2026-11-24: lock screen correct on Metal (Mesa 0009, 0005 GL-only)
 
-A clear of a 1125x2250 IOSurface texture took 19-24 ms of GPU time, against 2.5 ms for a private or shared one, in every TU_DEBUG mode (`cab12`, `cab13`). `NATIVE_METAL_WARNINGS=1` prints the runtime's degrade notices. `metal2vulkan-degrade-shadowed-texture` said the texture is shadowed because the driver asks a dedicated allocation for a linear image over host allocations (`cab14`). The runtime binds that image at the surface's offset in its host-pointer import, so it copied the texels into a separate image before each use and back after each write.
+![lock screen, backboardd on Metal](screenshots/2026-11-24-lockscreen-metal.png)
 
-Turnip sets `requiresDedicatedAllocation` for any image with an external handle type. That is needed for dma-buf and opaque-fd exports, not for `VK_EXT_external_memory_host`, where RADV and ANV do not ask it. Mesa patch **0009** leaves host allocations out.
-
-| 1125x2250 clear, GPU time | before (cab12/13) | after (cab15) |
-|---|---|---|
-| private | 2.5 ms | 2.6 ms |
-| IOSurface | 19-24 ms | 2.5 ms |
-| shared | 1.2-2.6 ms | 2.5 ms |
-
-The IOSurface CA frame minimum goes from 31 to 18 ms (`cab15`). `cab16` (`ca-draw -iosurface`): no shadowed-texture notice, 0 of 256 rows differ, hash c49901bb89571983 as before.
-
-backboardd on Metal with 0009 (`bbm5`): the lock screen shows its wallpaper now, and commit-to-complete has a median of 50 ms (bbm4: 92 ms). The clock, date and camera glyph are horizontal streaks. Two textures are still shadowed, each because its linear image would run a few bytes past its buffer's memory: the 1326x1326 BGRA wallpaper (draws correctly) and an A8 806x234 texture at offset 64 with 832-byte rows (probably the clock). New `ca-draw` modes rule out CA's own paths: `-text` (a CATextLayer, `cab17`) and `-a8` (a gray 806x234 image with 832-byte rows, `cab18`, hash equal to the Mac's) both draw correctly. So the fault is in content backboardd gets from SpringBoard, not in CA's renderer.
+- **IOSurface textures in place (Mesa 0009).** Turnip asked a dedicated allocation for every image with an external handle type, so metal2vulkan shadowed each IOSurface texture (copy in, copy back). Found with `NATIVE_METAL_WARNINGS=1` (`cab14`). 0009 exempts host allocations, as RADV/ANV do. 1125x2250 clear: 19-24 ms of GPU time to 2.5 ms (`cab12/13` vs `cab15`). Pixels unchanged (`cab16`).
+- **Clock, date and boot logo were sheared.** Our Mesa 0005 (GL: a linear import keeps a pitch off the 64-byte rule) lives in freedreno's shared layout code, so Turnip accepted such pitches too and the runtime rendered in place. The A630 then sampled them sheared: R8 at rows of 544/672 bytes, BGRA at 752/816 (`ca-draw -a8`, `-rgba`; `cab19`, `cab21`). 0005 now applies only to GL imports (`fdl_image_params.any_linear_pitch`) with 4-byte texels; Turnip refuses those pitches and the runtime copies. All test hashes match the Mac (`cab20`, `cab22`). The bytes from SpringBoard were correct throughout (`NATIVE_METAL_ART=1`, am-0002, `bbm6`).
+- **backboardd on Metal (`bbm8`)**: wallpaper, date, clock and camera button correct. Commit-to-complete median 50-57 ms (bbm4: 92 ms), still slow. The GL path is unchanged (`gl9`).
 
 ## 2026-11-24: Metal frames 15-20x faster (0216)
 

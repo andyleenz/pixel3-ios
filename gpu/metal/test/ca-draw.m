@@ -6,6 +6,7 @@
 //   ca-draw -bench [frames]
 //   ca-draw -a8: an alpha-only CGImage (806x234, rows of 832 bytes: a rect and an ellipse) as layer contents over white, as the
 //     lock screen's clock comes from SpringBoard
+//   ca-draw -rgba: the same with 32-bit BGRA images at rows of 752, 816 and 768 bytes
 //   ca-draw -text: a CATextLayer ("12:34", white on black, 256x96) drawn as text art and hashed, as the lock screen's clock
 //   ca-draw -matrix: -bench 12 again in child processes under several TU_DEBUG settings (Turnip's render modes)
 //
@@ -284,18 +285,24 @@ static void
 a8_one(id<MTLDevice> dev, uint8_t *bits, int iw, int ih, int row, int mask)
 {
 	CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, bits, (size_t)row * ih, NULL);
-	CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
-	CGImageRef img = mask ? CGImageMaskCreate(iw, ih, 8, 8, row, dp, NULL, false)
-	                      : CGImageCreate(iw, ih, 8, 8, row, gray, (CGBitmapInfo)kCGImageAlphaNone, dp, NULL, false,
-	                            kCGRenderingIntentDefault);
-	const char *what = mask ? "a8 mask" : "a8 gray";
+	CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray(), rgb_ = CGColorSpaceCreateDeviceRGB();
+	// mask 2: 32-bit BGRA (premultiplied, alpha first, little endian), the same shapes in white
+	CGImageRef img = mask == 1 ? CGImageMaskCreate(iw, ih, 8, 8, row, dp, NULL, false)
+	               : mask == 2 ? CGImageCreate(iw, ih, 8, 32, row, rgb_,
+	                                 (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little, dp, NULL, false,
+	                                 kCGRenderingIntentDefault)
+	                           : CGImageCreate(iw, ih, 8, 8, row, gray, (CGBitmapInfo)kCGImageAlphaNone, dp, NULL, false,
+	                                 kCGRenderingIntentDefault);
+	const char *what = mask == 1 ? "a8 mask" : mask == 2 ? "rgba" : "a8 gray";
+	if (mask == 2)
+		mask = 0;
 	printf("ca-draw: %s image %zux%zu, %zu bytes per row\n", what, CGImageGetWidth(img), CGImageGetHeight(img),
 	    CGImageGetBytesPerRow(img));
 	[CATransaction begin];
 	[CATransaction setDisableActions:YES];
 	CALayer *root = [CALayer layer];
 	root.frame = CGRectMake(0, 0, 832, 260);
-	root.backgroundColor = mask ? rgb(1, 1, 1) : rgb(0, 0, 0);
+	root.backgroundColor = mask ? rgb(1, 1, 1) : rgb(0, 0, 0);  // the largest image (806x234) with a margin
 	root.opaque = YES;
 	CALayer *l = [CALayer layer];
 	l.frame = CGRectMake(13, 13, iw, ih);
@@ -308,16 +315,42 @@ a8_one(id<MTLDevice> dev, uint8_t *bits, int iw, int ih, int row, int mask)
 static int
 a8(id<MTLDevice> dev)
 {
-	const int iw = 806, ih = 234, row = 832;
-	uint8_t *bits = calloc(row, ih);
-	for (int y = 0; y < ih; y++)
-		for (int x = 0; x < iw; x++) {
-			int rect = x >= 60 && x < 260 && y >= 40 && y < 190;
-			double ex = (x - 570) / 170.0, ey = (y - 115) / 95.0;
-			bits[y * row + x] = rect || ex * ex + ey * ey <= 1 ? 255 : 0;
-		}
-	a8_one(dev, bits, iw, ih, row, 0);
+	// widths and rows as backboardd's clock and date textures have them (bbm5, bbm6): 832 is a multiple of 64, 544 and 672 are not
+	const int sizes[][3] = { { 806, 234, 832 }, { 542, 234, 544 }, { 671, 234, 672 } };
+	for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+		const int iw = sizes[i][0], ih = sizes[i][1], row = sizes[i][2];
+		uint8_t *bits = calloc(row, ih);
+		for (int y = 0; y < ih; y++)
+			for (int x = 0; x < iw; x++) {
+				int rect = x >= iw * 6 / 80 && x < iw * 26 / 80 && y >= 40 && y < 190;
+				double ex = (x - iw * 0.7) / (iw * 0.21), ey = (y - 115) / 95.0;
+				bits[y * row + x] = rect || ex * ex + ey * ey <= 1 ? 255 : 0;
+			}
+		printf("ca-draw: a8 %dx%d rows of %d\n", iw, ih, row);
+		a8_one(dev, bits, iw, ih, row, 0);
+	}
+	return 0;
+}
 
+// -rgba: 32-bit images at rows that are multiples of 16 but not of 64 (752, 816) and one of 64 (768), as backboardd's boot
+// logo (sheared under Metal, bbm8)
+static int
+rgba(id<MTLDevice> dev)
+{
+	const int sizes[][3] = { { 186, 234, 752 }, { 201, 234, 816 }, { 190, 234, 768 } };
+	for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+		const int iw = sizes[i][0], ih = sizes[i][1], row = sizes[i][2];
+		uint8_t *bits = calloc(row, ih);
+		for (int y = 0; y < ih; y++)
+			for (int x = 0; x < iw; x++) {
+				int rect = x >= iw / 10 && x < iw * 4 / 10 && y >= 40 && y < 190;
+				double ex = (x - iw * 0.7) / (iw * 0.25), ey = (y - 115) / 95.0;
+				if (rect || ex * ex + ey * ey <= 1)
+					memset(bits + y * row + x * 4, 255, 4);
+			}
+		printf("ca-draw: rgba %dx%d rows of %d\n", iw, ih, row);
+		a8_one(dev, bits, iw, ih, row, 2);
+	}
 	return 0;
 }
 
@@ -367,6 +400,8 @@ main(int argc, char **argv)
 			return text(dev);
 		if (argc > 1 && !strcmp(argv[1], "-a8"))
 			return a8(dev);
+		if (argc > 1 && !strcmp(argv[1], "-rgba"))
+			return rgba(dev);
 
 		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 		                                                                              width:W height:H mipmapped:NO];

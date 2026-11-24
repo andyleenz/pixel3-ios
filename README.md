@@ -122,8 +122,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
    through Metal's plugin discovery, and QuartzCore's stroke_line pipeline draws through it (`mtl-sys`,
    2026-11-24), and so does CoreAnimation's compositor through `CARenderer` (`ca-draw`), and backboardd composites the lock screen through it. Kernel 0216 cut a frame from
    60-110 ms to 4-6 ms (write-combined overflow BOs, no clean at submit). Mesa 0009 renders IOSurface targets in
-   place (a clear: 20 ms to 2.5 ms of GPU). Next: backboardd's frames (64-256 ms of GPU each;
-   wallpaper and clock missing).
+   place (a clear: 20 ms to 2.5 ms of GPU), and the lock screen draws correctly on Metal. Next:
+   backboardd's frame time (median 50 ms commit to complete).
 2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
    with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
    better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their

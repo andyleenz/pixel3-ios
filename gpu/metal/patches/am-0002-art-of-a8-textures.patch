@@ -1,0 +1,65 @@
+NATIVE_METAL_ART=1: the first 8 one-byte textures over buffers that fragment functions sample, as text art of
+their buffer bytes, and the first 48 textures over buffers at rows or offsets off 64 bytes (format, size, rows,
+usage). pixel3-ios: debugging the lock screen under backboardd.
+
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1554,6 +1554,12 @@
+ static char gUnalignedImage[24];
+ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,const void *caller) {
+  if(!(row%64) && !(offset%64))return;
++ // NATIVE_METAL_ART=1 (pixel3-ios): each of the first 48, with its format and usage
++ static const bool art=getenv("NATIVE_METAL_ART")!=nullptr;
++ static std::atomic<int> told{0};
++ if(art && told.fetch_add(1)<48)
++  fprintf(stderr,"nmb-tex: fmt %lu %lux%lu off %lu row %lu usage %lx\n",(unsigned long)d.pixelFormat,(unsigned long)d.width,
++          (unsigned long)d.height,(unsigned long)offset,(unsigned long)row,(unsigned long)d.usage);
+  const uint64_t bytes=(uint64_t)row*d.height*(d.depth?d.depth:1);
+  std::lock_guard<std::mutex> lock(gUnalignedLock);
+  gUnalignedCount++;gUnalignedBytes+=bytes;
+@@ -2574,6 +2580,37 @@
+                             buffer.label.length?[@" " stringByAppendingString:buffer.label]:@"",
+                             contents && offset<buffer.length?dumpWords(contents+offset,buffer.length-offset):@" not CPU-visible"]);
+   } else dumpLine(_commandBuffer,[where stringByAppendingString:@" nil"]);
++ }
++}
++// NATIVE_METAL_ART=1 (pixel3-ios): the first 8 one-byte textures over buffers a fragment function samples, as the CPU sees their
++// buffer's bytes: size, offset, rows, the buffer's length and first bytes, then 64 columns of text art (cells of width/64 texels,
++// ' ' '.' '+' '#' by mean). Tells bytes laid out as declared from a fault in the copy or the sampling.
++static void artOfTexture(NBTexture *texture) {
++ static const bool on=getenv("NATIVE_METAL_ART")!=nullptr;
++ static std::atomic<int> printed{0};
++ if(!on || !texture.buffer || texture.width<64)return;
++ const MTLPixelFormat f=texture.pixelFormat;
++ if(f!=MTLPixelFormatA8Unorm && f!=MTLPixelFormatR8Unorm)return;
++ if(printed.fetch_add(1)>=8)return;
++ const uint8_t *base=(const uint8_t *)texture.buffer.contents;
++ const NSUInteger w=texture.width,h=texture.height,row=texture.rowBytes,off=texture.offset,len=texture.buffer.length;
++ fprintf(stderr,"nmb-art: fmt %lu %lux%lu off %lu row %lu buflen %lu need %lu%s\n",(unsigned long)f,(unsigned long)w,(unsigned long)h,
++         (unsigned long)off,(unsigned long)row,(unsigned long)len,(unsigned long)(off+row*(h-1)+w),base?"":" not CPU-visible");
++ if(!base || off+row*(h-1)+w>len)return;
++ const uint8_t *p=base+off;
++ fprintf(stderr,"nmb-art: bytes %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++         p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
++ const NSUInteger cw=w/64,ch=cw;
++ for(NSUInteger y=0;y+ch<=h;y+=ch) {
++  char line[65];
++  for(int c=0;c<64;c++) {
++   unsigned sum=0;
++   for(NSUInteger dy=0;dy<ch;dy++)for(NSUInteger dx=0;dx<cw;dx++)sum+=p[(y+dy)*row+c*cw+dx];
++   sum/=(unsigned)(cw*ch);
++   line[c]=sum>192?'#':sum>96?'+':sum>16?'.':' ';
++  }
++  line[64]=0;
++  fprintf(stderr,"nmb-art |%s|\n",line);
+  }
+ }
+ // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
+@@ -2586,6 +2623,7 @@
+ }
+ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
+  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
++ if(texture && stage==2)artOfTexture((NBTexture *)texture);
+  if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
+  static const bool captureInputs=getenv("NATIVE_METAL_DUMP_INPUTS")!=nullptr;
+  const bool captureInput=stage==2 && captureInputs;
