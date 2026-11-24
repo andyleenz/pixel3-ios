@@ -122,7 +122,7 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
    (`CARenderer`) draw through it with Apple M1 pixels; backboardd composites the lock screen correctly on it.
    Most apps don't need Metal (their views are drawn by CoreGraphics and composited by backboardd, on GL),
    but games, Maps, WebGL and Core Image do. In order:
-   1. CPU cost per command buffer (a kernel map for every command-stream BO; `bluedrm` BO reuse in test).
+   1. CPU cost per command buffer (Turnip re-maps existing command-stream BOs through a kernel call).
    2. Metal on by default in app processes (a deny-list instead of `BLUE_METAL=1`).
    3. Tests: Maps, WebGL in Safari, a SpriteKit/Metal sample app.
    4. Later: backboardd on Metal (median 31 ms commit to complete: half recording, half GPU in sysmem);
