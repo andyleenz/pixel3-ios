@@ -5,3 +5,9 @@ xnu/out*/
 backup/
 logs/
 CC-Session-Logs/
+
+# iOSOnAnd tracker CLI and its secrets
+.env
+.env.*
+cli.mjs
+TRACKER_QUEUE.md
