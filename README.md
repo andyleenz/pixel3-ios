@@ -33,7 +33,8 @@
   Metal's own discovery: the kernel's IOAcceleratorES names our plugin, `BlueMetal.bundle`, which hands out
   UniXNU's AdrenoMetal frontend over metal2vulkan and Mesa's Turnip. QuartzCore's stroke_line pipeline draws
   through it with the same pixels as the Vulkan path (`gpu/metal`, `mtl-sys`). CoreAnimation's own Metal
-  compositor renders a layer tree through it (`CARenderer`, `ca-draw`) with the pixels Apple's M1 gives.
+  compositor renders a layer tree through it (`CARenderer`, `ca-draw`), into a texture or an IOSurface, with
+  the pixels Apple's M1 gives.
   Processes opt in (`BLUE_METAL=1` or `/usr/local/etc/bluemetal.procs`); the UI still renders through GL.
 - **Vulkan on the Adreno 630.** Mesa's Turnip runs on the phone over our kernel GPU driver, and a QuartzCore
   Metal shader translated to SPIR-V (metal2vulkan) draws through it.

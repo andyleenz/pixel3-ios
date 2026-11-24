@@ -15,7 +15,7 @@ Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/m
 | `m2v-regen-turnip-a630.patch` | the `SOURCES` entry for metal2vulkan's `scripts/regen-device-profiles` (metal2vulkan 0d4d572, GPL-2.0-or-later) |
 | `qc-spv.sh` | translates the QuartzCore pipelines the tests draw, from the mounted iOS root, into `out/qc` (not in git: derived from Apple's shaders) |
 | `build-metal.sh` | builds into `out/`, from `work/ref/UniXNU`: `bluemetal.dylib` (frontend + metal2vulkan runtime), `BlueMetal.bundle`, `mtl-draw`, `mtl-sys`, `tri.metallib` |
-| `test/ca-draw.m` | `CARenderer` renders a layer tree into a texture of `MTLCreateSystemDefaultDevice`'s device (CoreAnimation's Metal compositor); `-dump` logs its command buffers. Built for the Mac too as the reference |
+| `test/ca-draw.m` | `CARenderer` renders a layer tree into a texture of `MTLCreateSystemDefaultDevice`'s device (CoreAnimation's Metal compositor); `-dump` logs its command buffers; `-iosurface` renders into an IOSurface and reads its pages (needs Mesa 0008, `VK_EXT_external_memory_host`). Built for the Mac too as the reference |
 | `plugin/` | `BlueMetal.bundle`: Metal's plugin (`/System/Library/Extensions`), loads `/usr/lib/bluemetal.dylib` for processes that opt in |
 | `test/mtl-draw.mm` | opens the frontend's `MTLDevice` over `bluevk.dylib` and draws QuartzCore's stroke_line through the Metal API; `MTL_DRAW_TRI=tri.metallib`: one full-screen triangle (`test/tri.metal`). Built with `-DMTL_DRAW_SYSTEM` as `mtl-sys`: the device from `MTLCreateSystemDefaultDevice`, after printing each discovery step |
 | `patches/m2v-0001-*` | metal2vulkan runtime: `read_pages` fallback on iOS |

@@ -1171,6 +1171,21 @@ On the Mac the first version rendered nothing (the texture stayed magenta, its u
 
 Next: backboardd's render server on Metal (`backboardd` in `/usr/local/etc/bluemetal.procs`). Its output goes to the display's IOSurfaces, so the frontend has to render into IOSurface-backed textures, and CoreAnimation has to pick Metal over the GL path it uses now.
 
+### IOSurface targets (Mesa 0008)
+
+The frontend makes a texture over an IOSurface (`newTextureWithDescriptor:iosurface:plane:`) as a no-copy buffer over the surface's pages, and refuses the texture if that import fails. metal2vulkan imports host pages only through `VK_EXT_external_memory_host` (`Limit::NoImport` otherwise), which Turnip's msm backend lacks. Mesa patch 0008 adds it over BlueGPU's USERPTR (`bluedrm_user_memory`, whole 16 KiB pages, so `minImportedHostPointerAlignment` 16384). The BO is mapped at the caller's pointer and never unmapped by Turnip. The kernel cleans the pages at each submit and invalidates them at CPU_PREP, so it is offered as the first, host-coherent type. UniXNU's Turnip patch does the same over its own kernel client.
+
+`ca-draw -iosurface` renders into a 256x256 BGRA IOSurface filled with 0x55 first, then reads the surface's pages with `IOSurfaceLock` (`work/test/ca3`):
+
+```
+BLUERUN: ca-draw: IOSurface 2, 262144 bytes, row 1024: texture ok
+BLUERUN: ca-draw: IOSurface pages vs blit: 0 of 256 rows differ
+BLUERUN: ca-draw: 25180 lit pixels, 20900 orange, hash c49901bb89571983
+BLUERUN: ca-draw: DRAW ok
+```
+
+Same pixels as the private texture, and as the Mac's `-iosurface` run (25180 / 20896).
+
 ## 2026-11-24: MTLCreateSystemDefaultDevice returns the A630
 
 `mtl-sys` (`mtl-draw.mm` built with `-DMTL_DRAW_SYSTEM`) takes its device from `MTLCreateSystemDefaultDevice()` and draws the same stroke_line test (`work/test/msys5`):

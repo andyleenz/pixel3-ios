@@ -2,7 +2,10 @@
 // MTLCreateSystemDefaultDevice's device (on the phone: the BlueMetal plugin's, opted in with BLUE_METAL=1). QuartzCore picks
 // its own compositor pipelines and function constants, so this is the path backboardd's render server would take.
 //
-//   ca-draw [-dump] [out.ppm]
+//   ca-draw [-dump] [-iosurface] [out.ppm]
+//
+// -iosurface: the target is an IOSurface-backed texture, as backboardd's display surfaces are, and the check reads
+// the surface's pages from the CPU (IOSurfaceLock) instead of a blit.
 //
 // The tree, 256x256 on black: an orange square (48..208, corner radius 24) and over it a blue square (96..160) at
 // opacity 0.5. Every probe is symmetric about the centre, so a flipped y axis doesn't matter. On the Mac the same program
@@ -12,6 +15,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +65,9 @@ main(int argc, char **argv)
 			setenv("NMB_LOG_STDERR", "1", 1);
 			argc--, argv++;
 		}
+		int surface = 0;
+		if (argc > 1 && !strcmp(argv[1], "-iosurface"))
+			surface = 1, argc--, argv++;
 		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
 		if (!dev) {
 			printf("ca-draw: MTLCreateSystemDefaultDevice: nil\n");
@@ -72,7 +79,30 @@ main(int argc, char **argv)
 		                                                                              width:W height:H mipmapped:NO];
 		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 		td.storageMode = MTLStorageModePrivate;
-		id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+		IOSurfaceRef ios = NULL;
+		id<MTLTexture> tex;
+		if (surface) {
+			ios = IOSurfaceCreate((__bridge CFDictionaryRef) @{
+				(id)kIOSurfaceWidth : @W, (id)kIOSurfaceHeight : @H, (id)kIOSurfaceBytesPerElement : @4,
+				(id)kIOSurfaceBytesPerRow : @(W * 4), (id)kIOSurfacePixelFormat : @(0x42475241) /* 'BGRA' */
+			});
+			if (!ios) {
+				printf("ca-draw: IOSurfaceCreate: NULL\n");
+				return 1;
+			}
+			IOSurfaceLock(ios, 0, NULL);
+			memset(IOSurfaceGetBaseAddress(ios), 0x55, IOSurfaceGetAllocSize(ios));
+			IOSurfaceUnlock(ios, 0, NULL);
+			td.storageMode = MTLStorageModeShared;
+			tex = [dev newTextureWithDescriptor:td iosurface:ios plane:0];
+			printf("ca-draw: IOSurface %u, %zu bytes, row %zu: texture %s\n", IOSurfaceGetID(ios), IOSurfaceGetAllocSize(ios),
+			    IOSurfaceGetBytesPerRow(ios), tex ? "ok" : "nil");
+		} else
+			tex = [dev newTextureWithDescriptor:td];
+		if (!tex) {
+			printf("ca-draw: no target texture\n");
+			return 1;
+		}
 		id<MTLCommandQueue> q = [dev newCommandQueue];
 
 		[CATransaction begin];
@@ -127,6 +157,20 @@ main(int argc, char **argv)
 			return 1;
 		}
 		const uint8_t *pix = rb.contents;
+		if (ios) {
+			// the surface's own pages, as the display reads them (rows are W * 4 bytes, checked above)
+			IOSurfaceLock(ios, kIOSurfaceLockReadOnly, NULL);
+			const uint8_t *sp = IOSurfaceGetBaseAddress(ios);
+			size_t row = IOSurfaceGetBytesPerRow(ios), differ = 0;
+			for (int y = 0; y < H; y++)
+				differ += memcmp(sp + y * row, pix + y * W * 4, W * 4) != 0;
+			printf("ca-draw: IOSurface pages vs blit: %zu of %d rows differ\n", differ, H);
+			uint8_t *copy = malloc(W * H * 4);
+			for (int y = 0; y < H; y++)
+				memcpy(copy + y * W * 4, sp + y * row, W * 4);
+			IOSurfaceUnlock(ios, kIOSurfaceLockReadOnly, NULL);
+			pix = copy;
+		}
 
 		// expected: orange ff ff 80 00; blue at 0.5 over orange (premultiplied source-over) ff 80 40 80
 		struct { int x, y; uint32_t want; const char *what; } probes[] = {

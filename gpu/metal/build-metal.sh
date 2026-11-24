@@ -66,7 +66,7 @@ FW=(-Wl,-dead_strip -lobjc -framework Foundation -framework Metal -framework IOS
 "${CC[@]}" -x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" -x none "$OUT/frontend.o" "$BRIDGE" "${FW[@]}" -o "$OUT/mtl-draw"
 "${CC[@]}" -DMTL_DRAW_SYSTEM -x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" -framework Foundation -framework Metal -framework IOKit -o "$OUT/mtl-sys"
 xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fobjc-arc "$REPO/gpu/metal/test/ca-draw.m" \
-	-framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -o "$OUT/ca-draw"
+	-framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework IOSurface -o "$OUT/ca-draw"
 B=$OUT/BlueMetal.bundle
 rm -rf "$B"; mkdir -p "$B"
 cp "$REPO/gpu/metal/plugin/Info.plist" "$B/"

@@ -1,0 +1,182 @@
+Turnip VK_EXT_external_memory_host on Darwin: a BO over the caller's pages through BlueGPU USERPTR
+(bluedrm_user_memory, 16 KiB pages), mapped at the caller's pointer and never unmapped. The
+metal2vulkan runtime imports IOSurfaces and no-copy buffers this way. After UniXNU
+patches/mesa/turnip-darwin-kmd.patch (MIT), which does the same over its own kernel client.
+
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -342,6 +342,7 @@
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_dma_buf = true,
++      .EXT_external_memory_host = device->has_host_import,
+       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
+       .EXT_fragment_density_map = true,
+       .EXT_fragment_density_map_offset = true,
+@@ -1208,6 +1209,8 @@
+          : pdevice->info->props.max_storage_buffer_range_bytes;
+    props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
+    props->maxMemoryAllocationCount = UINT32_MAX;
++   /* VK_EXT_external_memory_host (pixel3-ios): BlueGPU's USERPTR takes whole 16 KiB pages. */
++   props->minImportedHostPointerAlignment = 16384;
+    props->maxSamplerAllocationCount = 64 * 1024;
+    props->bufferImageGranularity = 64;          /* A cache line */
+    props->sparseAddressSpaceSize = pdevice->va_size;
+@@ -3769,7 +3772,17 @@
+                            BUFFER_DEVICE_ADDRESS_ALIGNMENT_ALLOCATE_INFO_VALVE);
+    uint64_t alignment = align_info ? align_info->alignment : 0;
+ 
+-   if (fd_info && fd_info->handleType) {
++   const VkImportMemoryHostPointerInfoEXT *host_info =
++      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
++
++   if (host_info && host_info->handleType) {
++      if (host_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++          ((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & 16383)
++         result = vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++      else
++         result = tu_bo_init_host(device, &mem->bo, host_info->pHostPointer,
++                                  pAllocateInfo->allocationSize);
++   } else if (fd_info && fd_info->handleType) {
+       assert(fd_info->handleType ==
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+              fd_info->handleType ==
+@@ -3891,6 +3904,22 @@
+ 
+    *pMem = tu_device_memory_to_handle(mem);
+ 
++   return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetMemoryHostPointerPropertiesEXT(VkDevice _device,
++                                     VkExternalMemoryHandleTypeFlagBits handleType,
++                                     const void *pHostPointer,
++                                     VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++       !device->physical_device->has_host_import || ((uintptr_t) pHostPointer & 16383))
++      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   /* The caller's pages keep its own CPU mapping; the kernel cleans and invalidates them around
++    * each submit, so they are offered as the first (host-coherent) type. */
++   pMemoryHostPointerProperties->memoryTypeBits = 1u;
+    return VK_SUCCESS;
+ }
+ 
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -136,6 +136,7 @@
+    bool has_sparse_prr;
+    /* Whether lazy allocations are supported. */
+    bool has_lazy_bos;
++   bool has_host_import;   /* pixel3-ios: VK_EXT_external_memory_host */
+    /* Whether allocations can be aligned. */
+    bool has_iova_align;
+    uint64_t va_start;
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -87,6 +87,14 @@
+ }
+ 
+ VkResult
++tu_bo_init_host(struct tu_device *dev, struct tu_bo **bo, void *pointer, uint64_t size)
++{
++   if (!dev->instance->knl->bo_init_host)
++      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   return dev->instance->knl->bo_init_host(dev, bo, pointer, size);
++}
++
++VkResult
+ tu_bo_init_dmabuf(struct tu_device *dev,
+                   struct tu_bo **bo,
+                   uint64_t size,
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -143,6 +143,9 @@
+    VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
+                               uint64_t size, uint64_t align,
+                               enum tu_bo_alloc_flags flags, int prime_fd);
++   /* Optional (VK_EXT_external_memory_host): a BO over the caller's own pages at pointer. */
++   VkResult (*bo_init_host)(struct tu_device *dev, struct tu_bo **out_bo,
++                            void *pointer, uint64_t size);
+    int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
+    VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
+    VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
+@@ -226,6 +229,9 @@
+ 
+ int
+ tu_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo);
++
++VkResult
++tu_bo_init_host(struct tu_device *dev, struct tu_bo **bo, void *pointer, uint64_t size);
+ 
+ void
+ tu_bo_finish(struct tu_device *dev, struct tu_bo *bo);
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -809,7 +809,36 @@
+    return result;
+ }
+ 
++#ifdef __APPLE__
++/* pixel3-ios, VK_EXT_external_memory_host: BlueGPU's USERPTR (0x7d) wires the caller's pages (an
++ * IOSurface's, for the Metal frontend's no-copy buffers) as a BO. The CPU keeps the caller's mapping:
++ * bo->map is the pointer and is never unmapped here. The kernel cleans the pages at each submit and
++ * invalidates them at CPU_PREP, so the BO is as coherent as the first memory type promises. */
+ static VkResult
++msm_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
++{
++   uint32_t gem_handle;
++   if (bluedrm_user_memory(dev->fd, pointer, size, &gem_handle))
++      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "bluedrm USERPTR: %s", strerror(errno));
++
++   u_rwlock_wrlock(&dev->dma_bo_lock);
++   struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
++   assert(bo->refcnt == 0);
++   uint64_t iova = 0;
++   VkResult result = tu_bo_init(dev, NULL, bo, gem_handle, size, iova, TU_BO_ALLOC_NO_FLAGS, "host import");
++   if (result == VK_SUCCESS) {
++      bo->map = pointer;
++      bo->never_unmap = true;
++      *out_bo = bo;
++   } else {
++      memset(bo, 0, sizeof(*bo));
++   }
++   u_rwlock_wrunlock(&dev->dma_bo_lock);
++   return result;
++}
++#endif
++
++static VkResult
+ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+ {
+    uint64_t offset = tu_gem_info(dev, bo->gem_handle, MSM_INFO_GET_OFFSET);
+@@ -896,7 +925,8 @@
+    if (bo->map) {
+       TU_RMV(bo_unmap, dev, bo);
+       #ifdef __APPLE__
+-      bluedrm_unmap(dev->fd, bo->gem_handle, bo->map, bo->size);
++      if (!bo->never_unmap)   /* a host import keeps the caller's mapping */
++         bluedrm_unmap(dev->fd, bo->gem_handle, bo->map, bo->size);
+ #else
+       munmap(bo->map, bo->size);
+ #endif
+@@ -1331,6 +1361,9 @@
+       .submitqueue_close = msm_submitqueue_close,
+       .bo_init = msm_bo_init,
+       .bo_init_dmabuf = msm_bo_init_dmabuf,
++#ifdef __APPLE__
++      .bo_init_host = msm_bo_init_host,
++#endif
+       .bo_export_dmabuf = tu_drm_export_dmabuf,
+       .bo_map = msm_bo_map,
+       .bo_allow_dump = msm_bo_allow_dump,
+@@ -1418,6 +1451,7 @@
+    /* pixel3-ios: BlueGPU has one VA space shared by every client and picks the IOVA at
+     * GEM_NEW (blue_gpu_uapi.h); no MSM_INFO_SET_IOVA. */
+    device->has_set_iova = false;
++   device->has_host_import = true;
+ #else
+    device->has_set_iova = !msm_common_get_va_prop(device->local_fd, MSM_PIPE_3D0, &device->va_start, &device->va_size);
+ #endif
