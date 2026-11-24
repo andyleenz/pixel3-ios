@@ -7,7 +7,7 @@ together with the kernel's BlueGPU user client (`xnu/patches/0153`, `0157`–`01
 |---|---|---|
 | `mesa-ios/` | Mesa 26.3.1 freedreno (fetched by the script, plus `patches/`), over `bluedrm` (a libdrm stand-in that talks to the BlueGPU user client) | `/usr/lib/bluegl.dylib`; with `VK=1` also Turnip, `/usr/lib/bluevk.dylib` |
 | `eagl-ios/` | the EAGLContext shim that backboardd's GL renderer uses (a port of HakiOS's MIT `eagl.c`) | `/usr/lib/blueeagl.dylib`, `/usr/lib/blueeagl-gl.dylib` |
-| `metal/` | the Metal route's pieces so far: the metal2vulkan device profile of Turnip on the A630 and the translation results (Turnip itself is `mesa-ios`, `VK=1`) | (not on the phone yet) |
+| `metal/` | Metal: the BlueMetal plugin and UniXNU's AdrenoMetal frontend over metal2vulkan and Turnip (`mesa-ios`, `VK=1`); `MTLCreateSystemDefaultDevice` for processes that opt in | `/System/Library/Extensions/BlueMetal.bundle`, `/usr/lib/bluemetal.dylib` |
 
 Build `mesa-ios` first (`./build-mesa-ios.sh`), then `eagl-ios` (`./build.sh`).
 Each folder's README has the details. Then boot (the GPU set, `blueui`, is on by default) and push the three

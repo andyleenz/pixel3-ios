@@ -136,7 +136,7 @@ Other knobs:
 - **Pitch.** It must be a multiple of 64 bytes (A6xx). `bluegl_iosurface_importable` refuses anything else.
 - **Unmapping.** Unmap only after the last fence that used the surface.
 - **Boot-args.** The full kernel needs 0203/0205/0206-0208 and `cs_enforcement_disable=1`. The vtable hooks write into the shared cache with `VM_PROT_COPY`.
-- **IOAcceleratorES.** Keep it empty, with no MetalPluginName, so Metal still fails first.
+- **IOAcceleratorES.** Since xnu 0215 it names the BlueMetal plugin, which answers nil to backboardd (not opted in), so Metal still fails first. Listing backboardd in `/usr/local/etc/bluemetal.procs` would hand it Metal instead.
 
 ## Mac test (HOST=1)
 
