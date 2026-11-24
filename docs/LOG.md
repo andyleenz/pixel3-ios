@@ -1148,6 +1148,29 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: CoreAnimation's Metal compositor renders on the A630
+
+`ca-draw` (`gpu/metal/test/ca-draw.m`) has `CARenderer` render a layer tree into an `MTLTexture` of `MTLCreateSystemDefaultDevice`'s device. The tree is 256x256 on black: an orange square (48..208, corner radius 24) with a blue square (96..160) at opacity 0.5 over it. QuartzCore chooses its own pipelines and function constants, the way backboardd's render server would. The same program on the Mac over Apple's Metal is the reference (`work/test/ca1`):
+
+```
+BLUERUN: BlueMetal: ca-draw: device ready
+BLUERUN: ca-draw: (128,128) ff7f4080 want ff804080 ok   centre: blue at 0.5 over orange
+BLUERUN: ca-draw: ( 50, 50) ff000000 want ff000000 ok   corner of the square, cut by the radius
+BLUERUN: ca-draw: 25180 lit pixels, 20900 orange, hash c49901bb89571983
+BLUERUN: ca-draw: DRAW ok
+```
+
+| | lit pixels | full orange |
+|---|---|---|
+| Phone (A630, frontend over Turnip) | 25180 | 20900 |
+| Mac (M1 Pro, Apple's Metal) | 25180 | 20896 |
+
+The 4-pixel difference is in the antialiased corners. `ca-draw -dump` turns on the frontend's command-buffer log (`work/test/ca2`). CoreAnimation built four render states, all from the layer compositor `fixed_vert_lph_spc` + `fixed_frag_lph_cph` (`com.apple.coreanimation.draw.PBGRAXm_A`, `..._TcimA`, `PBGRABsovXm_A`, `PBGRABsovXm_TcimA`). Each sets its own function constants (`fc_texcoord_count0`, `fc_attachment_count` 2, `fc_blend_function`, ...). Those are the values the earlier offline translation lacked: they come from CoreAnimation at run time, through `newFunctionWithName:constantValues:`. The pass has a second, memoryless colour attachment. The four draws cover the background, the rounded square (an indexed mesh with antialiased edges) and the blended blue square.
+
+On the Mac the first version rendered nothing (the texture stayed magenta, its undefined contents). The layer tree has to reach the renderer's context with `[CATransaction flush]` after `r.layer` is set. Then `updateBounds` covers the whole 256x256 target and it renders.
+
+Next: backboardd's render server on Metal (`backboardd` in `/usr/local/etc/bluemetal.procs`). Its output goes to the display's IOSurfaces, so the frontend has to render into IOSurface-backed textures, and CoreAnimation has to pick Metal over the GL path it uses now.
+
 ## 2026-11-24: MTLCreateSystemDefaultDevice returns the A630
 
 `mtl-sys` (`mtl-draw.mm` built with `-DMTL_DRAW_SYSTEM`) takes its device from `MTLCreateSystemDefaultDevice()` and draws the same stroke_line test (`work/test/msys5`):

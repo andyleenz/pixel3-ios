@@ -5,6 +5,7 @@
 #   BlueMetal.bundle    Metal's plugin (plugin/BlueMetal.m), /System/Library/Extensions/BlueMetal.bundle
 #   mtl-draw            test/mtl-draw.mm with the frontend linked in (opens the device itself)
 #   mtl-sys             test/mtl-draw.mm -DMTL_DRAW_SYSTEM (MTLCreateSystemDefaultDevice, through the plugin)
+#   ca-draw             test/ca-draw.m: CARenderer (QuartzCore's Metal compositor) into a texture of that device
 #   tri.metallib        test/tri.metal
 #
 #   gpu/metal/build-metal.sh [--reuse-bridge]
@@ -64,11 +65,13 @@ FW=(-Wl,-dead_strip -lobjc -framework Foundation -framework Metal -framework IOS
 "${CC[@]}" -dynamiclib -install_name /usr/lib/bluemetal.dylib "$OUT/frontend.o" "$BRIDGE" "${FW[@]}" -o "$OUT/bluemetal.dylib"
 "${CC[@]}" -x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" -x none "$OUT/frontend.o" "$BRIDGE" "${FW[@]}" -o "$OUT/mtl-draw"
 "${CC[@]}" -DMTL_DRAW_SYSTEM -x objective-c++ "$REPO/gpu/metal/test/mtl-draw.mm" -framework Foundation -framework Metal -framework IOKit -o "$OUT/mtl-sys"
+xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fobjc-arc "$REPO/gpu/metal/test/ca-draw.m" \
+	-framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -o "$OUT/ca-draw"
 B=$OUT/BlueMetal.bundle
 rm -rf "$B"; mkdir -p "$B"
 cp "$REPO/gpu/metal/plugin/Info.plist" "$B/"
 xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fobjc-arc -bundle "$REPO/gpu/metal/plugin/BlueMetal.m" \
 	-framework Foundation -framework Metal -framework IOKit -o "$B/BlueMetal"
-for f in bluemetal.dylib mtl-draw mtl-sys BlueMetal.bundle/BlueMetal; do codesign -f -s - "$OUT/$f" 2>/dev/null; done
+for f in bluemetal.dylib mtl-draw mtl-sys ca-draw BlueMetal.bundle/BlueMetal; do codesign -f -s - "$OUT/$f" 2>/dev/null; done
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -mios-version-min=16.0 "$REPO/gpu/metal/test/tri.metal" -o "$OUT/tri.metallib"
 ls -la "$OUT/bluemetal.dylib" "$OUT/mtl-draw" "$OUT/mtl-sys" "$B/BlueMetal" | awk '{print $5, $9}'
