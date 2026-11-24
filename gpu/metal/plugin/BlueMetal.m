@@ -10,6 +10,8 @@
 // unless the process opts in:
 //   - environment BLUE_METAL=1 (BLUE_METAL=0 refuses), or
 //   - its name (getprogname) on a line of /usr/local/etc/bluemetal.procs.
+// BLUE_METAL_LOG=1 logs (stderr and os_log) each new problem the frontend records, and every 5 s its status and texture
+// counters when they changed.
 // An opted-in process gets the native Metal frontend (UniXNU's AdrenoMetal over the metal2vulkan runtime on Turnip),
 // loaded from /usr/lib/bluemetal.dylib only then.
 //
@@ -17,6 +19,7 @@
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
 #include <os/log.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +50,57 @@ opted_in(void)
 	}
 	fclose(f);
 	return yes;
+}
+
+static void
+say(const char *what, const char *text)
+{
+	os_log(OS_LOG_DEFAULT, "BlueMetal: %{public}s: %{public}s %{public}s", getprogname(), what, text);
+	fprintf(stderr, "BlueMetal: %s: %s %s\n", getprogname(), what, text);
+}
+
+static void
+problem(const char *text)
+{
+	say("problem:", text);
+}
+
+static size_t (*status_fn)(char *, size_t);
+static size_t (*formats_fn)(char *, size_t);
+
+static void *
+status_loop(void *arg)
+{
+	(void)arg;
+	char last[2][1024] = { "", "" }, now[1024];
+	for (;;) {
+		sleep(5);
+		size_t (*fn[2])(char *, size_t) = { status_fn, formats_fn };
+		for (int i = 0; i < 2; i++) {
+			if (!fn[i])
+				continue;
+			now[0] = 0;
+			fn[i](now, sizeof now);
+			if (strcmp(now, last[i])) {
+				say(i ? "textures" : "status", now);
+				strlcpy(last[i], now, sizeof last[i]);
+			}
+		}
+	}
+	return NULL;
+}
+
+static void
+start_log(void *lib)
+{
+	void (**hook)(const char *) = dlsym(lib, "native_bridge_metal_problem_hook");
+	if (hook)
+		*hook = problem;
+	status_fn = (size_t (*)(char *, size_t))dlsym(lib, "native_bridge_metal_status");
+	formats_fn = (size_t (*)(char *, size_t))dlsym(lib, "native_bridge_metal_formats");
+	pthread_t t;
+	if (pthread_create(&t, NULL, status_loop, NULL) == 0)
+		pthread_detach(t);
 }
 
 @interface _MTLDevice : NSObject
@@ -88,6 +142,9 @@ opted_in(void)
 	char cache[96];
 	snprintf(cache, sizeof cache, "/private/var/tmp/bluemetal-%u", getuid());
 	mkdir(cache, 0700);
+	const char *log = getenv("BLUE_METAL_LOG");
+	if (log && strcmp(log, "0"))
+		start_log(lib);
 	id device = open(TURNIP, cache, registry, NULL);
 	os_log(OS_LOG_DEFAULT, "BlueMetal: %{public}s: device %{public}s", getprogname(), device ? "ready" : "refused");
 	fprintf(stderr, "BlueMetal: %s: device %s\n", getprogname(), device ? "ready" : "refused");

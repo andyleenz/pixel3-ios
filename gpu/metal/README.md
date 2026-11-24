@@ -5,7 +5,8 @@ SPIR-V and runs it), then Turnip (`gpu/mesa-ios`, `VK=1`, out/bluevk.dylib), the
 Metal reaches it through its plugin discovery: the kernel's IOAcceleratorES carries `MetalPluginName`
 `BlueMetal` and `MetalPluginClassName` `BlueMetalDevice` (xnu patch 0215), and `plugin/BlueMetal.m` answers
 the frontend's device to processes that opt in (`BLUE_METAL=1`, or the process name on a line of
-`/usr/local/etc/bluemetal.procs`) and nil to the rest.
+`/usr/local/etc/bluemetal.procs`) and nil to the rest. `BLUE_METAL_LOG=1` logs the frontend's problems, and its
+status every 5 s. One boot of backboardd on Metal: `sweetenv=backboardd:BLUE_METAL=1,BLUE_METAL_LOG=1` (replaces the GL shim's sweetenv).
 Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/mesa-ios/test/vk-draw.c`.
 
 | File | What |

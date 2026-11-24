@@ -35,7 +35,8 @@
   through it with the same pixels as the Vulkan path (`gpu/metal`, `mtl-sys`). CoreAnimation's own Metal
   compositor renders a layer tree through it (`CARenderer`, `ca-draw`), into a texture or an IOSurface, with
   the pixels Apple's M1 gives.
-  Processes opt in (`BLUE_METAL=1` or `/usr/local/etc/bluemetal.procs`); the UI still renders through GL.
+  backboardd has composited the lock screen through it (first light: slow, wallpaper missing); the UI still
+  renders through GL by default. Processes opt in (`BLUE_METAL=1` or `/usr/local/etc/bluemetal.procs`).
 - **Vulkan on the Adreno 630.** Mesa's Turnip runs on the phone over our kernel GPU driver, and a QuartzCore
   Metal shader translated to SPIR-V (metal2vulkan) draws through it.
 - The UI is drawn by the Adreno 630 at about 60 fps (the default; `blueui=0` falls back to the CPU). CoreAnimation runs over Mesa freedreno

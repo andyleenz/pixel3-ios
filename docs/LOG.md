@@ -1148,6 +1148,26 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: backboardd composites through Metal (first light)
+
+Boot-arg `sweetenv=backboardd:BLUE_METAL=1,...` opts backboardd in for one boot. It also replaces bluetest's default sweetenv, so the GL shim stays out. CoreAnimation's render server takes the Metal device, and nothing crashes (`work/test/bbm1`):
+
+![lock screen composited through Metal, first try](screenshots/2026-11-24-metal-lock-first.png)
+
+At SpringBoard +40 s the lock screen is up: the clock, the status bar, the camera button and the home bar. It isn't right yet:
+
+- The wallpaper and the date are missing.
+- The clock is white, not tinted, and its top is clipped.
+- A band of noise crosses the clock.
+
+It is also very slow. In `bbm2`, `BLUE_METAL_LOG=1` (new in the plugin) logs the frontend's status every 5 s. backboardd committed 16 command buffers in 45 s and built 79 pipelines, and the frontend recorded no real problems (no refused textures, no surface refusals). The time goes to first-use pipeline builds (AIR -> SPIR-V -> Turnip on the A630's CPUs), so the frames come seconds apart. `bbm3` adds the frontend's timing table (`NATIVE_METAL_TIMING=1`) to confirm that.
+
+UniXNU's own plugin (`NativeAdrenoMetalPlugin.mm`) does more around backboardd:
+
+- it sets `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1`;
+- it primes CoreAnimation's pipelines into a shared system shader cache;
+- it gives every process its own device, so PosterBoard (the wallpaper) and the apps render through Metal too.
+
 ## 2026-11-24: CoreAnimation's Metal compositor renders on the A630
 
 `ca-draw` (`gpu/metal/test/ca-draw.m`) has `CARenderer` render a layer tree into an `MTLTexture` of `MTLCreateSystemDefaultDevice`'s device. The tree is 256x256 on black: an orange square (48..208, corner radius 24) with a blue square (96..160) at opacity 0.5 over it. QuartzCore chooses its own pipelines and function constants, the way backboardd's render server would. The same program on the Mac over Apple's Metal is the reference (`work/test/ca1`):
