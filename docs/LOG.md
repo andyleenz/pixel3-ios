@@ -1162,6 +1162,8 @@ Turnip sets `requiresDedicatedAllocation` for any image with an external handle 
 
 The IOSurface CA frame minimum goes from 31 to 18 ms (`cab15`). `cab16` (`ca-draw -iosurface`): no shadowed-texture notice, 0 of 256 rows differ, hash c49901bb89571983 as before.
 
+backboardd on Metal with 0009 (`bbm5`): the lock screen shows its wallpaper now, and commit-to-complete has a median of 50 ms (bbm4: 92 ms). The clock, date and camera glyph are horizontal streaks. Two textures are still shadowed, each because its linear image would run a few bytes past its buffer's memory: the 1326x1326 BGRA wallpaper (draws correctly) and an A8 806x234 texture at offset 64 with 832-byte rows (probably the clock). New `ca-draw` modes rule out CA's own paths: `-text` (a CATextLayer, `cab17`) and `-a8` (a gray 806x234 image with 832-byte rows, `cab18`, hash equal to the Mac's) both draw correctly. So the fault is in content backboardd gets from SpringBoard, not in CA's renderer.
+
 ## 2026-11-24: Metal frames 15-20x faster (0216)
 
 Every Metal command buffer took 40-60 ms, even an empty clear. `ca-draw -bench` (new) splits each one. In `cab4`/`cab6` the GPU ran for 2.5 ms (`GPUEndTime - GPUStartTime`), and the rest went between `commit` and `scheduled`. bluedrm now times the SUBMIT call: 31-34 ms each, with "2 own cleaned (128 MiB)" (`cab7`). metal2vulkan allocates two 64 MiB host-visible blocks. Neither fits the 32 MiB pool, so bluedrm placed them in the process's own (cacheable) memory, and the kernel cleaned both to PoC at every submit. `NOSYNC` (6f) does not cover them, because the runtime keeps them mapped. GPU clock, TU_DEBUG sysmem/gmem/nobin/nolrz (`cab3`), and the fence wait were not the cause.

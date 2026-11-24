@@ -4,6 +4,9 @@
 //
 //   ca-draw [-dump] [-iosurface] [out.ppm]
 //   ca-draw -bench [frames]
+//   ca-draw -a8: an alpha-only CGImage (806x234, rows of 832 bytes: a rect and an ellipse) as layer contents over white, as the
+//     lock screen's clock comes from SpringBoard
+//   ca-draw -text: a CATextLayer ("12:34", white on black, 256x96) drawn as text art and hashed, as the lock screen's clock
 //   ca-draw -matrix: -bench 12 again in child processes under several TU_DEBUG settings (Turnip's render modes)
 //
 // -iosurface: the target is an IOSurface-backed texture, as backboardd's display surfaces are, and the check reads
@@ -200,6 +203,124 @@ bench(id<MTLDevice> dev, int frames)
 	return bench_one(dev, frames, 256, 256, 0) | bench_one(dev, frames, 1125, 2250, 0) | bench_one(dev, frames, 1125, 2250, 1);
 }
 
+// renders root (tw x th) into a private texture and prints it as 64 columns of text art (green channel, inverted if asked)
+// and a hash
+static void
+render_art(id<MTLDevice> dev, CALayer *root, int tw, int th, int invert, const char *what)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                              width:tw height:th mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+	id<MTLCommandQueue> q = [dev newCommandQueue];
+	CARenderer *r = [CARenderer rendererWithMTLTexture:tex options:@{ kCARendererMetalCommandQueue : q }];
+	r.layer = root;
+	r.bounds = CGRectMake(0, 0, tw, th);
+	[CATransaction flush];
+	[r beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
+	[r addUpdateRect:r.bounds];
+	[r render];
+	[r endFrame];
+	id<MTLBuffer> rb = [dev newBufferWithLength:tw * th * 4 options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+	[bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(tw, th, 1)
+	           toBuffer:rb destinationOffset:0 destinationBytesPerRow:tw * 4 destinationBytesPerImage:tw * th * 4];
+	[bl endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	const uint8_t *pix = rb.contents;
+	uint64_t hash = 1469598103934665603ull;
+	unsigned lit = 0;
+	for (int i = 0; i < tw * th; i++) {
+		uint32_t v = ((const uint32_t *)pix)[i];
+		lit += invert ? (v & 0x00ffffff) != 0x00ffffff : (v & 0x00ffffff) != 0;
+		hash = (hash ^ v) * 1099511628211ull;
+	}
+	// cells of tw/64 x the same height: ' ' none, '.' some, '+' half, '#' most of the cell's green
+	int cw = tw / 64, ch = cw;
+	for (int y = 0; y + ch <= th; y += ch) {
+		char line[65];
+		for (int c = 0; c < 64; c++) {
+			unsigned sum = 0;
+			for (int dy = 0; dy < ch; dy++)
+				for (int dx = 0; dx < cw; dx++) {
+					unsigned g = pix[((y + dy) * tw + c * cw + dx) * 4 + 1];
+					sum += invert ? 255 - g : g;
+				}
+			sum /= cw * ch;
+			line[c] = sum > 192 ? '#' : sum > 96 ? '+' : sum > 16 ? '.' : ' ';
+		}
+		line[64] = 0;
+		printf("ca-draw: %s |%s|\n", what, line);
+	}
+	printf("ca-draw: %s %u lit pixels, hash %016llx\n", what, lit, (unsigned long long)hash);
+}
+
+static int
+text(id<MTLDevice> dev)
+{
+	[CATransaction begin];
+	[CATransaction setDisableActions:YES];
+	CALayer *root = [CALayer layer];
+	root.frame = CGRectMake(0, 0, 256, 96);
+	root.backgroundColor = rgb(0, 0, 0);
+	root.opaque = YES;
+	CATextLayer *t = [CATextLayer layer];
+	t.frame = CGRectMake(8, 8, 240, 80);
+	t.string = @"12:34";
+	t.fontSize = 64;
+	t.foregroundColor = rgb(1, 1, 1);
+	t.contentsScale = 1;
+	[root addSublayer:t];
+	[CATransaction commit];
+	render_art(dev, root, 256, 96, 0, "text");
+	return 0;
+}
+
+// gray: a DeviceGray 8-bit image (white shapes) over black; mask: the same bytes as a CGImageMaskCreate mask over white
+static void
+a8_one(id<MTLDevice> dev, uint8_t *bits, int iw, int ih, int row, int mask)
+{
+	CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, bits, (size_t)row * ih, NULL);
+	CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+	CGImageRef img = mask ? CGImageMaskCreate(iw, ih, 8, 8, row, dp, NULL, false)
+	                      : CGImageCreate(iw, ih, 8, 8, row, gray, (CGBitmapInfo)kCGImageAlphaNone, dp, NULL, false,
+	                            kCGRenderingIntentDefault);
+	const char *what = mask ? "a8 mask" : "a8 gray";
+	printf("ca-draw: %s image %zux%zu, %zu bytes per row\n", what, CGImageGetWidth(img), CGImageGetHeight(img),
+	    CGImageGetBytesPerRow(img));
+	[CATransaction begin];
+	[CATransaction setDisableActions:YES];
+	CALayer *root = [CALayer layer];
+	root.frame = CGRectMake(0, 0, 832, 260);
+	root.backgroundColor = mask ? rgb(1, 1, 1) : rgb(0, 0, 0);
+	root.opaque = YES;
+	CALayer *l = [CALayer layer];
+	l.frame = CGRectMake(13, 13, iw, ih);
+	l.contents = (__bridge id)img;
+	[root addSublayer:l];
+	[CATransaction commit];
+	render_art(dev, root, 832, 260, mask, what);
+}
+
+static int
+a8(id<MTLDevice> dev)
+{
+	const int iw = 806, ih = 234, row = 832;
+	uint8_t *bits = calloc(row, ih);
+	for (int y = 0; y < ih; y++)
+		for (int x = 0; x < iw; x++) {
+			int rect = x >= 60 && x < 260 && y >= 40 && y < 190;
+			double ex = (x - 570) / 170.0, ey = (y - 115) / 95.0;
+			bits[y * row + x] = rect || ex * ex + ey * ey <= 1 ? 255 : 0;
+		}
+	a8_one(dev, bits, iw, ih, row, 0);
+
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -242,6 +363,10 @@ main(int argc, char **argv)
 		printf("ca-draw: device \"%s\"\n", dev.name.UTF8String);
 		if (argc > 1 && !strcmp(argv[1], "-bench"))
 			return bench(dev, argc > 2 ? atoi(argv[2]) : 30);
+		if (argc > 1 && !strcmp(argv[1], "-text"))
+			return text(dev);
+		if (argc > 1 && !strcmp(argv[1], "-a8"))
+			return a8(dev);
 
 		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 		                                                                              width:W height:H mipmapped:NO];
