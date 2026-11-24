@@ -1,0 +1,24 @@
+--- a/scripts/regen-device-profiles/regen_device_profiles.py
++++ b/scripts/regen-device-profiles/regen_device_profiles.py
+@@ -491,6 +491,21 @@
+         },
+     },
+     {
++        # pixel3-ios: Turnip on the Pixel 3's Adreno 630 (Mesa 26.3.1 + gpu/mesa-ios patches),
++        # captured on the Mac through the same driver build over the fake BlueGPU model.
++        "name": "turnip-a630",
++        "kind": "vulkaninfo",
++        "sha256": "54adbf9f90fd6bbf60087bcb6e267fa7f141a0fa3b81951a19945f09806b5e78",
++        "profile": "VP_VULKANINFO_Turnip_Adreno_(TM)_630_26_3_1",
++        "command": "vulkaninfo --json",
++        "host": ("Turnip Adreno 630 (pixel3-ios bluevk, Mesa 26.3.1), host build over the "
++                 "fake BlueGPU, Homebrew vulkan-tools 1.4.363.0"),
++        "formats": {
++            "command": "corpus-vulkan --capture-formats OUT --device-type gpu",
++            "sha256": "26751c34a8a3a9c0e1cbacaca08f1c01b5a21716f83ffc7f0b28f0743613098c",
++        },
++    },
++    {
+         "name": "lavapipe",
+         "kind": "gpuinfo",
+         "report": 51983,

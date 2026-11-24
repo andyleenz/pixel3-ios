@@ -1,0 +1,1456 @@
+{
+  "capture": "corpus-vulkan --capture-formats",
+  "device": {
+    "api_version": 4206955,
+    "device": "Turnip Adreno (TM) 630",
+    "device_id": 100859905,
+    "device_type": 1,
+    "driver_id": 18,
+    "driver_info": "Mesa 26.3.1",
+    "driver_version": 109064193,
+    "vendor_id": 20803
+  },
+  "formats": {
+    "VK_FORMAT_A1B5G5R5_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_A1R5G5B5_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_A2B10G10R10_SINT_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2B10G10R10_SNORM_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2B10G10R10_SSCALED_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2B10G10R10_UINT_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_A2B10G10R10_UNORM_PACK32": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70615704919427,
+      "optimalTilingFeatures": 70615704919427
+    },
+    "VK_FORMAT_A2B10G10R10_USCALED_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2R10G10B10_SINT_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2R10G10B10_SNORM_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2R10G10B10_SSCALED_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A2R10G10B10_UINT_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_A2R10G10B10_UNORM_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_A2R10G10B10_USCALED_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A4B4G4R4_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_A4R4G4B4_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_A8B8G8R8_SINT_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_A8B8G8R8_SNORM_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_A8B8G8R8_SRGB_PACK32": {
+      "bufferFeatures": 6442450968,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_A8B8G8R8_SSCALED_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A8B8G8R8_UINT_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_A8B8G8R8_UNORM_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70615704919427,
+      "optimalTilingFeatures": 70615704919427
+    },
+    "VK_FORMAT_A8B8G8R8_USCALED_PACK32": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_A8_UNORM": {
+      "bufferFeatures": 6442450968,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70615704919427,
+      "optimalTilingFeatures": 70615704919427
+    },
+    "VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x10_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x10_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x5_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x5_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x6_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x6_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x8_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_10x8_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_12x10_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_12x10_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_12x12_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_12x12_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_4x4_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_4x4_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_5x4_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_5x4_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_5x5_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_5x5_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_6x5_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_6x5_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_6x6_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_6x6_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x5_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x5_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x6_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x6_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x8_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ASTC_8x8_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_B10G11R11_UFLOAT_PACK32": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B16G16R16G16_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B4G4R4A4_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_B5G5R5A1_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_B5G6R5_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442689,
+      "optimalTilingFeatures": 70546985442689
+    },
+    "VK_FORMAT_B8G8R8A8_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_B8G8R8A8_SNORM": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_B8G8R8A8_SRGB": {
+      "bufferFeatures": 6442450968,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_B8G8R8A8_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_B8G8R8A8_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_B8G8R8A8_UNORM": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_B8G8R8A8_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_B8G8R8G8_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744427521,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_SINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_SNORM": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_SRGB": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_SSCALED": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_UINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_UNORM": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_B8G8R8_USCALED": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_BC1_RGBA_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC1_RGBA_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC1_RGB_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC1_RGB_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC2_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC2_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC3_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC3_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC4_SNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_BC4_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_BC5_SNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_BC5_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_BC6H_SFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC6H_UFLOAT_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC7_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_BC7_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_D16_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 8590056833,
+      "optimalTilingFeatures": 8590057345
+    },
+    "VK_FORMAT_D16_UNORM_S8_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_D24_UNORM_S8_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 8590056833,
+      "optimalTilingFeatures": 8590057345
+    },
+    "VK_FORMAT_D32_SFLOAT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 8590056833,
+      "optimalTilingFeatures": 8590057345
+    },
+    "VK_FORMAT_D32_SFLOAT_S8_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 8590057345
+    },
+    "VK_FORMAT_E5B9G9R9_UFLOAT_PACK32": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_EAC_R11G11_SNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_EAC_R11G11_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_EAC_R11_SNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_EAC_R11_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744297473,
+      "optimalTilingFeatures": 70368744297473
+    },
+    "VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70540542989313,
+      "optimalTilingFeatures": 70540542989313
+    },
+    "VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16B16G16R16_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16_B16R16_2PLANE_420_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16_B16R16_2PLANE_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16_B16R16_2PLANE_444_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G8B8G8R8_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744427521,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G8_B8R8_2PLANE_420_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368753078273,
+      "optimalTilingFeatures": 70368753078273
+    },
+    "VK_FORMAT_G8_B8R8_2PLANE_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G8_B8R8_2PLANE_444_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368753078273,
+      "optimalTilingFeatures": 70368753078273
+    },
+    "VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R10X6G10X6_UNORM_2PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R10X6_UNORM_PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R12X4G12X4_UNORM_2PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R12X4_UNORM_PACK16": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16A16_SFLOAT": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_R16G16B16A16_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R16G16B16A16_SNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R16G16B16A16_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R16G16B16A16_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R16G16B16A16_UNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R16G16B16A16_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R16G16B16_SFLOAT": {
+      "bufferFeatures": 536870984,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16_SINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16_SNORM": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16_UINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16_UNORM": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16B16_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R16G16_SFLOAT": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70547002219907,
+      "optimalTilingFeatures": 70547002219907
+    },
+    "VK_FORMAT_R16G16_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R16G16_SNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R16G16_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R16G16_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R16G16_UNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R16G16_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R16_SFLOAT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70564165311875,
+      "optimalTilingFeatures": 70564165311875
+    },
+    "VK_FORMAT_R16_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R16_SNORM": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R16_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R16_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R16_UNORM": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R16_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R32G32B32A32_SFLOAT": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R32G32B32A32_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R32G32B32A32_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R32G32B32_SFLOAT": {
+      "bufferFeatures": 536870984,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R32G32B32_SINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R32G32B32_UINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R32G32_SFLOAT": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375203528067,
+      "optimalTilingFeatures": 70375203528067
+    },
+    "VK_FORMAT_R32G32_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R32G32_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R32_SFLOAT": {
+      "bufferFeatures": 6442451064,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750855,
+      "optimalTilingFeatures": 70375186750855
+    },
+    "VK_FORMAT_R32_SINT": {
+      "bufferFeatures": 6442451064,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746503,
+      "optimalTilingFeatures": 70375186746503
+    },
+    "VK_FORMAT_R32_UINT": {
+      "bufferFeatures": 6442451064,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746503,
+      "optimalTilingFeatures": 70375186746503
+    },
+    "VK_FORMAT_R4G4B4A4_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_R4G4_UNORM_PACK8": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R5G5B5A1_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_R5G6B5_UNORM_PACK16": {
+      "bufferFeatures": 8,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750849,
+      "optimalTilingFeatures": 70375186750849
+    },
+    "VK_FORMAT_R64G64B64A64_SFLOAT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64B64A64_SINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64B64A64_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64B64_SFLOAT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64B64_SINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64B64_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64_SFLOAT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64_SINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64G64_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64_SFLOAT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64_SINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R64_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8A8_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R8G8B8A8_SNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_R8G8B8A8_SRGB": {
+      "bufferFeatures": 6442450968,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_R8G8B8A8_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R8G8B8A8_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R8G8B8A8_UNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70615704919427,
+      "optimalTilingFeatures": 70615704919427
+    },
+    "VK_FORMAT_R8G8B8A8_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R8G8B8_SINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8_SNORM": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8_SRGB": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8_UINT": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8_UNORM": {
+      "bufferFeatures": 72,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8B8_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 0,
+      "optimalTilingFeatures": 0
+    },
+    "VK_FORMAT_R8G8_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R8G8_SNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186750851,
+      "optimalTilingFeatures": 70375186750851
+    },
+    "VK_FORMAT_R8G8_SRGB": {
+      "bufferFeatures": 6442450968,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_R8G8_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R8G8_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R8G8_UNORM": {
+      "bufferFeatures": 6979321944,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70615704919427,
+      "optimalTilingFeatures": 70615704919427
+    },
+    "VK_FORMAT_R8G8_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R8_SINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70375186746499
+    },
+    "VK_FORMAT_R8_SNORM": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_R8_SRGB": {
+      "bufferFeatures": 6442450968,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70546985442691,
+      "optimalTilingFeatures": 70546985442691
+    },
+    "VK_FORMAT_R8_SSCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_R8_UINT": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70375186746499,
+      "optimalTilingFeatures": 70376260488323
+    },
+    "VK_FORMAT_R8_UNORM": {
+      "bufferFeatures": 6442451032,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70632884788611,
+      "optimalTilingFeatures": 70632884788611
+    },
+    "VK_FORMAT_R8_USCALED": {
+      "bufferFeatures": 64,
+      "colorAttachmentSampleCounts": 0,
+      "linearTilingFeatures": 70368744177664,
+      "optimalTilingFeatures": 70368744177664
+    },
+    "VK_FORMAT_S8_UINT": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 70368744295553,
+      "optimalTilingFeatures": 70368744296065
+    },
+    "VK_FORMAT_X8_D24_UNORM_PACK32": {
+      "bufferFeatures": 0,
+      "colorAttachmentSampleCounts": 7,
+      "linearTilingFeatures": 8590056833,
+      "optimalTilingFeatures": 8590057345
+    }
+  },
+  "instance_api_version": 4211051
+}

@@ -1116,8 +1116,10 @@ Plan (route A): Metal frontend (AdrenoMetal, MIT, adapted to iOS 16) -> metal2vu
 | "Failed to create VM_BIND queue" | SET_PARAM accepted every param, so `EN_VM_BIND` looked enabled. The fake and kernel (0153) now accept only SYSPROF, COMM and CMDLINE |
 | `MSM_INFO_SET_IOVA failed` | Turnip allocates IOVAs itself once VA_START/VA_SIZE exist. BlueGPU has one shared VA space with kernel-chosen IOVAs, so `has_set_iova` is false on Darwin |
 
+**A630 profile.** `gpu/metal/turnip-a630.json` is a metal2vulkan device profile from `vulkaninfo --json` and `corpus-vulkan --capture-formats`. Both were captured on the Mac through the Vulkan loader against the host Turnip, which is the same build and chip ID as the phone's. With it, QuartzCore translates 96 of 102 functions, RenderBox 29/29 and CoreImage 58/58. The two new failures are `inplace_copy_lp{f,h}`: raster order groups need `fragmentShaderPixelInterlock`, which Turnip doesn't offer on the A630.
+
 Next:
 
 1. `vk-smoke` on the phone with the 0153 fix. The fill must read `0xb10e0630`.
-2. An A630 Turnip device profile for metal2vulkan.
+2. Draw one translated QuartzCore pipeline through Turnip on the phone.
 3. The frontend.
