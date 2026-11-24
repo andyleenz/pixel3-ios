@@ -36,7 +36,7 @@ orig, out, mig = sys.argv[1:]
 data = plistlib.load(open(orig, 'rb'))
 jobs = data['LaunchDaemons']
 keep = {k: dict(j) for k, j in jobs.items() if j.get('Label') == 'com.apple.mobileassetd'}
-for k in [k for k, j in jobs.items() if any(w in j.get('Label', '') for w in t.DENY)]:
+for k in [k for k, j in jobs.items() if t.denied(k, j)]:
     del jobs[k]
 for j in jobs.values():
     if '_PanicOnCrash' in j:

@@ -1,0 +1,31 @@
+0214: blueline blueapps set
+
+blueapps=1 stands for the sweetenv that self-signed apps need: blueeagl in
+backboardd and bluemis (tools/apps/bluemis) in installd, the
+MobileInstallation helper and SpringBoard. Spelled out it is 186 bytes of
+the 607-byte command line (app14 went over). Needs 0990 for the
+several-process sweetenv.
+
+diff -ruN a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+--- a/pexpert/gen/bootargs.c	2026-11-24 15:35:33
++++ b/pexpert/gen/bootargs.c	2026-11-24 15:35:33
+@@ -194,7 +194,9 @@
+ /*
+  * 0156: blueui=1 stands for the GPU-rendered UI set (stage 6f), so test and
+  * demo boots stay well inside the 607-byte command line. 0161: bluetest=1
+- * stands for the board set every test boot carries (tools/phonetest.sh). An
++ * stands for the board set every test boot carries (tools/phonetest.sh). 0214:
++ * blueapps=1 adds bluemis (self-signed app installs and launches) to sweetenv;
++ * the first entry whose set is on wins, so it comes before blueui's. An
+  * argument given on the command line still wins over its value here.
+  */
+ static const struct {
+@@ -203,6 +205,8 @@
+ 	long long num;
+ 	const char *str;
+ } blue_ui_set[] = {
++	{ "blueapps", "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib;"
++	  "installd|com.apple.MobileInstallationHelperService|SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/bluemis.dylib" },
+ 	{ "blueui", "bluegpu", 8, NULL },
+ 	{ "blueui", "bluegpu_mhz", 710, NULL },
+ 	{ "blueui", "bluegpu_dcvs", 1, NULL },		/* 0198: load-based GPU clock with input boost */

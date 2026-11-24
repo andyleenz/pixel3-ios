@@ -19,8 +19,11 @@ NOTES.md; the code here is our own):
   audio/media     RedwoodAudio.driver (audio/redwood-hal, built with its
                   build.sh) installed in System/Library/Audio/Plug-Ins/HAL;
                   VirtualAudio kept (mediaserverd needs it), and put back if
-                  an older run moved it aside; MediaToolbox does not start
-                  the recorder server (no microphone yet)
+                  an older run moved it aside; BTAudioHALPlugin.driver moved
+                  to HAL.disabled (bluetoothd is not run: the plugin retried
+                  its connection in a tight loop, ~1.2 cores of mediaserverd
+                  and launchd at idle, LOG.md 2026-11-23); MediaToolbox does
+                  not start the recorder server (no microphone yet)
   SpringBoard     no watchdogs (CPU rendering is slow), launch watchdogs x20,
                   no cloud-config UI, battery percentage shown
   Setup           marked done, mini-buddies off
@@ -55,6 +58,21 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # FairPlay needs the Secure Enclave: fairplayd restarts forever, and checkpointd's call
         # to it never returns, which hangs Photos (and anything else that asks checkpointd).
         'fairplayd')
+
+# Jobs kept although a DENY word is in their label. CommCenter in its no-baseband
+# form (the job Wi-Fi-only iPads run; launchd loads it when the device tree has
+# no baseband node) and its helpers: without them SpringBoard retries the
+# CoreTelephony connection every frame, and every failed try resets the idle
+# timer, so the screen never locks by itself (LOG.md 2026-11-23). The cellular
+# CommCenter job (same label, needs a baseband node) stays out.
+KEEP_KEYS = ('/System/Library/LaunchDaemons/com.apple.CommCenter-noncellular.plist',
+             '/System/Library/LaunchDaemons/com.apple.CommCenterRootHelper.plist',
+             '/System/Library/LaunchDaemons/com.apple.CommCenterMobileHelper.plist')
+
+
+def denied(key, job):
+    """Whether launchd job KEY is removed: a DENY word in its label, not in KEEP_KEYS."""
+    return key not in KEEP_KEYS and any(w in job.get('Label', '') for w in DENY)
 
 
 def read_plist(path):
@@ -94,7 +112,7 @@ def launchd_jobs(root):
             if '_PanicOnCrash' in job:
                 job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
                 n += 1
-        gone = sorted(k for k, j in jobs.items() if any(w in j.get('Label', '') for w in DENY))
+        gone = sorted(k for k, j in jobs.items() if denied(k, j))
         for k in gone:
             del jobs[k]
         print('launchd.plist: %d _PanicOnCrash renamed, %d jobs removed:' % (n, len(gone)))
@@ -175,6 +193,12 @@ def audio_media(root):
         os.makedirs(hal, exist_ok=True)
         shutil.move(aside, hal)
         print('VirtualAudio.plugin put back')
+    bt = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver')
+    if os.path.isdir(bt):
+        bt_aside = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL.disabled')
+        os.makedirs(bt_aside, exist_ok=True)
+        shutil.move(bt, bt_aside)
+        print('BTAudioHALPlugin.driver moved aside (no bluetoothd)')
     driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../audio/redwood-hal/out/RedwoodAudio.driver')
     if os.path.isdir(driver):
         dest = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver')

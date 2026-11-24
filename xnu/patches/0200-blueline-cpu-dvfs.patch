@@ -1,0 +1,465 @@
+0200: CPU clocks follow the load (bluecpu_dvfs, on by default)
+
+0106/0139 left Silver at 1766 MHz and Gold at 2649 MHz all boot. A kernel
+thread now ticks every 20 ms: each core's idle time comes from recount
+(blue_cpu_idle_abs in osfmk/kern/recount.c), each cluster takes its busiest
+core and asks OSM for the lowest level at or above current kHz * busy / 80%.
+At 90% busy it jumps to a "hispeed" level (1228 / 1459 MHz) and from there
+to the top; it goes up at once and down only after 60 ms of lower wants.
+SweetHID's touch and key events (blue_cpu_input) hold at least 1228 / 1459
+MHz for 1 s. The 0143 guard caps Gold through the governor when both are on.
+A line every 10 s per cluster: average busy, changes, time per level.
+bluecpu_dvfs=0 keeps the fixed top levels.
+
+diff -ruN a/bsd/dev/blueline_cpufreq.c b/bsd/dev/blueline_cpufreq.c
+--- a/bsd/dev/blueline_cpufreq.c	2026-11-23 16:34:27
++++ b/bsd/dev/blueline_cpufreq.c	2026-11-23 18:33:25
+@@ -47,6 +47,21 @@
+  *                   change; default 0xf (all, as Linux on sdm845).
+  *   bluelmh_trips=0 skip the ARM/HI/LOW thermal threshold calls.
+  *   bluelmh_dump=1  also dump the whole 1 KiB LMh blocks (not +0x8, write only).
++ * Load-based levels (0200), after 0106's top levels; off with bluecpu_dvfs=0:
++ *   a kernel thread every bluecpu_dvfs_ms (20) reads each core's idle time
++ *   (recount, blue_cpu_idle_abs) and, per cluster, takes the busiest core:
++ *   want = current kHz * busy / bluecpu_dvfs_target (80%), the lowest level
++ *   at or above it. At or above bluecpu_dvfs_jump (90%) busy it goes to at
++ *   least the "hispeed" level (bluecpu_hi_silver / _gold MHz, 1228 / 1459),
++ *   and to the top if already there. Up at once; down only after
++ *   bluecpu_dvfs_down_ms (60) of lower wants, to the highest of them. A touch
++ *   or key (SweetHID, blue_cpu_input) holds at least bluecpu_boost_silver /
++ *   _gold MHz (1228 / 1459) for bluecpu_dvfs_boost_ms (1000). Range: level 0
++ *   to 0106's top (bluecpu_max_silver / _gold MHz lower it). Every 10 s one
++ *   line: average busy, changes, boosts and time per level. L3 follows: the
++ *   lowest L3 level at or above Silver's clock and bluecpu_l3_gold (60) % of
++ *   Gold's, below 1478 MHz (MX TURBO), with bluecpu_l3_follow=1 (default off:
++ *   no measurable gain).
+  * Software guard (0143), independent of LMh:
+  *   bluecpu_guard=1 every second read the CPU TSENS sensors (tsens0 s1-s4,
+  *                   s7-s10); at or above bluecpu_guard_hi (80 C) put Gold on
+@@ -839,6 +854,25 @@
+ 	tsens_dump("after LMh");
+ }
+ 
++/* ---- 0200 governor state (code after the guard) ---- */
++
++enum { G_DOMS = 2 };		/* D_SILVER, D_GOLD */
++static struct {
++	bool on;
++	int period_ms, target, jump, down_ms, boost_ms;
++	uint32_t max[G_DOMS], cap[G_DOMS], hi[G_DOMS], boost[G_DOMS];
++	uint32_t cur[G_DOMS], hold[G_DOMS];
++	uint64_t down_since[G_DOMS], idle_prev[8], t_prev, lvl_t, sum_t;
++	uint64_t lvl_ns[G_DOMS][LUT_ROWS];
++	uint64_t busy_acc[G_DOMS], busy_n, core_acc[8];
++	uint32_t changes[G_DOMS], boosts;
++	bool l3;
++	uint32_t l3_cur, l3_max, l3_changes;
++	int l3_gold_pct;
++	uint64_t l3_ns[LUT_ROWS];
++	uint64_t input_t;
++} gov;
++
+ /* ---- software guard: TSENS -> Gold level (bluecpu_guard=1) ---- */
+ 
+ static const uint32_t guard_sensor[] = { 1, 2, 3, 4, 7, 8, 9, 10 };	/* tsens0: cpu0-3, cpu4-7 */
+@@ -856,6 +890,11 @@
+ guard_set(uint32_t idx)
+ {
+ 	struct osm_dom *d = &doms[D_GOLD];
++	if (gov.on) {
++		gov.cap[D_GOLD] = idx;	/* 0200: the governor keeps Gold at or below it */
++		thread_wakeup((event_t)&gov.input_t);
++		return;
++	}
+ 	for (uint32_t i = 0; i < (d->per_core ? 4u : 1u); i++) {
+ 		wr(d->base, REG_PERF_STATE + 4 * i, idx);
+ 	}
+@@ -915,6 +954,11 @@
+ 				printf(TAG "guard: %d.%d C (tsens0 s%u) >= %d C: Gold already at level %u, "
+ 				    "left\n", a / 10, a % 10, ms, gd.hi / 10, cur);
+ 			}
++		} else if (gd.dropped && max < gd.lo && gov.on) {
++			gd.dropped = false;
++			gov.cap[D_GOLD] = gov.max[D_GOLD];
++			printf(TAG "guard: %d.%d C (tsens0 s%u) < %d C: Gold cap back to %u MHz (0200)\n",
++			    a / 10, a % 10, ms, gd.lo / 10, d->lut[gov.max[D_GOLD]].khz / 1000u);
+ 		} else if (gd.dropped && max < gd.lo) {
+ 			gd.dropped = false;
+ 			if (cur == gd.low_idx && gd.saved > gd.low_idx) {
+@@ -986,7 +1030,300 @@
+ 	(void)thread_call_enter_delayed(gd.tc, deadline);
+ }
+ 
++/* ---- 0200: load-based levels ---- */
++
++extern uint64_t blue_cpu_idle_abs(int cpu);	/* osfmk/kern/recount.c */
++void blue_cpu_input(void);
++
++/* Lowest level of d at or above khz, within [0, top]; top if none. */
++static uint32_t
++gov_level_at(const struct osm_dom *d, uint32_t khz, uint32_t top)
++{
++	for (uint32_t i = 0; i < top; i++) {
++		if (d->lut[i].khz >= khz) {
++			return i;
++		}
++	}
++	return top;
++}
++
+ static void
++gov_set(uint32_t di, uint32_t idx)
++{
++	struct osm_dom *d = &doms[di];
++	for (uint32_t i = 0; i < (d->per_core ? 4u : 1u); i++) {
++		wr(d->base, REG_PERF_STATE + 4 * i, idx);
++	}
++	gov.cur[di] = idx;
++	gov.changes[di]++;
++}
++
++static void
++gov_account(uint64_t now)
++{
++	if (gov.lvl_t) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - gov.lvl_t, &ns);
++		for (uint32_t di = 0; di < G_DOMS; di++) {
++			gov.lvl_ns[di][gov.cur[di]] += ns;
++		}
++		gov.l3_ns[gov.l3_cur] += ns;
++	}
++	gov.lvl_t = now;
++}
++
++static void
++gov_tick(uint64_t now)
++{
++	unsigned ncpu = ml_get_cpu_count() < 8 ? ml_get_cpu_count() : 8;
++	uint32_t busy[G_DOMS] = { 0, 0 };
++	uint64_t dt = now - gov.t_prev;
++	for (unsigned c = 0; c < ncpu; c++) {
++		uint64_t idle = blue_cpu_idle_abs((int)c), di = idle > gov.idle_prev[c] ? idle - gov.idle_prev[c] : 0;
++		gov.idle_prev[c] = idle;
++		uint32_t b = (dt && di < dt) ? (uint32_t)((dt - di) * 100 / dt) : 0;
++		gov.core_acc[c] += b;
++		uint32_t dom = c < 4 ? D_SILVER : D_GOLD;
++		if (b > busy[dom]) {
++			busy[dom] = b;
++		}
++	}
++	gov.t_prev = now;
++	uint64_t in_t = __atomic_load_n(&gov.input_t, __ATOMIC_ACQUIRE), boost_abs;
++	nanoseconds_to_absolutetime((uint64_t)gov.boost_ms * NSEC_PER_MSEC, &boost_abs);
++	bool boosted = gov.boost_ms > 0 && in_t && now - in_t < boost_abs;
++	uint64_t down_abs;
++	nanoseconds_to_absolutetime((uint64_t)gov.down_ms * NSEC_PER_MSEC, &down_abs);
++	gov.busy_n++;
++	for (uint32_t di = 0; di < G_DOMS; di++) {
++		struct osm_dom *d = &doms[di];
++		uint32_t cur = gov.cur[di], top = gov.cap[di];
++		gov.busy_acc[di] += busy[di];
++		uint32_t want = gov_level_at(d, (uint32_t)((uint64_t)d->lut[cur].khz * busy[di] /
++		    (uint32_t)gov.target), top);
++		if ((int)busy[di] >= gov.jump) {
++			uint32_t j = cur >= gov.hi[di] ? top : gov.hi[di];
++			if (want < j) {
++				want = j;
++			}
++		}
++		if (boosted && want < gov.boost[di]) {
++			if (cur < gov.boost[di]) {
++				gov.boosts++;
++			}
++			want = gov.boost[di];
++		}
++		if (want > top) {
++			want = top;
++		}
++		if (want > cur || cur > top) {
++			gov.down_since[di] = 0;
++			gov_set(di, want);
++		} else if (want == cur) {
++			gov.down_since[di] = 0;
++		} else if (!gov.down_since[di]) {
++			gov.down_since[di] = now;
++			gov.hold[di] = want;
++		} else {
++			if (want > gov.hold[di]) {
++				gov.hold[di] = want;
++			}
++			if (now - gov.down_since[di] >= down_abs) {
++				gov.down_since[di] = 0;
++				gov_set(di, gov.hold[di]);
++			}
++		}
++	}
++	if (gov.l3) {
++		/* L3 follows the clusters: at least Silver's clock, and bluecpu_l3_gold % of Gold's */
++		uint32_t sk = doms[D_SILVER].lut[gov.cur[D_SILVER]].khz, gk = doms[D_GOLD].lut[gov.cur[D_GOLD]].khz;
++		uint32_t want_khz = (uint32_t)((uint64_t)gk * (uint32_t)gov.l3_gold_pct / 100u);
++		if (sk > want_khz) {
++			want_khz = sk;
++		}
++		uint32_t l = gov_level_at(&doms[D_L3], want_khz, gov.l3_max);
++		if (l != gov.l3_cur) {
++			wr(doms[D_L3].base, REG_PERF_STATE, l);
++			gov.l3_cur = l;
++			gov.l3_changes++;
++		}
++	}
++}
++
++static void
++gov_report(uint64_t now)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(now - gov.sum_t, &ns);
++	if (ns < 10ull * NSEC_PER_SEC) {
++		return;
++	}
++	for (uint32_t di = 0; di < G_DOMS; di++) {
++		char line[200];
++		int o = 0;
++		for (uint32_t l = 0; l < doms[di].rows && o < (int)sizeof(line) - 16; l++) {
++			uint64_t pct = gov.lvl_ns[di][l] * 100 / ns;
++			if (pct) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " %u:%llu%%",
++				    doms[di].lut[l].khz / 1000u, pct);
++			}
++			gov.lvl_ns[di][l] = 0;
++		}
++		printf(TAG "DVFS 10s: %s busy %llu%%, now %u MHz, %u changes; MHz:time%s\n",
++		    doms[di].name, gov.busy_n ? gov.busy_acc[di] / gov.busy_n : 0,
++		    doms[di].lut[gov.cur[di]].khz / 1000u, gov.changes[di], line);
++		gov.busy_acc[di] = 0;
++		gov.changes[di] = 0;
++	}
++	if (gov.l3) {
++		char line[200];
++		int o = 0;
++		for (uint32_t l = 0; l < doms[D_L3].rows && o < (int)sizeof(line) - 16; l++) {
++			uint64_t pct = gov.l3_ns[l] * 100 / ns;
++			if (pct) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " %u:%llu%%", doms[D_L3].lut[l].khz / 1000u, pct);
++			}
++			gov.l3_ns[l] = 0;
++		}
++		printf(TAG "DVFS 10s: L3 now %u MHz, %u changes; MHz:time%s\n", doms[D_L3].lut[gov.l3_cur].khz / 1000u,
++		    gov.l3_changes, line);
++		gov.l3_changes = 0;
++	}
++	uint64_t n = gov.busy_n ? gov.busy_n : 1, *ca = gov.core_acc;
++	printf(TAG "DVFS 10s: busy per core %llu %llu %llu %llu | %llu %llu %llu %llu %%, %u input boosts\n",
++	    ca[0] / n, ca[1] / n, ca[2] / n, ca[3] / n, ca[4] / n, ca[5] / n, ca[6] / n, ca[7] / n, gov.boosts);
++	for (int c = 0; c < 8; c++) {
++		ca[c] = 0;
++	}
++	gov.boosts = 0;
++	gov.busy_n = 0;
++	gov.sum_t = now;
++}
++
++static void
++gov_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		assert_wait_timeout((event_t)&gov.input_t, THREAD_UNINT, (uint32_t)gov.period_ms, NSEC_PER_MSEC);
++		(void)thread_block(THREAD_CONTINUE_NULL);	/* the period, or at once on input */
++		uint64_t now = mach_absolute_time();
++		gov_account(now);
++		gov_tick(now);
++		gov_report(now);
++	}
++}
++
++/* SweetHID on every touch event and key (0200). */
++void
++blue_cpu_input(void)
++{
++	__atomic_store_n(&gov.input_t, mach_absolute_time(), __ATOMIC_RELEASE);
++	if (gov.on && (gov.cur[D_SILVER] < gov.boost[D_SILVER] || gov.cur[D_GOLD] < gov.boost[D_GOLD])) {
++		thread_wakeup((event_t)&gov.input_t);
++	}
++}
++
++static int
++gov_arg_mhz(const char *name, int def)
++{
++	int v = def;
++	(void)PE_parse_boot_argn(name, &v, sizeof(v));
++	return v;
++}
++
++static void
++gov_start(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("bluecpu_dvfs", &on, sizeof(on));
++	if (!on) {
++		printf(TAG "DVFS: off (bluecpu_dvfs=0); fixed levels\n");
++		return;
++	}
++	for (uint32_t di = 0; di < G_DOMS; di++) {
++		if (!doms[di].base || !doms[di].enabled || !doms[di].rows) {
++			printf(TAG "DVFS: %s OSM not usable; fixed levels\n", doms[di].name);
++			return;
++		}
++	}
++	gov.period_ms = 20;
++	gov.target = 80;
++	gov.jump = 90;
++	gov.down_ms = 60;
++	gov.boost_ms = 1000;
++	(void)PE_parse_boot_argn("bluecpu_dvfs_ms", &gov.period_ms, sizeof(gov.period_ms));
++	(void)PE_parse_boot_argn("bluecpu_dvfs_target", &gov.target, sizeof(gov.target));
++	(void)PE_parse_boot_argn("bluecpu_dvfs_jump", &gov.jump, sizeof(gov.jump));
++	(void)PE_parse_boot_argn("bluecpu_dvfs_down_ms", &gov.down_ms, sizeof(gov.down_ms));
++	(void)PE_parse_boot_argn("bluecpu_dvfs_boost_ms", &gov.boost_ms, sizeof(gov.boost_ms));
++	if (gov.period_ms < 5 || gov.period_ms > 1000) {
++		gov.period_ms = 20;
++	}
++	if (gov.target < 20 || gov.target > 100) {
++		gov.target = 80;
++	}
++	static const char *const nm[G_DOMS][4] = {
++		{ "bluecpu_max_silver", "bluecpu_hi_silver", "bluecpu_boost_silver", NULL },
++		{ "bluecpu_max_gold", "bluecpu_hi_gold", "bluecpu_boost_gold", NULL },
++	};
++	static const int def_hi[G_DOMS] = { 1228, 1459 }, def_boost[G_DOMS] = { 1228, 1459 };
++	for (uint32_t di = 0; di < G_DOMS; di++) {
++		struct osm_dom *d = &doms[di];
++		uint32_t top = osm_top(d, false);
++		int mx = gov_arg_mhz(nm[di][0], 0);
++		if (mx > 0) {
++			top = gov_level_at(d, (uint32_t)mx * 1000u, top);
++		}
++		gov.max[di] = gov.cap[di] = top;
++		gov.hi[di] = gov_level_at(d, (uint32_t)gov_arg_mhz(nm[di][1], def_hi[di]) * 1000u, top);
++		gov.boost[di] = gov_level_at(d, (uint32_t)gov_arg_mhz(nm[di][2], def_boost[di]) * 1000u, top);
++		uint32_t ps = rd(d->base, REG_PERF_STATE);
++		gov.cur[di] = ps < d->rows ? ps : top;
++	}
++	int l3 = 0;	/* no measurable gain (l3a: 212 mA screen off, 211 without) */
++	gov.l3_gold_pct = 60;
++	(void)PE_parse_boot_argn("bluecpu_l3_follow", &l3, sizeof(l3));
++	(void)PE_parse_boot_argn("bluecpu_l3_gold", &gov.l3_gold_pct, sizeof(gov.l3_gold_pct));
++	struct osm_dom *l3d = &doms[D_L3];
++	if (l3 && osm_probe(l3d, false) && l3d->enabled && l3d->rows) {
++		/* top: below the MX TURBO level (downstream votes MX for it; we do not) */
++		gov.l3_max = 0;
++		for (uint32_t i = 0; i < l3d->rows; i++) {
++			if (l3d->lut[i].khz < l3d->mx_turbo_khz) {
++				gov.l3_max = i;
++			}
++		}
++		uint32_t ps = rd(l3d->base, REG_PERF_STATE);
++		gov.l3_cur = ps < l3d->rows ? ps : gov.l3_max;
++		gov.l3 = true;
++		printf(TAG "DVFS: L3 follows the clusters (Silver's clock, %d%% of Gold's), %u-%u MHz, now %u MHz"
++		    " (bluecpu_l3_follow=1)\n", gov.l3_gold_pct, l3d->lut[0].khz / 1000u,
++		    l3d->lut[gov.l3_max].khz / 1000u, l3d->lut[gov.l3_cur].khz / 1000u);
++	}
++	unsigned ncpu = ml_get_cpu_count() < 8 ? ml_get_cpu_count() : 8;
++	for (unsigned c = 0; c < ncpu; c++) {
++		gov.idle_prev[c] = blue_cpu_idle_abs((int)c);
++	}
++	gov.t_prev = gov.lvl_t = gov.sum_t = mach_absolute_time();
++	gov.on = true;
++	thread_t th;
++	if (kernel_thread_start(gov_thread, NULL, &th) != KERN_SUCCESS) {
++		gov.on = false;
++		printf(TAG "DVFS: no thread; fixed levels\n");
++		return;
++	}
++	thread_deallocate(th);
++	printf(TAG "DVFS: on (0200), every %d ms, target busy %d%%, jump at %d%%, down after %d ms; "
++	    "silver %u-%u MHz (hi %u, boost %u), gold %u-%u MHz (hi %u, boost %u) for %d ms after input\n",
++	    gov.period_ms, gov.target, gov.jump, gov.down_ms,
++	    doms[D_SILVER].lut[0].khz / 1000u, doms[D_SILVER].lut[gov.max[D_SILVER]].khz / 1000u,
++	    doms[D_SILVER].lut[gov.hi[D_SILVER]].khz / 1000u, doms[D_SILVER].lut[gov.boost[D_SILVER]].khz / 1000u,
++	    doms[D_GOLD].lut[0].khz / 1000u, doms[D_GOLD].lut[gov.max[D_GOLD]].khz / 1000u,
++	    doms[D_GOLD].lut[gov.hi[D_GOLD]].khz / 1000u, doms[D_GOLD].lut[gov.boost[D_GOLD]].khz / 1000u,
++	    gov.boost_ms);
++}
++
++static void
+ cpufreq_levels(void)
+ {
+ 	int mode = 0;
+@@ -1003,6 +1340,7 @@
+ 	}
+ 	cpufreq_legacy(0, D_SILVER);
+ 	cpufreq_legacy(1, D_GOLD);
++	gov_start();
+ }
+ 
+ void
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-23 16:34:27
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-23 18:33:25
+@@ -25,6 +25,7 @@
+ #include "IOHIDEventService.h"
+ 
+ extern "C" void blue_gpu_core_input(void);	/* 0198: DCVS input boost (blueline_gpu.c) */
++extern "C" void blue_cpu_input(void);		/* 0200: CPU clock input boost (blueline_cpufreq.c) */
+ #include "IOHIDEventServiceUserClient.h"
+ #include "IOHIDEvent.h"
+ #include "IOHIDKeys.h"
+@@ -561,6 +562,7 @@
+ 		IOLog("SWEET HID: touch %d %s at %d,%d\n", finger, down ? "down" : "up", x, y);
+ 	}
+ 	blue_gpu_core_input();	/* 0198 */
++	blue_cpu_input();	/* 0200 */
+ 	dispatchEvent(collection);
+ 	collection->release();
+ }
+@@ -575,6 +577,7 @@
+ 	};
+ 
+ 	blue_gpu_core_input();	/* 0198 */
++	blue_cpu_input();	/* 0200 */
+ 	blueline_fake_accel_key(key, down);	/* volume keys can turn the fake accelerometer (BlueFakeMotion.cpp) */
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+ 		gSweetButtons->key(usages[key], down != 0);
+diff -ruN a/osfmk/kern/recount.c b/osfmk/kern/recount.c
+--- a/osfmk/kern/recount.c	2026-11-23 16:34:27
++++ b/osfmk/kern/recount.c	2026-11-23 18:33:25
+@@ -1002,6 +1002,37 @@
+ 	*idle_time_out = idle_time;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0200: one CPU's idle time so far (mach absolute, up to now if it is idle), for
++ * the CPU clock governor in bsd/dev/blueline_cpufreq.c. Read without locks; the
++ * stamp is read on both sides of the total and the read retried if it moved.
++ */
++uint64_t blue_cpu_idle_abs(int cpu);
++uint64_t
++blue_cpu_idle_abs(int cpu)
++{
++	processor_t p = cpu_to_processor(cpu);
++	if (p == PROCESSOR_NULL) {
++		return 0;
++	}
++	struct recount_processor *pr = &p->pr_recount;
++	for (int tries = 0;; tries++) {
++		uint64_t s1 = os_atomic_load_wide(&pr->rpr_state_last_abs_time, acquire);
++		uint64_t idle = os_atomic_load_wide(&pr->rpr_idle_time_mach, acquire);
++		uint64_t now = mach_absolute_time();
++		uint64_t s2 = os_atomic_load_wide(&pr->rpr_state_last_abs_time, acquire);
++		if (s1 != s2 && tries < 4) {
++			continue;
++		}
++		if ((s2 & RCT_PR_IDLING) == RCT_PR_IDLING && now > _state_time(s2)) {
++			idle += now - _state_time(s2);
++		}
++		return idle;
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ bool
+ recount_task_thread_perf_level_usage(struct task *task, uint64_t tid,
+     struct recount_usage *usage_levels)

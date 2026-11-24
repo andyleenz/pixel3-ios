@@ -82,13 +82,13 @@ if [ "$quick" = 1 ]; then
 	mapfile -t old < "$work/patch-list.txt"
 	new=()
 	for n in "${old[@]}"; do
-		case $n in 01[0-9][0-9]-*) [ -e "$repo/xnu/patches/$n" ] && new+=("$n") ;; *) new+=("$n") ;; esac
+		case $n in 0[1-8][0-9][0-9]-*|099[0-9]-*) [ -e "$repo/xnu/patches/$n" ] && new+=("$n") ;; *) new+=("$n") ;; esac
 	done
 	for f in "$repo"/xnu/patches/*.patch; do
 		n=$(basename "$f"); printf '%s\n' "${old[@]}" | grep -qx "$n" || new+=("$n")
 	done
 	# the pinned sailfish patches always belong at the end, even if an earlier failure dropped them from the list
-	i=200
+	i=900	# sailfish patches go after ours (ours: 0100-0899; 0990-0999 are ours on top of sailfish's)
 	for s in $SAILFISH_PATCHES; do
 		n=$(cd "$work/dxb/patches" && ls 0${i}-sf-$s-*.patch 2>/dev/null | head -1)
 		[ -n "$n" ] || { echo "sailfish patch $s missing from dxb/patches; run without --quick" >&2; exit 1; }
@@ -99,7 +99,7 @@ if [ "$quick" = 1 ]; then
 	first=-1	# first position where the stack differs
 	for ((i = 0; i < ${#old[@]} || i < ${#new[@]}; i++)); do
 		o=${old[i]:-} n=${new[i]:-}
-		if [ "$o" != "$n" ] || { case $n in 01[0-9][0-9]-*) ! cmp -s "$repo/xnu/patches/$n" "$work/dxb/patches/$n" ;; *) false ;; esac; }; then
+		if [ "$o" != "$n" ] || { case $n in 0[1-8][0-9][0-9]-*|099[0-9]-*) ! cmp -s "$repo/xnu/patches/$n" "$work/dxb/patches/$n" ;; *) false ;; esac; }; then
 			first=$i; break
 		fi
 	done
@@ -114,7 +114,7 @@ if [ "$quick" = 1 ]; then
 		done
 		for ((i = first; i < ${#new[@]}; i++)); do
 			n=${new[i]}
-			case $n in 01[0-9][0-9]-*) cp "$repo/xnu/patches/$n" "$work/dxb/patches/" ;; esac
+			case $n in 0[1-8][0-9][0-9]-*|099[0-9]-*) cp "$repo/xnu/patches/$n" "$work/dxb/patches/" ;; esac
 			echo "put in  $n"
 			git -C "$x" apply "$work/dxb/patches/$n" || { echo "could not put in $n; tree has the patches before it" >&2; exit 1; }
 			printf '%s\n' "${new[@]:0:i+1}" > "$work/patch-list.txt"
@@ -155,17 +155,22 @@ for f in sweet/xnu/patches/*; do
 	case $n in *.patch) echo "$n" >> patch-list.txt ;; esac
 done
 for f in "$repo"/xnu/patches/*.sh; do [ -e "$f" ] && cp "$f" dxb/patches/; done
-for f in "$repo"/xnu/patches/*.patch; do
+for f in "$repo"/xnu/patches/0[1-8]*.patch; do
 	cp "$f" dxb/patches/
 	basename "$f" >> patch-list.txt
 done
-i=200
+i=900	# sailfish patches go after ours (ours: 0100-0899)
 for n in $SAILFISH_PATCHES; do
 	f=$(ls sailfish/xnu/patches/$n-*.patch)
 	dst="0${i}-sf-$(basename "$f")"
 	cp "$f" "dxb/patches/$dst"
 	echo "$dst" >> patch-list.txt
 	i=$((i + 1))
+done
+for f in "$repo"/xnu/patches/099[0-9]-*.patch; do	# ours that change sailfish's code (sailfish stays below 0990)
+	[ -e "$f" ] || continue
+	cp "$f" dxb/patches/
+	basename "$f" >> patch-list.txt
 done
 # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
 sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh

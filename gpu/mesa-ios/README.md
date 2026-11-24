@@ -9,6 +9,7 @@ here talks to the phone, and `ref/mesa` is not touched (the build uses a pinned 
 ./build-mesa-ios.sh                       # incremental (seconds after a frontend/bluedrm edit)
 CLEAN=1 PAD=67108864 ./build-mesa-ios.sh  # from scratch: about 70 s on this Mac (M-series, 10 cores)
 HOST=1 ./build-mesa-ios.sh                # also build for macOS over fake/ and run the test there
+VK=1 HOST=1 ./build-mesa-ios.sh           # also Turnip (Vulkan) for iOS and macOS, run vk-smoke on the Mac
 ```
 
 Needs Xcode 15.4 (`DEVELOPER_DIR`, defaults to `/Applications/Xcode-15.4.0.app`; iPhoneOS 17.5 SDK, minos
@@ -25,6 +26,8 @@ Needs Xcode 15.4 (`DEVELOPER_DIR`, defaults to `/Applications/Xcode-15.4.0.app`;
 | `gles-triangle` | 70 KB | test binary, links `/usr/lib/bluegl.dylib` |
 | `exports.txt`, `sizes.txt` | | 1310 exported `gl*` entry points + `bluegl_*`; size report |
 | `host/` | | `HOST=1`: macOS build linked with the fake GPU, and `gles-triangle.log` |
+| `bluevk.dylib` | 15,470,976 B | `VK=1`: Turnip (Vulkan 1.3, msm backend over bluedrm), install name `/usr/lib/bluevk.dylib`, minos 16.0, imports from libSystem, libc++, IOKit and libz only |
+| `vk-smoke` | 68 KB | `VK=1`: loader-less Vulkan test: device, host-visible buffer, `vkCmdFillBuffer`, fence. On the phone the buffer must read `0xb10e0630` |
 
 The dylib imports 209 symbols, all from libSystem, libc++, IOKit and libz. The script fails if there is any
 weak import other than C++ `operator new/delete` and `pthread_mutexattr_*` (Mesa's `#pragma weak`), or if
@@ -62,6 +65,8 @@ functions of `libglapi_bridge.a` plus `_bluegl_*`. A `_gl*` wildcard would also 
 | 0002 darwin-freedreno-bo-map-import-clock | `fd_bo` mmap/munmap go through `bluedrm_map`/`bluedrm_unmap` (IOConnectMapMemory64, with the token from `GEM_INFO(GET_OFFSET)`). IOSurface import size comes from the kernel (no `lseek` on a dma-buf fd). Absolute timeouts use `CLOCK_MONOTONIC_RAW` (= `mach_continuous_time`, the kernel's clock) |
 | 0003 darwin-freedreno-dbg-tid | `DBG()` called `syscall(SYS_gettid)`. Darwin's 286 is a different call with out-pointers, so with `FD_MESA_DEBUG=msgs` it would write through garbage. Use the mach thread port instead |
 | 0004 fd6-fbfetch-first-draw-barrier-hakios | HakiOS's fix ported to 26.3.1: before the first framebuffer-fetch draw after non-fetch draws, flush CCU colour and invalidate. CA's GL renderer needs it |
+| 0005 fd6-linear-import-any-pitch | A linear one-level import keeps its own pitch, so the GPU reads CoreAnimation's wrapped client images in place |
+| 0006 darwin-turnip-msm-over-bluedrm | Turnip on Darwin: the msm backend over bluedrm. Enumerates the user client by name (no `/dev/dri`), maps BOs with `bluedrm_map`, never placed maps or `SET_IOVA` (one shared VA space, kernel-chosen IOVAs), compiles `bluedrm.c` in, and backs `vk_drm_syncobj` with bluedrm's emulated syncobjs (`u_sync_provider.c` now built, `HAVE_BLUEDRM_SYNCOBJ`). No DRM WSI. From UniXNU's `turnip-darwin-kmd.patch` (MIT): constant `CTR_EL0` (an EL0 read traps on XNU), condvar on `CLOCK_REALTIME`, `-undefined dynamic_lookup` for the weak entrypoint tables |
 
 HakiOS's other Mesa changes are not needed on 26.3.1. Its Mach-O build-id for the disk cache is now
 upstream (LC_UUID), freedreno no longer uses `sysinfo()`, and its OSMesa changes do not apply because
@@ -88,7 +93,7 @@ row pitch that is a multiple of 64. This is the hook the EAGL shim (6f) builds o
   |---|---|
   | 0x09 | GEM_CLOSE |
   | 0x40 | GET_PARAM |
-  | 0x41 | SET_PARAM |
+  | 0x41 | SET_PARAM (SYSPROF, COMM, CMDLINE only: EN_VM_BIND must fail, or Turnip uses VM_BIND) |
   | 0x42 | GEM_NEW |
   | 0x43 | GEM_INFO |
   | 0x44 | CPU_PREP |

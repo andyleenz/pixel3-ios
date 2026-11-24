@@ -1,0 +1,254 @@
+0198: GPU DCVS on its own thread, with an input boost, on by default
+
+Since 0189 iOS draws through user submits (0153), so 0151's DCVS tick,
+called at the end of a kernel present, never ran: the GPU stayed at
+bluegpu_mhz (710 MHz) for the whole boot. A kernel thread now ticks
+every 100 ms with the ring lock held (rs_recover takes it too); the
+present-path tick only runs without the thread.
+
+Input boost: SweetHID calls blue_gpu_core_input() on every touch event
+and key. For bluegpu_dcvs_boost_ms (1000) after one, the level is at
+least bluegpu_dcvs_boost (520 MHz); the thread is woken at once when
+the clock is below it. Without it, animations started by a touch began
+at 257 MHz and lost frames (p90 frame gaps 44-60 ms against 37 ms at
+710 MHz, tools/framegaps.py). The busy target is 50% (was 65).
+
+blueui now includes bluegpu_dcvs=1 (bluegpu_dcvs=0 fixes the clock at
+bluegpu_mhz again). Log: the first 20 level changes, then one in 100;
+every 10 s one line with busy %, the level, changes, boosts and the
+time spent at each level.
+
+diff -ruN a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c
++++ b/bsd/dev/blueline_gpu.c
+@@ -4167,6 +4167,12 @@
+ 	bool busy_gmu;
+ 	uint64_t dcvs_t, dcvs_xo, dcvs_ticks;
+ 	uint32_t dcvs_low, dcvs_changes, busy_pct;
++	bool dcvs_thread;		/* 0198: ticks from a thread of their own, not from presents */
++	uint64_t dcvs_lvl_ns[GX_LEVELS];	/* 0198: time at each level since the last summary */
++	uint64_t dcvs_lvl_t, dcvs_sum_t;
++	int dcvs_boost, dcvs_boost_ms;	/* 0198: after input, at least this many MHz for this long */
++	uint64_t input_t;		/* 0198: last touch or key (blue_gpu_core_input) */
++	uint32_t dcvs_boosts;
+ 	/* 0151 cache */
+ 	bool coherent;
+ 	uint32_t n_irq_wake, n_slice, n_clean_skip;
+@@ -4208,7 +4214,9 @@
+ 	rs.test_kind = 3;
+ 	rs.dcvs_min = 257;
+ 	rs.dcvs_max = 710;
+-	rs.dcvs_target = 65;
++	rs.dcvs_target = 50;	/* 0198: was 65 */
++	rs.dcvs_boost = 520;
++	rs.dcvs_boost_ms = 1000;
+ 	rs.clean = 1;
+ 	(void)PE_parse_boot_argn("bluegpu_irq", &rs.irq, sizeof(rs.irq));
+ 	(void)PE_parse_boot_argn("bluegpu_gmu_irq", &rs.gmu_irq, sizeof(rs.gmu_irq));
+@@ -4221,6 +4229,8 @@
+ 	(void)PE_parse_boot_argn("bluegpu_dcvs_min", &rs.dcvs_min, sizeof(rs.dcvs_min));
+ 	(void)PE_parse_boot_argn("bluegpu_dcvs_max", &rs.dcvs_max, sizeof(rs.dcvs_max));
+ 	(void)PE_parse_boot_argn("bluegpu_dcvs_target", &rs.dcvs_target, sizeof(rs.dcvs_target));
++	(void)PE_parse_boot_argn("bluegpu_dcvs_boost", &rs.dcvs_boost, sizeof(rs.dcvs_boost));
++	(void)PE_parse_boot_argn("bluegpu_dcvs_boost_ms", &rs.dcvs_boost_ms, sizeof(rs.dcvs_boost_ms));
+ 	(void)PE_parse_boot_argn("bluegpu_present_clean", &rs.clean, sizeof(rs.clean));
+ 	if (rs.recover_max < 1 || rs.recover_max > RS_REC_MAX) {
+ 		rs.recover_max = 3;
+@@ -4235,7 +4245,7 @@
+ 		rs.test_every = 0;
+ 	}
+ 	if (rs.dcvs_target < 20 || rs.dcvs_target > 95) {
+-		rs.dcvs_target = 65;
++		rs.dcvs_target = 50;
+ 	}
+ 	if (rs.clean < 0 || rs.clean > 2) {
+ 		rs.clean = 1;
+@@ -4730,8 +4740,11 @@
+ 	if (gx.bw_voted && gx_level_kbps(gx.perf) < gx.bw_kbps) {
+ 		err = gx_bw_vote_kbps(gx_level_kbps(gx.perf), true);
+ 	}
+-	uint32_t mhz = rs_clock_mhz();
+ 	rs.dcvs_changes++;
++	if (rs.dcvs_changes > 20 && rs.dcvs_changes % 100 && ok && !ret && !err) {
++		return gx.perf == l;	/* 0198: after the first 20, one line in 100 (the summary counts the rest) */
++	}
++	uint32_t mhz = rs_clock_mhz();
+ 	printf("BLUELINE GPU: DCVS %u -> %u MHz (%s): OOB %s after %llu us (gmu2host %#x), DCVS_RETURN %#x%s, DDR vote %u kBps"
+ 	    "%s%d, measured %u MHz\n", gpu_khz[old] / 1000, gpu_khz[l] / 1000, why, ok ? "acked" : "NOT ACKED", ns / 1000,
+ 	    info, ret, ret ? " (ERROR: level kept)" : "", gx.bw_voted ? gx.bw_kbps : 0,
+@@ -4748,6 +4761,16 @@
+ 	if (!rs.dcvs) {
+ 		return;
+ 	}
++	/* 0198: input boost: a touch or key starts an animation before the busy counter can show it */
++	uint64_t in_t = __atomic_load_n(&rs.input_t, __ATOMIC_ACQUIRE), boost_abs = 0;
++	nanoseconds_to_absolutetime((uint64_t)rs.dcvs_boost_ms * NSEC_PER_MSEC, &boost_abs);
++	bool boosted = rs.dcvs_boost > 0 && in_t && now - in_t < boost_abs;
++	int lboost = boosted ? gx_level_at(rs.dcvs_boost) : 0;
++	if (boosted && gx.perf < lboost) {
++		rs.dcvs_boosts++;
++		rs.dcvs_low = 0;
++		(void)gx_set_level(lboost, "input boost");
++	}
+ 	if (!rs.dcvs_t) {
+ 		rs.dcvs_t = now;
+ 		rs.dcvs_xo = rs_xoclk();
+@@ -4774,6 +4797,9 @@
+ 	int l = lmin;
+ 	while (l < lmax && gpu_khz[l] < want * 1000) {
+ 		l++;
++	}
++	if (l < lboost) {
++		l = lboost;	/* 0198: not below the boost while it lasts */
+ 	}
+ 	char why[48];
+ 	snprintf(why, sizeof(why), "busy %u%% (%s)", rs.busy_pct, rs.busy_gmu ? "GMU counter" : "blit time");
+@@ -4790,6 +4816,90 @@
+ 	}
+ }
+ 
++/*
++ * 0198: since 0189 iOS draws through user submits (0153), not presents, so the present-path tick
++ * never ran and the clock stayed where bluegpu_mhz left it. A thread ticks every 100 ms instead,
++ * with the ring lock (rs_recover takes it too), and every 10 s logs the time spent at each level.
++ */
++static void
++rs_dcvs_account(uint64_t now)
++{
++	uint64_t ns;
++
++	if (rs.dcvs_lvl_t) {
++		absolutetime_to_nanoseconds(now - rs.dcvs_lvl_t, &ns);
++		rs.dcvs_lvl_ns[gx.perf < GX_LEVELS ? gx.perf : 0] += ns;
++	}
++	rs.dcvs_lvl_t = now;
++}
++
++static void
++rs_dcvs_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t changes0 = 0;
++
++	for (;;) {
++		assert_wait_timeout((event_t)&rs.input_t, THREAD_UNINT, 100, NSEC_PER_MSEC);
++		(void)thread_block(THREAD_CONTINUE_NULL);	/* 100 ms, or at once on input (blue_gpu_core_input) */
++		if (!blue_gpu_core_ready()) {
++			continue;
++		}
++		blue_gpu_ring_lock();
++		uint64_t now = mach_absolute_time(), ns;
++		rs_dcvs_account(now);
++		rs_dcvs_tick();
++		rs_dcvs_account(mach_absolute_time());
++		if (!rs.dcvs_sum_t) {
++			rs.dcvs_sum_t = now;
++		}
++		absolutetime_to_nanoseconds(now - rs.dcvs_sum_t, &ns);
++		if (ns >= 10ull * NSEC_PER_SEC) {
++			char line[160];
++			int o = 0;
++			for (int l = 1; l < GX_LEVELS; l++) {
++				o += snprintf(line + o, sizeof(line) - o, " %u:%llu%%", gpu_khz[l] / 1000,
++				    rs.dcvs_lvl_ns[l] * 100 / ns);
++				rs.dcvs_lvl_ns[l] = 0;
++			}
++			rs.dcvs_lvl_ns[0] = 0;
++			printf("BLUELINE GPU: DCVS 10s: busy %u%%, now %u MHz, %u changes, %u boosts; MHz:time%s\n", rs.busy_pct,
++			    gpu_khz[gx.perf] / 1000, rs.dcvs_changes - changes0, rs.dcvs_boosts, line);
++			rs.dcvs_boosts = 0;
++			changes0 = rs.dcvs_changes;
++			rs.dcvs_sum_t = now;
++		}
++		blue_gpu_ring_unlock();
++	}
++}
++
++static void
++rs_dcvs_start(void)
++{
++	thread_t th;
++
++	if (!rs.dcvs || rs.dcvs_thread) {
++		return;
++	}
++	if (kernel_thread_start(rs_dcvs_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("BLUELINE GPU: DCVS: no thread: ticks on presents only\n");
++		return;
++	}
++	thread_deallocate(th);
++	rs.dcvs_thread = true;
++	printf("BLUELINE GPU: DCVS: own thread, every 100 ms (0198); input boost to %d MHz for %d ms"
++	    " (bluegpu_dcvs_boost, _boost_ms), target busy %d%%\n", rs.dcvs_boost, rs.dcvs_boost_ms, rs.dcvs_target);
++}
++
++/* 0198: SweetHID on every touch event and key: note the time, wake the DCVS thread if below the boost. */
++void
++blue_gpu_core_input(void)
++{
++	__atomic_store_n(&rs.input_t, mach_absolute_time(), __ATOMIC_RELEASE);
++	if (rs.dcvs_thread && rs.dcvs_boost > 0 && gx.perf < gx_level_at(rs.dcvs_boost)) {
++		thread_wakeup((event_t)&rs.input_t);
++	}
++}
++
+ /* 0151 interrupts on (after the ring check): GPU SPI 300 with a fenced check, GMU SPIs 304/305. */
+ static void
+ rs_irq_attach(void)
+@@ -5003,6 +5113,7 @@
+ 	rs.up = true;
+ 	rs.first_map = true;
+ 	rs.t_stat = rs.t_up = mach_absolute_time();
++	rs_dcvs_start();	/* 0198 */
+ 	if (rs.test_hang) {
+ 		uint64_t d;
+ 		nanoseconds_to_absolutetime((uint64_t)rs.test_hang * NSEC_PER_SEC, &d);
+@@ -5979,7 +6090,9 @@
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	rs.cpu_ns += ns;
+ 	rs.cpu_max = MAX(rs.cpu_max, ns);
+-	rs_dcvs_tick();
++	if (!rs.dcvs_thread) {
++		rs_dcvs_tick();
++	}
+ 	rs_stats();
+ 	return 1;
+ }
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -23,6 +23,8 @@
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
++
++extern "C" void blue_gpu_core_input(void);	/* 0198: DCVS input boost (blueline_gpu.c) */
+ #include "IOHIDEventServiceUserClient.h"
+ #include "IOHIDEvent.h"
+ #include "IOHIDKeys.h"
+@@ -558,6 +560,7 @@
+ 	if (was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d\n", finger, down ? "down" : "up", x, y);
+ 	}
++	blue_gpu_core_input();	/* 0198 */
+ 	dispatchEvent(collection);
+ 	collection->release();
+ }
+@@ -571,6 +574,7 @@
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
+ 	};
+ 
++	blue_gpu_core_input();	/* 0198 */
+ 	blueline_fake_accel_key(key, down);	/* volume keys can turn the fake accelerometer (BlueFakeMotion.cpp) */
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+ 		gSweetButtons->key(usages[key], down != 0);
+diff -ruN a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -205,6 +205,7 @@
+ } blue_ui_set[] = {
+ 	{ "blueui", "bluegpu", 8, NULL },
+ 	{ "blueui", "bluegpu_mhz", 710, NULL },
++	{ "blueui", "bluegpu_dcvs", 1, NULL },		/* 0198: load-based GPU clock with input boost */
+ 	{ "blueui", "bluedpu_flip", 1, NULL },
+ 	{ "blueui", "cs_enforcement_disable", 1, NULL },
+ 	{ "blueui", "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib" },

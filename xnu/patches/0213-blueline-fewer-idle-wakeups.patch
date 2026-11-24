@@ -1,0 +1,130 @@
+0213: blueline fewer idle wakeups (audio GLINK on its interrupt, key reads spin)
+
+From 0212's bluetimers census, screen off:
+- The ADSP GLINK receive thread (0187) polled every 1 ms for good: ~860
+  timer wakeups a second, two thirds of all of them, so the eight cores
+  were never all down at once. It now sleeps until the lpass glink-edge
+  interrupt (SPI 156, rising edge, as sdm845.dtsi), with a 200 ms fallback
+  (bluesnd_glink_irq=0 polls as before).
+- The keys' SPMI reads waited for each command with delay(1), which blocks
+  and arms a timer (~140 a second); they now spin for the microsecond.
+
+diff -ruN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
+--- a/bsd/dev/blueline_audio.c	2026-11-24 10:34:45
++++ b/bsd/dev/blueline_audio.c	2026-11-24 10:47:54
+@@ -1558,12 +1558,34 @@
+ 	return true;
+ }
+ 
++/*
++ * 0213: the ADSP rings the APSS when it writes our FIFO (sdm845.dtsi lpass
++ * glink-edge: SPI 156, rising edge). The receive thread sleeps until that
++ * interrupt (or LG_IDLE_MS as a fallback) instead of polling every 1 ms,
++ * which was ~860 wakeups a second with the screen off and kept the cores
++ * from ever all being down together (0212's census).
++ */
++#define LG_INTID	(32u + 156u)
++#define LG_IDLE_MS	200
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++static volatile uint32_t lg_irqs;
++static bool lg_irq_on;
++static int lg_chan;
++
+ static void
++lg_irq(void *arg __unused)
++{
++	lg_irqs++;
++	thread_wakeup(&lg_chan);
++}
++
++static void
+ lg_thread(void *arg __unused, wait_result_t w __unused)
+ {
+ 	static uint8_t pkt[sizeof(lg_rxbuf)];
+ 
+ 	while (!lg.stop) {
++		uint32_t seen = lg_irqs;
+ 		bool any = false;
+ 		for (int n = 0; n < 64; n++) {
+ 			uint32_t len = 0;
+@@ -1582,7 +1604,17 @@
+ 			}
+ 		}
+ 		if (!any) {
+-			IOSleep(1);
++			if (!lg_irq_on) {
++				IOSleep(1);
++				continue;
++			}
++			/* An interrupt after the drain above changes lg_irqs: don't sleep through it. */
++			assert_wait_timeout(&lg_chan, THREAD_UNINT, LG_IDLE_MS, NSEC_PER_MSEC);
++			if (lg_irqs != seen) {
++				clear_wait(current_thread(), THREAD_AWAKENED);
++			} else {
++				thread_block(THREAD_CONTINUE_NULL);
++			}
+ 		}
+ 	}
+ }
+@@ -1639,6 +1671,11 @@
+ 	lck_mtx_lock(&lg_lock);
+ 	(void)lg_send(LG_VERSION, 1, LG_FEAT_REUSE, NULL, 0);
+ 	lck_mtx_unlock(&lg_lock);
++	int lgirq = 1;
++	(void)PE_parse_boot_argn("bluesnd_glink_irq", &lgirq, sizeof(lgirq));
++	if (lgirq && !lg_irq_on) {
++		lg_irq_on = sweet_spi_attach(LG_INTID, true, lg_irq, NULL);
++	}
+ 	thread_t th;
+ 	if (kernel_thread_start(lg_thread, NULL, &th) != KERN_SUCCESS) {
+ 		return false;
+@@ -1650,9 +1687,10 @@
+ 	}
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-	printf("BLUE SOUND: glink: apr_audio_svc %s after %llu ms (version %d, remote open %d, ack %d, %d intents)\n",
++	printf("BLUE SOUND: glink: apr_audio_svc %s after %llu ms (version %d, remote open %d, ack %d, %d intents);"
++	    " rx %s, %u interrupts so far\n",
+ 	    (lg.open_acked && lg.remote_open) ? "open" : "NOT open", ns / NSEC_PER_MSEC, lg.version_done, lg.remote_open,
+-	    lg.open_acked, lg.nri);
++	    lg.open_acked, lg.nri, lg_irq_on ? "on SPI 156" : "polled every 1 ms", lg_irqs);
+ 	return lg.open_acked && lg.remote_open;
+ }
+ 
+diff -ruN a/bsd/dev/blueline_keys.c b/bsd/dev/blueline_keys.c
+--- a/bsd/dev/blueline_keys.c	2026-11-24 10:46:57
++++ b/bsd/dev/blueline_keys.c	2026-11-24 10:47:54
+@@ -89,6 +89,15 @@
+  * (EE 0): byte count len - 1 in bits 2:0, the bytes come back little-endian
+  * in RDATA0 (Linux pmic_arb_fmt_read_cmd/pmic_arb_read_cmd_unlocked, v2+).
+  */
++static inline void
++arb_spin_1us(void)
++{
++	uint64_t end = mach_absolute_time() + 20;	/* 19.2 MHz */
++	while (mach_absolute_time() < end) {
++		__builtin_arm_yield();
++	}
++}
++
+ static bool
+ arb_read_n(uint16_t apid, uint16_t addr, uint8_t *out, unsigned len)
+ {
+@@ -111,7 +120,7 @@
+ 			}
+ 			return true;
+ 		}
+-		delay(1);
++		arb_spin_1us();	/* 0213: delay(1) blocked and armed a timer, ~140 a second */
+ 	}
+ 	return false;
+ }
+@@ -143,7 +152,7 @@
+ 		if (arb_status & 1u) {
+ 			return !(arb_status & 0x0eu);
+ 		}
+-		delay(1);
++		arb_spin_1us();	/* 0213: delay(1) blocked and armed a timer, ~140 a second */
+ 	}
+ 	return false;
+ }

@@ -965,3 +965,233 @@ No panics. Screenshots correct: home, apple.com loaded and scrolled, Control Cen
 
 The CPUs sit at fixed top levels (no DVFS), the GPU stays up at 710 MHz, and idle cores only WFI: no PSCI power collapse, so the shared rails and DDR never reach their sleep levels. Each core takes 600-1000 IPIs and 100-300 timer interrupts a second at idle. Order of work: CPU DVFS, GPU idle/slumber, the IPI rate, PSCI CPU_SUSPEND.
 
+
+### GPU clock follows the load (2026-11-23)
+
+**Measuring (tools/pwr.sh).** One command per power run: USB input suspended (0197), two minutes on SpringBoard, a scripted power press, five minutes off, a press, two minutes on, then `tools/pwrsum.py` prints battery mA, DPU flips/s and timer/IPI rates per phase. Phases follow the display; minutes with input the script did not send are kept apart (in base1 someone used the phone during the off phase). `tools/framegaps.py` gives the frame-timing numbers of the table above from eagl's timeline lines (`touch_lat=1`).
+
+**DCVS never ran.** 0151's DCVS ticked at the end of a kernel present. Since 0189 iOS draws through its own submits (0153), so there were no presents and the GPU stayed at 710 MHz all boot.
+
+**0198.** A kernel thread ticks DCVS every 100 ms with the ring lock (rs_recover takes it too). With only that (dcvs1), the GPU spends 99% of idle time at 257 MHz, but animations started by a touch begin at 257 MHz: p90 frame gaps 44-60 ms in three of four runs, against 37 ms at 710 MHz. Input boost: SweetHID calls `blue_gpu_core_input()` on every touch event and key; for 1 s (`bluegpu_dcvs_boost_ms`) the level is at least 520 MHz (`bluegpu_dcvs_boost`), and the thread is woken at once. Busy target 50% (was 65). On by default in the `blueui` set (`bluegpu_dcvs=0` restores the fixed clock).
+
+| Run | Setup | Screen on, idle | Screen off | After wake |
+|---|---|---|---|---|
+| base1 | fixed 710 MHz | 872 mA | 700 mA | 860 mA |
+| dcvs1 | DCVS, target 65 | 596 mA | 444 mA | 672 mA |
+| dcvs2 | defaults (DCVS, boost, target 50) | 681 mA | 506 mA | 588 mA |
+
+Runs differ by up to ~80 mA with the same setup. Frame gaps, def1 script (gap median / p90 / gaps over 33 ms):
+
+| Run | Setup | Wi-Fi | Median | p90 | > 33 ms |
+|---|---|---|---|---|---|
+| off1 | `bluegpu_dcvs=0` | no | 19.5 ms | 34.9 ms | 54 |
+| off2 | `bluegpu_dcvs=0` | yes | 19.1 ms | 35.4 ms | 74 |
+| bst1 | defaults | no | 20.3 ms | 44.8 ms | 68 |
+| bst2 | defaults | yes | 20.0 ms | 35.4 ms | 97 |
+| bst3 | defaults | no | 20.5 ms | 36.2 ms | 59 |
+| bst4 | defaults | yes | 16.9 ms | 32.8 ms | 84 |
+
+**Wi-Fi joins on every other boot.** Over 16 boots in a row (sm0-sm9, bst1-off2-bst4), the join failed ("join: failed (60) in state 2") on every second one, without exception. Open; the previous boot's teardown is the suspect. Safari runs without Wi-Fi draw fewer frames, so frame-gap runs are only compared within the same Wi-Fi state.
+
+**Still drawing after a wake.** In every power run the lock screen is still before the first press (0.4 flips/s) and draws ~45 frames/s after the wake press with nothing touched: a steady 17-draw, 90-triangle frame. Next: what animates.
+
+### The screen locks itself: CommCenter back (2026-11-23)
+
+**Why the screen never went off.** After a wake the lock screen pulsed "Swipe up to open" at ~45 frames/s and the display stayed on until the next press; after boot it stayed on too. SpringBoard's settings were right (lock screen 6 s, auto-lock 60 s), but its log showed `SBIdleTimerGlobalCoordinator - updateIdleTimerForReason:"IdleTimerReset"` every ~19 ms, each next to `CTServerConnection returned error: (2, 5). Destroying connection` and launchd's `failed lookup: name = com.apple.commcenter.xpc ... No such process`: about 100 failed CoreTelephony connections a second after each SpringBoard start and wake, each resetting the idle timer. CommCenter had been removed with the rest of the DENY list ("no baseband").
+
+**Fix.** iOS has a CommCenter job for devices without a baseband, `com.apple.CommCenter-noncellular` (`_LimitLoadFromDeviceTree = baseband`: loaded when the device tree has no `baseband` node; ours has only the product's `baseband-chipset` property). That job and the root/mobile helpers are now kept (`KEEP_KEYS` in `tools/iosroot-tweaks.py`, also used by `launchd-build.py` and `remigrate-push.sh`); the cellular job stays out. iOS still sees a phone, so a later cellular/eSIM path goes through the same daemon. On the phone with `launchd-build.py OUT com.apple.wifid` and `--push`.
+
+| Run | Screen on after a wake | Screen on after boot | Screen off, median | IPIs/s, screen off |
+|---|---|---|---|---|
+| dcvs2 (no CommCenter) | until the next press | until the press | 506 mA | 17.3k |
+| cc1 (CommCenter back) | ~10 s | ~40 s | 349 mA | 12.5k |
+| cc4 (same, final plist) | ~10 s | ~40 s | 317 mA | 12.4k |
+
+pwr.sh's phases assume the presses turn the screen off and on; now the first press wakes a screen that already went off, so "off" is most of the run and on2 is empty.
+
+**Open: CommCenter restarts every ~15 s** (41 crashes in 10 min), two ways, about half each:
+- SIGSEGV in `ApplePDPHelperInterface::callStructMethod` (`std::mutex::lock` on a null object): the packet-data helper's kernel service does not exist here.
+- SIGABRT: an uncaught C++ exception escaping a dispatch block (`std::terminate` from `_dispatch_client_callout`). The message is not on stderr (`StandardErrorPath` stays empty), and CommCenter's own lines never reach the persistent log.
+Backtraces symbolised with `ipsw dyld a2s` against the SystemOS cryptex's cache (address minus the CRASH line's slide).
+
+**0199: AppleIPAppender stand-in.** The PDP helper looks up the `AppleIPAppender` service (strings in ApplePDPHelper.framework). `iokit/Kernel/arm/MiniIPAppender.cpp` publishes one under IOResources with a user client that refuses every method; `bluepdp=0` leaves it out. SIGSEGVs 20 -> 0 in 10 min (cc5).
+
+**The abort is the baseband path.** CommCenter started by hand under bluesh prints it: `libc++abi: terminating due to uncaught exception of type std::runtime_error: Unable to communicate with AppleBaseband driver`, after `overrides_D22.plist` is picked as the device's signature plist. Not the PDP helper: making method 16 ("Block PDP traffic", called about four times before each abort) succeed changed nothing (cc6), and neither did leaving `baseband-chipset` out of `/product` (cc8). Still 35 restarts in 10 min; the screen locks itself regardless. Next, if worth it: what makes CommCenter choose its baseband path on a D22 (MobileGestalt answers, the overrides plist); else a small stand-in daemon for the CommCenter services.
+
+### CPU clocks follow the load; a Bluetooth plugin was eating a core (2026-11-23)
+
+**0200: CPU DVFS.** Silver sat at 1766 MHz and Gold at 2649 MHz all boot (0106/0139). A kernel thread now ticks every 20 ms (`bluecpu_dvfs`, on by default). Each core's idle time comes from recount (`blue_cpu_idle_abs`, osfmk/kern/recount.c). Each cluster takes its busiest core and asks OSM for the lowest level at or above current kHz x busy / 80%. At 90% busy it jumps to a "hispeed" level (1228 / 1459 MHz), and from there to the top. It goes up at once and down only after 60 ms of lower wants. Touches and keys hold at least 1228 / 1459 MHz for 1 s (`blue_cpu_input` from SweetHID). Every 10 s it logs average busy, busy per core, changes and time per level. `bluecpu_dvfs=0` keeps the fixed top levels. Our patch numbers reached 0200, so the pinned sailfish patches now start at 0900 (build-xnu.sh, CI).
+
+**Idle wasn't idle.** With the governor on (dvfs1), Silver stayed ~60% busy with the screen off: cores 0-2 ~40% each, Gold ~5%. `tools/bluerun/blueps.c` (per-process CPU over N seconds; iOS has no ps) showed launchd at 73% and mediaserverd at 48% of a core. mediaserverd's log had about 2000 lines a second of `Starting BTAudioPlugin` / `Register audio plugin connection with bluetoothd` / `XPC server error: Connection invalid`. `BTAudioHALPlugin.driver` reconnects to bluetoothd (not run here, DENY list) in a tight loop, and every try goes through launchd. The plugin is now moved to `HAL.disabled` (`tools/iosroot-tweaks.py`; on this phone, an `Info.plist` with no plug-in factories was pushed). All processes together at idle: 162% -> 45% of one core. The largest one left is CommCenter's restart loop, ~15%.
+
+| Run | Screen off, median | Timer/s | IPIs/s, screen off | Silver busy, idle |
+|---|---|---|---|---|
+| cc4 (before) | 317 mA | 1.3k | 12.4k | - |
+| dvfs1 (0200) | 241 mA | 1.3k | 6.2k | ~60% |
+| dvfs2 (0200, no BT plugin) | 211 mA | 1.3k | 0.7k | ~12% |
+
+The IPI rate (stage 4 of the battery plan) was mostly this loop. In dvfs2, Silver spends ~75% of idle time at 300 MHz and Gold ~95% at 825 MHz.
+
+**Frame timing.** The screen now locks ~40 s after boot, so the touch script presses power at SpringBoard +50 s before swiping (`work/test/smruns.sh`). Same script, one boot each: dv6 (DVFS) median 22.4 ms, p90 46.3 ms, 97 gaps over 33 ms; fx4 (`bluecpu_dvfs=0`) 22.8 / 48.7 / 95. No visible cost. After fx6 (`bluecpu_dvfs=0`, a normal boot and reboot) slot B's recovery came up without adb and waited for the Enable ADB tap, though that recovery is meant to be tap-free; seen once.
+
+**Where the remaining ~210 mA goes (screen off).** One power run per change, each against dvfs2's 211 mA:
+
+| Run | Change | Screen off, median |
+|---|---|---|
+| nogpu1 | `blueui=0` (no GPU, no GPU DDR vote, no sound) | 206 mA |
+| l3a | L3 follows the clusters (0200, `bluecpu_l3_follow=1`) | 212 mA |
+| nosnd1 | `bluesnd=0` (speaker amps and audio path off) | 212 mA |
+| notouch1 | `bluetouch=0` (touch controller never powered) | 214 mA |
+
+Wi-Fi and the modem are not started in these runs (`bluewifi` defaults to 0). The GPU idling at 257 MHz costs ~5 mA, so GPU slumber is not worth a full GPU restart path yet. L3 following is in 0200 but off by default. What is left is the SoC: cores that only WFI, clusters and L3 that never collapse, and the CX/MX/DDR rails held at active levels because the apps subsystem never enters its RPMh sleep state. 
+**Idle cores power down; the draw does not move (2026-11-23).** 0210 (`bluecpu_idle=1|2`, off by default) calls PSCI CPU_SUSPEND in place of WFI when a core's next timer is at least 2 ms away. The core wakes through XNU's own path for a core that lost its state in idle (`sweet_secondary_entry` -> `resume_idle_cpu` -> `arm_init_idle_cpu`), plus the GIC CPU interface and the timer deadline. Deadlines of cores that are down go into timer frame 0 at 0x17ca0000. Its physical timer (SPI 8, INTID 40) fires but never reaches the non-secure side, since it reads as group 0. The virtual one (SPI 6, INTID 38) works. The frame's interrupt IPIs the cores whose deadlines have passed. Firmware: PSCI 1.1, CPU_SUSPEND with extended state ids and OS-initiated mode offered; all seven frames are non-secure (CNTACR 0x3f).
+
+| Run | Change | Screen off, median | Cores powered down |
+|---|---|---|---|
+| cpus4 | `cpus=4` (Gold never started) | 210 mA | - |
+| cpus1 | `cpus=1` | 256 mA | - |
+| idle4 | `bluecpu_idle=1`: 0x40000003, core power-down | 212 mA | 63-96% of the time |
+| idle5 | `bluecpu_idle=2`: 0x400000f4 (cluster) when >= 10 ms | 212 mA | 52-101%, ~4.5k cluster requests / 10 s |
+
+No errors, no CPU_SUSPEND returns, and no hangs over 4 runs (~10 min each). The cores and the cluster are not where the ~210 mA goes. Next to look at: what ABL leaves on (the display pipeline's clocks and DSI PHY while the panel sleeps, its bandwidth votes, PMIC regulators), measured the same way.
+
+**Bus votes and a regulator census, screen off (0211, 2026-11-24).** `bluebw_park=1` sets the apps RSC's votes for MC0, SH0 and MM0-3 to Linux's keepalive (x 1, y 1) once the panel sleeps, and restores them before it wakes. Votes accepted (err 0), wake is normal, draw unchanged: bw1 208 mA. `bluecensus=15` dumps the PMICs over SPMI and the main GDSCs 15 s after the panel sleeps (census1):
+
+- PM8998 (SID 1): 18 of 28 LDOs on, all in normal (high-power) mode, at their usual voltages: L1 0.88, L2 1.2, L4 0.824, L5 0.8, L7 1.8, L9 1.808, L11 1.0, L12 1.8, L13 3.3, L14 1.88, L15 1.8, L17 1.304, L19 3.3, L20 2.96, L21 2.96, L24 3.088, L25 3.104, L26 1.2, L27 0.872, L28 3.008 V. Off: L3, L6, L8, L10, L16, L18, L22, L23. Bucks in auto mode.
+- PMI8998 (SID 3): BOB on at 3.556 V. PM8005 (SID 5): all four bucks on (the GFX rail at 0.752 V).
+- GDSCs powered: ufs_phy, ufs_card (no card slot on this phone), usb30_prim (the test cable), all seven MMU TBU votes, dispcc mdss, gpucc cx and gx. Off: pcie_0, pcie_1, usb30_sec.
+
+Nothing left on here explains ~200 mA. An LDO's own loss in normal mode is well under a milliamp, and the GPU (gx on) was already measured at ~5 mA (nogpu1). What the census can't show is CX/MX/DDR. The apps RSC only drops its votes when the subsystem goes to sleep, and its sleep and wake command sets are never written. ABL's active votes therefore hold the SoC rails and the DDR at active levels, whatever the cores do. Next: write RSC sleep/wake sets (as Linux's `rpmh_flush`) with keepalive BCM votes and retention ARC levels, then check whether the last core's cluster request ever reaches the AOSS.
+
+**OS-initiated cluster idle, RSC sleep sets and a timer census (0212, 0213, 2026-11-24).** 0212 (`bluecpu_idle=3`) switches PSCI to OS-initiated mode with Linux's sdm845 idle states. The last core down asks for the cluster state (0x4100c244) and puts the next deadline in the apps RSC's CONTROL TCS. `bluetimers=1` counts the timers that fire, screen off:
+
+| Source | per second |
+|---|---|
+| ADSP GLINK receive thread, 1 ms poll (0187) | 864 |
+| keys thread, `delay(1)` in SPMI reads | 142 |
+| `serial_keyboard_poll` | 56 |
+| an `IOTimerEventSource` | 54 |
+| CPU governor (20 ms) | 46 |
+| all | 1279 |
+
+0213 puts the GLINK thread on its interrupt (SPI 156, 200 ms fallback; `bluesnd_glink_irq=0` polls) and makes the key reads spin for the microsecond. Timers go 1279 → 293 a second, and the whole APSS is collapsed 6-8 s of every 10 (~300 cluster entries per 10 s). Sound still works. Draw: 199-201 mA before, 196-200 after.
+
+`bluecpu_idle_ss` writes the apps RSC's sleep/wake sets as `rpmh_flush`: MC0, SH0, MM0-3 at 0, xo.lvl 0, cx.lvl/mx.lvl at their lowest level. With the panel on this hung the phone within ~25 s. It is armed only while the panel sleeps, with no cluster entry during UFS commands, and is then stable. Draw with each set: 209 (BCMs), 213 (+XO), 216 mA (+CX/MX). The AOP's own counters (AOSD, CXSD) stay at 0: the SoC never reaches system sleep.
+
+Elimination, screen off, all with 0212/0213:
+
+| Run | Off | mA |
+|---|---|---|
+| ss5 | nothing | 216 |
+| nogpu | GPU (`bluegpu=0`, CPU presents) | 209 |
+| bare | GPU, Wi-Fi/modem, sound/ADSP | 197 |
+
+DVFS already holds silver at 300 MHz (76% of the time) and gold at 825 MHz. For scale, LineageOS recovery on the same rig is 256 mA at WFI only and 176 mA with its LPM levels on, panel on at brightness 0.
+
+So ~200 mA is close to this SoC's floor without system sleep. On this rig the cable stays in (input suspended), USB stays up, and Android would not reach CXSD either. The next real step is a suspend path: every DRV voting down so the AOP reaches AOSD/CXSD. Measuring it means taking USB off the bus.
+
+## 2026-11-24: Metal stage 1, the translator and Turnip on the Mac
+
+Plan (route A): Metal frontend (AdrenoMetal, MIT, adapted to iOS 16) -> metal2vulkan (Rust, translates AIR to SPIR-V) -> Turnip (Mesa's Adreno Vulkan driver) on its msm backend -> bluedrm -> the existing BlueGPU user client. No new kernel ABI. Route B, UniXNU's darwin KMD and the NativeAdreno ABI in our kernel, is the fallback.
+
+**Translator.** The stock iOS 16.7 metallibs from the IPSW, through metal2vulkan's CLI with a generic vertex descriptor and, for fragments, every vertex function tried in turn:
+
+| Library | Functions | SPIR-V written | Failed |
+|---|---|---|---|
+| QuartzCore | 102 | 98 | 4 (`tile_downsample_*`, `IdentityDomains`) |
+| RenderBox | 29 | 29 | 0 |
+| CoreImage | 58 | 58 | 0 |
+
+**Turnip.** Mesa 26.3.1 patch 0006 (`gpu/mesa-ios/patches/`), built with `VK=1 ./build-mesa-ios.sh`. Results:
+
+- `out/bluevk.dylib` for iOS: 15.5 MB, minos 16.0, imports only from libSystem, libc++, IOKit and libz.
+- On the Mac, linked with the fake BlueGPU, `vk-smoke` runs the whole path with 0 ABI errors: instance, device "Turnip Adreno (TM) 630" (Vulkan 1.3), buffer, map, `vkCmdFillBuffer`, one submit (73 PM4 packets), fence wait.
+
+| Hit | Fix |
+|---|---|
+| `xf86drm.h`, `pthread_condattr_setclock`, DRM WSI | meson guard on Darwin. The condvar uses `CLOCK_REALTIME` (only kgsl waits on it). WSI off |
+| Undefined `wsi_*`, `vk_cmd_enqueue_*` at link | Weak entrypoint-table symbols: `-undefined dynamic_lookup` (as UniXNU). It hid that `bluedrm.c` was not linked, so it is now compiled into Turnip |
+| No device | Darwin enumeration: `drmOpenWithType("msm")` instead of `/dev/dri` |
+| `brk` in `vk_drm_syncobj_get_type` | The sync provider was a NULL stub without `HAVE_LIBDRM`. bluedrm's emulated syncobjs now back it |
+| "Failed to create VM_BIND queue" | SET_PARAM accepted every param, so `EN_VM_BIND` looked enabled. The fake and kernel (0153) now accept only SYSPROF, COMM and CMDLINE |
+| `MSM_INFO_SET_IOVA failed` | Turnip allocates IOVAs itself once VA_START/VA_SIZE exist. BlueGPU has one shared VA space with kernel-chosen IOVAs, so `has_set_iova` is false on Darwin |
+
+**A630 profile.** `gpu/metal/turnip-a630.json` is a metal2vulkan device profile from `vulkaninfo --json` and `corpus-vulkan --capture-formats`. Both were captured on the Mac through the Vulkan loader against the host Turnip, which is the same build and chip ID as the phone's. With it, QuartzCore translates 96 of 102 functions, RenderBox 29/29 and CoreImage 58/58. The two new failures are `inplace_copy_lp{f,h}`: raster order groups need `fragmentShaderPixelInterlock`, which Turnip doesn't offer on the A630.
+
+Next:
+
+1. ~~`vk-smoke` on the phone~~: done, below.
+2. Draw one translated QuartzCore pipeline through Turnip on the phone.
+3. The frontend.
+
+## 2026-11-24: Turnip on the phone
+
+`vk-smoke` (`gpu/mesa-ios/test/`) on the phone, with `bluevk.dylib` at `/usr/lib` and no Vulkan loader. It creates an instance, a device and a 64 KiB host-visible buffer, then submits one `vkCmdFillBuffer` and waits on a fence:
+
+```
+vk-smoke: device "Turnip Adreno (TM) 630", Vulkan 1.3.363, driver 0x6803001, max image 2D 16384
+vk-smoke: FILL ok: 16384 of 16384 words = 0xb10e0630 (first 0xb10e0630, last 0xb10e0630)
+vk-smoke: all calls succeeded
+BLUERUN: exit 0 after 1.19 s
+```
+
+This is the first GPU work on the phone that does not come from gallium freedreno. Three runs (`work/test/vk1..3.txt`):
+
+| Run | Result | Cause | Fix (bluedrm.c) |
+|---|---|---|---|
+| vk1 | `vkWaitForFences` -> -13 (VK_ERROR_UNKNOWN) | `drmSyncobj*` returned -errno; libdrm returns -1 and sets errno, and Mesa checks `errno == ETIME` | -1 plus errno at the public entry points |
+| vk1 | (also) | Mesa's absolute deadlines are on `CLOCK_MONOTONIC` (c11 `TIME_MONOTONIC`); the kernel's on `CLOCK_MONOTONIC_RAW` | move the deadline across clocks (`to_kernel_deadline`) |
+| vk2 | `vkWaitForFences` -> 2 (VK_TIMEOUT) | `WAIT_FENCE` was always sent with queue 0. Turnip submits on its own queue (1), and the kernel rejects a fence never issued on the given queue (as Linux) | keep the queue with each pending fence |
+| vk3 | FILL ok | | |
+
+The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so the host test (`VK=1 HOST=1 ./build-mesa-ios.sh`) catches it. `BLUEDRM_DEBUG=1` now also logs each submit's queue and fence.
+
+Next: draw one translated QuartzCore pipeline through Turnip on the phone.
+
+## 2026-11-24: a translated QuartzCore pipeline draws on the phone
+
+`vk-draw` (`gpu/mesa-ios/test/`) draws QuartzCore's `stroke_line_vert_lpf` + `stroke_line_frag_lpf` (iOS 16.7 `default.metallib`) through Turnip. metal2vulkan translates them for the `turnip-a630` profile (`gpu/metal/qc-spv.sh`; the `.spv` files are derived from Apple's shaders and stay out of git). The pipeline strokes a polyline with antialiased edges, one instance per segment. Its interface (`--emit-meta`): no descriptor sets, and 64 bytes of vertex push constants holding Metal buffer slots as device addresses less 2^31 (points, a transform, the style), plus a zero buffer for out-of-bounds loads and slot 0's bounds.
+
+The test strokes a square and a diagonal (premultiplied orange, half width 4 px) into a 256x256 B8G8R8A8 target and reads it back (`work/test/draw1`):
+
+```
+BLUERUN: vk-draw: device "Turnip Adreno (TM) 630", Vulkan 1.3.363
+BLUERUN: vk-draw: pipeline stroke_line_vert_lpf + stroke_line_frag_lpf created
+BLUERUN: vk-draw: (128, 48) ffff8000 ok   top edge, centre of the stroke
+BLUERUN: vk-draw: (128,128) ffff8000 ok   diagonal, centre
+BLUERUN: vk-draw: 6770 lit pixels, 5174 full orange, hash 98f3a750374e0000
+BLUERUN: vk-draw: DRAW ok
+BLUERUN: exit 0 after 1.48 s
+```
+
+MoltenVK on the Mac (the reference: `vk-draw libMoltenVK.dylib ...` with `VK_DRAW_PORTABILITY=1`) gives the same counts, 6770 lit and 5174 full. Only the hash differs, so the difference is in edge antialiasing rounding. It worked on the first run.
+
+Not every QuartzCore pipeline is this simple. The layer compositor's `fixed_frag_lph_cpf`, translated without its function constants, has no inputs and no colour output. The constants probably select its paths (not checked yet), so the compositor would need the values CoreAnimation sets. Next: find those values for one compositor pipeline, then the Metal frontend.
+
+## 2026-11-24: a self-signed app installs and runs
+
+![Hello.app on the phone](screenshots/2026-11-24-hello-app.png)
+
+`Hello.app` (`tools/apps/hello`, ad-hoc signed, bundle ID `dev.blueline.hello`) installs through installd into the user domain. LaunchServices registers it with bundle and data containers, FrontBoard launches it, and it writes `Documents/hello.txt` (`work/test/app14`):
+
+```
+BLUERUN: APPTEST: hello.txt (attempt 1, 1 s): hello from dev.blueline.hello, pid 257
+BLUERUN: APPTEST: PASS
+```
+
+Boot with `blueapps=1` (kernel 0214). Test with `apptest /private/var/tmp/Hello.app dev.blueline.hello 3` (`tools/bluerun`).
+
+What it took (`work/test/app1..14`):
+
+| Step | Error | Fix |
+|---|---|---|
+| installd verifies the signature | `0xe8008014` invalid signature | `bluemis.dylib` in installd. AppSync Unified's approach (GPL-3), our own code (MIT) |
+| | the hook never ran | `MICodeSigningVerifier` (InstalledContentLibrary) calls `MISValidateSignatureAndCopyInfo`, a libmis wrapper that jumps straight to `...WithProgress`. dyld interposing does not reach calls inside the shared cache. bluemis patches the WithProgress entry in place, with the prologue moved to a trampoline page in its own `__TEXT` (`VM_PROT_COPY`) |
+| | installd crashed (SIGBUS) | the first trampoline shared a page with the code that was writing it; RW took away execute. It now has its own 16 KiB section |
+| signer identity | "Failed to extract signer identity" | `SignerCertificate`: Apple's public 2008 "Apple iPhone OS Application Signing" certificate (parses, so no Security hooks) |
+| install type | "System app install missing system app entitlement" | `miinstall` asked for a system install. Domain 3 (UserPrivate) with PackageType Developer, as Xcode |
+| launch | SpringBoard: "invalid code signature, inadequate entitlements or its profile has not been explicitly trusted" | bluemis in SpringBoard: `-[FBSSignatureValidationService trustStateForApplication:]` returns 8 (trusted) when it said otherwise (it said 1) |
+| boot-args | `sweetenv` takes one process | 0990: several `NAME[\|NAME]:VARS` entries. It changes sailfish 0104's code, so 0990-0999 now apply after the sailfish patches (build-xnu, CI) |
+| | 628 bytes, over the 607 limit | 0214: `blueapps=1` stands for the 186-byte `sweetenv` |
+
+Open: installing again over an installed copy fails ("Failed to make staged container live"); IPA files; launching from the home screen icon.

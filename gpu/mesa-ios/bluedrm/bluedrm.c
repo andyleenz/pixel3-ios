@@ -458,7 +458,7 @@ struct syncobj {
 	bool used;
 	uint64_t reached;
 	unsigned pending;
-	struct { uint64_t point; uint32_t fence; } on_the_way[PENDING];
+	struct { uint64_t point; uint32_t fence, queue; } on_the_way[PENDING]; /* queue: WAIT_FENCE checks fence <= queue's last */
 };
 static struct syncobj syncobjs[SYNCOBJS];
 static pthread_mutex_t syncobj_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -479,11 +479,27 @@ now_ns(void)
 	return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
+/* Callers' absolute syncobj deadlines are on Mesa's clock (os_time_get_nano: TIME_MONOTONIC = CLOCK_MONOTONIC),
+ * which on Darwin is not CLOCK_MONOTONIC_RAW. Move one onto the kernel's clock. */
+static int64_t
+to_kernel_deadline(int64_t deadline)
+{
+	struct timespec t;
+	int64_t mesa_now, left;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);   /* = Mesa TIME_MONOTONIC (c11/impl/time.c) */
+	mesa_now = (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+	left = deadline - mesa_now;
+	if (deadline > INT64_MAX / 2 || left > INT64_MAX / 4)
+		return INT64_MAX;               /* "forever" */
+	return now_ns() + left;
+}
+
 /* whether the kernel retired FENCE, waiting until DEADLINE (absolute ns; 0 = poll) */
 static bool
-fence_done(uint32_t fence, int64_t deadline)
+fence_done(uint32_t fence, uint32_t queue, int64_t deadline)
 {
-	struct drm_msm_wait_fence wait = { .fence = fence, .queueid = 0 };
+	struct drm_msm_wait_fence wait = { .fence = fence, .queueid = queue };
 
 	wait.timeout.tv_sec = deadline / 1000000000;
 	wait.timeout.tv_nsec = deadline % 1000000000;
@@ -496,7 +512,7 @@ syncobj_poll(struct syncobj *s)
 	unsigned kept = 0;
 
 	for (unsigned i = 0; i < s->pending; i++) {
-		if (fence_done(s->on_the_way[i].fence, 0)) {
+		if (fence_done(s->on_the_way[i].fence, s->on_the_way[i].queue, 0)) {
 			if (s->on_the_way[i].point > s->reached)
 				s->reached = s->on_the_way[i].point;
 		} else {
@@ -507,12 +523,12 @@ syncobj_poll(struct syncobj *s)
 }
 
 static void
-syncobj_add(struct syncobj *s, uint64_t point, uint32_t fence)
+syncobj_add(struct syncobj *s, uint64_t point, uint32_t fence, uint32_t queue)
 {
 	if (s->pending == PENDING)
 		syncobj_poll(s);
 	if (s->pending == PENDING) {
-		fence_done(s->on_the_way[0].fence, now_ns() + 10000000000LL);
+		fence_done(s->on_the_way[0].fence, s->on_the_way[0].queue, now_ns() + 10000000000LL);
 		if (s->on_the_way[0].point > s->reached)
 			s->reached = s->on_the_way[0].point;
 		memmove(&s->on_the_way[0], &s->on_the_way[1], (PENDING - 1) * sizeof(s->on_the_way[0]));
@@ -520,6 +536,7 @@ syncobj_add(struct syncobj *s, uint64_t point, uint32_t fence)
 	}
 	s->on_the_way[s->pending].point = point;
 	s->on_the_way[s->pending].fence = fence;
+	s->on_the_way[s->pending].queue = queue;
 	s->pending++;
 }
 
@@ -540,7 +557,7 @@ drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 	}
 	pthread_mutex_unlock(&syncobj_lock);
 	errno = ENOMEM;
-	return -ENOMEM;
+	return -1;
 }
 
 int
@@ -615,17 +632,17 @@ drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count)
 	return drmSyncobjQuery2(fd, handles, points, count, 0);
 }
 
-int
-drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline,
-                       unsigned flags, uint32_t *first)
+/* deadline on the kernel clock; returns 0 or -errno */
+static int
+timeline_wait(uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline, unsigned flags,
+              uint32_t *first)
 {
 	const bool all = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
 
-	(void)fd;
 	pthread_mutex_lock(&syncobj_lock);
 	for (;;) {
 		unsigned reached = 0, unknown = 0;
-		uint32_t wait_fence = 0;
+		uint32_t wait_fence = 0, wait_queue = 0;
 		bool have_fence = false;
 
 		for (unsigned i = 0; i < count; i++) {
@@ -642,7 +659,8 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned cou
 				if (s->on_the_way[k].point >= point) {
 					on_the_way = true;
 					if (!have_fence || (int32_t)(s->on_the_way[k].fence - wait_fence) < 0)
-						wait_fence = s->on_the_way[k].fence;
+						wait_fence = s->on_the_way[k].fence,
+						wait_queue = s->on_the_way[k].queue;
 					have_fence = true;
 					break;
 				}
@@ -673,7 +691,7 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned cou
 			break;
 		if (have_fence && unknown == 0) {
 			pthread_mutex_unlock(&syncobj_lock);
-			fence_done(wait_fence, deadline);
+			fence_done(wait_fence, wait_queue, deadline);
 			pthread_mutex_lock(&syncobj_lock);
 		} else {
 			/* a point not submitted yet: wait for a submit/signal, 1 ms steps (realtime cond clock) */
@@ -691,6 +709,21 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned cou
 	}
 	pthread_mutex_unlock(&syncobj_lock);
 	return -ETIME;
+}
+
+/* libdrm convention: -1 with errno set (Mesa's vk_drm_syncobj tests errno == ETIME) */
+int
+drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline,
+                       unsigned flags, uint32_t *first)
+{
+	int r;
+
+	(void)fd;
+	r = timeline_wait(handles, points, count, to_kernel_deadline(deadline), flags, first);
+	if (r == 0)
+		return 0;
+	errno = -r;
+	return -1;
 }
 
 int
@@ -712,7 +745,8 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 	s = syncobj_of(src);
 	if (d == NULL || s == NULL) {
 		pthread_mutex_unlock(&syncobj_lock);
-		return -EINVAL;
+		errno = EINVAL;
+		return -1;
 	}
 	syncobj_poll(s);
 	if (dst_point == 0)
@@ -723,7 +757,7 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 	} else {
 		for (unsigned k = 0; k < s->pending; k++) {
 			if (s->on_the_way[k].point >= want) {
-				syncobj_add(d, to, s->on_the_way[k].fence);
+				syncobj_add(d, to, s->on_the_way[k].fence, s->on_the_way[k].queue);
 				break;
 			}
 		}
@@ -733,7 +767,7 @@ drmSyncobjTransfer(int fd, uint32_t dst, uint64_t dst_point, uint32_t src, uint6
 	return 0;
 }
 
-static uint32_t last_fence;
+static uint32_t last_fence, last_queue; /* last_queue: queue of last_fence (WAIT_FENCE is per queue) */
 
 static int
 submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
@@ -743,14 +777,15 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 	const uint32_t stride = submit->syncobj_stride ? submit->syncobj_stride : sizeof(*in);
 	const uint32_t nin = (submit->flags & MSM_SUBMIT_SYNCOBJ_IN) ? submit->nr_in_syncobjs : 0;
 	const uint32_t nout = (submit->flags & MSM_SUBMIT_SYNCOBJ_OUT) ? submit->nr_out_syncobjs : 0;
+	uint32_t queue;
 	int error;
 
 	for (uint32_t i = 0; i < nin; i++) {
 		const struct drm_msm_syncobj *x = (const void *)((const uint8_t *)in + i * stride);
 		uint32_t h = x->handle;
 		uint64_t p = x->point;
-		int r = drmSyncobjTimelineWait(0, &h, &p, 1, now_ns() + 10000000000LL,
-		                               DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+		int r = timeline_wait(&h, &p, 1, now_ns() + 10000000000LL,
+		                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
 		if (r != 0)
 			return r;
 		if (x->flags & MSM_SYNCOBJ_RESET)
@@ -762,6 +797,7 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 	if (submit->nr_cmds == 0) {
 		/* nothing for the GPU: done when everything before it is (one ring) */
 		submit->fence = __atomic_load_n(&last_fence, __ATOMIC_ACQUIRE);
+		queue = __atomic_load_n(&last_queue, __ATOMIC_RELAXED);
 	} else {
 		struct drm_msm_gem_submit_bo *bos = (void *)(uintptr_t)submit->bos;
 		if (owns != 0 && getenv("BLUEDRM_SYNC_ALL") == NULL)
@@ -773,7 +809,11 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 			errno = error;
 			return -error;
 		}
+		queue = submit->queueid;
+		__atomic_store_n(&last_queue, queue, __ATOMIC_RELAXED);
 		__atomic_store_n(&last_fence, submit->fence, __ATOMIC_RELEASE);
+		TRACE("submit queue %u: %u IB(s), %u BO(s) -> fence %u (%u syncobj in, %u out)\n", submit->queueid,
+		      submit->nr_cmds, submit->nr_bos, submit->fence, nin, nout);
 	}
 	pthread_mutex_lock(&syncobj_lock);
 	for (uint32_t i = 0; i < nout; i++) {
@@ -783,7 +823,7 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 			continue;
 		if (x->point == 0)
 			s->reached = 0, s->pending = 0;
-		syncobj_add(s, x->point != 0 ? x->point : 1, submit->fence);
+		syncobj_add(s, x->point != 0 ? x->point : 1, submit->fence, queue);
 	}
 	pthread_cond_broadcast(&syncobj_submitted);
 	pthread_mutex_unlock(&syncobj_lock);

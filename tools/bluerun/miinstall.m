@@ -5,7 +5,7 @@
  *
  *   miinstall DOMAIN /private/var/tmp/Calculator.app ...
  *
- * DOMAIN is installd's installation domain (1 = system). Prints installd's
+ * DOMAIN is installd's installation domain (1 = system; otherwise a user app, as Xcode, e.g. 3). Prints installd's
  * result or error for each bundle. Needs the entitlement in miinstall.ent:
  *
  *   xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall \
@@ -56,14 +56,20 @@ main(int argc, char **argv)
 			    [url URLByAppendingPathComponent:@"Info.plist"]];
 			NSString *bid = info[@"CFBundleIdentifier"];
 			id identity = [[NSClassFromString(@"MIAppIdentity") alloc] initWithBundleID:bid];
-			/* PackageType System sets the install target type, which
-			 * installd needs to accept a bundle id for a directory install */
+			/* Domain 1: a system app (PackageType System sets the install target
+			 * type, which installd needs to accept a bundle id for a directory
+			 * install). Otherwise a user app, as Xcode installs one: PackageType
+			 * Developer, no system flags (installd refuses a system install
+			 * without the system-app entitlement). */
+			const BOOL sys = domain == 1;
 			MIInstallOptions *o = [[NSClassFromString(@"MIInstallOptions") alloc]
-			    initWithLegacyOptionsDictionary:@{ @"PackageType" : @"System",
+			    initWithLegacyOptionsDictionary:@{ @"PackageType" : sys ? @"System" : @"Developer",
 				@"CFBundleIdentifier" : bid }];
 			[o setBundleIdentifier:bid];
-			[o setSystemAppInstall:YES];
-			[o setInstallForMigrator:YES];
+			if (sys) {
+				[o setSystemAppInstall:YES];
+				[o setInstallForMigrator:YES];
+			}
 			NSDate *t0 = [NSDate date];
 			dispatch_semaphore_t done = dispatch_semaphore_create(0);
 			MIInstallerClient *c = [NSClassFromString(@"MIInstallerClient")

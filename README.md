@@ -26,6 +26,11 @@
 - **USB live channel.** With `sweetusb=2` the phone is a USB network adapter: the kernel log streams to the
   Mac live, and `tools/bluesh.py` runs programs and swaps files on the running phone (a userland change takes
   seconds instead of a reboot).
+- **Self-signed apps install and run.** An ad-hoc signed app installs through Apple's installd and
+  launches from FrontBoard (boot with `blueapps=1`; `tools/apps/bluemis`). App Store apps stay out of reach
+  (FairPlay needs a real Secure Enclave).
+- **Vulkan on the Adreno 630.** Mesa's Turnip runs on the phone over our kernel GPU driver, and a QuartzCore
+  Metal shader translated to SPIR-V (metal2vulkan) draws through it: the first step towards Metal.
 - The UI is drawn by the Adreno 630 at about 60 fps (the default; `blueui=0` falls back to the CPU). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
@@ -49,7 +54,7 @@ partition.
 > anything personal on it. No Apple software is stored in this repository: the iOS root is built on your own
 > Mac from Apple's IPSW. Not affiliated with or endorsed by Apple or Google.
 
-## What works (2026-11-20)
+## What works (2026-11-24)
 
 | Area | State |
 | --- | --- |
@@ -57,8 +62,9 @@ partition.
 | CPU | All 8 cores (4x Kryo 385 Silver at 1.77 GHz, 4x Gold at 2.65 GHz), PSCI |
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
 | Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X 1125 pixels wide at the panel's 2:1 (1125x2250, scaled by 0.96 to fill the panel; 0184), with the X's status bar (why it was a red bar: [docs/ios16-red-status-bar.md](docs/ios16-red-status-bar.md)). By default the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; with `blueui=0`, a CPU copy at 30 Hz. Brightness works |
-| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames |
+| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames. Vulkan 1.3 through Mesa Turnip (`gpu/mesa-ios`, `VK=1`): GPU work and a translated QuartzCore pipeline run on the phone (`vk-smoke`, `vk-draw`); nothing in iOS uses it yet |
 | iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. the App Library and Control Center blurs, Control Center's glyphs and brightness slider. Photos crashes (no photo library yet), and parts of Control Center blink while it animates |
+| Apps | Self-signed (ad-hoc) apps install through installd into the user domain and launch through FrontBoard (`blueapps=1`, `tools/apps/bluemis`, test: `tools/bluerun` `apptest`). Reinstalling over an installed copy and IPA files don't work yet |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
 | Buttons | Power, volume up and down (SPMI PMIC) |
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
@@ -69,7 +75,7 @@ partition.
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
 
-**Not working yet:** Metal, 5 GHz Wi-Fi, microphone, the camera in iOS, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal (Vulkan works; the Metal frontend is not written), 5 GHz Wi-Fi, microphone, the camera in iOS, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
@@ -87,23 +93,38 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   from Control Center without a stall.
 
 **In progress: battery life**
-- Measured (0197, on battery with the cable in): ~530 mA with the screen off, ~850 mA on (3.5-5.5 h).
-  CPUs at fixed top clocks (~70 mA), the GPU always up at 710 MHz (~195 mA), and cores that only WFI
-  (no power collapse, so the SoC rails never drop). Next: CPU DVFS, GPU idle/slumber, the IPI rate,
-  then PSCI CPU_SUSPEND. Then a flashed standalone boot (slot A) and a soak test.
+- Measured (0197, on battery with the cable in; `tools/pwr.sh`): GPU clock following the load (0198),
+  CommCenter back so the screen locks itself, CPU clocks following the load (0200) and the Bluetooth
+  audio plugin out of mediaserverd (it was looping on the missing bluetoothd, ~1.2 cores at idle):
+  ~210 mA with the screen off, down from ~530 mA. ~700 IPIs a second with the screen off, down from
+  12-17k. Idle cores can power down with PSCI CPU_SUSPEND (0210, `bluecpu_idle=1`), but that, the
+  GPU, the L3 clock, sound and touch each change the screen-off draw by under 5 mA. OS-initiated
+  cluster idle and the RSC sleep sets (0212) and fewer wakeups (0213, 1279 → 293 timers a second) put
+  the whole APSS down 6-8 s of every 10, but the draw stays ~200 mA. The AOP never reaches system
+  sleep (AOSD/CXSD 0), and GPU, Wi-Fi and sound off save only ~15 mA together. LineageOS recovery on
+  the same rig: 176 mA. Next: a flashed standalone boot (slot A) and a soak test. Later: a suspend
+  path (all subsystems voting down, USB off the bus). Still: CommCenter restarting every ~17 s.
 
 **Parked: camera**
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.
 
-**Next**
-- Photos: find out why it sees no photo library (assetsd never starts).
-- GPU memory: a larger BO pool than 32 MiB, and a 4th scanout buffer.
-- Widgets ("Waiting..."), GPU clock scaling (DCVS).
+**Next, in order**
+1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
+   translated to SPIR-V by metal2vulkan. QuartzCore's stroke_line pipeline, translated, draws through
+   Turnip on the phone (`vk-draw`, 2026-11-24). Next: the layer compositor (`fixed_*`), then the frontend.
+2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
+   with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
+   better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their
+   keys live in a real SEP).
+3. Wi-Fi (5 GHz, joins on every boot), Photos (assetsd never starts), widgets ("Waiting..."),
+   GPU memory (a BO pool over 32 MiB, a 4th scanout buffer).
+4. Microphone and sensors.
+5. Cellular data (eSIM later).
+6. Bluetooth.
 
 **Later**
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
-- Metal: a much larger project (no Apple GPU driver to stand on).
 
 **Why iOS 16:** every iOS for newer iPhones is built for arm64e, which uses ARMv8.3 pointer authentication.
 The Pixel 3's cores are ARMv8.2 and have none, so iOS 16 for the iPhone X (plain arm64) is the newest *iPhone*
