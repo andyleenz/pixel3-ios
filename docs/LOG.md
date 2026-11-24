@@ -1165,7 +1165,7 @@ Every Metal command buffer took 40-60 ms, even an empty clear. `ca-draw -bench` 
 
 Pixels are unchanged: `cab10` reports DRAW ok with the same hash, and `cab10s` (IOSurface) differs in 0 of 256 rows. Frames into an IOSurface still cost 32 ms: the kernel cleans and invalidates a surface the GPU writes at every submit (10 MiB here). That is next.
 
-The first backboardd boot on Metal with 0216 (`bbm4`, `bluesnap=sb+10,sb+25,sb+35`) never came back: the phone left USB and did not reach recovery in 30 min, and no log was captured. It is a hang with no panic. Under investigation.
+backboardd on Metal with 0216 (`bbm4`) boots normally. The run was missing `bluereboot=`, so the phone stayed in iOS; it did not hang. BG_SYS pages hold at 256-320 MiB with BOs being freed (no leak), and no submit cleans own BOs. Commit-to-complete is 113 ms on average, down from about 256 ms. The frontend's histogram puts most frames at 64-256 ms of GPU time, so backboardd is now limited by GPU work, not by submits. At SpringBoard +35 s the lock screen shows the status bar, the camera button and the home bar, but no wallpaper or clock, and blue lines cross it.
 
 ## 2026-11-24: backboardd composites through Metal (first light)
 
