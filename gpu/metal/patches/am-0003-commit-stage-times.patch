@@ -1,0 +1,53 @@
+NATIVE_METAL_STAGES=1: per commit, where the time from commit to completion goes (the wait for the encoding
+thread, the surface flush, the runtime's commit, its scheduling, the GPU), to standard error at completion for
+the first 400 render commits. pixel3-ios: backboardd frame time.
+
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -257,7 +257,19 @@
+  }
+ }
+ // Types 14/15 persist CPU-side phases beside runtime stages in frames.trace.
++// NATIVE_METAL_STAGES=1 (pixel3-ios): each commit's stage times (2 commit, 3 on the encoding thread, 5 surfaces flushed, 7 the runtime's
++// commit returned, 8 scheduled, 9 completed), printed at completion for the first 400 commits of at least 2 Mpx or a render pass.
++static bool stagesOn() {static const bool on=getenv("NATIVE_METAL_STAGES")!=nullptr;return on;}
++static uint64_t gStageUs[64][10];
++static uint64_t gStageFlushed[64];
++static void stageNote(uint64_t commit,uint32_t phase,uint64_t bytes=0) {
++ if(!commit || phase>9)return;
++ struct timespec ts;clock_gettime(CLOCK_UPTIME_RAW,&ts);
++ gStageUs[commit%64][phase]=(uint64_t)ts.tv_sec*1000000ull+(uint64_t)ts.tv_nsec/1000;
++ if(phase==5)gStageFlushed[commit%64]=bytes;
++}
+ static void frontStage(uint64_t command,uint64_t commit,uint32_t phase,uint64_t bytes=0,uint32_t surfaces=0) {
++ if(stagesOn())stageNote(commit,phase,bytes);
+  if(!diagOn())return;
+  uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
+  TraceRec rec={};rec.type=15;rec.t0=nowUs();rec.t1=command;rec.t2=commit;rec.t3=tEncodeBatchId;
+@@ -3600,6 +3612,7 @@
+ - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
+ // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
+ - (void)didSchedule {
++ if(stagesOn())stageNote(self.commitIndex,8);
+  {
+   const uint64_t took=nowUs()-self.committedUs;
+   std::lock_guard<std::mutex> lock(gCommitLock);
+@@ -3802,6 +3815,18 @@
+ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
++ if(stagesOn()) {
++  NBCommandBuffer *b=(__bridge NBCommandBuffer *)context;
++  const uint32_t k=b.commitIndex;stageNote(k,9);
++  static std::atomic<unsigned> printed{0};
++  if((b->encodedWork.passes || b->encodedWork.pixels>=2000000) && printed.fetch_add(1)<400) {
++   const uint64_t *t=gStageUs[k%64];
++   auto d=[&](int a,int z)->long long{return t[a]&&t[z]?(long long)(t[z]-t[a]):-1;};
++   fprintf(stderr,"nmb-stage K%u rp%u dr%u kpx%llu q%lld flush%lld(%lluK) rt%lld sched%lld gpu%lld total%lld\n",k,b->encodedWork.passes,
++    b->encodedWork.draws,(unsigned long long)(b->encodedWork.pixels>>10),d(2,3),d(4,5),(unsigned long long)(gStageFlushed[k%64]>>10),d(6,7),d(7,8),
++    d(8,9),d(2,9));
++  }
++ }
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+  if(iconMetalTrace() && !commandBuffer.failedLocally &&

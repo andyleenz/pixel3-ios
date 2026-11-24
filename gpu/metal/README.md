@@ -22,6 +22,7 @@ Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/m
 | `patches/m2v-0001-*` | metal2vulkan runtime: `read_pages` fallback on iOS |
 | `patches/am-0001-*` | AdrenoMetal frontend: accept iOS 16's `_MTLDevice` (528 bytes; held to iPadOS 17's 536) |
 | `patches/am-0002-*` | Debug: `NATIVE_METAL_ART=1` prints one-byte textures over buffers as text art of their bytes, and textures at rows off 64 bytes |
+| `patches/am-0003-*` | Debug: `NATIVE_METAL_STAGES=1` prints each render commit's stage times (encoding thread, runtime commit, scheduling, GPU) |
 | `m2vbatch.py` | translates every function of a metallib: `M2V_PROFILE=turnip-a630 python3 m2vbatch.py SCRATCH LIB TAG` |
 
 The captures come from the Mac: the host build of the same Turnip (`VK=1 HOST=1`) over the fake BlueGPU,

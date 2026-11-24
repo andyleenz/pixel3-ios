@@ -845,6 +845,20 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: where backboardd's Metal frame time goes (am-0003)
+
+`NATIVE_METAL_STAGES=1` (am-0003) prints each render commit's stages at completion. `bbm11`, 48 commits (boot to lock screen):
+
+| Stage | Median | p90 |
+| --- | --- | --- |
+| commit to the encoding thread's submit (`q`) | 12 ms (17 ms with 20+ draws) | 53 ms |
+| runtime commit (`rt`) | 0 ms | 7 ms |
+| runtime commit to scheduled | 0 ms | 9 ms |
+| scheduled to completed (GPU) | 14 ms (15 ms with 20+ draws) | 29 ms |
+| total | 31 ms | 115 ms |
+
+Surface flushes take 10-70 us. The time is split between the encoding thread (encoders are replayed there after `commit`, so `q` is this frame's Vulkan recording plus any backlog) and the GPU (15 ms for 5.5 Mpx of 4 passes; every pass renders in sysmem, `SA big 77 whole 77`, `tile pipelines 0`). 157 copies, 11 shadowed textures. Next: profile the encoding thread; GMEM for the IOSurface targets.
+
 ## 2026-11-24: lock screen correct on Metal (Mesa 0009, 0005 GL-only)
 
 ![lock screen, backboardd on Metal](screenshots/2026-11-24-lockscreen-metal.png)
