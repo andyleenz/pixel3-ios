@@ -239,7 +239,7 @@ var t='dark';try{t=localStorage.getItem('p3theme')||t}catch(e){}document.documen
 <h2 id="roadmap">Roadmap</h2>
 <p class="sub">In order. Battery first: a flashed standalone boot and a soak test.</p>
 <ol class="sub">
- <li><b>Metal</b>: a Metal frontend over Mesa's Turnip Vulkan driver, Apple's shader IR translated to SPIR-V. MTLCreateSystemDefaultDevice already returns the A630, and CoreAnimation's Metal compositor renders through it, and backboardd draws the lock screen with it correctly. A kernel fix cut a frame from 60-110 ms to 4-6 ms, and IOSurface targets now render in place. Next: the UI on Metal at full speed.</li>
+ <li><b>Metal</b>: a Metal frontend over Mesa's Turnip Vulkan driver, Apple's shader IR translated to SPIR-V. MTLCreateSystemDefaultDevice already returns the A630, and CoreAnimation's Metal compositor renders through it, and backboardd draws the lock screen with it correctly. A kernel fix cut a frame from 60-110 ms to 4-6 ms, and IOSurface targets now render in place. Next: Metal on by default for apps (games, Maps, WebGL need it); the UI stays composited on GL until Metal is faster.</li>
  <li><b>Installing apps</b>: self-signed apps now install through installd and launch (a test app, 24 Nov). Next: reinstalls, IPA files, a better Secure Enclave stand-in. (FairPlay App Store apps stay out of reach.)</li>
  <li>Wi-Fi 5 GHz and reliable joins, Photos, widgets.</li>
  <li>Microphone and sensors.</li>

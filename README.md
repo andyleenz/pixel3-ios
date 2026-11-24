@@ -117,14 +117,16 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.
 
 **Next, in order**
-1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
-   translated to SPIR-V by metal2vulkan. `MTLCreateSystemDefaultDevice` returns the frontend's device
-   through Metal's plugin discovery, and QuartzCore's stroke_line pipeline draws through it (`mtl-sys`,
-   2026-11-24), and so does CoreAnimation's compositor through `CARenderer` (`ca-draw`), and backboardd composites the lock screen through it. Kernel 0216 cut a frame from
-   60-110 ms to 4-6 ms (write-combined overflow BOs, no clean at submit). Mesa 0009 renders IOSurface targets in
-   place (a clear: 20 ms to 2.5 ms of GPU), and the lock screen draws correctly on Metal. Next:
-   backboardd's frame time (median 31 ms commit to complete: half recording on the encoding thread, half
-   GPU in sysmem).
+1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery
+   (AdrenoMetal frontend, metal2vulkan, Mesa Turnip); QuartzCore pipelines and CoreAnimation's compositor
+   (`CARenderer`) draw through it with Apple M1 pixels; backboardd composites the lock screen correctly on it.
+   Most apps don't need Metal (their views are drawn by CoreGraphics and composited by backboardd, on GL),
+   but games, Maps, WebGL and Core Image do. In order:
+   1. CPU cost per command buffer (a kernel map for every command-stream BO; `bluedrm` BO reuse in test).
+   2. Metal on by default in app processes (a deny-list instead of `BLUE_METAL=1`).
+   3. Tests: Maps, WebGL in Safari, a SpriteKit/Metal sample app.
+   4. Later: backboardd on Metal (median 31 ms commit to complete: half recording, half GPU in sysmem);
+      GL stays the compositor until it is faster.
 2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
    with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
    better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their
