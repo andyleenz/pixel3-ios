@@ -3,9 +3,13 @@
 // its own compositor pipelines and function constants, so this is the path backboardd's render server would take.
 //
 //   ca-draw [-dump] [-iosurface] [out.ppm]
+//   ca-draw -bench [frames]
+//   ca-draw -matrix: -bench 12 again in child processes under several TU_DEBUG settings (Turnip's render modes)
 //
 // -iosurface: the target is an IOSurface-backed texture, as backboardd's display surfaces are, and the check reads
 // the surface's pages from the CPU (IOSurfaceLock) instead of a blit.
+// -bench: frames (default 30) of a screen-sized (1125x2250) IOSurface target, the blue square moving each frame; prints the
+// time of each frame (CARenderer render + the GPU until its command buffer completes) and the pipeline-free average.
 //
 // The tree, 256x256 on black: an orange square (48..208, corner radius 24) and over it a blue square (96..160) at
 // opacity 0.5. Every probe is symmetric about the centre, so a flipped y axis doesn't matter. On the Mac the same program
@@ -20,6 +24,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <mach-o/dyld.h>
+
+extern char **environ;
 
 #define W 256
 #define H 256
@@ -52,11 +61,158 @@ near(uint32_t a, uint32_t b, int tol)
 	return 1;
 }
 
+static double
+now_ms(void)
+{
+	return CACurrentMediaTime() * 1000.0;
+}
+
+static int
+bench_one(id<MTLDevice> dev, int frames, int bw, int bh, int surface)
+{
+	IOSurfaceRef ios = !surface ? NULL : IOSurfaceCreate((__bridge CFDictionaryRef) @{
+		(id)kIOSurfaceWidth : @(bw), (id)kIOSurfaceHeight : @(bh), (id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfaceBytesPerRow : @((bw * 4 + 63) / 64 * 64), (id)kIOSurfacePixelFormat : @(0x42475241)
+	});
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                              width:bw height:bh mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	td.storageMode = surface ? MTLStorageModeShared : MTLStorageModePrivate;
+	id<MTLTexture> tex = surface ? (ios ? [dev newTextureWithDescriptor:td iosurface:ios plane:0] : nil) : [dev newTextureWithDescriptor:td];
+	if (!tex) {
+		printf("ca-draw: bench: no target texture\n");
+		return 1;
+	}
+	id<MTLCommandQueue> q = [dev newCommandQueue];
+	[CATransaction begin];
+	[CATransaction setDisableActions:YES];
+	CALayer *root = [CALayer layer];
+	root.frame = CGRectMake(0, 0, bw, bh);
+	root.backgroundColor = rgb(0, 0, 0);
+	root.opaque = YES;
+	CALayer *sq = [CALayer layer];
+	sq.frame = CGRectMake(bw * 0.09, bh * 0.13, bw * 0.8, bh * 0.4);
+	sq.backgroundColor = rgb(1, 0.5, 0);
+	sq.cornerRadius = bw * 0.05;
+	[root addSublayer:sq];
+	CALayer *blue = [CALayer layer];
+	blue.frame = CGRectMake(bw * 0.18, bh * 0.18, bw * 0.27, bw * 0.27);
+	blue.backgroundColor = rgb(0, 0, 1);
+	blue.opacity = 0.5;
+	[root addSublayer:blue];
+	[CATransaction commit];
+	CARenderer *r = [CARenderer rendererWithMTLTexture:tex options:@{ kCARendererMetalCommandQueue : q }];
+	r.layer = root;
+	r.bounds = CGRectMake(0, 0, bw, bh);
+	double sum = 0, lo = 1e9, hi = 0;
+	int counted = 0;
+	for (int f = 0; f < frames; f++) {
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		blue.position = CGPointMake(bw * (0.3 + (f % 20) * 0.02), bh * (0.25 + (f % 20) * 0.02));
+		[CATransaction commit];
+		[CATransaction flush];
+		double t0 = now_ms();
+		[r beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
+		[r addUpdateRect:r.bounds];
+		[r render];
+		[r endFrame];
+		double t1 = now_ms();
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		[cb commit];
+		[cb waitUntilCompleted];
+		double t2 = now_ms();
+		if (f < 3 || f == frames - 1)
+			printf("ca-draw: bench frame %2d: %7.2f ms (render %.2f, GPU wait %.2f)\n", f, t2 - t0, t1 - t0, t2 - t1);
+		if (f >= 3) {
+			sum += t2 - t0, counted++;
+			lo = t2 - t0 < lo ? t2 - t0 : lo;
+			hi = t2 - t0 > hi ? t2 - t0 : hi;
+		}
+	}
+	if (counted)
+		printf("ca-draw: bench %4dx%-4d %-9s frames 3..%d mean %7.2f ms, min %7.2f, max %7.2f\n", bw, bh,
+		    surface ? "IOSurface" : "private", frames - 1, sum / counted, lo, hi);
+	return 0;
+}
+
+static int
+bench(id<MTLDevice> dev, int frames)
+{
+	// the queue alone: an empty command buffer, committed and waited for
+	id<MTLCommandQueue> q = [dev newCommandQueue];
+	double sum = 0;
+	for (int i = 0; i < frames; i++) {
+		double t0 = now_ms();
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		[cb commit];
+		[cb waitUntilCompleted];
+		if (i >= 3)
+			sum += now_ms() - t0;
+	}
+	printf("ca-draw: bench empty command buffer: mean %.2f ms\n", sum / (frames - 3));
+	// a clear of a screen-sized private texture, one render pass, nothing drawn
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                              width:1125 height:2250 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+	sum = 0;
+	double gpu = 0, kern = 0;
+	for (int i = 0; i < frames; i++) {
+		double t0 = now_ms();
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		double te = now_ms();
+		[cb commit];
+		double tc = now_ms();
+		[cb waitUntilScheduled];
+		double ts = now_ms();
+		[cb waitUntilCompleted];
+		double td = now_ms();
+		if (i < 8)
+			printf("ca-draw: clear %d: encode %.2f, commit %.2f, scheduled +%.2f, completed +%.2f ms\n", i, te - t0, tc - te, ts - tc, td - ts);
+		if (i >= 3) {
+			sum += now_ms() - t0;
+			gpu += (cb.GPUEndTime - cb.GPUStartTime) * 1000;
+			kern += (cb.kernelEndTime - cb.kernelStartTime) * 1000;
+		}
+		if (i < 6)
+			printf("ca-draw: clear %d: %.2f ms, GPU %.3f ms (%.3f..%.3f s), kernel %.3f ms\n", i, now_ms() - t0,
+			    (cb.GPUEndTime - cb.GPUStartTime) * 1000, cb.GPUStartTime, cb.GPUEndTime, (cb.kernelEndTime - cb.kernelStartTime) * 1000);
+	}
+	printf("ca-draw: bench clear 1125x2250 private: mean %.2f ms, GPU %.3f ms, kernel %.3f ms\n", sum / (frames - 3),
+	    gpu / (frames - 3), kern / (frames - 3));
+	return bench_one(dev, frames, 256, 256, 0) | bench_one(dev, frames, 1125, 2250, 0) | bench_one(dev, frames, 1125, 2250, 1);
+}
+
 int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
 		setvbuf(stdout, NULL, _IOLBF, 0);
+		if (argc > 1 && !strcmp(argv[1], "-matrix")) {
+			const char *modes[] = { "startup", "sysmem", "gmem", "nobin", "nolrz" };
+			char self[1024];
+			uint32_t size = sizeof self;
+			if (_NSGetExecutablePath(self, &size))
+				return 1;
+			for (unsigned m = 0; m < sizeof modes / sizeof modes[0]; m++) {
+				printf("ca-draw: matrix: TU_DEBUG=%s\n", modes[m]);
+				setenv("TU_DEBUG", modes[m], 1);
+				char *args[] = { self, "-bench", "12", NULL };
+				pid_t pid;
+				int st = 0;
+				if (posix_spawn(&pid, self, NULL, NULL, args, environ) == 0)
+					waitpid(pid, &st, 0);
+				printf("ca-draw: matrix: TU_DEBUG=%s exit %d\n", modes[m], WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+			}
+			return 0;
+		}
 		setenv("BLUE_METAL", "1", 0);
 		// -dump: the frontend logs CoreAnimation's command buffers (passes, draws, pipelines, bound data)
 		if (argc > 1 && !strcmp(argv[1], "-dump")) {
@@ -74,6 +230,8 @@ main(int argc, char **argv)
 			return 1;
 		}
 		printf("ca-draw: device \"%s\"\n", dev.name.UTF8String);
+		if (argc > 1 && !strcmp(argv[1], "-bench"))
+			return bench(dev, argc > 2 ? atoi(argv[2]) : 30);
 
 		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 		                                                                              width:W height:H mipmapped:NO];

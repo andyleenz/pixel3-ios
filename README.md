@@ -120,8 +120,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
    translated to SPIR-V by metal2vulkan. `MTLCreateSystemDefaultDevice` returns the frontend's device
    through Metal's plugin discovery, and QuartzCore's stroke_line pipeline draws through it (`mtl-sys`,
-   2026-11-24), and so does CoreAnimation's compositor through `CARenderer` (`ca-draw`). Next: backboardd's
-   render server on Metal (IOSurface-backed targets).
+   2026-11-24), and so does CoreAnimation's compositor through `CARenderer` (`ca-draw`), and backboardd composites the lock screen through it. Kernel 0216 cut a frame from
+   60-110 ms to 4-6 ms (write-combined overflow BOs, no clean at submit). Next: IOSurface frames (32 ms),
+   then backboardd's render server.
 2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
    with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
    better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their

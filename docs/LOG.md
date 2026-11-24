@@ -1148,6 +1148,25 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: Metal frames 15-20x faster (0216)
+
+Every Metal command buffer took 40-60 ms, even an empty clear. `ca-draw -bench` (new) splits each one. In `cab4`/`cab6` the GPU ran for 2.5 ms (`GPUEndTime - GPUStartTime`), and the rest went between `commit` and `scheduled`. bluedrm now times the SUBMIT call: 31-34 ms each, with "2 own cleaned (128 MiB)" (`cab7`). metal2vulkan allocates two 64 MiB host-visible blocks. Neither fits the 32 MiB pool, so bluedrm placed them in the process's own (cacheable) memory, and the kernel cleaned both to PoC at every submit. `NOSYNC` (6f) does not cover them, because the runtime keeps them mapped. GPU clock, TU_DEBUG sysmem/gmem/nobin/nolrz (`cab3`), and the fence wait were not the cause.
+
+**0216** fills a GEM_NEW the pool can't take from wired XNU pages (`IOBufferMemoryDescriptor`), set write-combined with `pmap_set_cache_attributes` (as the GPU tables). The GPU maps them through the import PTEs, and the user maps them like a pool BO. They need no cache maintenance. Boot-arg `bluegpu_sysbo=0` turns this off. The first try panicked: `phystokv_range: illegal PA: 0x709e8000`. XNU's `pmap_sync_page_attributes_phys` computes `pp << PAGE_SHIFT` on a 32-bit `ppnum_t`, so it drops bit 32 of pages above 4 GiB (here 0x1709e8000). 0216 changes it to `ptoa(pp)`.
+
+`ca-draw -bench`, 1125x2250 unless noted, mean of frames 3 and on:
+
+| | before (cab5/cab7) | after (cab9) |
+|---|---|---|
+| clear, private texture | 61-68 ms | 10.7 ms |
+| CA frame, 256x256 private | 59-86 ms | 3.7 ms |
+| CA frame, private | 107-116 ms | 5.7 ms |
+| CA frame, IOSurface | 175-195 ms | 31.8 ms |
+
+Pixels are unchanged: `cab10` reports DRAW ok with the same hash, and `cab10s` (IOSurface) differs in 0 of 256 rows. Frames into an IOSurface still cost 32 ms: the kernel cleans and invalidates a surface the GPU writes at every submit (10 MiB here). That is next.
+
+The first backboardd boot on Metal with 0216 (`bbm4`, `bluesnap=sb+10,sb+25,sb+35`) never came back: the phone left USB and did not reach recovery in 30 min, and no log was captured. It is a hang with no panic. Under investigation.
+
 ## 2026-11-24: backboardd composites through Metal (first light)
 
 Boot-arg `sweetenv=backboardd:BLUE_METAL=1,...` opts backboardd in for one boot. It also replaces bluetest's default sweetenv, so the GL shim stays out. CoreAnimation's render server takes the Metal device, and nothing crashes (`work/test/bbm1`):

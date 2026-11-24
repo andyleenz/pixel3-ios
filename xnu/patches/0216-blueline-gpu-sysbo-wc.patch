@@ -1,0 +1,220 @@
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+@@ -64,6 +64,13 @@
+ #include <mach/mach_time.h>
+ #include <sys/errno.h>
+ #include <sys/proc.h>
++__BEGIN_DECLS
++#include <vm/pmap.h>                     /* 0216: kernel_pmap */
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);  /* osfmk/vm/pmap.h, kernel-private */
++__END_DECLS
++#define BG_WIMG_DEFAULT         0x2u    /* osfmk/arm/memory_types.h VM_WIMG_DEFAULT (VM_MEM_COHERENT) */
++#define BG_WIMG_WCOMB           0x6u    /* VM_WIMG_WCOMB (VM_MEM_NOT_CACHEABLE | VM_MEM_COHERENT) */
+ #include "SweetSurface.h"
+ #include "blue_gpu_uapi.h"
+ #include "../../../bsd/dev/blueline_gpu_core.h"
+@@ -87,7 +94,13 @@
+ #define BG_STAT_NS              (5ull * NSEC_PER_SEC)
+ #define BG_A630_MAX_FREQ        710000000ull
+ 
+-enum { BG_POOL = 1, BG_SURF, BG_UPTR };
++/*
++ * BG_SYS (0216): when the pool is full, GEM_NEW takes wired XNU pages (an IOBufferMemoryDescriptor) set write-combined
++ * (pmap_set_cache_attributes, as the GPU tables), mapped for the GPU through the import PTEs. Like the pool they need no
++ * cache maintenance; the userptr fallback (bluedrm's own memory, cacheable) had the kernel clean every mapped BO at every
++ * submit: 2 x 64 MiB, ~32 ms, under metal2vulkan. bluegpu_sysbo=0 turns it off (GEM_NEW fails as before).
++ */
++enum { BG_POOL = 1, BG_SURF, BG_UPTR, BG_SYS };
+ 
+ struct BGBo {
+ 	uint32_t kind, flags, handle;
+@@ -130,6 +143,9 @@
+ 	uint64_t t_prog;
+ 	BGBo *zombies;
+ 	uint32_t nzombie, nconn, nbo_live;
++	int sysbo;                      /* 0216: bluegpu_sysbo */
++	bool sys_said;
++	uint64_t sys_bytes;             /* BG_SYS pages live */
+ 	/* per 5 s */
+ 	uint64_t t_stat;
+ 	uint32_t n_submit, n_ib, n_wait, n_busy, n_ring_full, n_new, n_close;
+@@ -270,6 +286,8 @@
+ 
+ /* ---- BOs -------------------------------------------------------------------------------- */
+ 
++static void bg_sys_attr(uintptr_t kva, uint64_t size, unsigned int wimg);
++
+ static void
+ bg_bo_free(BGBo *b)
+ {
+@@ -279,11 +297,16 @@
+ 		break;
+ 	case BG_SURF:
+ 	case BG_UPTR:
++	case BG_SYS:
+ 		blue_gmem_imp_unmap(b->gva, b->map_len);
+ 		(void)blue_gmem_sync();
+ 		blue_gmem_imp_free(b->gva, b->map_len);
+ 		if (b->kind == BG_UPTR && b->md != NULL) {
+ 			b->md->complete();
++		}
++		if (b->kind == BG_SYS) {
++			bg_sys_attr(b->kva, b->size, BG_WIMG_DEFAULT);  /* the pages go back to XNU cacheable */
++			g.sys_bytes -= b->size;
+ 		}
+ 		break;
+ 	}
+@@ -297,7 +320,7 @@
+ static bool
+ bg_bo_idle(BGBo *b)
+ {
+-	return bg_done(b->fence) && !(b->kind == BG_POOL && b->md != NULL && b->md->getRetainCount() > 1);
++	return bg_done(b->fence) && !((b->kind == BG_POOL || b->kind == BG_SYS) && b->md != NULL && b->md->getRetainCount() > 1);
+ }
+ 
+ static void
+@@ -498,7 +521,65 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Set the cache attributes of every page of a wired kernel range (kva, page multiple). WCOMB: flush first, so the
++ * zeroes written through the cacheable view reach memory and no dirty line lands on the pages later. */
++static void
++bg_sys_attr(uintptr_t kva, uint64_t size, unsigned int wimg)
++{
++	if (wimg != BG_WIMG_DEFAULT) {
++		FlushPoC_DcacheRegion((vm_offset_t)kva, (size_t)size);
++	}
++	for (uint64_t o = 0; o < size; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(kva + o));
++		if (pn != 0) {
++			pmap_set_cache_attributes(pn, wimg);
++		}
++	}
++}
++
++/* GEM_NEW with the pool full (lock not held): b->size, b->flags set; on success b is in c, lock released. */
+ static IOReturn
++bg_sys_new(BGCtx *c, BGBo *b)
++{
++	b->size = (b->size + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, b->size, PAGE_SIZE);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	b->kind = BG_SYS;
++	b->md = md;
++	b->kva = (uintptr_t)md->getBytesNoCopy();
++	bg_sys_attr(b->kva, b->size, BG_WIMG_WCOMB);
++	IOLockLock(g.lock);
++	IOReturn ret = bg_import_map(b, md, b->size, false);
++	if (ret == kIOReturnSuccess) {
++		ret = bg_insert(c, b);
++		if (ret != kIOReturnSuccess) {
++			blue_gmem_imp_unmap(b->gva, b->map_len);
++			(void)blue_gmem_sync();
++			blue_gmem_imp_free(b->gva, b->map_len);
++		}
++	}
++	if (ret == kIOReturnSuccess) {
++		g.n_new++;
++		g.sys_bytes += b->size;
++		if (!g.sys_said) {
++			g.sys_said = true;
++			printf("BLUEGPU UAPI: pool full: %s's BOs now in write-combined XNU pages (first %llu KiB)\n", c->comm,
++			    (unsigned long long)(b->size >> 10));
++		}
++	}
++	IOLockUnlock(g.lock);
++	if (ret != kIOReturnSuccess) {
++		bg_sys_attr(b->kva, b->size, BG_WIMG_DEFAULT);
++		md->release();
++		b->md = NULL;
++	}
++	return ret;
++}
++
++static IOReturn
+ bg_gem_new(BGCtx *c, struct blue_gpu_gem_new *a)
+ {
+ 	uint32_t cache = a->flags & BLUE_GPU_BO_CACHE_MASK;
+@@ -519,6 +600,16 @@
+ 		bg_reap();
+ 		ok = blue_gmem_alloc(b->size, &b->pa, &b->gva, &b->kva);
+ 	}
++	if (!ok && g.sysbo) {
++		IOLockUnlock(g.lock);
++		IOReturn r = bg_sys_new(c, b);
++		if (r == kIOReturnSuccess) {
++			a->handle = b->handle;
++		} else {
++			IOFree(b, sizeof(*b));
++		}
++		return r;
++	}
+ 	IOReturn ret = kIOReturnNoMemory;
+ 	if (ok) {
+ 		/* physical, its cache mode in _flags: a default-cache user map comes out write-combined too */
+@@ -706,7 +797,7 @@
+ 			goto out;
+ 		}
+ 		BGBo *b = bg_lookup(c, bos[k->submit_idx].handle);
+-		if ((b->kind != BG_POOL && b->kind != BG_UPTR) || k->size == 0 || (k->size & 3) || (k->submit_offset & 3) ||
++		if ((b->kind != BG_POOL && b->kind != BG_UPTR && b->kind != BG_SYS) || k->size == 0 || (k->size & 3) || (k->submit_offset & 3) ||
+ 		    (uint64_t)k->submit_offset + k->size > b->size || k->size / 4 > BLUE_GPU_CORE_IB_MAX_DW) {
+ 			ret = kIOReturnBadArgument;     /* IBs only from the caller's own pool/userptr BOs, inside them */
+ 			goto out;
+@@ -799,7 +890,7 @@
+ 		b->fence = seq;
+ 		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE) {
+ 			b->wfence = seq;
+-			b->gpu_wrote = b->kind != BG_POOL;
++			b->gpu_wrote = b->kind != BG_POOL && b->kind != BG_SYS;
+ 		}
+ 	}
+ 	a->fence = seq;
+@@ -1016,7 +1107,7 @@
+ 	IOMemoryDescriptor *md = NULL;
+ 	IOLockLock(g.lock);
+ 	BGBo *b = bg_lookup(c, handle);
+-	if (b != NULL && b->kind == BG_POOL) {
++	if (b != NULL && (b->kind == BG_POOL || b->kind == BG_SYS)) {
+ 		md = b->md;
+ 	} else if (b != NULL && b->kind == BG_SURF) {
+ 		md = b->surf->memory;
+@@ -1040,10 +1131,10 @@
+ 	struct blue_gmem_info mi;
+ 	blue_gmem_get_info(&mi);
+ 	printf("BLUEGPU UAPI 5s: %u submits (%u IBs), %u waits (%llu us), %u cache cleans (%llu MiB, %llu us), %u ring-full retries, %u EBUSY, %u new %u closed;"
+-	    " %u connection(s), %u BO(s), %u parked; pool %llu of %llu MiB free (largest %llu); fence %u retired %u%s\n",
++	    " %u connection(s), %u BO(s), %u parked; pool %llu of %llu MiB free (largest %llu), %llu MiB WC XNU pages; fence %u retired %u%s\n",
+ 	    g.n_submit, g.n_ib, g.n_wait, g.wait_ns / 1000, g.n_clean, g.clean_bytes >> 20, g.clean_ns / 1000, g.n_ring_full, g.n_busy, g.n_new, g.n_close, g.nconn,
+ 	    g.nbo_live, g.nzombie, (uint64_t)mi.free_granules * BLUE_GMEM_GRANULE >> 20, mi.pool_size >> 20,
+-	    (uint64_t)mi.low_free * BLUE_GMEM_GRANULE >> 20, g.last_seq, bg_retired(), g.dead ? "; DEAD (hang)" : "");
++	    (uint64_t)mi.low_free * BLUE_GMEM_GRANULE >> 20, g.sys_bytes >> 20, g.last_seq, bg_retired(), g.dead ? "; DEAD (hang)" : "");
+ 	g.t_stat = mach_absolute_time();
+ 	g.n_submit = g.n_ib = g.n_wait = g.n_busy = g.n_ring_full = g.n_new = g.n_close = 0;
+ 	g.wait_ns = 0;
+@@ -1770,6 +1861,8 @@
+ 	(void)PE_parse_boot_argn("bluegpu_uapi_test", &g.test, sizeof(g.test));
+ 	g.lazy_clean = 1;               /* on by default since 0189 (2026-11-21): bluegpu_lazyclean=0 cleans every submit */
+ 	(void)PE_parse_boot_argn("bluegpu_lazyclean", &g.lazy_clean, sizeof(g.lazy_clean));
++	g.sysbo = 1;
++	(void)PE_parse_boot_argn("bluegpu_sysbo", &g.sysbo, sizeof(g.sysbo));
+ 	if (!on || !blue_gpu_core_ready()) {
+ 		printf("BLUEGPU UAPI: %s: no BlueGPU service\n", on ? "GPU not resident" : "off (bluegpu_uapi=0)");
+ 		return;
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,8 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* 0216: ptoa, not pp << PAGE_SHIFT (32-bit ppnum_t): a page above 4 GiB panicked in phystokv_range */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP

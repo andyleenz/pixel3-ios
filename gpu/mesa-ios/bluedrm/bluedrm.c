@@ -127,6 +127,22 @@ own_unmapped(uint32_t handle)
 	return r;
 }
 
+/* size of an own BO (0: not one of ours) */
+static uint64_t
+own_size(uint32_t handle)
+{
+	uint64_t size = 0;
+	pthread_mutex_lock(&own_lock);
+	for (unsigned i = 0; i < owns; i++) {
+		if (own[i].handle == handle) {
+			size = own[i].size;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&own_lock);
+	return size;
+}
+
 static void *
 own_find_map(uint32_t handle, int map)
 {
@@ -479,6 +495,24 @@ now_ns(void)
 	return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
+/* The SUBMIT call's own time: the kernel cleans every own BO the CPU may have written (not NOSYNC) before the GPU gets it.
+ * Slow ones (8 ms or more, the first 16) and a summary every 256 submits go to stderr. */
+static void
+submit_report(int64_t ns, unsigned nbos, unsigned nsynced, uint64_t synced)
+{
+	static uint64_t n, total_ns, slow;
+	static int64_t worst;
+	n++, total_ns += (uint64_t)ns;
+	if (ns > worst)
+		worst = ns;
+	if (ns >= 8000000 && slow++ < 16)
+		fprintf(stderr, "bluedrm: slow submit: %.2f ms, %u BOs, %u own cleaned (%llu MiB)\n", ns / 1e6, nbos, nsynced,
+		        (unsigned long long)(synced >> 20));
+	if ((n & 255) == 0)
+		fprintf(stderr, "bluedrm: %llu submits: mean %.2f ms, worst %.2f ms, %llu slow\n", (unsigned long long)n,
+		        total_ns / 1e6 / n, worst / 1e6, (unsigned long long)slow);
+}
+
 /* Callers' absolute syncobj deadlines are on Mesa's clock (os_time_get_nano: TIME_MONOTONIC = CLOCK_MONOTONIC),
  * which on Darwin is not CLOCK_MONOTONIC_RAW. Move one onto the kernel's clock. */
 static int64_t
@@ -800,11 +834,20 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 		queue = __atomic_load_n(&last_queue, __ATOMIC_RELAXED);
 	} else {
 		struct drm_msm_gem_submit_bo *bos = (void *)(uintptr_t)submit->bos;
+		uint64_t synced = 0;    /* bytes of own BOs the kernel cleans at this submit */
+		unsigned nsynced = 0;
 		if (owns != 0 && getenv("BLUEDRM_SYNC_ALL") == NULL)
-			for (uint32_t i = 0; i < submit->nr_bos; i++)
-				if (own_unmapped(bos[i].handle))
+			for (uint32_t i = 0; i < submit->nr_bos; i++) {
+				if (own_unmapped(bos[i].handle)) {
 					bos[i].flags |= BLUE_GPU_SUBMIT_BO_NOSYNC;
+				} else {
+					uint64_t sz = own_size(bos[i].handle);
+					synced += sz, nsynced += sz != 0;
+				}
+			}
+		int64_t t0 = now_ns();
 		error = call((unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT), submit, size);
+		submit_report(now_ns() - t0, submit->nr_bos, nsynced, synced);
 		if (error != 0) {
 			errno = error;
 			return -error;
