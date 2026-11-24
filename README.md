@@ -106,8 +106,10 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
    translated to SPIR-V by metal2vulkan. Turnip runs GPU work on the phone (a buffer fill, 2026-11-24);
    next a translated QuartzCore pipeline, then the frontend.
-2. Installing apps: unencrypted and self-signed apps, and a better stand-in for the Secure Enclave.
-   FairPlay-encrypted App Store apps are out of reach (their keys live in a real SEP).
+2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
+   with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
+   better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their
+   keys live in a real SEP).
 3. Wi-Fi (5 GHz, joins on every boot), Photos (assetsd never starts), widgets ("Waiting..."),
    GPU memory (a BO pool over 32 MiB, a 4th scanout buffer).
 4. Microphone and sensors.

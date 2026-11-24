@@ -1147,3 +1147,31 @@ This is the first GPU work on the phone that does not come from gallium freedren
 The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so the host test (`VK=1 HOST=1 ./build-mesa-ios.sh`) catches it. `BLUEDRM_DEBUG=1` now also logs each submit's queue and fence.
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
+
+## 2026-11-24: a self-signed app installs and runs
+
+![Hello.app on the phone](screenshots/2026-11-24-hello-app.png)
+
+`Hello.app` (`tools/apps/hello`, ad-hoc signed, bundle ID `dev.blueline.hello`) installs through installd into the user domain. LaunchServices registers it with bundle and data containers, FrontBoard launches it, and it writes `Documents/hello.txt` (`work/test/app14`):
+
+```
+BLUERUN: APPTEST: hello.txt (attempt 1, 1 s): hello from dev.blueline.hello, pid 257
+BLUERUN: APPTEST: PASS
+```
+
+Boot with `blueapps=1` (kernel 0214). Test with `apptest /private/var/tmp/Hello.app dev.blueline.hello 3` (`tools/bluerun`).
+
+What it took (`work/test/app1..14`):
+
+| Step | Error | Fix |
+|---|---|---|
+| installd verifies the signature | `0xe8008014` invalid signature | `bluemis.dylib` in installd. AppSync Unified's approach (GPL-3), our own code (MIT) |
+| | the hook never ran | `MICodeSigningVerifier` (InstalledContentLibrary) calls `MISValidateSignatureAndCopyInfo`, a libmis wrapper that jumps straight to `...WithProgress`. dyld interposing does not reach calls inside the shared cache. bluemis patches the WithProgress entry in place, with the prologue moved to a trampoline page in its own `__TEXT` (`VM_PROT_COPY`) |
+| | installd crashed (SIGBUS) | the first trampoline shared a page with the code that was writing it; RW took away execute. It now has its own 16 KiB section |
+| signer identity | "Failed to extract signer identity" | `SignerCertificate`: Apple's public 2008 "Apple iPhone OS Application Signing" certificate (parses, so no Security hooks) |
+| install type | "System app install missing system app entitlement" | `miinstall` asked for a system install. Domain 3 (UserPrivate) with PackageType Developer, as Xcode |
+| launch | SpringBoard: "invalid code signature, inadequate entitlements or its profile has not been explicitly trusted" | bluemis in SpringBoard: `-[FBSSignatureValidationService trustStateForApplication:]` returns 8 (trusted) when it said otherwise (it said 1) |
+| boot-args | `sweetenv` takes one process | 0990: several `NAME[\|NAME]:VARS` entries. It changes sailfish 0104's code, so 0990-0999 now apply after the sailfish patches (build-xnu, CI) |
+| | 628 bytes, over the 607 limit | 0214: `blueapps=1` stands for the 186-byte `sweetenv` |
+
+Open: installing again over an installed copy fails ("Failed to make staged container live"); IPA files; launching from the home screen icon.

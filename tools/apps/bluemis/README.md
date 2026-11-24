@@ -2,7 +2,7 @@
 
 `/usr/lib/bluemis.dylib` makes installd accept self-signed (ad-hoc) apps. `build.sh` builds `out/bluemis.dylib`.
 
-Boot with kernel 0990 and:
+Boot with `blueapps=1` (kernel 0214, which spells out:)
 
 ```
 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib;installd|com.apple.MobileInstallationHelperService:DYLD_INSERT_LIBRARIES=/usr/lib/bluemis.dylib

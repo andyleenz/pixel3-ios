@@ -25,6 +25,8 @@
  * Application Signing" certificate (apple-iphone-os-application-signing.der,
  * bytes as in AppSync's kSecSigningCertificate; SHA-256 8AE18558...055CD3).
  *
+ * In SpringBoard it instead makes FrontBoard trust the app (see trust_hooks).
+ *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
  */
 #include <CommonCrypto/CommonDigest.h>
@@ -33,6 +35,7 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <objc/runtime.h>
 #include <mach-o/loader.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -341,6 +344,73 @@ hook(void)
 }
 
 
+/*
+ * SpringBoard: FrontBoard refuses to launch an app whose signature it does not trust
+ * ("invalid code signature, inadequate entitlements or its profile has not been
+ * explicitly trusted", app12). The trust answers are replaced, when they say anything
+ * else, by the trusted values AppSync Unified's FrontBoard part returns:
+ * FBSSignatureValidationService -trustStateForApplication: 8, FBApplicationTrustData
+ * -trustState and -trustStateWithTrustRequiredReasons: 2. Plain method replacement.
+ */
+typedef unsigned long (*trust_app_fn)(id, SEL, id);
+typedef unsigned long (*trust_fn)(id, SEL);
+typedef unsigned long (*trust_reasons_fn)(id, SEL, unsigned long *);
+static trust_app_fn orig_trust_app;
+static trust_fn orig_trust;
+static trust_reasons_fn orig_trust_reasons;
+
+static unsigned long
+my_trust_app(id self, SEL sel, id app)
+{
+	unsigned long v = orig_trust_app(self, sel, app);
+	if (v != 8)
+		LOG("trustStateForApplication: %lu -> 8\n", v);
+	return 8;
+}
+
+static unsigned long
+my_trust(id self, SEL sel)
+{
+	unsigned long v = orig_trust(self, sel);
+	if (v != 2)
+		LOG("trustState: %lu -> 2\n", v);
+	return 2;
+}
+
+static unsigned long
+my_trust_reasons(id self, SEL sel, unsigned long *reasons)
+{
+	unsigned long v = orig_trust_reasons(self, sel, reasons);
+	if (v != 2) {
+		LOG("trustStateWithTrustRequiredReasons: %lu (reasons 0x%lx) -> 2\n", v, reasons ? *reasons : 0);
+		if (reasons)
+			*reasons = 0;
+	}
+	return 2;
+}
+
+static void *
+replace(const char *cls, const char *sel, void *imp)
+{
+	Class c = objc_getClass(cls);
+	Method m = c ? class_getInstanceMethod(c, sel_registerName(sel)) : NULL;
+	if (m == NULL) {
+		LOG("no -[%s %s]\n", cls, sel);
+		return NULL;
+	}
+	LOG("replaced -[%s %s]\n", cls, sel);
+	return (void *)method_setImplementation(m, (IMP)imp);
+}
+
+static void
+trust_hooks(void)
+{
+	orig_trust_app = (trust_app_fn)replace("FBSSignatureValidationService", "trustStateForApplication:", (void *)my_trust_app);
+	orig_trust = (trust_fn)replace("FBApplicationTrustData", "trustState", (void *)my_trust);
+	orig_trust_reasons = (trust_reasons_fn)replace("FBApplicationTrustData", "trustStateWithTrustRequiredReasons:",
+	                                               (void *)my_trust_reasons);
+}
+
 __attribute__((constructor)) static void
 bluemis_init(void)
 {
@@ -349,5 +419,9 @@ bluemis_init(void)
 	_NSGetExecutablePath(name, &len);
 	LOG("loaded in %s[%d], libmis WithProgress at %p\n", name, getpid(),
 	    (void *)MISValidateSignatureAndCopyInfoWithProgress);
-	hook();
+	const char *base = strrchr(name, '/') ? strrchr(name, '/') + 1 : name;
+	if (strcmp(base, "SpringBoard") == 0)
+		trust_hooks();
+	else
+		hook();
 }
