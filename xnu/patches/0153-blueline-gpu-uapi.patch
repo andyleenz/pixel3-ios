@@ -2131,7 +2131,7 @@ index 000000000..a13f02441
 +		ret = bg_get_param(fCtx, &u.param);
 +		break;
 +	case BLUE_GPU_SEL_SET_PARAM:
-+		ret = u.param.pipe == BLUE_GPU_PIPE_3D0 ? kIOReturnSuccess : kIOReturnBadArgument;  /* accept, ignore */
++		ret = u.param.pipe == BLUE_GPU_PIPE_3D0 && (u.param.param == BLUE_GPU_PARAM_SYSPROF || u.param.param == BLUE_GPU_PARAM_COMM || u.param.param == BLUE_GPU_PARAM_CMDLINE) ? kIOReturnSuccess : kIOReturnBadArgument;  /* the write-only params: accept, ignore. Others (EN_VM_BIND 0x16) -> EINVAL */
 +		break;
 +	case BLUE_GPU_SEL_GEM_NEW:
 +		ret = bg_gem_new(fCtx, &u.gem_new);

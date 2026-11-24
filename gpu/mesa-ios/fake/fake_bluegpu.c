@@ -263,9 +263,15 @@ dispatch(uint32_t sel, void *in, size_t insz)
 	case BLUE_GPU_SEL_GET_PARAM:
 		NEED(struct blue_gpu_param);
 		return do_param(in);
-	case BLUE_GPU_SEL_SET_PARAM:
-		NEED(struct blue_gpu_param);
-		return kIOReturnSuccess;
+	case BLUE_GPU_SEL_SET_PARAM: {
+		struct blue_gpu_param *p = in;
+		NEED(*p);
+		if (p->pipe != BLUE_GPU_PIPE_3D0)
+			return kIOReturnBadArgument;
+		/* only the write-only params; EN_VM_BIND (0x16) must fail or Turnip uses VM_BIND */
+		return p->param == BLUE_GPU_PARAM_SYSPROF || p->param == BLUE_GPU_PARAM_COMM ||
+		    p->param == BLUE_GPU_PARAM_CMDLINE ? kIOReturnSuccess : kIOReturnBadArgument;
+	}
 	case BLUE_GPU_SEL_GEM_NEW: {
 		struct blue_gpu_gem_new *r = in;
 		uint64_t size = (r->size + GRANULE - 1) & ~(uint64_t)(GRANULE - 1);

@@ -11,6 +11,9 @@
 #                                  (an in-process BlueGPU model) into out/host/ and run
 #                                  gles-triangle there: exercises bluedrm, the uapi and Mesa's
 #                                  compiler + command-stream building on the Mac
+#   VK=1 ./build-mesa-ios.sh       also build Turnip (Vulkan 1.3, msm over bluedrm) as
+#                                  out/bluevk.dylib + out/vk-smoke; with HOST=1 also a macOS
+#                                  copy with the fake BlueGPU, and run vk-smoke there
 #
 # Outputs in mesa-ios/out/: bluegl.dylib (stripped, ad-hoc signed, install name
 # /usr/lib/bluegl.dylib), bluegl-unstripped.dylib, gles-triangle, exports.txt, sizes.txt.
@@ -167,7 +170,53 @@ build_for() {
 	codesign -f -s - "$OD/gles-triangle" 2>/dev/null
 }
 
+# Turnip: Mesa's own shared library (meson links it), renamed and signed. The host copy is
+# relinked with fake_bluegpu.o (ninja's link command + one object), as bluegl's is.
+build_vk_for() {
+	local T=$1 SDKNAME MINFLAG OD BO
+	case $T in
+	ios)   SDKNAME=iphoneos; MINFLAG=-miphoneos-version-min=$MIN; OD=$O ;;
+	macos) SDKNAME=macosx; MINFLAG=-mmacosx-version-min=13.0; OD=$O/host ;;
+	esac
+	BO=$B/out-tu-$T
+	local OPTS=(--buildtype=release -Db_ndebug=true -Ddefault_library=static
+		-Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled
+		-Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm
+		-Dllvm=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=false
+		-Dzstd=disabled -Dzlib=enabled -Dexpat=disabled -Dxmlconfig=disabled
+		-Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled
+		-Dbuild-tests=false -Dshader-cache=enabled -Dperfetto=false
+		-Dgallium-va=disabled -Dgallium-rusticl=false -Dtools=
+		-Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false)
+	if [ ! -f "$BO/build.ninja" ] || [ "$(cat "$BO/.bluevk-opts" 2>/dev/null)" != "${OPTS[*]}" ]; then
+		log "[$T] meson setup (Turnip)"
+		rm -rf "$BO"
+		meson setup "$BO" "$M" --cross-file "$B/cross-$T.ini" --wrap-mode=nofallback \
+			"${OPTS[@]}" > "$B/meson-setup-tu-$T.log"
+		echo "${OPTS[*]}" > "$BO/.bluevk-opts"
+	fi
+	log "[$T] ninja (Turnip)"
+	local LIB=src/freedreno/vulkan/libvulkan_freedreno.dylib
+	ninja -C "$BO" $LIB > "$B/ninja-tu-$T.log" || { tail -40 "$B/ninja-tu-$T.log"; exit 1; }
+	local CC=(xcrun -sdk $SDKNAME clang -arch arm64 $MINFLAG)
+	if [ $T = ios ]; then
+		cp "$BO/$LIB" "$OD/bluevk-unstripped.dylib"
+		install_name_tool -id /usr/lib/bluevk.dylib "$OD/bluevk-unstripped.dylib" 2>/dev/null
+		xcrun strip -x -o "$OD/bluevk.dylib" "$OD/bluevk-unstripped.dylib"
+	else
+		"${CC[@]}" -O2 -Wall -I"$H" -c "$H/fake/fake_bluegpu.c" -o "$OD/fake_bluegpu.o"
+		local LINK
+		LINK=$(ninja -C "$BO" -t commands $LIB | tail -1)
+		LINK=${LINK/ -o $LIB / -o $OD/bluevk.dylib $OD/fake_bluegpu.o }
+		(cd "$BO" && eval "$LINK") 2>&1 | grep -v -e 'duplicate libraries' -e "newer 'macOS'" || true
+	fi
+	codesign -f -s - "$OD/bluevk.dylib" 2>/dev/null
+	"${CC[@]}" -O2 -Wall -I"$M/include" "$H/test/vk-smoke.c" -o "$OD/vk-smoke"
+	codesign -f -s - "$OD/vk-smoke" 2>/dev/null
+}
+
 build_for ios
+[ "${VK:-0}" = 1 ] && build_vk_for ios
 
 # ---- checks + report (iOS) -----------------------------------------------------------------
 # Every import must be a plain libSystem/libc++/IOKit/libz symbol that iOS 16.0 has. Weak
@@ -197,5 +246,12 @@ if [ "${HOST:-0}" = 1 ]; then
 	log "[macos] running gles-triangle over the fake BlueGPU"
 	GLES_TRIANGLE_NO_PIXELS=1 "$O/host/gles-triangle" 2>&1 | tee "$O/host/gles-triangle.log"
 	grep -q 'errors 0$' "$O/host/gles-triangle.log" || { echo "fake BlueGPU saw ABI errors"; exit 1; }
+	if [ "${VK:-0}" = 1 ]; then
+		build_vk_for macos
+		log "[macos] running vk-smoke over the fake BlueGPU"
+		"$O/host/vk-smoke" "$O/host/bluevk.dylib" 2>&1 | tee "$O/host/vk-smoke.log"
+		grep -q 'errors 0$' "$O/host/vk-smoke.log" && grep -q 'all calls succeeded' "$O/host/vk-smoke.log" ||
+			{ echo "vk-smoke failed on the fake BlueGPU"; exit 1; }
+	fi
 fi
 log "done: $O/bluegl.dylib, $O/gles-triangle"

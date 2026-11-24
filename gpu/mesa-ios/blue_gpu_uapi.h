@@ -53,7 +53,7 @@
 /* ---- selectors -------------------------------------------------------------------------- */
 #define BLUE_GPU_SEL_GEM_CLOSE          0x09    /* DRM_IOCTL_GEM_CLOSE (generic drm.h)      */
 #define BLUE_GPU_SEL_GET_PARAM          0x40    /* DRM_MSM_GET_PARAM                        */
-#define BLUE_GPU_SEL_SET_PARAM          0x41    /* DRM_MSM_SET_PARAM      (accept, ignore)  */
+#define BLUE_GPU_SEL_SET_PARAM          0x41    /* DRM_MSM_SET_PARAM      (see below)       */
 #define BLUE_GPU_SEL_GEM_NEW            0x42    /* DRM_MSM_GEM_NEW                          */
 #define BLUE_GPU_SEL_GEM_INFO           0x43    /* DRM_MSM_GEM_INFO                         */
 #define BLUE_GPU_SEL_GEM_CPU_PREP       0x44    /* DRM_MSM_GEM_CPU_PREP                     */
@@ -104,7 +104,9 @@ struct blue_gpu_param {                 /* == struct drm_msm_param (24 bytes) */
 #define BLUE_GPU_PARAM_MACROTILE_MODE   0x13    /* 0                                             */
 #define BLUE_GPU_PARAM_UCHE_TRAP_BASE   0x14    /* EINVAL ok (Mesa then uses its default)        */
 #define BLUE_GPU_PARAM_HAS_PRR          0x15    /* 0                                             */
-/* unknown param -> kIOReturnBadArgument (EINVAL) */
+/* unknown param -> kIOReturnBadArgument (EINVAL). SET_PARAM accepts (and ignores) only SYSPROF,
+ * COMM and CMDLINE; anything else is EINVAL, in particular MSM_PARAM_EN_VM_BIND (0x16): Turnip
+ * enables VM_BIND when that call succeeds, and BlueGPU has no VM_BIND. */
 
 #define BLUE_GPU_A630_GPU_ID            630
 #define BLUE_GPU_A630_CHIP_ID           0x06030001ull

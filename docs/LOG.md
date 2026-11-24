@@ -1089,3 +1089,35 @@ Elimination, screen off, all with 0212/0213:
 DVFS already holds silver at 300 MHz (76% of the time) and gold at 825 MHz. For scale, LineageOS recovery on the same rig is 256 mA at WFI only and 176 mA with its LPM levels on, panel on at brightness 0.
 
 So ~200 mA is close to this SoC's floor without system sleep. On this rig the cable stays in (input suspended), USB stays up, and Android would not reach CXSD either. The next real step is a suspend path: every DRV voting down so the AOP reaches AOSD/CXSD. Measuring it means taking USB off the bus.
+
+## 2026-11-24: Metal stage 1, the translator and Turnip on the Mac
+
+Plan (route A): Metal frontend (AdrenoMetal, MIT, adapted to iOS 16) -> metal2vulkan (Rust, translates AIR to SPIR-V) -> Turnip (Mesa's Adreno Vulkan driver) on its msm backend -> bluedrm -> the existing BlueGPU user client. No new kernel ABI. Route B, UniXNU's darwin KMD and the NativeAdreno ABI in our kernel, is the fallback.
+
+**Translator.** The stock iOS 16.7 metallibs from the IPSW, through metal2vulkan's CLI with a generic vertex descriptor and, for fragments, every vertex function tried in turn:
+
+| Library | Functions | SPIR-V written | Failed |
+|---|---|---|---|
+| QuartzCore | 102 | 98 | 4 (`tile_downsample_*`, `IdentityDomains`) |
+| RenderBox | 29 | 29 | 0 |
+| CoreImage | 58 | 58 | 0 |
+
+**Turnip.** Mesa 26.3.1 patch 0006 (`gpu/mesa-ios/patches/`), built with `VK=1 ./build-mesa-ios.sh`. Results:
+
+- `out/bluevk.dylib` for iOS: 15.5 MB, minos 16.0, imports only from libSystem, libc++, IOKit and libz.
+- On the Mac, linked with the fake BlueGPU, `vk-smoke` runs the whole path with 0 ABI errors: instance, device "Turnip Adreno (TM) 630" (Vulkan 1.3), buffer, map, `vkCmdFillBuffer`, one submit (73 PM4 packets), fence wait.
+
+| Hit | Fix |
+|---|---|
+| `xf86drm.h`, `pthread_condattr_setclock`, DRM WSI | meson guard on Darwin. The condvar uses `CLOCK_REALTIME` (only kgsl waits on it). WSI off |
+| Undefined `wsi_*`, `vk_cmd_enqueue_*` at link | Weak entrypoint-table symbols: `-undefined dynamic_lookup` (as UniXNU). It hid that `bluedrm.c` was not linked, so it is now compiled into Turnip |
+| No device | Darwin enumeration: `drmOpenWithType("msm")` instead of `/dev/dri` |
+| `brk` in `vk_drm_syncobj_get_type` | The sync provider was a NULL stub without `HAVE_LIBDRM`. bluedrm's emulated syncobjs now back it |
+| "Failed to create VM_BIND queue" | SET_PARAM accepted every param, so `EN_VM_BIND` looked enabled. The fake and kernel (0153) now accept only SYSPROF, COMM and CMDLINE |
+| `MSM_INFO_SET_IOVA failed` | Turnip allocates IOVAs itself once VA_START/VA_SIZE exist. BlueGPU has one shared VA space with kernel-chosen IOVAs, so `has_set_iova` is false on Darwin |
+
+Next:
+
+1. `vk-smoke` on the phone with the 0153 fix. The fill must read `0xb10e0630`.
+2. An A630 Turnip device profile for metal2vulkan.
+3. The frontend.
