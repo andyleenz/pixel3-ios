@@ -7,13 +7,49 @@
  * Defaults: dev.blueline.hello, domain 1 (system). Prints "APPTEST: PASS" or the step that failed.
  * Built by tools/bluerun/build.sh-style flags, signed with apptest.ent.
  *
+ * The launch is ios-flame's phone/tools/openapp.m (FBSOpenApplicationService, MIT),
+ * with LaunchServices as the fallback.
+ *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
  */
 #import <Foundation/Foundation.h>
+#include <dlfcn.h>
 #include <spawn.h>
 #include <sys/wait.h>
 
 extern char **environ;
+
+@interface FBSOpenApplicationOptions : NSObject
++ (instancetype)optionsWithDictionary:(NSDictionary *)dict;
+@end
+@interface FBSOpenApplicationService : NSObject
++ (instancetype)serviceWithDefaultShellEndpoint;
+- (void)openApplication:(NSString *)bundleID withOptions:(FBSOpenApplicationOptions *)options
+	     completion:(void (^)(id process, NSError *error))completion;
+@end
+
+/* ios-flame openapp.m (MIT): FrontBoard asks SpringBoard to launch it */
+static BOOL
+open_app(NSString *bid)
+{
+	dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW);
+	Class svc = NSClassFromString(@"FBSOpenApplicationService");
+	Class optc = NSClassFromString(@"FBSOpenApplicationOptions");
+	if (!svc || !optc)
+		return NO;
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	__block BOOL ok = NO;
+	[[svc serviceWithDefaultShellEndpoint] openApplication:bid
+	    withOptions:[optc optionsWithDictionary:@{ @"__UnlockDevice": @YES, @"__ActivateSuspended": @NO }]
+	    completion:^(id process, NSError *error) {
+		printf("APPTEST: FrontBoard open: %s\n", error ? error.description.UTF8String : [[process description] UTF8String]);
+		ok = error == nil;
+		dispatch_semaphore_signal(done);
+	    }];
+	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)))
+		printf("APPTEST: FrontBoard open: no answer in 30 s\n");
+	return ok;
+}
 
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
@@ -65,8 +101,10 @@ main(int argc, char **argv)
 		}
 		NSString *txt = [p.dataContainerURL.path stringByAppendingPathComponent:@"Documents/hello.txt"];
 		[[NSFileManager defaultManager] removeItemAtPath:txt error:nil];
-		BOOL opened = [[LSApplicationWorkspace defaultWorkspace] openApplicationWithBundleID:bid];
-		printf("APPTEST: openApplicationWithBundleID %d\n", opened);
+		if (!open_app(bid)) {
+			BOOL opened = [[LSApplicationWorkspace defaultWorkspace] openApplicationWithBundleID:bid];
+			printf("APPTEST: LaunchServices openApplicationWithBundleID %d\n", opened);
+		}
 		for (int i = 0; i < 30; i++) {
 			NSString *s = [NSString stringWithContentsOfFile:txt encoding:NSUTF8StringEncoding error:nil];
 			if (s) {
