@@ -1,0 +1,738 @@
+0212: blueline OS-initiated cluster idle (bluecpu_idle=3, off by default)
+
+Step 1 toward the apps subsystem's RPMh sleep: PSCI OS-initiated mode with
+Linux's sdm845 states (cores 0x40000004, the last one 0x4100c244), and the
+earliest deadline in the apps RSC's CONTROL TCS so the AOSS wakes the APSS.
+
+bluecpu_idle_ss (bits, off by default): the apps RSC's sleep/wake sets.
+1 = MC0, SH0, MM0-3 at 0 in sleep; 2 = xo.lvl 0; 4 = cx.lvl and mx.lvl at
+level index 0 (wake: first level >= NOM). The sleep TCS is enabled only
+while the panel sleeps (from blue_bw_park, 0211; armed with the panel on,
+the phone hung within ~25 s), and the last core skips the cluster state
+while a UFS command is in flight. Every 10 s it also logs the AOP's SoC
+sleep counters (AOSD, CXSD; msg RAM 0xc3f0000 + 0x48, as qcom_stats).
+
+Result: stable, no change in draw (209-216 mA screen off with any set).
+AOSD and CXSD stay at 0, also with GPU, Wi-Fi and sound off.
+
+bluetimers=1 (diagnostic): every 10 s, the timers that fired most (timer
+calls, thread calls, and threads' wait timeouts by process), from hooks in
+timer_call.c and thread_call.c.
+
+diff -ruN a/bsd/dev/blueline_bw.c b/bsd/dev/blueline_bw.c
+--- a/bsd/dev/blueline_bw.c	2026-11-24 11:03:16
++++ b/bsd/dev/blueline_bw.c	2026-11-24 11:41:59
+@@ -126,11 +126,17 @@
+ }
+ 
+ /* From the vsync workloop thread: 1 once the panel sleeps, 0 before it wakes. */
++extern void blue_sleepset_panel(int off);	/* osfmk/arm64/blueline_idle.c, 0212 */
++
+ void
+ blue_bw_park(int park)
+ {
+ 	uint32_t data[MAXB];
+ 
++	if (!park) {
++		blue_sleepset_panel(0);		/* before anything is voted back up */
++	}
++
+ 	if (bw_mode < 0) {
+ 		bw_init();
+ 		int secs = 0;
+@@ -139,6 +145,9 @@
+ 		if (park && secs > 0 && kernel_thread_start(census_thread, (void *)(uintptr_t)secs, &th) == KERN_SUCCESS) {
+ 			thread_deallocate(th);
+ 		}
++	}
++	if (park) {
++		blue_sleepset_panel(1);		/* the panel is in sleep: the RSC's sleep set may drop the votes */
+ 	}
+ 	if (bw_mode <= 0 || nb == 0) {
+ 		return;
+diff -ruN a/bsd/dev/blueline_touch.c b/bsd/dev/blueline_touch.c
+--- a/bsd/dev/blueline_touch.c	2026-11-24 10:50:13
++++ b/bsd/dev/blueline_touch.c	2026-11-24 11:41:59
+@@ -500,6 +500,7 @@
+ 
+ /* For blueline_gpu.c: the same, mapping the apps RSC if touch did not (bluetouch=0). */
+ int blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n);
++extern void blue_sleepset_note(uint32_t addr, uint32_t data);
+ int
+ blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n)
+ {
+@@ -509,7 +510,13 @@
+ 	if (!rsc || n < 1 || n > 16) {
+ 		return ENXIO;
+ 	}
+-	return rpmh_write(addr, data, n);
++	int err = rpmh_write(addr, data, n);
++	if (err == 0) {
++		for (int i = 0; i < n; i++) {
++			blue_sleepset_note(addr[i], data[i]);	/* blueline_idle.c: the wake set follows (0212) */
++		}
++	}
++	return err;
+ }
+ 
+ static int
+diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-24 11:03:16
++++ b/bsd/dev/sweet_ufs.c	2026-11-24 11:41:59
+@@ -156,6 +156,14 @@
+ static int _Atomic ufs_emergency_cpu = -1;
+ static uint32_t _Atomic ufs_busy;
+ 
++/* For blueline_idle.c (0212): commands in flight; no APSS collapse with DDR votes dropped while one is. */
++uint32_t sweet_ufs_busy(void);
++uint32_t
++sweet_ufs_busy(void)
++{
++	return os_atomic_load(&ufs_busy, relaxed);
++}
++
+ static int ufs_scsi_cmd(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write);
+ 
+ static int
+diff -ruN a/osfmk/arm64/blueline_idle.c b/osfmk/arm64/blueline_idle.c
+--- a/osfmk/arm64/blueline_idle.c	2026-11-24 10:02:04
++++ b/osfmk/arm64/blueline_idle.c	2026-11-24 11:41:59
+@@ -38,6 +38,37 @@
+  * sends an IPI to every core whose deadline has passed and re-arms the
+  * frame for the rest.
+  *
++ * bluecpu_idle=3 (0212): OS-initiated mode, as Linux runs the SDM845
++ * (cpuidle-psci-domain). PSCI_SET_SUSPEND_MODE(1) at start; cores ask for
++ * 0x40000004 (LITTLE/BIG_CPU_SLEEP_0), and the core that finds all others
++ * already down asks for 0x4100c244 (CLUSTER_SLEEP_0, the APSS and the apps
++ * RSC) when the earliest deadline of all of them is at least
++ * bluecpu_idle_cluster_us away. If another core is in fact up, the firmware
++ * answers DENIED and the core goes on as after WFI. In that state the
++ * cores' timers and the broadcast frame cannot wake the APSS (SPI 6 is not
++ * a PDC wake input), so before asking, the core writes the earliest
++ * deadline, capped at bluecpu_idle_max_ms (100), into the apps RSC's
++ * CONTROL TCS (DRV2 +0x40 lo, +0x38 hi | valid), as rpmh_rsc_write_next_wakeup.
++ * bluecpu_idle_ss (with bluecpu_idle=3): the apps RSC's sleep and wake
++ * sets, which the firmware sends when the APSS goes down and comes back
++ * (Linux rpmh_flush). Bit 1: the BCMs MC0, SH0, MM0-3 at 0 in sleep (the
++ * apps' DDR and multimedia NoC votes drop); bit 2: xo.lvl 0 in sleep (the
++ * apps stop holding CXO). The wake set puts back the last active value
++ * written to each address (blueline_rpmh_write reports every vote here),
++ * or a safe default (BCMs at their top, xo.lvl 3) until there is one. Bit
++ * 4: cx.lvl and mx.lvl at level index 0 in sleep (Linux rpmhpd's sleep vote
++ * with no consumer), and in wake at the first cmd-db level >= NOM (256). The
++ * sets are written once at start (sleep TCS 2, wake TCS 5) and a wake slot
++ * is rewritten in place when its address is voted again.
++ *
++ * The sleep set is armed (its CMD_ENABLE) only while the panel sleeps
++ * (blue_bw_park, 0211): the display engine reads DDR over the MM NoC and
++ * its DSI PLL runs from CXO, so in Linux those votes stay in sleep while
++ * the display is on. With the sleep set armed, the last core does not ask
++ * for the cluster state while a UFS command is in flight (the controller
++ * DMAs to DDR while its thread waits). ss1/ss2: armed with the panel on,
++ * the phone hung within ~25 s.
++ *
+  * Every 10 s: "BLUELINE IDLE: 10s:" with suspends, returns, resumes,
+  * broadcast interrupts and IPIs, and the time each core spent powered down.
+  */
+@@ -56,6 +87,8 @@
+ #include <machine/atomic.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <string.h>
++#include <mach/vm_param.h>
+ 
+ #define TAG "BLUELINE IDLE: "
+ #define NCPU 8
+@@ -80,10 +113,29 @@
+ #define PSCI_VERSION		0x84000000ULL
+ #define PSCI_FEATURES		0x8400000aULL
+ #define PSCI_CPU_SUSPEND	0xc4000001ULL
++#define PSCI_SET_SUSPEND_MODE	0x8400000fULL
++#define PSCI_DENIED		(-3)
+ 
++#define RSC_DRV2_PA		0x179e0000u	/* apps RSC, DRV 2 */
++#define RSC_CTL_TCS_DATA_HI	0x38u
++#define RSC_CTL_TCS_DATA_LO	0x40u
++#define RSC_CTL_HI_VALID	(1u << 31)
++#define RSC_TCS_BASE		0xd00u
++#define RSC_TCS_STRIDE		0x2a0u
++#define RSC_CMD_STRIDE		20u
++#define TCS_CMD_ENABLE		0x1cu
++#define TCS_CMD_MSGID		0x30u
++#define TCS_CMD_ADDR		0x34u
++#define TCS_CMD_DATA		0x38u
++#define TCS_SLEEP		2		/* sdm845 tcs-config: ACTIVE 2, SLEEP 3, WAKE 3, CONTROL 1 */
++#define TCS_WAKE		5
++#define BCM_CMD(commit, valid, x, y) (((uint32_t)(commit) << 30) | ((uint32_t)(valid) << 29) | \
++	(((uint32_t)(x) & 0x3fffu) << 14) | ((uint32_t)(y) & 0x3fffu))
++
+ #define SLEEPING_NO_DEADLINE	UINT64_MAX
+ 
+ extern void sweet_secondary_entry(void);
++extern uint32_t sweet_ufs_busy(void);
+ extern void pe_init_fiq(void);
+ extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
+ bool blue_idle_enter(int cpu, uint64_t deadline);
+@@ -107,6 +159,23 @@
+ 	uint32_t irqs, ipis;
+ 	uint64_t down_abs[NCPU];
+ 	int32_t last_rc;
++	/* bluecpu_idle=3: OS-initiated mode */
++	bool osi;
++	uint32_t ncpus;
++	uint32_t ndown;			/* cores between CPU_SUSPEND and their return or resume */
++	uint64_t max_ticks;		/* cap on the RSC wakeup */
++	vm_offset_t rsc;
++	bool incl[NCPU];		/* this core asked for the cluster state */
++	uint32_t c_tries, c_denied, c_resumed, c_alldown;
++	uint64_t c_bestgap;
++	/* bluecpu_idle_ss */
++	int ss_n;
++	bool ss_on;
++	bool ss_armed;			/* sleep TCS enabled: the panel sleeps */
++	uint32_t c_ufs_busy;
++	vm_offset_t aop_stats;		/* 0xc3f0000, AOP msg RAM: SoC sleep stats */
++	uint32_t ss_addr[12], ss_sleep[12], ss_wake[12];
++	uint64_t c_down_abs;
+ } bi;
+ 
+ static inline void
+@@ -187,8 +256,8 @@
+ 	return ok;
+ }
+ 
+-/* Under bi.lock: program the frame for the earliest deadline at or after now, or stop it. */
+-static void
++/* Under bi.lock: program the frame for the earliest deadline at or after now, or stop it; returns it. */
++static uint64_t
+ bc_program(uint64_t now)
+ {
+ 	uint64_t min = UINT64_MAX;
+@@ -201,7 +270,7 @@
+ 	}
+ 	if (min == UINT64_MAX) {
+ 		frame_wr(bi.ctl, CTL_IMASK);
+-		return;
++		return min;
+ 	}
+ 	uint64_t delta = min > now ? min - now : 1;
+ 	if (delta > 0x7fffffffULL) {
+@@ -209,6 +278,7 @@
+ 	}
+ 	frame_wr(bi.tval, (uint32_t)delta);
+ 	frame_wr(bi.ctl, CTL_ENABLE);
++	return min;
+ }
+ 
+ /* The frame's interrupt: wake every powered-down core whose deadline has passed. */
+@@ -252,18 +322,48 @@
+ 		return false;
+ 	}
+ 	uint32_t ps = bi.ps;
+-	if (bi.cps && (deadline == EndOfAllTime || deadline - now >= bi.cluster_ticks)) {
++	if (!bi.osi && bi.cps && (deadline == EndOfAllTime || deadline - now >= bi.cluster_ticks)) {
+ 		ps = bi.cps;	/* platform-coordinated: the cluster goes when its last core asks too */
+ 		bi.cluster_calls++;
+ 	}
+ 
+ 	bi_lock();
+ 	bi.dl[cpu] = deadline == EndOfAllTime ? SLEEPING_NO_DEADLINE : deadline;
+-	bc_program(now);
++	uint64_t mind = bc_program(now);
+ 	bi_unlock();
+ 	bi.t_in[cpu] = now;
+ 	bi.calls[cpu]++;
++	bi.incl[cpu] = false;
+ 
++	if (bi.osi) {
++		uint32_t n = os_atomic_inc(&bi.ndown, relaxed);
++		if (n >= bi.ncpus) {
++			uint64_t g = mind == UINT64_MAX ? UINT64_MAX : (mind > now ? mind - now : 0);
++			bi.c_alldown++;
++			if (g > bi.c_bestgap) {
++				bi.c_bestgap = g;
++			}
++		}
++		bool ufs = false;
++		if (n >= bi.ncpus && bi.ss_armed && sweet_ufs_busy() != 0) {
++			ufs = true;
++			bi.c_ufs_busy++;
++		}
++		if (n >= bi.ncpus && !ufs && (mind == UINT64_MAX || mind - now >= bi.cluster_ticks)) {
++			/* Looks like the last core up: the APSS can go, woken by the RSC at the earliest deadline. */
++			uint64_t gap = mind == UINT64_MAX ? bi.max_ticks : mind - now;
++			if (gap > bi.max_ticks) {
++				gap = bi.max_ticks;
++			}
++			uint64_t w = __builtin_arm_rsr64("CNTPCT_EL0") + gap;
++			*(volatile uint32_t *)(bi.rsc + RSC_CTL_TCS_DATA_LO) = (uint32_t)w;
++			*(volatile uint32_t *)(bi.rsc + RSC_CTL_TCS_DATA_HI) = ((uint32_t)(w >> 32) & 0xffffffu) | RSC_CTL_HI_VALID;
++			ps = bi.cps;
++			bi.incl[cpu] = true;
++			bi.c_tries++;
++		}
++	}
++
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int64_t rc = psci_call(PSCI_CPU_SUSPEND, ps, bi.entry_pa, 0);
+ 
+@@ -271,8 +371,13 @@
+ 	bi_lock();
+ 	bi.dl[cpu] = 0;
+ 	bi_unlock();
++	if (bi.osi) {
++		os_atomic_dec(&bi.ndown, relaxed);
++	}
+ 	bi.returns[cpu]++;
+-	if (rc != 0) {
++	if (rc == PSCI_DENIED && bi.incl[cpu]) {
++		bi.c_denied++;	/* another core was up after all */
++	} else if (rc != 0) {
+ 		bi.last_rc = (int32_t)rc;
+ 		if (++bi.errors >= 100) {
+ 			bi.on = false;
+@@ -292,11 +397,302 @@
+ 		bi_unlock();
+ 		bi.resumes[cpu]++;
+ 		bi.down_abs[cpu] += mach_absolute_time() - bi.t_in[cpu];
++		if (bi.osi) {
++			os_atomic_dec(&bi.ndown, relaxed);
++			if (bi.incl[cpu]) {
++				bi.c_resumed++;
++				bi.c_down_abs += mach_absolute_time() - bi.t_in[cpu];
++			}
++		}
+ 	}
+ 	ClearIdlePop(FALSE);
+ }
+ 
++/*
++ * bluetimers=1 (diagnostic): every 10 s, the timers that fired most, from
++ * timer_queue_expire_with_options (timer calls; a thread's own wait timeout,
++ * thread_timer_expire, is counted per thread with its process name) and
++ * thread_call_delayed_timer (thread calls). Function addresses are unslid,
++ * for nm on kernel.development.sweet.
++ */
++#define TC_N 96
++static struct tc_ent {
++	uintptr_t key, func;
++	uint32_t n;
++	uint8_t kind;			/* 0 timer call, 1 thread call, 2 thread wait timeout */
++	uint64_t tid;
++	uintptr_t ev, cont;		/* a waiting thread's wait event and continuation */
++	uintptr_t pcs[6];		/* ... and where it blocked */
++	char name[17];
++} tc[TC_N], tc_copy[TC_N];
++static uint32_t tc_lock, tc_total, tc_drop;
++static bool tc_on;
++extern void thread_timer_expire(void *p0, void *p1);
++extern task_t get_threadtask(thread_t th);
++extern void *get_bsdtask_info(task_t t);
++extern char *proc_name_address(void *p);
++void blue_tc_note(int kind, void *func, void *p0);
++
++/* A blocked thread's saved lr and frame-pointer chain, kept inside its kernel stack. */
+ static void
++tc_stack(thread_t th, uintptr_t *pcs, int n)
++{
++	vm_offset_t lo = th->kernel_stack, hi = lo + kernel_stack_size;
++	if (lo == 0 || th->machine.kstackptr < lo || th->machine.kstackptr >= hi) {
++		return;
++	}
++	struct arm_kernel_saved_state *ss = &((thread_kernel_state_t)th->machine.kstackptr)->machine.ss;
++	uintptr_t fp = ss->fp;
++	int k = 0;
++	pcs[k++] = ss->lr;
++	while (k < n && fp >= lo && fp + 16 <= hi && (fp & 7) == 0) {
++		pcs[k++] = ((uintptr_t *)fp)[1];
++		uintptr_t nfp = ((uintptr_t *)fp)[0];
++		if (nfp <= fp) {
++			break;
++		}
++		fp = nfp;
++	}
++}
++
++/* Timer context, interrupts off. */
++void
++blue_tc_note(int kind, void *func, void *p0)
++{
++	if (!tc_on) {
++		return;
++	}
++	uintptr_t key = (uintptr_t)func;
++	if (kind == 0 && func == (void *)thread_timer_expire && p0 != NULL) {
++		kind = 2;
++		key = (uintptr_t)p0;
++	}
++	while (os_atomic_xchg(&tc_lock, 1u, acquire)) {
++		__builtin_arm_yield();
++	}
++	tc_total++;
++	int i;
++	for (i = 0; i < TC_N; i++) {
++		if (tc[i].n == 0 || (tc[i].key == key && tc[i].kind == kind)) {
++			break;
++		}
++	}
++	if (i == TC_N) {
++		tc_drop++;
++	} else {
++		if (tc[i].n == 0) {
++			tc[i].key = key;
++			tc[i].func = (uintptr_t)func;
++			tc[i].kind = (uint8_t)kind;
++			tc[i].tid = 0;
++			tc[i].name[0] = 0;
++			if (kind == 2) {
++				thread_t th = (thread_t)p0;
++				tc[i].tid = thread_tid(th);
++				tc[i].ev = (uintptr_t)th->wait_event;
++				tc[i].cont = (uintptr_t)th->continuation;
++				bzero(tc[i].pcs, sizeof(tc[i].pcs));
++				tc_stack(th, tc[i].pcs, 6);
++				task_t t = get_threadtask(th);
++				void *p = t ? get_bsdtask_info(t) : NULL;
++				if (p) {
++					strlcpy(tc[i].name, proc_name_address(p), sizeof(tc[i].name));
++				} else {
++					strlcpy(tc[i].name, "kernel", sizeof(tc[i].name));
++				}
++			}
++		}
++		tc[i].n++;
++	}
++	os_atomic_store(&tc_lock, 0u, release);
++}
++
++static void
++tc_report_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static uint32_t dummy;
++	static const char *kinds[3] = { "timer_call", "thread_call", "wait" };
++
++	for (;;) {
++		assert_wait_timeout(&dummy, THREAD_UNINT, 10000, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		boolean_t ie = ml_set_interrupts_enabled(FALSE);
++		while (os_atomic_xchg(&tc_lock, 1u, acquire)) {
++			__builtin_arm_yield();
++		}
++		memcpy(tc_copy, tc, sizeof(tc));
++		bzero(tc, sizeof(tc));
++		uint32_t total = tc_total, drop = tc_drop;
++		tc_total = tc_drop = 0;
++		os_atomic_store(&tc_lock, 0u, release);
++		ml_set_interrupts_enabled(ie);
++
++		printf("BLUELINE TIMERS: 10s: %u fired (%u not tallied)\n", total, drop);
++		for (int k = 0; k < 20; k++) {
++			int best = -1;
++			for (int i = 0; i < TC_N; i++) {
++				if (tc_copy[i].n && (best < 0 || tc_copy[i].n > tc_copy[best].n)) {
++					best = i;
++				}
++			}
++			if (best < 0) {
++				break;
++			}
++			struct tc_ent *e = &tc_copy[best];
++			if (e->kind == 2) {
++				printf("BLUELINE TIMERS:  %5u wait   thread %llu (%s) event %#lx (unslid %#lx) continuation %#lx\n", e->n, e->tid,
++				    e->name, (unsigned long)e->ev, (unsigned long)VM_KERNEL_UNSLIDE(e->ev), (unsigned long)VM_KERNEL_UNSLIDE(e->cont));
++				printf("BLUELINE TIMERS:         stack %#lx %#lx %#lx %#lx %#lx %#lx\n",
++				    (unsigned long)VM_KERNEL_UNSLIDE(e->pcs[0]), (unsigned long)VM_KERNEL_UNSLIDE(e->pcs[1]),
++				    (unsigned long)VM_KERNEL_UNSLIDE(e->pcs[2]), (unsigned long)VM_KERNEL_UNSLIDE(e->pcs[3]),
++				    (unsigned long)VM_KERNEL_UNSLIDE(e->pcs[4]), (unsigned long)VM_KERNEL_UNSLIDE(e->pcs[5]));
++			} else {
++				printf("BLUELINE TIMERS:  %5u %s %#lx\n", e->n, kinds[e->kind],
++				    (unsigned long)VM_KERNEL_UNSLIDE(e->func));
++			}
++			e->n = 0;
++		}
++	}
++}
++
++static inline vm_offset_t
++tcs_cmd(int tcs, int cmd, uint32_t reg)
++{
++	return bi.rsc + RSC_TCS_BASE + RSC_TCS_STRIDE * (uint32_t)tcs + reg + RSC_CMD_STRIDE * (uint32_t)cmd;
++}
++
++/* From blueline_rpmh_write after an active vote: keep the wake set in step. */
++void blue_sleepset_note(uint32_t addr, uint32_t data);
++void
++blue_sleepset_note(uint32_t addr, uint32_t data)
++{
++	for (int i = 0; i < bi.ss_n; i++) {
++		if (bi.ss_addr[i] == addr) {
++			bi.ss_wake[i] = data;
++			if (bi.ss_on) {
++				*(volatile uint32_t *)tcs_cmd(TCS_WAKE, i, TCS_CMD_DATA) = data;
++			}
++		}
++	}
++}
++
++extern uint32_t blueline_cmddb_addr(const char *id);
++
++/* From blue_bw_park (0211): 1 once the panel sleeps, 0 before it wakes. */
++void blue_sleepset_panel(int off);
++void
++blue_sleepset_panel(int off)
++{
++	if (!bi.ss_on) {
++		return;
++	}
++	uint32_t m = off ? (1u << bi.ss_n) - 1 : 0;
++	if (!off) {
++		bi.ss_armed = false;
++		__builtin_arm_dmb(DMB_ISH);
++	}
++	*(volatile uint32_t *)(bi.rsc + RSC_TCS_BASE + RSC_TCS_STRIDE * TCS_SLEEP + TCS_CMD_ENABLE) = m;
++	__builtin_arm_dsb(DSB_SY);
++	if (off) {
++		bi.ss_armed = true;
++	}
++	printf(TAG "sleep set %s (panel %s)\n", off ? "armed" : "disarmed", off ? "asleep" : "waking");
++}
++
++static void
++ss_add(const char *name, uint32_t sleep, uint32_t wake)
++{
++	uint32_t a = blueline_cmddb_addr(name);
++	if (a == 0 || bi.ss_n >= 12) {
++		printf(TAG "sleep set: %s not in cmd-db\n", name);
++		return;
++	}
++	bi.ss_addr[bi.ss_n] = a;
++	bi.ss_sleep[bi.ss_n] = sleep;
++	bi.ss_wake[bi.ss_n] = wake;
++	bi.ss_n++;
++}
++
++extern uint32_t blueline_cmddb_aux(const char *id, uint8_t *buf, uint32_t max);
++
++/* Index of the first cmd-db aux level >= want (the top one if none is). */
++static uint32_t
++arc_idx(const char *id, uint16_t want)
++{
++	uint8_t b[64] = { 0 };
++	uint32_t len = blueline_cmddb_aux(id, b, sizeof(b));
++	int n = (int)((len < sizeof(b) ? len : sizeof(b)) / 2);
++	uint16_t lv[32];
++	for (int i = 0; i < n; i++) {
++		lv[i] = (uint16_t)(b[2 * i] | b[2 * i + 1] << 8);
++	}
++	while (n > 0 && lv[n - 1] == 0) {
++		n--;
++	}
++	printf(TAG "sleep set: %s levels:", id);
++	for (int i = 0; i < n; i++) {
++		printf(" %u", lv[i]);
++	}
++	printf("\n");
++	for (int i = 0; i < n; i++) {
++		if (lv[i] >= want) {
++			return (uint32_t)i;
++		}
++	}
++	return n > 0 ? (uint32_t)(n - 1) : 0;
++}
++
++static void
++ss_write(int which)
++{
++	for (int t = 2; t <= 7; t++) {
++		uint32_t en = *(volatile uint32_t *)(bi.rsc + RSC_TCS_BASE + RSC_TCS_STRIDE * (uint32_t)t + TCS_CMD_ENABLE);
++		printf(TAG "sleep set: TCS %d (%s) left with CMD_ENABLE %#x", t, t < 5 ? "sleep" : "wake", en);
++		for (int c = 0; c < 16 && en; c++) {
++			if (en & (1u << c)) {
++				printf(" [%d] %#x=%#x", c, *(volatile uint32_t *)tcs_cmd(t, c, TCS_CMD_ADDR),
++				    *(volatile uint32_t *)tcs_cmd(t, c, TCS_CMD_DATA));
++			}
++		}
++		printf("\n");
++	}
++	if (which & 1) {
++		static const char *bcms[6] = { "MC0", "SH0", "MM0", "MM1", "MM2", "MM3" };
++		for (int i = 0; i < 6; i++) {
++			ss_add(bcms[i], BCM_CMD(1, 0, 0, 0), BCM_CMD(1, 1, 0x3fff, 0x3fff));
++		}
++	}
++	if (which & 2) {
++		ss_add("xo.lvl", 0, 3);
++	}
++	if (which & 4) {
++		ss_add("cx.lvl", 0, arc_idx("cx.lvl", 256));
++		ss_add("mx.lvl", 0, arc_idx("mx.lvl", 256));
++	}
++	for (int t = 2; t <= 7; t++) {
++		*(volatile uint32_t *)(bi.rsc + RSC_TCS_BASE + RSC_TCS_STRIDE * (uint32_t)t + TCS_CMD_ENABLE) = 0;
++	}
++	for (int i = 0; i < bi.ss_n; i++) {
++		*(volatile uint32_t *)tcs_cmd(TCS_SLEEP, i, TCS_CMD_MSGID) = 8u | (1u << 16);		/* write, fire and forget */
++		*(volatile uint32_t *)tcs_cmd(TCS_SLEEP, i, TCS_CMD_ADDR) = bi.ss_addr[i];
++		*(volatile uint32_t *)tcs_cmd(TCS_SLEEP, i, TCS_CMD_DATA) = bi.ss_sleep[i];
++		*(volatile uint32_t *)tcs_cmd(TCS_WAKE, i, TCS_CMD_MSGID) = 8u | (1u << 16) | (1u << 8);	/* write, response */
++		*(volatile uint32_t *)tcs_cmd(TCS_WAKE, i, TCS_CMD_ADDR) = bi.ss_addr[i];
++		*(volatile uint32_t *)tcs_cmd(TCS_WAKE, i, TCS_CMD_DATA) = bi.ss_wake[i];
++		printf(TAG "sleep set: [%d] %#x sleep %#x wake %#x\n", i, bi.ss_addr[i], bi.ss_sleep[i], bi.ss_wake[i]);
++	}
++	if (bi.ss_n) {
++		uint32_t m = (1u << bi.ss_n) - 1;
++		/* sleep TCS left disabled until the panel sleeps (blue_sleepset_panel) */
++		*(volatile uint32_t *)(bi.rsc + RSC_TCS_BASE + RSC_TCS_STRIDE * TCS_WAKE + TCS_CMD_ENABLE) = m;
++		__builtin_arm_dsb(DSB_SY);
++		bi.ss_on = true;
++	}
++	printf(TAG "sleep set: %d commands in sleep TCS %d and wake TCS %d\n", bi.ss_n, TCS_SLEEP, TCS_WAKE);
++}
++
++static void
+ report_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	static uint32_t dummy;
+@@ -323,16 +719,59 @@
+ 		    " %u ipis, %u errors (last rc %d); %% down per core:%s\n", bi.on ? "on" : "OFF",
+ 		    calls, bi.cluster_calls, rets, res, bi.irqs, bi.ipis, bi.errors, bi.last_rc, down);
+ 		bi.irqs = bi.ipis = bi.cluster_calls = 0;
++		if (bi.osi) {
++			printf(TAG "10s: OSI: all %u cores down %u times (longest gap then %lld us), %u cluster requests, %u denied,"
++			    " %u resumed from it, last core down %llu ms; sleep set %s, %u skipped for UFS\n", bi.ncpus, bi.c_alldown,
++			    bi.c_bestgap == UINT64_MAX ? -1LL : (long long)(bi.c_bestgap / 19), bi.c_tries, bi.c_denied,
++			    bi.c_resumed, bi.c_down_abs / 19200, bi.ss_armed ? "armed" : bi.ss_on ? "disarmed" : "off", bi.c_ufs_busy);
++			bi.c_ufs_busy = 0;
++			if (bi.aop_stats) {
++				/* AOP's SoC sleep stats (Linux qcom_stats rpmh_data: 3 records at +0x48) */
++				for (int r = 0; r < 3; r++) {
++					volatile uint32_t *s = (volatile uint32_t *)(bi.aop_stats + 0x48 + 32 * r);
++					uint32_t ty = s[0];
++					char nm[5] = { (char)(ty), (char)(ty >> 8), (char)(ty >> 16), (char)(ty >> 24), 0 };
++					uint64_t acc = (uint64_t)s[6] | (uint64_t)s[7] << 32;
++					printf(TAG "10s: AOP %s: count %u, total %llu ms\n", nm, s[1], acc / 19200);
++				}
++			}
++			if (bi.ss_on) {
++				/* CMD_STATUS bit 8 issued, bit 16 completed: did the firmware send the sets? */
++				printf(TAG "10s: sleep TCS %d status %#x %#x, wake TCS %d status %#x %#x, CONTROL TCS data %#x %#x\n",
++				    TCS_SLEEP, *(volatile uint32_t *)tcs_cmd(TCS_SLEEP, 0, 0x3cu),
++				    *(volatile uint32_t *)tcs_cmd(TCS_SLEEP, bi.ss_n - 1, 0x3cu), TCS_WAKE,
++				    *(volatile uint32_t *)tcs_cmd(TCS_WAKE, 0, 0x3cu), *(volatile uint32_t *)tcs_cmd(TCS_WAKE, bi.ss_n - 1, 0x3cu),
++				    *(volatile uint32_t *)(bi.rsc + RSC_CTL_TCS_DATA_HI), *(volatile uint32_t *)(bi.rsc + RSC_CTL_TCS_DATA_LO));
++			}
++			bi.c_tries = bi.c_denied = bi.c_resumed = bi.c_alldown = 0;
++			bi.c_bestgap = 0;
++			bi.c_down_abs = 0;
++		}
+ 	}
+ }
+ 
+ void
+ blue_idle_init(void)
+ {
+-	int mode = 0, us = 2000, cus = 10000;
++	int mode = 0, us = 2000, cus = 10000, max_ms = 100;
+ 	uint32_t ps = 0x40000003u, cps = 0x400000f4u;
+ 
+ 	(void)PE_parse_boot_argn("bluecpu_idle", &mode, sizeof(mode));
++	if (mode >= 3) {
++		ps = 0x40000004u;	/* Linux sdm845.dtsi, OS-initiated */
++		cps = 0x4100c244u;
++	}
++	(void)PE_parse_boot_argn("bluecpu_idle_max_ms", &max_ms, sizeof(max_ms));
++	int timers = 0;
++	(void)PE_parse_boot_argn("bluetimers", &timers, sizeof(timers));
++	if (timers > 0) {
++		thread_t tth;
++		if (kernel_thread_start(tc_report_thread, NULL, &tth) == KERN_SUCCESS) {
++			thread_deallocate(tth);
++		}
++		tc_on = true;
++		printf(TAG "timer census on (bluetimers=1)\n");
++	}
+ 	(void)PE_parse_boot_argn("bluecpu_idle_us", &us, sizeof(us));
+ 	(void)PE_parse_boot_argn("bluecpu_idle_ps", &ps, sizeof(ps));
+ 	(void)PE_parse_boot_argn("bluecpu_idle_cluster_us", &cus, sizeof(cus));
+@@ -381,8 +820,31 @@
+ 
+ 	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &bi.min_ticks);
+ 	nanoseconds_to_absolutetime((uint64_t)cus * NSEC_PER_USEC, &bi.cluster_ticks);
++	nanoseconds_to_absolutetime((uint64_t)max_ms * NSEC_PER_MSEC, &bi.max_ticks);
+ 	bi.ps = ps;
+ 	bi.cps = mode >= 2 ? cps : 0;
++	if (mode >= 3) {
++		int64_t f = psci_call(PSCI_FEATURES, PSCI_SET_SUSPEND_MODE, 0, 0);
++		int64_t rc = f < 0 ? f : psci_call(PSCI_SET_SUSPEND_MODE, 1, 0, 0);
++		bi.rsc = ml_io_map(RSC_DRV2_PA, 0x4000);
++		bi.aop_stats = ml_io_map(0x0c3f0000u, 0x1000);
++		bi.ncpus = ml_get_cpu_count();
++		printf(TAG "OS-initiated mode: SET_SUSPEND_MODE features %lld, set: %lld; %u cores; RSC CONTROL TCS was %#x %#x\n",
++		    f, rc, bi.ncpus, *(volatile uint32_t *)(bi.rsc + RSC_CTL_TCS_DATA_HI),
++		    *(volatile uint32_t *)(bi.rsc + RSC_CTL_TCS_DATA_LO));
++		if (rc != 0 || bi.rsc == 0) {
++			bi.ps = 0x40000003u;	/* stay platform-coordinated, cores only */
++			bi.cps = 0;
++			printf(TAG "OS-initiated mode refused: cores only\n");
++		} else {
++			bi.osi = true;
++			int ss = 0;
++			(void)PE_parse_boot_argn("bluecpu_idle_ss", &ss, sizeof(ss));
++			if (ss > 0) {
++				ss_write(ss);
++			}
++		}
++	}
+ 	bi.entry_pa = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 	thread_t th;
+ 	if (kernel_thread_start(report_thread, NULL, &th) == KERN_SUCCESS) {
+diff -ruN a/osfmk/kern/thread_call.c b/osfmk/kern/thread_call.c
+--- a/osfmk/kern/thread_call.c	2026-11-24 10:15:16
++++ b/osfmk/kern/thread_call.c	2026-11-24 11:41:59
+@@ -28,6 +28,10 @@
+ 
+ #include <mach/mach_types.h>
+ #include <mach/thread_act.h>
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++extern void blue_tc_note(int kind, void *func, void *p0);	/* blueline_idle.c, bluetimers=1 */
++#endif
+ 
+ #include <kern/kern_types.h>
+ #include <kern/zalloc.h>
+@@ -2033,6 +2037,9 @@
+ 			break;
+ 		}
+ 
++#if defined(SWEET)
++		blue_tc_note(1, (void *)call->tc_func, NULL);
++#endif
+ 		if (THREAD_CALL_SIGNAL & call->tc_flags) {
+ 			__assert_only queue_head_t *old_queue;
+ 			old_queue = thread_call_dequeue(call);
+diff -ruN a/osfmk/kern/timer_call.c b/osfmk/kern/timer_call.c
+--- a/osfmk/kern/timer_call.c	2026-11-24 10:15:16
++++ b/osfmk/kern/timer_call.c	2026-11-24 11:41:59
+@@ -30,6 +30,10 @@
+  */
+ 
+ #include <mach/mach_types.h>
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++extern void blue_tc_note(int kind, void *func, void *p0);	/* blueline_idle.c, bluetimers=1 */
++#endif
+ 
+ #include <kern/clock.h>
+ #include <kern/counter.h>
+@@ -1014,6 +1018,9 @@
+ 			 */
+ 			uint64_t *ttdp = &current_processor()->timer_call_ttd;
+ 			*ttdp = call->tc_ttd;
++#if defined(SWEET)
++			blue_tc_note(0, (void *)func, param0);
++#endif
+ 			(*func)(param0, param1);
+ 			*ttdp = 0;
+ #if CONFIG_DTRACE

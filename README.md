@@ -92,10 +92,12 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   audio plugin out of mediaserverd (it was looping on the missing bluetoothd, ~1.2 cores at idle):
   ~210 mA with the screen off, down from ~530 mA. ~700 IPIs a second with the screen off, down from
   12-17k. Idle cores can power down with PSCI CPU_SUSPEND (0210, `bluecpu_idle=1`), but that, the
-  GPU, the L3 clock, sound and touch each change the screen-off draw by under 5 mA. Still: CommCenter
-  restarting every ~17 s (it still expects a baseband, ~15% of a core). Next: what the bootloader
-  leaves powered (display pipeline, bus votes, regulators). Then a flashed standalone boot (slot A)
-  and a soak test.
+  GPU, the L3 clock, sound and touch each change the screen-off draw by under 5 mA. OS-initiated
+  cluster idle and the RSC sleep sets (0212) and fewer wakeups (0213, 1279 → 293 timers a second) put
+  the whole APSS down 6-8 s of every 10, but the draw stays ~200 mA. The AOP never reaches system
+  sleep (AOSD/CXSD 0), and GPU, Wi-Fi and sound off save only ~15 mA together. LineageOS recovery on
+  the same rig: 176 mA. Next: a suspend path (all subsystems voting down, USB off the bus), then a
+  flashed standalone boot (slot A) and a soak test. Still: CommCenter restarting every ~17 s.
 
 **Parked: camera**
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.

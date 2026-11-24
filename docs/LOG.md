@@ -1062,3 +1062,30 @@ No errors, no CPU_SUSPEND returns, and no hangs over 4 runs (~10 min each). The 
 - GDSCs powered: ufs_phy, ufs_card (no card slot on this phone), usb30_prim (the test cable), all seven MMU TBU votes, dispcc mdss, gpucc cx and gx. Off: pcie_0, pcie_1, usb30_sec.
 
 Nothing left on here explains ~200 mA. An LDO's own loss in normal mode is well under a milliamp, and the GPU (gx on) was already measured at ~5 mA (nogpu1). What the census can't show is CX/MX/DDR. The apps RSC only drops its votes when the subsystem goes to sleep, and its sleep and wake command sets are never written. ABL's active votes therefore hold the SoC rails and the DDR at active levels, whatever the cores do. Next: write RSC sleep/wake sets (as Linux's `rpmh_flush`) with keepalive BCM votes and retention ARC levels, then check whether the last core's cluster request ever reaches the AOSS.
+
+**OS-initiated cluster idle, RSC sleep sets and a timer census (0212, 0213, 2026-11-24).** 0212 (`bluecpu_idle=3`) switches PSCI to OS-initiated mode with Linux's sdm845 idle states. The last core down asks for the cluster state (0x4100c244) and puts the next deadline in the apps RSC's CONTROL TCS. `bluetimers=1` counts the timers that fire, screen off:
+
+| Source | per second |
+|---|---|
+| ADSP GLINK receive thread, 1 ms poll (0187) | 864 |
+| keys thread, `delay(1)` in SPMI reads | 142 |
+| `serial_keyboard_poll` | 56 |
+| an `IOTimerEventSource` | 54 |
+| CPU governor (20 ms) | 46 |
+| all | 1279 |
+
+0213 puts the GLINK thread on its interrupt (SPI 156, 200 ms fallback; `bluesnd_glink_irq=0` polls) and makes the key reads spin for the microsecond. Timers go 1279 → 293 a second, and the whole APSS is collapsed 6-8 s of every 10 (~300 cluster entries per 10 s). Sound still works. Draw: 199-201 mA before, 196-200 after.
+
+`bluecpu_idle_ss` writes the apps RSC's sleep/wake sets as `rpmh_flush`: MC0, SH0, MM0-3 at 0, xo.lvl 0, cx.lvl/mx.lvl at their lowest level. With the panel on this hung the phone within ~25 s. It is armed only while the panel sleeps, with no cluster entry during UFS commands, and is then stable. Draw with each set: 209 (BCMs), 213 (+XO), 216 mA (+CX/MX). The AOP's own counters (AOSD, CXSD) stay at 0: the SoC never reaches system sleep.
+
+Elimination, screen off, all with 0212/0213:
+
+| Run | Off | mA |
+|---|---|---|
+| ss5 | nothing | 216 |
+| nogpu | GPU (`bluegpu=0`, CPU presents) | 209 |
+| bare | GPU, Wi-Fi/modem, sound/ADSP | 197 |
+
+DVFS already holds silver at 300 MHz (76% of the time) and gold at 825 MHz. For scale, LineageOS recovery on the same rig is 256 mA at WFI only and 176 mA with its LPM levels on, panel on at brightness 0.
+
+So ~200 mA is close to this SoC's floor without system sleep. On this rig the cable stays in (input suspended), USB stays up, and Android would not reach CXSD either. The next real step is a suspend path: every DRV voting down so the AOP reaches AOSD/CXSD. Measuring it means taking USB off the bus.
