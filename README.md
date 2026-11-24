@@ -96,22 +96,26 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   cluster idle and the RSC sleep sets (0212) and fewer wakeups (0213, 1279 → 293 timers a second) put
   the whole APSS down 6-8 s of every 10, but the draw stays ~200 mA. The AOP never reaches system
   sleep (AOSD/CXSD 0), and GPU, Wi-Fi and sound off save only ~15 mA together. LineageOS recovery on
-  the same rig: 176 mA. Next: a suspend path (all subsystems voting down, USB off the bus), then a
-  flashed standalone boot (slot A) and a soak test. Still: CommCenter restarting every ~17 s.
+  the same rig: 176 mA. Next: a flashed standalone boot (slot A) and a soak test. Later: a suspend
+  path (all subsystems voting down, USB off the bus). Still: CommCenter restarting every ~17 s.
 
 **Parked: camera**
 - Rear focus (LC898219XI), continuous frames, then a path into iOS.
 
-**Next**
-- Photos: find out why it sees no photo library (assetsd never starts).
-- GPU memory: a larger BO pool than 32 MiB, and a 4th scanout buffer.
-- Widgets ("Waiting...").
-- Wi-Fi joins only on every other boot.
+**Next, in order**
+1. Metal: our own `MTLDevice` on Mesa freedreno, with Apple's shader IR (AIR) translated to NIR for
+   the ir3 compiler. Staged: device and buffers, then a triangle, then compute, then the apps that use it.
+2. Installing apps: unencrypted and self-signed apps, and a better stand-in for the Secure Enclave.
+   FairPlay-encrypted App Store apps are out of reach (their keys live in a real SEP).
+3. Wi-Fi (5 GHz, joins on every boot), Photos (assetsd never starts), widgets ("Waiting..."),
+   GPU memory (a BO pool over 32 MiB, a 4th scanout buffer).
+4. Microphone and sensors.
+5. Cellular data (eSIM later).
+6. Bluetooth.
 
 **Later**
 - iPadOS 18 (the iPad 7's arm64 build, with the phone home-screen layout switched on by feature flags):
   a newer kernel generation and a re-port of our patches. Suggested in erikkunz/pixel3-ios#1.
-- Metal: a much larger project (no Apple GPU driver to stand on).
 
 **Why iOS 16:** every iOS for newer iPhones is built for arm64e, which uses ARMv8.3 pointer authentication.
 The Pixel 3's cores are ARMv8.2 and have none, so iOS 16 for the iPhone X (plain arm64) is the newest *iPhone*

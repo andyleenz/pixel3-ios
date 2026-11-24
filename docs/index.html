@@ -236,6 +236,17 @@ var t='dark';try{t=localStorage.getItem('p3theme')||t}catch(e){}document.documen
  <div class="card"><span class="st no">No</span><h3>Face ID / SEP</h3><p>So no FairPlay: App Store apps don't run.</p></div>
 </div>
 
+<h2 id="roadmap">Roadmap</h2>
+<p class="sub">In order. Battery first: a flashed standalone boot and a soak test.</p>
+<ol class="sub">
+ <li><b>Metal</b>: our own MTLDevice on Mesa freedreno, Apple's shader IR translated for the Adreno compiler.</li>
+ <li><b>Installing apps</b>: unencrypted and self-signed apps; a better Secure Enclave stand-in. (FairPlay App Store apps stay out of reach.)</li>
+ <li>Wi-Fi 5 GHz and reliable joins, Photos, widgets.</li>
+ <li>Microphone and sensors.</li>
+ <li>Cellular data.</li>
+ <li>Bluetooth.</li>
+</ol>
+
 <h2 id="how">How it works</h2>
 <p class="sub">A ported kernel under Apple's own userland.</p>
 <div class="how">
