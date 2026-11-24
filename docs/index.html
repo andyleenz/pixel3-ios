@@ -224,7 +224,7 @@ var t='dark';try{t=localStorage.getItem('p3theme')||t}catch(e){}document.documen
 <div class="grid">
  <div class="card"><span class="st ok">✓ Works</span><h3>Boot</h3><p>Google's bootloader (unlocked) starts a shim that loads XNU with an Apple device tree. Android stays in slot B.</p></div>
  <div class="card"><span class="st ok">✓ Works</span><h3>Display</h3><p>1080x2160 panel. iOS sees an iPhone X width at 2:1 (1125x2250, scaled 0.96). Triple-buffered scan-out at 60 Hz.</p></div>
- <div class="card"><span class="st ok">✓ Works</span><h3>GPU</h3><p>Adreno 630 under Mesa freedreno (GLES 3.2). CoreAnimation draws through an EAGL shim, straight into the display's buffers. Vulkan 1.3 through Turnip runs on the phone; no Metal yet.</p></div>
+ <div class="card"><span class="st ok">✓ Works</span><h3>GPU</h3><p>Adreno 630 under Mesa freedreno (GLES 3.2). CoreAnimation draws through an EAGL shim, straight into the display's buffers. Vulkan 1.3 through Turnip runs on the phone, and a test program draws through Metal over it.</p></div>
  <div class="card"><span class="st ok">✓ Works</span><h3>Touch and buttons</h3><p>ST FTM5 touch with edge gestures; power and volume keys.</p></div>
  <div class="card"><span class="st part">◐ 2.4 GHz</span><h3>Wi-Fi</h3><p>WCN3990, WPA2, DHCP, joins at boot; Apple's wifid and configd. 5 GHz not yet.</p></div>
  <div class="card"><span class="st ok">✓ Works</span><h3>CPU and storage</h3><p>All 8 cores with frequency and thermal limits. UFS; the iOS root is an HFS+ image on <code>userdata</code>.</p></div>
@@ -239,7 +239,7 @@ var t='dark';try{t=localStorage.getItem('p3theme')||t}catch(e){}document.documen
 <h2 id="roadmap">Roadmap</h2>
 <p class="sub">In order. Battery first: a flashed standalone boot and a soak test.</p>
 <ol class="sub">
- <li><b>Metal</b>: a Metal frontend over Mesa's Turnip Vulkan driver, Apple's shader IR translated to SPIR-V. A translated QuartzCore pipeline already draws through Turnip on the phone.</li>
+ <li><b>Metal</b>: a Metal frontend over Mesa's Turnip Vulkan driver, Apple's shader IR translated to SPIR-V. A test program already draws QuartzCore's stroke_line pipeline through the Metal API on the phone; next, Metal for iOS itself.</li>
  <li><b>Installing apps</b>: self-signed apps now install through installd and launch (a test app, 24 Nov). Next: reinstalls, IPA files, a better Secure Enclave stand-in. (FairPlay App Store apps stay out of reach.)</li>
  <li>Wi-Fi 5 GHz and reliable joins, Photos, widgets.</li>
  <li>Microphone and sensors.</li>

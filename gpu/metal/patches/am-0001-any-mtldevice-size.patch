@@ -1,0 +1,16 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index df72c78..f8ed8b9 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -5343,8 +5343,10 @@ static void logClientMemory() {
+ #if TARGET_OS_IPHONE
+  // The target's base class ABI (iPadOS 17.7.11, 536 bytes): the dynamic subclass adds no instance variables and reads none of the base's,
+  // so only 17's size is held to; the arm64e build (iPadOS 27, whose _MTLDevice is larger) needs the class to exist.
+-#if defined(__arm64e__)
++#if defined(__arm64e__) || defined(NMB_ANY_MTLDEVICE_SIZE)
++ // NMB_ANY_MTLDEVICE_SIZE (pixel3-ios, iOS 16.7): another OS's _MTLDevice; the subclass touches none of its ivars either way.
+  if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
++ NBLOG(@"native-metal: _MTLDevice %zu bytes",class_getInstanceSize(base));
+ #else
+  if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
+ #endif

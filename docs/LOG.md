@@ -1148,6 +1148,32 @@ The fake BlueGPU passed vk2's bug because it ignored queue ids. It now checks pe
 
 Next: draw one translated QuartzCore pipeline through Turnip on the phone.
 
+## 2026-11-24: Metal draws on the phone
+
+`mtl-draw` (`gpu/metal/test/mtl-draw.mm`) creates a Metal device and draws through the Metal API: `newLibraryWithURL:` on QuartzCore's `default.metallib`, `newRenderPipelineStateWithDescriptor:` for `stroke_line_vert_lpf` + `stroke_line_frag_lpf`, a render pass into a private BGRA8 texture, `drawPrimitives:`, and a blit to a shared buffer for the readback. The device is UniXNU's AdrenoMetal frontend (`NativeBridgeMetalFrontend.mm`, MIT), which subclasses `_MTLDevice` and hands every call to the metal2vulkan runtime (Rust, `libadreno_metal_bridge.a`) running on our Turnip. The program opens it directly with `native_bridge_metal_open`. No plugin is involved yet, and iOS's own `MTLCreateSystemDefaultDevice` still returns nil.
+
+```
+BLUERUN: mtl-draw: device "Turnip Adreno (TM) 630"
+BLUERUN: mtl-draw: pipeline stroke_line_vert_lpf + stroke_line_frag_lpf created
+BLUERUN: mtl-draw: (128, 48) ffff8000 ok   top edge, centre of the stroke
+BLUERUN: mtl-draw: (128,128) ffff8000 ok   diagonal, centre
+BLUERUN: mtl-draw: 6770 lit pixels, 5174 full orange (vk-draw: 6770, 5174)
+BLUERUN: mtl-draw: DRAW ok
+BLUERUN: Y1 qc lib=8ms made=12 refused=8 create=322ms max=65ms draw=730ms max=74ms
+BLUERUN: exit 0 after 7.95 s
+```
+
+The counts match `vk-draw` exactly. The `Y1` line is the frontend's benchmark, run with 24 pairs requested: it builds render states for QuartzCore's vertex/fragment pairs and draws each. 12 are made; 8 are refused because the benchmark's generic descriptor has no vertex descriptor and one colour attachment. The Mac over MoltenVK refuses the same 8.
+
+What it took:
+
+- **Bridge for iOS** (UniXNU's `build-adreno-metal-bridge.py --target ios`, metal2vulkan at UniXNU's pin 46e7cc9): the runtime's `read_pages` exists only for Linux, macOS and Windows. `gpu/metal/patches/m2v-0001` adds a fallback that answers "not readable".
+- **Loader**: the runtime opens its Vulkan "loader" by path and looks up `vkGetInstanceProcAddr`. Turnip exported only `vk_icd*`. Mesa patch 0007 exports it on Apple platforms, as UniXNU's Turnip does.
+- **`_MTLDevice` size**: the frontend refused any `_MTLDevice` other than iPadOS 17's 536 bytes. iOS 16.7's is 528. The subclass adds no ivars and reads none, so `am-0001` accepts any size (`NMB_ANY_MTLDEVICE_SIZE`).
+- **Buffer indices**: the first runs drew nothing. A Mac build over MoltenVK showed the same empty result in seconds, and a one-triangle shader (`test/tri.metal`) filled the target, which cleared the frontend. stroke_line reads `[[buffer(1)]]` (points), `[[buffer(2)]]` (transform) and `[[buffer(5)]]` (style), per the meta's `interface.slots`. I had bound 0, 1 and 2, the push-slot order `vk-draw` uses.
+
+Next: a Metal plugin bundle (`MetalPluginName` on the kernel's IOAcceleratorES, then the bundle's principal class), so that `MTLCreateSystemDefaultDevice` returns this device to any process. Then CoreAnimation's compositor on it, which also gets the compositor's function constants from CoreAnimation itself.
+
 ## 2026-11-24: a translated QuartzCore pipeline draws on the phone
 
 `vk-draw` (`gpu/mesa-ios/test/`) draws QuartzCore's `stroke_line_vert_lpf` + `stroke_line_frag_lpf` (iOS 16.7 `default.metallib`) through Turnip. metal2vulkan translates them for the `turnip-a630` profile (`gpu/metal/qc-spv.sh`; the `.spv` files are derived from Apple's shaders and stay out of git). The pipeline strokes a polyline with antialiased edges, one instance per segment. Its interface (`--emit-meta`): no descriptor sets, and 64 bytes of vertex push constants holding Metal buffer slots as device addresses less 2^31 (points, a transform, the style), plus a zero buffer for out-of-bounds loads and slot 0's bounds.

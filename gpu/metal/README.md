@@ -1,8 +1,9 @@
 # metal: Metal on the Adreno 630 (stage 1)
 
-Route: Metal frontend (AdrenoMetal, MIT, to be adapted to iOS 16), then metal2vulkan (translates
-AIR to SPIR-V), then Turnip (`gpu/mesa-ios`, `VK=1`, out/bluevk.dylib), then bluedrm, then BlueGPU.
-The frontend doesn't exist yet. Translated QuartzCore pipelines are drawn by `gpu/mesa-ios/test/vk-draw.c`.
+Route: Metal frontend (UniXNU's AdrenoMetal, MIT), then the metal2vulkan runtime (translates AIR to
+SPIR-V and runs it), then Turnip (`gpu/mesa-ios`, `VK=1`, out/bluevk.dylib), then bluedrm, then BlueGPU.
+The frontend runs in a test program, `mtl-draw` (not yet behind `MTLCreateSystemDefaultDevice`).
+Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/mesa-ios/test/vk-draw.c`.
 
 | File | What |
 |---|---|
@@ -10,6 +11,10 @@ The frontend doesn't exist yet. Translated QuartzCore pipelines are drawn by `gp
 | `turnip-a630-vulkaninfo.json`, `turnip-a630-formats.json` | its sources: `vulkaninfo --json` and `corpus-vulkan --capture-formats` |
 | `m2v-regen-turnip-a630.patch` | the `SOURCES` entry for metal2vulkan's `scripts/regen-device-profiles` (metal2vulkan 0d4d572, GPL-2.0-or-later) |
 | `qc-spv.sh` | translates the QuartzCore pipelines the tests draw, from the mounted iOS root, into `out/qc` (not in git: derived from Apple's shaders) |
+| `build-mtl-draw.sh` | builds `out/mtl-draw` for iOS 16: the frontend and UniXNU's bridge library (the metal2vulkan runtime), from `work/ref/UniXNU` |
+| `test/mtl-draw.mm` | opens the frontend's `MTLDevice` over `bluevk.dylib` and draws QuartzCore's stroke_line through the Metal API; `MTL_DRAW_TRI=tri.metallib`: one full-screen triangle (`test/tri.metal`) |
+| `patches/m2v-0001-*` | metal2vulkan runtime: `read_pages` fallback on iOS |
+| `patches/am-0001-*` | AdrenoMetal frontend: accept iOS 16's `_MTLDevice` (528 bytes; held to iPadOS 17's 536) |
 | `m2vbatch.py` | translates every function of a metallib: `M2V_PROFILE=turnip-a630 python3 m2vbatch.py SCRATCH LIB TAG` |
 
 The captures come from the Mac: the host build of the same Turnip (`VK=1 HOST=1`) over the fake BlueGPU,
@@ -41,3 +46,20 @@ The failures on the A630:
   `fragmentShaderPixelInterlock`. Turnip doesn't offer it on the A630.
 
 "Translated" means a `.spv` was written. These are not drawn yet.
+
+## mtl-draw: Metal on the phone (2026-11-24)
+
+```sh
+gpu/metal/build-mtl-draw.sh          # or --reuse-bridge after the first build (the bridge takes ~8 min)
+tools/phonetest.sh --name mtl --push gpu/metal/out/mtl-draw:/usr/local/bin/mtl-draw:755 --run /usr/local/bin/mtl-draw
+```
+
+Turnip must export `vkGetInstanceProcAddr` (the runtime opens the "loader" with `ash::Entry::load_from`):
+`gpu/mesa-ios/patches/0007`. The same program builds for macOS against the bridge's `--target host`
+build and runs over MoltenVK, for debugging in seconds instead of a phone boot:
+
+```sh
+mtl-draw-mac /opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib /Volumes/*D22D221OS/System/Library/Frameworks/QuartzCore.framework/default.metallib
+```
+
+`NATIVE_METAL_DUMP_CB=1:1 NATIVE_METAL_DUMP_LOG=1` logs the first command buffer's passes, draws and bound data.

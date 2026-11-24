@@ -29,8 +29,11 @@
 - **Self-signed apps install and run.** An ad-hoc signed app installs through Apple's installd and
   launches from FrontBoard (boot with `blueapps=1`; `tools/apps/bluemis`). App Store apps stay out of reach
   (FairPlay needs a real Secure Enclave).
+- **Metal draws on the Adreno 630.** A program creates a Metal device (UniXNU's AdrenoMetal frontend over
+  metal2vulkan and Mesa's Turnip), loads QuartzCore's metallib and draws its stroke_line pipeline through
+  the Metal API, with the same pixels as the Vulkan path (`gpu/metal`, `mtl-draw`). iOS itself doesn't use it yet.
 - **Vulkan on the Adreno 630.** Mesa's Turnip runs on the phone over our kernel GPU driver, and a QuartzCore
-  Metal shader translated to SPIR-V (metal2vulkan) draws through it: the first step towards Metal.
+  Metal shader translated to SPIR-V (metal2vulkan) draws through it.
 - The UI is drawn by the Adreno 630 at about 60 fps (the default; `blueui=0` falls back to the CPU). CoreAnimation runs over Mesa freedreno
   ([`gpu/`](gpu/README.md)).
 - The display scans out iOS's own buffers, triple-buffered, with flips that wait for the GPU in the kernel.
@@ -62,7 +65,7 @@ partition.
 | CPU | All 8 cores (4x Kryo 385 Silver at 1.77 GHz, 4x Gold at 2.65 GHz), PSCI |
 | Storage | UFS; the iOS root is an HFS+ image on `userdata`, read/write. Changes go to the phone as small sparse diffs (seconds) |
 | Display | The 1080x2160 command-mode panel ABL leaves running. iOS sees an iPhone X 1125 pixels wide at the panel's 2:1 (1125x2250, scaled by 0.96 to fill the panel; 0184), with the X's status bar (why it was a red bar: [docs/ios16-red-status-bar.md](docs/ios16-red-status-bar.md)). By default the DPU scans out iOS's own buffers (triple-buffered, flips wait for the GPU) at 60 Hz; with `blueui=0`, a CPU copy at 30 Hz. Brightness works |
-| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames. Vulkan 1.3 through Mesa Turnip (`gpu/mesa-ios`, `VK=1`): GPU work and a translated QuartzCore pipeline run on the phone (`vk-smoke`, `vk-draw`); nothing in iOS uses it yet |
+| GPU | Adreno 630 under Mesa freedreno (GLES 3.2); CoreAnimation draws through it via an EAGL shim, straight into the display's buffers (0189, `gldirect=0` copies instead). Scripted Safari scroll with Wi-Fi: median 18 ms between frames. Vulkan 1.3 through Mesa Turnip (`gpu/mesa-ios`, `VK=1`): GPU work and a translated QuartzCore pipeline run on the phone (`vk-smoke`, `vk-draw`). Metal over it, in a test program: a Metal device, QuartzCore's metallib, a render pipeline and a draw (`gpu/metal`, `mtl-draw`); nothing in iOS uses either yet |
 | iOS | Data migration with all 32 removable stock apps, wallpaper (PosterBoard) on the lock and home screens, widgets, SpringBoard, Settings, Safari. the App Library and Control Center blurs, Control Center's glyphs and brightness slider. Photos crashes (no photo library yet), and parts of Control Center blink while it animates |
 | Apps | Self-signed (ad-hoc) apps install through installd into the user domain and launch through FrontBoard (`blueapps=1`, `tools/apps/bluemis`, test: `tools/bluerun` `apptest`). Reinstalling over an installed copy and IPA files don't work yet |
 | Touch | ST FTM5 over bit-banged I2C (the QUP's GPI DMA path is not usable yet), its 3.3 V supply asked for over RPMh, interrupt-driven, edge gestures (home, app switcher) |
@@ -75,7 +78,7 @@ partition.
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
 
-**Not working yet:** Metal (Vulkan works; the Metal frontend is not written), 5 GHz Wi-Fi, microphone, the camera in iOS, Bluetooth, cellular data, sensors, Face ID / SEP (and so
+**Not working yet:** Metal for iOS itself (`MTLCreateSystemDefaultDevice`; a test program draws through the frontend), 5 GHz Wi-Fi, microphone, the camera in iOS, Bluetooth, cellular data, sensors, Face ID / SEP (and so
 FairPlay: App Store apps).
 
 ## Roadmap
@@ -110,8 +113,10 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 
 **Next, in order**
 1. Metal: a Metal frontend over Mesa's Turnip (Adreno Vulkan) driver, with Apple's shader IR (AIR)
-   translated to SPIR-V by metal2vulkan. QuartzCore's stroke_line pipeline, translated, draws through
-   Turnip on the phone (`vk-draw`, 2026-11-24). Next: the layer compositor (`fixed_*`), then the frontend.
+   translated to SPIR-V by metal2vulkan. The frontend (UniXNU's AdrenoMetal) runs on the phone in a test
+   program and draws QuartzCore's stroke_line pipeline through the Metal API (`mtl-draw`, 2026-11-24).
+   Next: a Metal plugin bundle so `MTLCreateSystemDefaultDevice` returns that device (MetalPluginName on
+   the kernel's IOAcceleratorES), then CoreAnimation's compositor on it.
 2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
    with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
    better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their

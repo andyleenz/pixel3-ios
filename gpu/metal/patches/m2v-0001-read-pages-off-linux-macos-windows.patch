@@ -1,0 +1,18 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+index d303f93..28dfc07 100644
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -2698,6 +2698,13 @@ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+     answer == libc::KERN_SUCCESS && read == into.len() as u64
+ }
+ 
++/// [`read_pages`] where the runtime does not ask the system for its mappings (iOS and the
++/// others): `false`, as [`mapped_readable`] answers there, so no caller's page is read.
++#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
++pub(crate) fn read_pages(_pages: NonNull<u8>, _into: &mut [u8]) -> bool {
++    false
++}
++
+ /// [`read_pages`] on Windows: `ReadProcessMemory` of the process's own pages, which answers a
+ /// page it cannot read with a failure.
+ #[cfg(windows)]

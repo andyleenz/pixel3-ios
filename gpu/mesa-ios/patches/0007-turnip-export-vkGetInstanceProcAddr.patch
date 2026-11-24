@@ -1,0 +1,22 @@
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3551,6 +3551,19 @@
+    return tu_GetInstanceProcAddr(instance, pName);
+ }
+ 
++#ifdef __APPLE__
++/* No Khronos loader on iOS: a consumer that opens "the loader" by path (the metal2vulkan
++ * runtime behind the native Metal frontend, through ash::Entry::load_from) looks up
++ * vkGetInstanceProcAddr. Turnip is the only Vulkan driver there, so the loader's entry is the
++ * driver's own (as UniXNU's turnip-darwin-kmd.patch does). */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return tu_GetInstanceProcAddr(instance, pName);
++}
++#endif
++
+ static VkResult
+ tu_add_to_heap(struct tu_device *dev, struct tu_bo *bo)
+ {
