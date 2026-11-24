@@ -70,7 +70,7 @@ jobs:
             case $n in *.patch) echo "$n" >> patch-list.txt ;; esac
           done
           for f in xnu/patches/*.sh; do cp "$f" dxb/patches/; done
-          for f in xnu/patches/*.patch; do
+          for f in xnu/patches/0[1-8]*.patch; do
             cp "$f" dxb/patches/
             basename "$f" >> patch-list.txt
           done
@@ -84,6 +84,11 @@ jobs:
             cp "$f" "dxb/patches/$dst"
             echo "$dst" >> patch-list.txt
             i=$((i + 1))
+          done
+          for f in xnu/patches/099[0-9]-*.patch; do  # ours on top of sailfish's code
+            [ -e "$f" ] || continue
+            cp "$f" dxb/patches/
+            basename "$f" >> patch-list.txt
           done
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh

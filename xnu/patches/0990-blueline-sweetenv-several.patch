@@ -1,0 +1,114 @@
+0990: blueline sweetenv for several processes
+
+sweetenv= took one process name per boot. It now takes several
+NAME[|NAME]:VAR=VAL[,VAR=VAL] entries split by ";", so installd and
+com.apple.MobileInstallationHelperService can get
+DYLD_INSERT_LIBRARIES=/usr/lib/bluemis.dylib (self-signed app installs)
+next to backboardd's blueeagl. The buffer grows to 512 bytes. Applies
+on top of sailfish 0104 (0903), hence 0990.
+
+diff -ruN a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c	2026-11-24 14:31:21
++++ b/bsd/kern/kern_exec.c	2026-11-24 14:41:10
+@@ -447,15 +447,18 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /*
+- * Boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...] appends VAR=VAL to the
+- * environment of every executable whose file name is NAME, e.g.
++ * Boot-arg sweetenv=NAME[|NAME...]:VAR=VAL[,VAR=VAL...][;NAME...:VAR=VAL...]
++ * appends VAR=VAL to the environment of every executable whose file name is a
++ * NAME, e.g.
+  * sweetenv=backboardd:CA_DISABLE_BACKDROP_CACHE=1 (CoreAnimation knobs
+- * without editing launchd.plist on the phone). One NAME per boot.
++ * without editing launchd.plist on the phone). 0990: several entries split by ';',
++ * several names per entry split by '|' (backboardd's blueeagl plus bluemis for
++ * installd and com.apple.MobileInstallationHelperService; boot-args max 608).
+  */
+ static int
+ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ {
+-	static char spec[256];
++	static char spec[512];
+ 	static int state;       /* 0 not parsed, 1 none, 2 set */
+ 	if (state == 0) {
+ 		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
+@@ -469,37 +472,51 @@
+ 			base = c + 1;
+ 		}
+ 	}
+-	size_t n = 0;
+-	while (spec[n] && spec[n] != ':') {
+-		n++;
+-	}
+-	if (spec[n] != ':' || strlen(base) != n || strncmp(base, spec, n) != 0) {
+-		return 0;
+-	}
+-	const char *p = spec + n + 1;
+-	while (*p) {
+-		char var[128];
+-		size_t len = 0;
+-		while (p[len] && p[len] != ',') {
+-			len++;
++	for (const char *e = spec; *e; ) {
++		size_t n = 0, end = 0;
++		while (e[end] && e[end] != ';') {
++			end++;
+ 		}
+-		if (len > 0 && len < sizeof(var)) {
+-			memcpy(var, p, len);
+-			var[len] = '\0';
+-			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
+-			if (error) {
+-				return error;
++		while (n < end && e[n] != ':') {
++			n++;
++		}
++		bool match = false;
++		for (size_t a = 0, z; a < n && !match; a = z + 1) {   /* NAME|NAME|... */
++			for (z = a; z < n && e[z] != '|'; z++) {
+ 			}
+-			if (imgp->ip_argspace < ptr_size) {
+-				return E2BIG;
++			match = strlen(base) == z - a && strncmp(base, e + a, z - a) == 0;
++		}
++		if (n < end && match) {
++			const char *p = e + n + 1, *stop = e + end;
++			while (p < stop) {
++				char var[128];
++				size_t len = 0;
++				while (p + len < stop && p[len] != ',') {
++					len++;
++				}
++				if (len > 0 && len < sizeof(var)) {
++					memcpy(var, p, len);
++					var[len] = '\0';
++					int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++					if (error) {
++						return error;
++					}
++					if (imgp->ip_argspace < ptr_size) {
++						return E2BIG;
++					}
++					imgp->ip_argspace -= ptr_size;
++					imgp->ip_envc++;
++					printf("SWEET ENV: %s += %s\n", base, var);
++				}
++				p += len;
++				if (p < stop && *p == ',') {
++					p++;
++				}
+ 			}
+-			imgp->ip_argspace -= ptr_size;
+-			imgp->ip_envc++;
+-			printf("SWEET ENV: %s += %s\n", base, var);
+ 		}
+-		p += len;
+-		if (*p == ',') {
+-			p++;
++		e += end;
++		if (*e == ';') {
++			e++;
+ 		}
+ 	}
+ 	return 0;
