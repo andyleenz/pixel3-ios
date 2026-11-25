@@ -6,10 +6,11 @@
 // (getMetalPluginClassForService) and registers what -alloc/-initWithAcceleratorPort: returns (MTLAddDevice). The kernel's
 // IOAcceleratorES (xnu patches 0107, 0215) names this bundle and BlueMetalDevice.
 //
-// Every process that touches Metal loads this bundle, CoreAnimation's included, so it stays small and answers nil
-// unless the process opts in:
-//   - environment BLUE_METAL=1 (BLUE_METAL=0 refuses), or
-//   - its name (getprogname) on a line of /usr/local/etc/bluemetal.procs.
+// Every process that touches Metal loads this bundle, CoreAnimation's included, so it stays small. Who gets a device:
+//   - environment BLUE_METAL=1 (BLUE_METAL=0 refuses) decides first;
+//   - then /usr/local/etc/bluemetal.procs, a name (getprogname) a line: NAME opts in, -NAME refuses;
+//   - else apps: the executable of an .app bundle under /Applications or an installed app's container (not its
+//     extensions). System daemons (backboardd composites on GL) stay off unless named.
 // BLUE_METAL_LOG=1 logs (stderr and os_log) each new problem the frontend records, and every 5 s its status and texture
 // counters when they changed.
 // An opted-in process gets the native Metal frontend (UniXNU's AdrenoMetal over the metal2vulkan runtime on Turnip),
@@ -18,6 +19,7 @@
 // Copyright (c) 2026 pixel3-ios. MIT licence.
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <os/log.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -33,23 +35,45 @@
 extern int IORegistryEntryGetRegistryEntryID(unsigned entry, uint64_t *id);
 
 static int
+is_app(void)
+{
+	static const char *const roots[] = { "/Applications/", "/private/var/containers/Bundle/", "/var/containers/Bundle/",
+		"/private/var/mobile/Containers/Bundle/", "/var/mobile/Containers/Bundle/" };
+	char path[1024];
+	uint32_t size = sizeof path;
+	const char *app;
+	// the app's own executable, not an extension inside it (widgets: memory limits too small for the stack)
+	if (_NSGetExecutablePath(path, &size) != 0 || !(app = strstr(path, ".app/")) || strchr(app + 5, '/'))
+		return 0;
+	for (size_t i = 0; i < sizeof roots / sizeof roots[0]; i++)
+		if (strncmp(path, roots[i], strlen(roots[i])) == 0)
+			return 1;
+	return 0;
+}
+
+static int
 opted_in(void)
 {
 	const char *env = getenv("BLUE_METAL");
 	if (env)
 		return strcmp(env, "0") != 0;
-	FILE *f = fopen(PROCS, "r");
-	if (!f)
-		return 0;
 	const char *me = getprogname();
-	char line[256];
-	int yes = 0;
-	while (!yes && fgets(line, sizeof line, f)) {
-		line[strcspn(line, "\r\n# \t")] = 0;
-		yes = line[0] && strcmp(line, me) == 0;
+	FILE *f = fopen(PROCS, "r");
+	if (f) {
+		char line[256];
+		int verdict = -1;
+		while (verdict < 0 && fgets(line, sizeof line, f)) {
+			line[strcspn(line, "\r\n# \t")] = 0;
+			if (line[0] == '-' && strcmp(line + 1, me) == 0)
+				verdict = 0;
+			else if (line[0] && strcmp(line, me) == 0)
+				verdict = 1;
+		}
+		fclose(f);
+		if (verdict >= 0)
+			return verdict;
 	}
-	fclose(f);
-	return yes;
+	return is_app();
 }
 
 static void

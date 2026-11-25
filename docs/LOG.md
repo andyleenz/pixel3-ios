@@ -845,6 +845,15 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: Metal on by default for apps
+
+`BlueMetal.bundle` now gives a device to the executable of an `.app` under `/Applications` or an installed app's container, without opting in. Extensions stay off: with them on, FitnessWidget (a widget) loaded the stack and was killed 3 times (`mh11`). Daemons stay off (backboardd composites on GL). `/usr/local/etc/bluemetal.procs`: `NAME` opts in, `-NAME` refuses; `BLUE_METAL=0/1` overrides both.
+
+- MetalHello with no opt-in file: device, 60 frames, readback whole (`mh11`).
+- Maps opens BlueGPU and draws its UI (`maps1`); no map tiles: the phone has no network.
+
+![Maps on Metal](screenshots/2026-11-25-maps-metal.png)
+
 ## 2026-11-25: an app draws with Metal (MetalHello, 0218)
 
 ![MetalHello on the phone](screenshots/2026-11-25-metalhello.png)
