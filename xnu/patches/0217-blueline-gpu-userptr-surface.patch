@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0217: a USERPTR import of a surface's pages is linked to the surface
+
+Metal (metal2vulkan over Turnip) imports IOSurfaces as USERPTR (Mesa 0008),
+so the kernel saw backboardd's display buffers as plain user memory: a
+flip did not wait for the GPU's last write (0160 gpuWriteFence) and a
+submit drawing into the buffer still being fetched did not wait for the
+latch (0157/0158). Home-screen swipes flickered on Metal, not on GL
+(GPU held for a latch: GL 156 times, Metal 0). bg_userptr now looks up
+the surface whose first physical segment holds the import's first page
+(sweet_surface_copy_by_phys) and keeps it; writable linked USERPTR BOs
+get the same latch wait and write fence as BG_SURF.
+---
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp	2026-11-25 11:36:10
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp	2026-11-25 11:36:10
+@@ -817,7 +817,7 @@
+ 	for (uint32_t i = 0; i < a->nr_bos; i++) {
+ 		BGBo *wb = bg_lookup(c, bos[i].handle);
+ 		/* 0158: only a surface the display still holds (2 buffers); 3+ buffers never wait */
+-		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && wb->kind == BG_SURF && sweet_surface_in_use(wb->surf)) {
++		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && wb->surf != NULL && !wb->ro && sweet_surface_in_use(wb->surf)) {
+ 			(void)blue_dpu_flip_settle();   /* 0157: maybe the buffer a pending flip replaces */
+ 			break;
+ 		}
+@@ -897,7 +897,7 @@
+ 	g.n_submit++;
+ 	for (uint32_t i = 0; i < a->nr_bos; i++) {
+ 		BGBo *b = bg_lookup(c, bos[i].handle);
+-		if (b->kind == BG_SURF && (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE)) {
++		if (b->surf != NULL && !b->ro && (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE)) {   /* 0217: USERPTR too */
+ 			b->surf->gpuWriteFence = seq;   /* 0160: the display waits for it before a flip */
+ 		}
+ 	}
+@@ -1076,6 +1076,12 @@
+ 	b->kind = BG_UPTR;
+ 	b->size = a->size;
+ 	b->md = md;
++	/*
++	 * 0217: Metal imports IOSurfaces as USERPTR (Mesa 0008). Link the BO to the surface its
++	 * pages belong to, so a submit writing it waits out a pending latch (0157) and stamps
++	 * the surface's gpuWriteFence the display waits for before a flip (0160), as for BG_SURF.
++	 */
++	b->surf = sweet_surface_copy_by_phys(md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone));
+ 	b->ro = ro;
+ 	b->flags = ro ? BLUE_GPU_BO_GPU_READONLY : 0;
+ 	IOLockLock(g.lock);
+@@ -1093,6 +1099,7 @@
+ 	}
+ 	IOLockUnlock(g.lock);
+ 	if (ret != kIOReturnSuccess) {
++		OSSafeReleaseNULL(b->surf);
+ 		md->complete();
+ 		md->release();
+ 		IOFree(b, sizeof(*b));
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-25 11:36:10
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-25 11:36:10
+@@ -220,6 +220,30 @@
+ 	return s;
+ }
+ 
++SweetSurface *
++sweet_surface_copy_by_phys(uint64_t pa)
++{
++	SweetSurface *found = NULL;
++	if (pa == 0 || sweet_surface_lock == NULL) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID && found == NULL; id++) {
++		SweetSurface *s = sweet_surface_table[id];
++		if (s == NULL || s->memory == NULL) {
++			continue;
++		}
++		IOByteCount len = 0;
++		addr64_t base = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++		if (base != 0 && pa >= base && pa < base + len) {
++			found = s;
++			found->retain();
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return found;
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)
+--- a/iokit/Kernel/arm/SweetSurface.h	2026-11-25 11:36:10
++++ b/iokit/Kernel/arm/SweetSurface.h	2026-11-25 11:36:10
+@@ -54,6 +54,11 @@
+ /* 0158: the display's use of a surface, seen by IOSurfaceIsInUse (u64 at +0x18 of the state page) */
+ void sweet_surface_display_use(SweetSurface *s, int delta);
+ bool sweet_surface_in_use(SweetSurface *s);
++/*
++ * 0217: retained surface whose first physical segment holds PA, or NULL. A
++ * USERPTR import of a surface's pages (Metal) is linked to it with this.
++ */
++SweetSurface *sweet_surface_copy_by_phys(uint64_t pa);
+ 
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a

@@ -845,6 +845,12 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: Metal flicker on the home screen (0217)
+
+Page swipes flickered with backboardd on Metal (seen on the phone, `bbm20`), not on GL. The display's stats showed why: "GPU held for a latch" 156 times on GL (`gl11`), 0 on Metal (`bbm19`). metal2vulkan imports IOSurfaces as USERPTR (Mesa 0008), so the kernel treated backboardd's display buffers as plain memory: a flip didn't wait for the GPU's last write (0160 `gpuWriteFence`), and a submit drawing into the buffer still being fetched didn't wait for the latch (0157/0158).
+
+**0217**: `bg_userptr` links the import to the surface whose first physical segment holds its first page (`sweet_surface_copy_by_phys`); writable linked USERPTR BOs get the same latch wait and write fence as surface imports. Same swipe script: Metal held 125 times (avg 2.7 ms), 285 flips vs 292 before (`bbm21`); GL unchanged, 176 held, 327 flips (`gl12`).
+
 ## 2026-11-25: home screen on Metal; Metal vs GL with the same swipes
 
 ![home screen, backboardd on Metal](screenshots/2026-11-25-homescreen-metal.png)
