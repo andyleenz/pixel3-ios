@@ -845,6 +845,12 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: WebGL on Metal (WebGLHello)
+
+`tools/apps/webglhello`: a WKWebView page draws a rotating triangle with WebGL. WebKit runs WebGL in `com.apple.WebKit.GPU` (ANGLE on Metal), an XPC service, not an app, so `BlueMetal.bundle` now turns Metal on for it by name. Renderer "Apple GPU", 120 frames in 2.53 s (47.4 fps), centre and corner pixels read back as drawn, no GL error (`wgl4`, no `bluemetal.procs`; `wgl3`: 44.9 fps).
+
+![WebGL](screenshots/2026-11-25-webgl.png)
+
 ## 2026-11-25: SpriteKit at 35 fps (SpriteHello)
 
 `tools/apps/spritehello`: 300 sprites moved and spun by actions, 30 physics boxes, a CoreText label. 180 frames in 5.1 s (35.3 fps), physics 2.8 ms a frame (`sk9`).

@@ -10,7 +10,7 @@
 //   - environment BLUE_METAL=1 (BLUE_METAL=0 refuses) decides first;
 //   - then /usr/local/etc/bluemetal.procs, a name (getprogname) a line: NAME opts in, -NAME refuses;
 //   - else apps: the executable of an .app bundle under /Applications or an installed app's container (not its
-//     extensions). System daemons (backboardd composites on GL) stay off unless named.
+//     extensions), and WebKit's GPU process. System daemons (backboardd composites on GL) stay off unless named.
 // BLUE_METAL_LOG=1 logs (stderr and os_log) each new problem the frontend records, and every 5 s its status and texture
 // counters when they changed.
 // An opted-in process gets the native Metal frontend (UniXNU's AdrenoMetal over the metal2vulkan runtime on Turnip),
@@ -73,7 +73,8 @@ opted_in(void)
 		if (verdict >= 0)
 			return verdict;
 	}
-	return is_app();
+	// WebKit draws WebGL, canvas and video for every web view in this one XPC service
+	return is_app() || strcmp(me, "com.apple.WebKit.GPU") == 0;
 }
 
 static void
