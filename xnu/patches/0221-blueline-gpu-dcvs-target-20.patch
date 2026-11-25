@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 18:40:00 +1100
+Subject: [PATCH] 0221: GPU DCVS aims at 20% busy
+
+An app on Metal ran at ~36 fps with the GPU busy 35-50% of the time, so
+DCVS (target 50%) held it at 257-342 MHz. A frame is a serial chain (the
+app, then backboardd's composite, then the flip, within one 16.7 ms
+vsync): at 342 MHz backboardd's composite took ~9 ms and frames missed
+the vsync, though the average load was low. At 20% it runs at 520-710 MHz
+while frames are drawn (MetalHello: 36 -> 44 fps, as at a fixed 710 MHz)
+and still drops to 257 MHz when idle.
+---
+diff -ru a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c	2026-11-25 17:30:04
++++ b/bsd/dev/blueline_gpu.c	2026-11-25 17:30:13
+@@ -351,7 +351,7 @@
+  *  - bluegpu_mhz=N: the lowest level >= N (257 342 414 520 596 675 710) at
+  *    start. bluegpu_dcvs=1: every >= 100 ms of presents, busy % (GMU power
+  *    counter 0 XOCLK, else blit time) -> lowest level that runs it at
+- *    bluegpu_dcvs_target % (65) within bluegpu_dcvs_min..max; up at once,
++ *    bluegpu_dcvs_target % (20) within bluegpu_dcvs_min..max; up at once,
+  *    down after 3 windows; legacy GMU DCVS OOB (a6xx_gmu_set_freq), the DDR
+  *    vote follows the level (bluegpu_bw_kbps=N fixes it). Logged per change.
+  *  - bluegpu_present_clean: 1 (default) DC CVAC to PoC per present; 0 no
+@@ -4225,7 +4225,7 @@
+ 	rs.test_kind = 3;
+ 	rs.dcvs_min = 257;
+ 	rs.dcvs_max = 710;
+-	rs.dcvs_target = 50;	/* 0198: was 65 */
++	rs.dcvs_target = 20;	/* 0221: was 50 (0198: 65); a frame is a serial chain, average busy hides it */
+ 	rs.dcvs_boost = 520;
+ 	rs.dcvs_boost_ms = 1000;
+ 	rs.clean = 1;

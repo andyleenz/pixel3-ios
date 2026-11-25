@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 17:40:00 +1100
+Subject: [PATCH] 0219: bluetrace=K, a frame timeline
+
+Apps on Metal reach ~37 fps though one frame's GPU work is ~12 ms. To see
+where a frame waits between an app, backboardd and the display: a ring of
+GPU submits (with the process), fences retired at the GPU interrupt, GPU
+submits held for a display latch, and swaps queued, flipped or copied,
+printed at the K-th 5 s stats tick as BLUETRACE lines.
+---
+diff -ru a/iokit/Kernel/arm/BlueGPUUserClient.cpp b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp	2026-11-25 17:08:45
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp	2026-11-25 17:08:45
+@@ -81,8 +81,61 @@
+ extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
+ extern uint32_t blue_dpu_flip_settle(void);     /* 0157, BlueDPU.cpp */
++extern void proc_name(int pid, char *buf, int size);
+ }
+ 
++/*
++ * 0219: bluetrace=K, a frame timeline. A ring of events: GPU submits (S, the
++ * process and fence), fences retired at the GPU interrupt (R), GPU submits
++ * held for a display latch (H, us), display swaps queued by backboardd (W),
++ * shown by a flip (F) or left for a copy (K), and copies (P). At the K-th
++ * 5 s stats tick the last BT_DUMP are printed as BLUETRACE lines (us).
++ */
++struct BTEv {
++	uint64_t t;
++	uint32_t a, b;
++	char k;
++};
++#define BT_N    4096u
++#define BT_DUMP 1200u
++static BTEv bt_ring[BT_N];
++static volatile SInt32 bt_head;
++static uint32_t bt_dump_tick, bt_tick;
++
++extern "C" void
++blue_trace(char k, uint32_t a, uint32_t b)
++{
++	if (bt_dump_tick == 0 || bt_tick >= bt_dump_tick) {
++		return;
++	}
++	BTEv *e = &bt_ring[(uint32_t)OSIncrementAtomic(&bt_head) % BT_N];
++	e->t = mach_absolute_time();
++	e->a = a;
++	e->b = b;
++	e->k = k;
++}
++
++static void
++bt_dump(void)
++{
++	uint32_t head = (uint32_t)bt_head, n = head < BT_DUMP ? head : BT_DUMP;
++	uint64_t t0 = 0;
++	printf("BLUETRACE: %u events, last %u (t us, kind, a, b)\n", head, n);
++	for (uint32_t i = head - n; i != head; i++) {
++		BTEv *e = &bt_ring[i % BT_N];
++		uint64_t ns;
++		absolutetime_to_nanoseconds(e->t, &ns);
++		if (t0 == 0) {
++			t0 = ns;
++		}
++		char name[24] = "";
++		if (e->k == 'S') {
++			proc_name((int)e->a, name, sizeof(name));
++		}
++		printf("BLUETRACE %llu %c %u %u %s\n", (ns - t0) / 1000, e->k, e->a, e->b, name);
++	}
++}
++
+ #define BG_MAX_BOS              4096u           /* handles per connection */
+ #define BG_MAX_QUEUES           64u             /* submit queues per connection (0 = default) */
+ #define BG_MAX_SUBMIT_BOS       4096u
+@@ -818,7 +871,10 @@
+ 		BGBo *wb = bg_lookup(c, bos[i].handle);
+ 		/* 0158: only a surface the display still holds (2 buffers); 3+ buffers never wait */
+ 		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && wb->surf != NULL && !wb->ro && sweet_surface_in_use(wb->surf)) {
+-			(void)blue_dpu_flip_settle();   /* 0157: maybe the buffer a pending flip replaces */
++			uint32_t held = blue_dpu_flip_settle();   /* 0157: maybe the buffer a pending flip replaces */
++			if (held != 0) {
++				blue_trace('H', held, 0);
++			}
+ 			break;
+ 		}
+ 	}
+@@ -884,6 +940,7 @@
+ 		}
+ 	}
+ 	g.last_seq = seq;
++	blue_trace('S', (uint32_t)c->pid, seq);
+ 	c->q[a->queueid].last = seq;
+ 	for (uint32_t i = 0; i < a->nr_bos; i++) {
+ 		BGBo *b = bg_lookup(c, bos[i].handle);
+@@ -1148,6 +1205,9 @@
+ 	g.n_clean = 0;
+ 	g.clean_ns = g.clean_bytes = 0;
+ 	IOLockUnlock(g.lock);
++	if (bt_dump_tick != 0 && ++bt_tick == bt_dump_tick) {
++		bt_dump();
++	}
+ }
+ 
+ /* ---- the service and its user client ---------------------------------------------------- */
+@@ -1860,6 +1920,7 @@
+ 	}
+ 	g.started = true;
+ 	(void)PE_parse_boot_argn("bluegpu_uapi", &on, sizeof(on));
++	(void)PE_parse_boot_argn("bluetrace", &bt_dump_tick, sizeof(bt_dump_tick));
+ 	g.hang_ms = 1000;
+ 	(void)PE_parse_boot_argn("bluegpu_uapi_hang_ms", &g.hang_ms, sizeof(g.hang_ms));
+ 	if (g.hang_ms < 100 || g.hang_ms > 10000) {
+@@ -1914,6 +1975,7 @@
+ extern "C" void
+ blue_gpu_uapi_fence_signal(void)
+ {
++	blue_trace('R', blue_gpu_core_retired(), 0);
+ 	if (g.ready) {
+ 		IOLockWakeup(g.lock, &g.wake, false);
+ 	}
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 17:08:45
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 17:08:45
+@@ -781,10 +781,12 @@
+  * default 10 Hz).
+  */
+ extern "C" bool blue_gpu_surface_wait(SweetSurface *s, uint32_t max_ms);   /* 0160, BlueGPUUserClient.cpp */
++extern "C" void blue_trace(char k, uint32_t a, uint32_t b);                 /* 0219, BlueGPUUserClient.cpp */
+ 
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	blue_trace('W', get32(rec, 0x50), get32(rec, 0x104));
+ 	if (fFlipThreadOn) {
+ 		IOLockLock(fLock);
+ 		fQueuedDropped += fHasQueued;
+@@ -897,6 +899,7 @@
+ 		sweet_fb_print(get32(rec, 0x50), get32(rec, 0x54));
+ 	}
+ 	bool flipped = fFlip && swapFlip(rec);
++	blue_trace(flipped ? 'F' : 'K', get32(rec, 0x50), 0);
+ 	if (sweet_fb_swaplog > 16 && sweet_fb_shown_logged < sweet_fb_swaplog) {
+ 		uint32_t mask = get32(rec, 0x104);
+ 		uint64_t ns = 0;
+@@ -1057,6 +1060,7 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	blue_trace('P', get32(rec, 0x50), mask);
+ 
+ 
+ 	consoleOnce();

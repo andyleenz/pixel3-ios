@@ -845,6 +845,21 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: toward 60 fps: vsync at 60 Hz, GPU clock (0219-0221)
+
+MetalHello ran at ~36 fps though its frame is ~1.3 ms of GPU work. 0219 (`bluetrace=K`) records GPU submits with their process, fence retires, display swaps queued and flipped, and vsync ticks, printed at the K-th 5 s stats tick (`grep ^BLUETRACE`).
+
+| Run | vsync ticks / 5 s | GPU clock | flips / 5 s | backboardd composite (first submit to flip) |
+|---|---|---|---|---|
+| `tr1` | 285 (57 Hz) | DCVS 50%: 257-342 MHz | 171-192 | 10.1 ms median |
+| `tr2` | 285 | fixed 710 MHz | 213-247 | 5.8 ms |
+| `tr3` (0220) | 300 | fixed 710 MHz | 217-247 | 5.8 ms |
+| `tr4` (0220, target 20%) | 300 | 520-710 MHz | 203-251 | 6.1 ms |
+
+- **0220: vsync on a fixed grid.** The vsync timer re-armed 16.667 ms after each tick ran, so its latency added to every period: 57 Hz, the ceiling on everything (the home screen's ~56 fps). Ticks now fall on absolute 16.667 ms deadlines.
+- **0221: DCVS target 50% -> 20%.** The GPU was busy 35-50% on average, so DCVS kept 257-342 MHz, but a frame is a serial chain (app, backboardd's composite of 3 layers in 5 submits, flip) inside one vsync. At 342 MHz the composite alone took ~9 ms.
+- **Left:** with backboardd starting 0.2 ms after each vsync and flipping ~6 ms later, the missed vsyncs (21 of 99 in `tr3`) are ones where the app had no new frame. It submits ~11-12 ms after a vsync, so its CPU side (Metal frontend and runtime) is next.
+
 ## 2026-11-25: WebGL on Metal (WebGLHello)
 
 `tools/apps/webglhello`: a WKWebView page draws a rotating triangle with WebGL. WebKit runs WebGL in `com.apple.WebKit.GPU` (ANGLE on Metal), an XPC service, not an app, so `BlueMetal.bundle` now turns Metal on for it by name. Renderer "Apple GPU", 120 frames in 2.53 s (47.4 fps), centre and corner pixels read back as drawn, no GL error (`wgl4`, no `bluemetal.procs`; `wgl3`: 44.9 fps).

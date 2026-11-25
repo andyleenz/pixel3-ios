@@ -127,7 +127,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
    2. Tests (2026-11-25): a Metal app draws and shows correctly (`tools/apps/metalhello`, ~37 fps,
       composited by backboardd and flipped without a copy); Maps opens and draws its UI (no network: no
       tiles); a SpriteKit scene of 330 sprites runs at 35 fps (`tools/apps/spritehello`); WebGL in a WKWebView
-      at 45-47 fps (`tools/apps/webglhello`). Next: 60 fps (time each stage of a frame).
+      at 45-47 fps (`tools/apps/webglhello`). Toward 60 fps: vsync now 60 Hz (was 57)
+      and GPU DCVS aims at 20% busy: MetalHello 36 -> 44 fps. Next: the app's CPU side per frame.
    3. Later: backboardd on Metal. It unlocks and pages the home screen correctly with as many frames as
       GL on the same swipes (334 vs 327-345; median 36 ms commit to complete, 14 ms recording, 18 ms GPU
       in sysmem); GL stays the compositor until it is clearly faster.

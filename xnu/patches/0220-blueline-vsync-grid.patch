@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 18:10:00 +1100
+Subject: [PATCH] 0220: vsync ticks on a fixed 60 Hz grid
+
+The vsync timer re-armed 16.667 ms after each tick had run, panel copy
+included, so every period carried the handler's latency: 285 ticks in
+5 s, 57 Hz. backboardd and CADisplayLink pace on these ticks, so nothing
+could reach 60 fps. Ticks now fall on absolute 16.667 ms deadlines; a
+late tick skips whole periods. Also a V event in the 0219 trace.
+---
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 17:19:55
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 17:19:55
+@@ -169,6 +169,8 @@
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	uint64_t            fVsyncNext;     /* 0220: the next tick's deadline (absolute time) */
++	void armVsync(IOTimerEventSource *timer);
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+@@ -368,7 +370,8 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fVsyncNext = mach_absolute_time();
++	armVsync(fVsync);
+ 	powerStart();
+ 	blue_bl_start(this);
+ 	blue_dpu_start(fPhys, fWidth, fHeight, fRowBytes, fPixels, fLogicalW, fLogicalH);
+@@ -421,12 +424,15 @@
+ 	return true;
+ }
+ 
++extern "C" void blue_trace(char k, uint32_t a, uint32_t b);                 /* 0219, BlueGPUUserClient.cpp */
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	blue_trace('V', (uint32_t)count, 0);
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -475,7 +481,7 @@
+ 			/* One more vsync for autorefresh to send the black frame. */
+ 			fb->panelSleep();
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->armVsync(sender);
+ 		return;
+ 	}
+ 	if (fb->fPanelAsleep) {
+@@ -526,7 +532,25 @@
+ 		IOLockUnlock(fb->fPresentLock);
+ 	}
+ 	blue_bl_tick(fb->fFlip ? fb->fPresentLock : NULL);
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->armVsync(sender);
++}
++
++/*
++ * 0220: the next tick on a fixed 16.667 ms grid. Re-arming 16.667 ms after
++ * each tick ran (and after its panel copy) added the handler's latency to
++ * every period: 285 ticks in 5 s (57 Hz), which capped every animation. A
++ * tick that ran late skips whole periods and keeps the grid.
++ */
++void
++AppleCLCD::armVsync(IOTimerEventSource *timer)
++{
++	uint64_t period, now = mach_absolute_time();
++	nanoseconds_to_absolutetime(16666667ull, &period);   /* 60 Hz */
++	fVsyncNext += period;
++	if (fVsyncNext <= now) {
++		fVsyncNext += ((now - fVsyncNext) / period + 1) * period;
++	}
++	timer->wakeAtTime(fVsyncNext);
+ }
+ 
+ IOReturn
