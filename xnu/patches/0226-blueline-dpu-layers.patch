@@ -1,0 +1,588 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 08:00:00 +1100
+Subject: [PATCH] 0226: DPU blends a detached app layer under backboardd's
+
+bluedpu_layers=N: N contiguous app buffers below 4 GiB for other
+processes' full-width BGRA surfaces (CAMetalLayer drawables). A swap of a
+full-width layer 0 under a full-screen layer 1 is flipped as two layers:
+each LM gets an idle VIG pipe for layer 0 at blend stage 0 (opaque), the
+flipped pipe at stage 1, premultiplied source over. The display holds a
+use on both surfaces until their replacements latch.
+---
+diff -ru a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+--- a/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 07:37:27
++++ b/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 07:37:27
+@@ -130,6 +130,11 @@
+ extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
+     uint32_t planes, uint32_t offset, uint64_t size);
+ extern "C" void blue_dpu_pool_put(IOMemoryDescriptor *md);
++extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take_app(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
++    uint32_t planes, uint32_t offset, uint64_t size);
++extern "C" int blue_dpu_flip_layers(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
++    uint32_t w, uint32_t h, uint32_t fmt, IOMemoryDescriptor *umd, uintptr_t ukva, uint32_t ubpr, uint32_t uw,
++    uint32_t uh, uint32_t ufmt, uint32_t sy, uint32_t sh, uint32_t dy);
+ 
+ #define BD_MDSS_PA      0x0ae00000ULL   /* sdm845.dtsi mdss */
+ #define BD_MDSS_SIZE    0x90000         /* MDSS 0x1000 + MDP 0x8f000 */
+@@ -795,7 +800,7 @@
+ 	bool     touched;
+ };
+ 
+-static struct bd_reg bd_regs[96];
++static struct bd_reg bd_regs[256];
+ static int bd_nregs;
+ 
+ static int
+@@ -1141,6 +1146,8 @@
+ }
+ 
+ /* Back to ABL's registers (reverse order); flush, and wait unless max_ms is 0. */
++static uint32_t bd_extra_flush;        /* 0226: under-layer pipes, mixers, CTL: flushed on restore too */
++
+ static int64_t
+ bd_restore(const struct bd_state *st, const char *tag, bool sleep, uint32_t max_ms)
+ {
+@@ -1155,7 +1162,9 @@
+ 	if (tag != NULL) {
+ 		IOLog("BLUE DPU: %s: %d registers back to ABL's values\n", tag, n);
+ 	}
+-	return bd_flush(st, st->flush, tag, sleep, max_ms);
++	int64_t r = bd_flush(st, st->flush | bd_extra_flush, tag, sleep, max_ms);
++	bd_extra_flush = 0;
++	return r;
+ }
+ 
+ /* ---------------- bluedpu=2: point the pipes at another buffer ---------------- */
+@@ -1449,7 +1458,7 @@
+ 
+ /* ---------------- 0145: zero-copy present (bluedpu_flip=1) ---------------- */
+ 
+-#define BD_POOL_MAX     4
++#define BD_POOL_MAX     16
+ #define BD_FLIP_WAIT_MS 50      /* > 2 frames at 60 Hz; dpu2 latched in 1.9 ms */
+ #define BD_ONCE_MAX     24
+ 
+@@ -1477,6 +1486,8 @@
+ static IOBufferMemoryDescriptor *bd_pool[BD_POOL_MAX];
+ static uint64_t bd_pool_pa[BD_POOL_MAX];
+ static bool bd_pool_used[BD_POOL_MAX];
++static bool bd_pool_app[BD_POOL_MAX];   /* 0226: app (detached layer) buffer */
++static bool bd_pool_clean[BD_POOL_MAX]; /* 0226: app buffer cleaned to DRAM since it was taken */
+ static int bd_pool_n;
+ static uint64_t bd_pool_size;
+ static const char *bd_once_seen[BD_ONCE_MAX];
+@@ -1500,6 +1511,132 @@
+ 	}
+ }
+ 
++/*
++ * 0226: a second layer under the flipped one (bluedpu_layers=N). backboardd
++ * hands a full-screen CAMetalLayer to the display as layer 0 (detached) and
++ * its own buffer, mostly clear, as layer 1. Each LM gets an idle VIG pipe
++ * for layer 0 at blend stage 0 (opaque), and the flipped pipe moves to stage
++ * 1, premultiplied source over (dpu_crtc.c _dpu_crtc_setup_blend_cfg).
++ * Layer 0 is full width at canvas row dy, from a contiguous app buffer
++ * (blue_dpu_pool_take_app); the same horizontal split and scale as the top.
++ */
++#define LM_BLEND_STAGE(n)       (0x20 + 0x18 * (n))     /* sdm845_lm_sblk blendstage_base */
++#define LM_BLEND_OP             0x00
++#define LM_BLEND_CONST_ALPHA    0x04                    /* combined alpha: fg << 16 | bg */
++#define BLEND_OPAQUE            0x100                   /* FG_ALPHA_FG_CONST | BG_ALPHA_BG_CONST */
++#define BLEND_PREMULT           0x600                   /* FG_ALPHA_FG_CONST | BG_ALPHA_FG_PIXEL | BG_INV_ALPHA */
++#define CTL_FLUSH_CTL           (1u << 17)
++#define CTL_MIXER_BORDER_OUT    (1u << 24)
++
++static int bd_layers_n;                 /* app buffers (bluedpu_layers) */
++static bool bd_layered;                 /* a layer is staged under the flipped one */
++static bool bd_ugeom;                   /* bd_uplan's geometry written */
++static struct bd_plan bd_uplan;
++static uint32_t bd_ukey[4];             /* bpr, sy, sh, dy bd_uplan was made for */
++static int bd_upipe[4];                 /* per top rect: its under pipe */
++static uint32_t bd_n_layered, bd_n_unlayered;
++
++static uint32_t
++bd_lm_flush(int lm)
++{
++	static const uint32_t bits[4] = { 1u << 6, 1u << 7, 1u << 8, 1u << 20 };       /* LM0 1 2 5 */
++	return bits[lm];
++}
++
++/* The under-layer plan for rows sy..sy+sh of a bpr-stride buffer shown at canvas row dy. NULL or why not. */
++static const char *
++bd_plan_under(const struct bd_state *st, const struct bd_plan *top, uint32_t bpr, uint32_t sy, uint32_t sh,
++    uint32_t dy, struct bd_plan *pl)
++{
++	bzero(pl, sizeof(*pl));
++	if (!top->fit || top->n != st->nsrc || top->n > 2) {
++		return "top plan is not a fit plan with one rect per LM";
++	}
++	uint32_t y0 = top->src_y0, yh = top->src_h;
++	uint32_t c0 = dy > y0 ? dy : y0, c1 = dy + sh < y0 + yh ? dy + sh : y0 + yh;
++	if (c1 <= c0) {
++		return "layer outside the shown rows";
++	}
++	uint32_t o0 = (uint32_t)(((uint64_t)(c0 - y0) * bd_h + yh / 2) / yh);
++	uint32_t o1 = (uint32_t)(((uint64_t)(c1 - y0) * bd_h + yh / 2) / yh);
++	if (o1 <= o0 || o1 > bd_h) {
++		return "layer maps to no panel rows";
++	}
++	uint32_t rows = c1 - c0, srow = sy + (c0 - dy);
++	pl->fit = true;
++	pl->stride = bpr;
++	pl->src_y0 = srow;
++	pl->src_h = rows;
++	int used = 0;
++	for (int s = 0; s < st->nsrc; s++) {
++		used |= 1 << st->src[s].pipe;
++	}
++	int next = 0;
++	for (int i = 0; i < top->n; i++) {
++		while (next < 4 && (used & (1 << next))) {
++			next++;
++		}
++		if (next >= 4) {
++			return "no idle VIG pipe";
++		}
++		int pipe = next++;
++		const struct bd_pipe_desc *p = &bd_pipes[pipe];
++		if (mdp_rd(p->base + SSPP_MULTIRECT_OPMODE) != 0 || (mdp_rd(p->base + SSPP_QSEED3 + QS3_HW_VERSION) >> 8) == 0) {
++			return "idle VIG pipe not usable";
++		}
++		const struct bd_rect_plan *t = &top->r[i];
++		uint32_t oh = o1 - o0;
++		bd_upipe[i] = pipe;
++		pl->r[pl->n++] = (struct bd_rect_plan){
++			.base = p->base, .rect = 0,
++			.addr_off = p->base + SSPP_SRC0_ADDR, .xy_off = p->base + SSPP_SRC_XY,
++			.byte_off = 0, .xy = srow << 16 | (t->xy & 0xffff),
++			.fit = true,
++			.src_size = rows << 16 | (t->src_size & 0xffff),
++			.out_size = oh << 16 | (t->out_size & 0xffff),
++			.out_xy = o0 << 16 | (t->out_xy & 0xffff),
++			.step_h = t->step_h,
++			.step_v = (uint32_t)(((uint64_t)rows << QS3_PHASE_SHIFT) / oh),
++		};
++		pl->flush |= p->flush;
++	}
++	return NULL;
++}
++
++/* Stage (on) or unstage the under layer on each LM; registers only. Flush bits to add. */
++static uint32_t
++bd_layer_stage(bool on)
++{
++	uint32_t bits = CTL_FLUSH_CTL;
++	for (int i = 0; i < bd_st.nsrc; i++) {
++		const struct bd_src *src = &bd_st.src[i];
++		const struct bd_pipe_desc *tp = &bd_pipes[src->pipe], *up = &bd_pipes[bd_upipe[i]];
++		uint32_t lmb = bd_lms[src->lm].base;
++		uint32_t mix = CTL_MIXER_BORDER_OUT | 3u << tp->sh0;
++		if (on) {
++			/* format, fetch and QoS as the top pipe's (ABL's) */
++			static const uint32_t copy[] = {
++				SSPP_SRC_FORMAT, SSPP_SRC_UNPACK, SSPP_SRC_OP_MODE, 0x3c, SSPP_FETCH_CONFIG, 0x60, 0x64, 0x68,
++				SSPP_QOS_CTRL, 0x74, 0x78, 0x130, 0x134, 0x150,
++			};
++			for (size_t k = 0; k < sizeof(copy) / sizeof(copy[0]); k++) {
++				bd_set(up->base + copy[k], mdp_rd(tp->base + copy[k]));
++			}
++			mix |= 2u << up->sh0;
++			bits |= up->flush;
++		}
++		bd_set(CTL_BASE(bd_st.ctl) + CTL_LAYER(bd_lms[src->lm].id), mix);
++		bd_set(lmb + LM_BLEND_STAGE(0) + LM_BLEND_OP, BLEND_OPAQUE);
++		bd_set(lmb + LM_BLEND_STAGE(0) + LM_BLEND_CONST_ALPHA, 0xffu << 16);
++		bd_set(lmb + LM_BLEND_STAGE(1) + LM_BLEND_OP, BLEND_PREMULT);
++		bd_set(lmb + LM_BLEND_STAGE(1) + LM_BLEND_CONST_ALPHA, 0xffu << 16);
++		bits |= bd_lm_flush(src->lm) | tp->flush;
++	}
++	bd_layered = on;
++	bd_extra_flush |= bits;
++	return bits;
++}
++
+ /* Back to the panel buffer (flip lock held). */
+ static void
+ bd_unflip_locked(const char *why)
+@@ -1516,6 +1653,8 @@
+ 	bd_flipped = false;
+ 	bd_geom = false;
+ 	bd_flip_pa = 0;
++	bd_ugeom = false;
++	bd_layered = false;
+ }
+ 
+ /* Something is wrong: no more flips this boot (flip lock held). */
+@@ -1549,10 +1688,29 @@
+ blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr, uint32_t w, uint32_t h,
+     uint32_t fmt)
+ {
++	return blue_dpu_flip_layers(md, kva, offset, bpr, w, h, fmt, NULL, 0, 0, 0, 0, 0, 0, 0, 0);
++}
++
++/*
++ * 0226: the same, with umd (rows sy..sy+sh of a full-width app buffer) shown
++ * under it at canvas row dy, blended by the layer mixers. umd NULL: no layer
++ * under. 0: the caller composes on the CPU.
++ */
++int
++blue_dpu_flip_layers(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr, uint32_t w, uint32_t h,
++    uint32_t fmt, IOMemoryDescriptor *umd, uintptr_t ukva, uint32_t ubpr, uint32_t uw, uint32_t uh, uint32_t ufmt,
++    uint32_t sy, uint32_t sh, uint32_t dy)
++{
+ 	char detail[128];
+ 	if (!bd_flip_on) {
+ 		return 0;
+ 	}
++	if (umd != NULL && (bd_layers_n == 0 || !bd_fit || uw != bd_lw || ufmt != BD_FMT_BGRA || ukva == 0 ||
++	    (ubpr & 15) || ubpr < uw * 4 || sh == 0 || sy + sh > uh || dy + sh > bd_lh)) {
++		snprintf(detail, sizeof(detail), "%ux%u fmt 0x%x bpr %u rows %u+%u at %u", uw, uh, ufmt, ubpr, sy, sh, dy);
++		bd_once("layer the DPU cannot show", detail);
++		return 0;
++	}
+ 	if (w != bd_lw || h != bd_lh || fmt != BD_FMT_BGRA || md == NULL || kva == 0) {
+ 		snprintf(detail, sizeof(detail), "%ux%u fmt 0x%x", w, h, fmt);
+ 		bd_once("not a full-screen BGRA surface", detail);
+@@ -1588,6 +1746,18 @@
+ 		IOLockUnlock(bd_flip_lock);
+ 		return 0;
+ 	}
++	int uslot = -1;
++	uint64_t upa = 0;
++	if (umd != NULL) {
++		uslot = bd_pool_index(umd);
++		uint64_t useg = 0, ulen = (uint64_t)ubpr * uh;
++		upa = uslot >= 0 ? umd->getPhysicalSegment(0, &useg, kIOMemoryMapperNone) : 0;
++		if (uslot < 0 || upa != bd_pool_pa[uslot] || useg < ulen || upa + ulen > 0x100000000ULL) {
++			IOLockUnlock(bd_flip_lock);
++			bd_once("layer not from the scanout pool", NULL);
++			return 0;
++		}
++	}
+ 	if (bd_fplan_stride != bpr) {
+ 		if (bd_flipped) {
+ 			bd_unflip_locked("new stride");
+@@ -1602,7 +1772,26 @@
+ 		}
+ 		bd_fplan_stride = bpr;
+ 		bd_plan_log(bd_fit ? "flip plan (fit)" : "flip plan (crop)", &bd_fplan);
++		bd_ugeom = false;
++		bd_ukey[0] = 0;
+ 	}
++	if (umd != NULL && (!bd_ugeom || bd_ukey[0] != ubpr || bd_ukey[1] != sy || bd_ukey[2] != sh || bd_ukey[3] != dy)) {
++		const char *bad = bd_plan_under(&bd_st, &bd_fplan, ubpr, sy, sh, dy, &bd_uplan);
++		if (bad != NULL) {
++			IOLockUnlock(bd_flip_lock);
++			snprintf(detail, sizeof(detail), "%s (rows %u+%u at %u)", bad, sy, sh, dy);
++			bd_once("layer plan", detail);
++			return 0;
++		}
++		bd_ugeom = false;
++		bd_ukey[0] = ubpr;
++		bd_ukey[1] = sy;
++		bd_ukey[2] = sh;
++		bd_ukey[3] = dy;
++		if (bd_n_layered < 4) {
++			bd_plan_log("layer plan", &bd_uplan);
++		}
++	}
+ 	/* 0157: the previous flip's latch, if it is still pending (rarely: a frame takes > 1 vsync) */
+ 	int64_t lat = 0;
+ 	if (mdp_rd(CTL_BASE(bd_st.ctl) + CTL_FLUSH) & bd_fplan.flush) {
+@@ -1638,6 +1827,10 @@
+ 	/* The DPU is not IO-coherent: the frame has to be in DRAM before it is fetched. */
+ 	uint64_t t0 = mach_absolute_time();
+ 	CleanPoC_DcacheRegion((vm_offset_t)kva, (size_t)len);
++	if (umd != NULL && !bd_pool_clean[uslot]) {
++		CleanPoC_DcacheRegion((vm_offset_t)ukva, (size_t)ubpr * uh);    /* GPU-drawn: once, for the CPU's zeroing */
++		bd_pool_clean[uslot] = true;
++	}
+ 	bd_dsb();
+ 	uint64_t t1 = mach_absolute_time();
+ 	if (!bd_geom) {
+@@ -1647,6 +1840,24 @@
+ 	bool first = bd_n_flip == 0;
+ 	bool wait = first || !bd_geom || bd_flip_sync;
+ 	bd_plan_write(&bd_fplan, pa, !bd_geom);
++	uint32_t bits = bd_fplan.flush;
++	if (umd != NULL) {
++		bd_plan_write(&bd_uplan, upa, !bd_ugeom);
++		bd_ugeom = true;
++		bits |= bd_uplan.flush;
++		if (!bd_layered) {
++			bits |= bd_layer_stage(true);
++			if (bd_n_layered++ < 4) {
++				IOLog("BLUE DPU: layer on: pool buffer %d at 0x%llx under 0x%llx, rows %u+%u at %u\n", uslot, upa,
++				    pa, sy, sh, dy);
++			}
++		}
++	} else if (bd_layered) {
++		bits |= bd_layer_stage(false);
++		if (bd_n_unlayered++ < 4) {
++			IOLog("BLUE DPU: layer off\n");
++		}
++	}
+ 	bd_geom = true;
+ 	bd_flipped = true;
+ 	if (pa != bd_flip_pa) {
+@@ -1654,9 +1865,9 @@
+ 	}
+ 	bd_flip_pa = pa;
+ 	if (wait) {
+-		lat = bd_flush(&bd_st, bd_fplan.flush, first ? "first flip" : NULL, true, BD_FLIP_WAIT_MS);
++		lat = bd_flush(&bd_st, bits, first ? "first flip" : NULL, true, BD_FLIP_WAIT_MS);
+ 	} else {
+-		(void)bd_flush(&bd_st, bd_fplan.flush, NULL, true, 0);
++		(void)bd_flush(&bd_st, bits, NULL, true, 0);
+ 		bd_latch_pending = true;
+ 	}
+ 	if (lat < 0) {
+@@ -1872,7 +2083,7 @@
+ 	IOBufferMemoryDescriptor *md = NULL;
+ 	IOLockLock(bd_flip_lock);
+ 	for (int i = 0; i < bd_pool_n && md == NULL; i++) {
+-		if (!bd_pool_used[i] && !(bd_flipped && bd_pool_pa[i] == bd_flip_pa)) {
++		if (!bd_pool_app[i] && !bd_pool_used[i] && !(bd_flipped && bd_pool_pa[i] == bd_flip_pa)) {
+ 			bd_pool_used[i] = true;
+ 			md = bd_pool[i];
+ 			md->retain();
+@@ -1886,6 +2097,34 @@
+ 	return md;
+ }
+ 
++/* 0226: an app's full-width BGRA surface (a CAMetalLayer drawable) the DPU can show as a layer */
++IOBufferMemoryDescriptor *
++blue_dpu_pool_take_app(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt, uint32_t planes, uint32_t offset,
++    uint64_t size)
++{
++	if (!bd_flip_on || bd_flip_lock == NULL || bd_layers_n == 0 || w != bd_lw || h > bd_lh || h < bd_lh / 2 ||
++	    fmt != BD_FMT_BGRA || planes != 0 || offset != 0 || (bpr & 15) || size > bd_pool_size ||
++	    (uint64_t)bpr * h > bd_pool_size) {
++		return NULL;
++	}
++	IOBufferMemoryDescriptor *md = NULL;
++	IOLockLock(bd_flip_lock);
++	for (int i = 0; i < bd_pool_n && md == NULL; i++) {
++		if (bd_pool_app[i] && !bd_pool_used[i]) {
++			bd_pool_used[i] = true;
++			bd_pool_clean[i] = false;
++			md = bd_pool[i];
++			md->retain();
++			IOLog("BLUE DPU: app pool buffer %d (0x%llx) -> %ux%u bpr %u surface\n", i, bd_pool_pa[i], w, h, bpr);
++		}
++	}
++	IOLockUnlock(bd_flip_lock);
++	if (md == NULL) {
++		bd_once("app pool empty", NULL);
++	}
++	return md;
++}
++
+ void
+ blue_dpu_pool_put(IOMemoryDescriptor *md)
+ {
+@@ -1945,6 +2184,28 @@
+ 	if (bd_pool_n < 2) {
+ 		IOLog("BLUE DPU: flip: off: %d pool buffers, need 2\n", bd_pool_n);
+ 		return 0;
++	}
++	int layers = 0;
++	PE_parse_boot_argn("bluedpu_layers", &layers, sizeof(layers));
++	layers = layers < 0 ? 0 : (layers > BD_POOL_MAX - bd_pool_n ? BD_POOL_MAX - bd_pool_n : layers);
++	for (int i = 0; i < layers; i++) {
++		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous |
++		    kIOMemoryHostPhysicallyContiguous, bd_pool_size, 0x00000000ffffc000ULL);
++		uint64_t seg = 0, pa = md != NULL ? md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++		if (md == NULL || pa == 0 || seg < bd_pool_size || pa + bd_pool_size > 0x100000000ULL ||
++		    md->getBytesNoCopy() == NULL) {
++			IOLog("BLUE DPU: layers: app buffer %d: no contiguous %llu bytes below 4 GiB\n", i, bd_pool_size);
++			OSSafeReleaseNULL(md);
++			break;
++		}
++		bd_pool_app[bd_pool_n] = true;
++		bd_pool[bd_pool_n] = md;
++		bd_pool_pa[bd_pool_n++] = pa;
++		bd_layers_n++;
++	}
++	if (layers > 0) {
++		IOLog("BLUE DPU: layers: %d app buffers of %llu bytes\n", bd_layers_n, bd_pool_size);
+ 	}
+ 	bd_health_baseline(&bd_st, "flip baseline");
+ 	return 1;
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 07:37:27
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 07:37:27
+@@ -130,6 +130,9 @@
+ extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
+     uint32_t w, uint32_t h, uint32_t fmt);
+ extern "C" int blue_dpu_unflip(const char *why);
++extern "C" int blue_dpu_flip_layers(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
++    uint32_t w, uint32_t h, uint32_t fmt, IOMemoryDescriptor *umd, uintptr_t ukva, uint32_t ubpr, uint32_t uw,
++    uint32_t uh, uint32_t ufmt, uint32_t sy, uint32_t sh, uint32_t dy);   /* 0226 */
+ extern "C" int blue_dpu_scanout(void);
+ extern "C" void blue_bw_park(int park);       /* 0211, bsd/dev/blueline_bw.c */
+ extern "C" int blue_dpu_flip_tick(void);
+@@ -260,6 +263,8 @@
+ 	 */
+ 	SweetSurface *fShown;
+ 	SweetSurface *fRetiring;
++	SweetSurface *fShownU;          /* 0226: the same for the layer under it (a detached app layer) */
++	SweetSurface *fRetiringU;
+ 	/*
+ 	 * 0159 (under fLock): SwapWait. As IOMFB, a swap is complete when its
+ 	 * buffers are released: a later swap's flip has latched. CoreAnimation
+@@ -289,6 +294,7 @@
+ 	IOReturn swapWait(uint32_t id, uint32_t flags);
+ 	void displayHold(SweetSurface *s);
+ 	void displayDrop(bool all);
++	void displayHoldUnder(SweetSurface *s);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void powerStart(void);
+@@ -573,7 +579,7 @@
+ 		}
+ 	}
+ 	if (fb->fFlip && owner_ok) {
+-		if (fb->fRetiring != NULL && !sweet_fb_latch_pending()) {
++		if ((fb->fRetiring != NULL || fb->fRetiringU != NULL) && !sweet_fb_latch_pending()) {
+ 			fb->displayDrop(false);                 /* 0158: its replacement is fetched now */
+ 		}
+ 		if ((count % 60) == 0 && blue_dpu_flip_tick()) {
+@@ -1051,6 +1057,25 @@
+ 	fShown = s;
+ }
+ 
++/* 0226: s (or none) is the layer under the shown one now. fPresentLock held. */
++void
++AppleCLCD::displayHoldUnder(SweetSurface *s)
++{
++	if (s == fShownU) {
++		return;
++	}
++	if (fRetiringU != NULL) {
++		sweet_surface_display_use(fRetiringU, -1);
++		OSSafeReleaseNULL(fRetiringU);
++	}
++	fRetiringU = fShownU;
++	if (s != NULL) {
++		s->retain();
++		sweet_surface_display_use(s, 1);
++	}
++	fShownU = s;
++}
++
+ /* 0223: swap id is on screen since the last TE: tell CoreAnimation when. fLock held. */
+ void
+ AppleCLCD::frameInfoLatched(uint32_t id)
+@@ -1087,10 +1112,18 @@
+ 		sweet_surface_display_use(fRetiring, -1);
+ 		OSSafeReleaseNULL(fRetiring);
+ 	}
++	if (fRetiringU != NULL) {
++		sweet_surface_display_use(fRetiringU, -1);
++		OSSafeReleaseNULL(fRetiringU);
++	}
+ 	if (all && fShown != NULL) {
+ 		sweet_surface_display_use(fShown, -1);
+ 		OSSafeReleaseNULL(fShown);
+ 	}
++	if (all && fShownU != NULL) {
++		sweet_surface_display_use(fShownU, -1);
++		OSSafeReleaseNULL(fShownU);
++	}
+ }
+ 
+ /* 0159: 0 when swap id is complete; 0xe00002d5 while pending and flags bit 31 (poll) */
+@@ -1163,6 +1196,28 @@
+ 	if (sweet_fb_dtest && n >= 2 && (mask & 1) && get32(rec, 0x54) != 0) {
+ 		return fakeFlip(rec, get32(rec, 0x54));         /* 0225 */
+ 	}
++	/*
++	 * 0226: layer 0 a full-width app layer (detached CAMetalLayer), layer 1 the
++	 * full-screen one over it: the DPU blends them (bluedpu_layers).
++	 */
++	SweetSurface *u = NULL;
++	uint32_t usy = 0, ush = 0, udy = 0;
++	if (n == 2 && (mask & 3) == 3 && layer == 1 && get32(rec, 0x54) != 0) {
++		const uint8_t *ua = rec + 0x64, *ub = rec + 0xc4;
++		u = sweet_surface_copy(get32(rec, 0x54));
++		if (u == NULL || u->memory == NULL || u->bytesPerElement != 4 || u->planeCount != 0 || u->offset != 0 ||
++		    get32(ua, 0) != 0 || get32(ub, 0) != 0 || (int32_t)get32(ua, 4) < 0 || (int32_t)get32(ub, 4) < 0 ||
++		    get32(ua, 8) != u->width || get32(ub, 8) != fLogicalW || u->width != fLogicalW ||
++		    get32(ua, 12) != get32(ub, 12) || get32(ua, 4) + get32(ua, 12) > u->height ||
++		    (uint64_t)u->bytesPerRow * u->height > u->memory->getLength()) {
++			OSSafeReleaseNULL(u);
++			return false;
++		}
++		usy = get32(ua, 4);
++		ush = get32(ua, 12);
++		udy = get32(ub, 4);
++		n = 1;
++	}
+ 	if (n != 1) {
+ 		return false;
+ 	}
+@@ -1171,6 +1226,7 @@
+ 	uint32_t bw = get32(b, 8), bh = get32(b, 12);
+ 	if (get32(a, 0) != 0 || get32(a, 4) != 0 || get32(b, 0) != 0 || get32(b, 4) != 0 ||
+ 	    !((bw == fLogicalW && bh == fLogicalH) || (bw == 0 && bh == 0))) {
++		OSSafeReleaseNULL(u);
+ 		return false;
+ 	}
+ 	SweetSurface *s = sweet_surface_copy(id);
+@@ -1178,6 +1234,7 @@
+ 	    s->bytesPerElement != 4 || s->planeCount != 0 ||
+ 	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+ 		OSSafeReleaseNULL(s);
++		OSSafeReleaseNULL(u);
+ 		return false;
+ 	}
+ 	bool ok = false;
+@@ -1186,11 +1243,13 @@
+ 	bool off = fPowerOff;
+ 	IOLockUnlock(fLock);
+ 	if (!off) {
+-		ok = blue_dpu_flip(s->memory, s->kernelAddress(), s->offset, s->bytesPerRow, s->width, s->height,
+-		    s->pixelFormat) != 0;
++		ok = blue_dpu_flip_layers(s->memory, s->kernelAddress(), s->offset, s->bytesPerRow, s->width, s->height,
++		    s->pixelFormat, u ? u->memory : NULL, u ? u->kernelAddress() : 0, u ? u->bytesPerRow : 0,
++		    u ? u->width : 0, u ? u->height : 0, u ? u->pixelFormat : 0, usy, ush, udy) != 0;
+ 	}
+ 	if (ok) {
+ 		displayHold(s);
++		displayHoldUnder(u);
+ 		consoleOnce();
+ 		IOLockLock(fLock);
+ 		/* 0159: the flip waited for the previous latch: that swap is shown (and its predecessor released) */
+@@ -1210,6 +1269,7 @@
+ 	}
+ 	IOLockUnlock(fPresentLock);
+ 	s->release();
++	OSSafeReleaseNULL(u);
+ 	return ok;
+ }
+ 
+diff -ru a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-26 07:37:27
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-26 07:37:27
+@@ -84,6 +84,8 @@
+ extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
+     uint32_t planes, uint32_t offset, uint64_t size);
+ extern "C" void blue_dpu_pool_put(IOMemoryDescriptor *md);
++extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take_app(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
++    uint32_t planes, uint32_t offset, uint64_t size);      /* 0226: other processes' full-width surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -854,6 +856,9 @@
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+ 			if (strcmp(creator, "backboardd") == 0) {
+ 				mem = blue_dpu_pool_take(s->width, s->height, s->bytesPerRow, s->pixelFormat,
++				    s->planeCount, s->offset, s->allocSize);
++			} else {
++				mem = blue_dpu_pool_take_app(s->width, s->height, s->bytesPerRow, s->pixelFormat,
+ 				    s->planeCount, s->offset, s->allocSize);
+ 			}
+ 			if (mem == NULL) {

@@ -896,6 +896,8 @@ Shifting backboardd's update can't help: it frees the drawable and composites ~1
 
 `dt1`/`dt2`: CA submits swap N once N-2 is complete; its swap lands just after the TE, latches a frame late, and the app settles at every other frame. `dt3`: steady 60, present to on screen 30 ms. Next: DPU hardware blending of the two detached layers (app, status bar), then this check on screen (the 0224 rule striped in composited mode). Present-when-scheduled is parked in `gpu/metal/patches/held/`.
 
+**0226**: `bluedpu_layers=N` (N contiguous app buffers below 4 GiB, 10.4 MB each). A detached swap (full-width app layer 0 under backboardd's full-screen layer 1) is flipped as two layers: idle VIG2/VIG3 fetch the app buffer at blend stage 0, the flipped VIG0/VIG1 move to stage 1, premultiplied source over (register layout from Linux `dpu1`). `lp1` (MetalHello, `bluedetached=1 bluedpu_layers=8 bluefb_swapdone=1`, present when scheduled): layer on, ~58 flips/s, 0 unflips, no underrun or SMMU fault; 230 of 240 frames one vsync apart, drawable wait 15 ms, present to on screen 30 ms. Not yet checked on screen (screenshots capture only layer 1).
+
 Disk: `work/test` held 13.8 GB of per-run boot images (payload, shim, ADT); only the last 10 runs' are kept now.
 
 ## 2026-11-25: WebGL on Metal (WebGLHello)
