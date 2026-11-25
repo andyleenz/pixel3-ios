@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 14:00:00 +1100
+Subject: [PATCH] 0991: backboardd composites every layer (CA_DISABLE_DETACHED=1)
+
+CoreAnimation hands an app's full-screen CAMetalLayer to the display as its
+own layer, under backboardd's status-bar buffer. The display has no cheap
+overlay blending: 0218 blends them on the CPU, 40 ms a frame (MetalHello
+84-89 frames per 5 s, a tear). With CA_DISABLE_DETACHED=1 backboardd draws
+both on the GPU and the display flips the result (174-178 per 5 s, no
+copies). sweetenv now always starts with it; bluedetached=1 leaves it out.
+---
+diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c	2026-11-25 13:43:51
++++ b/bsd/kern/kern_exec.c	2026-11-25 14:22:30
+@@ -458,10 +458,22 @@
+ static int
+ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ {
+-	static char spec[512];
++	static char spec[640];
+ 	static int state;       /* 0 not parsed, 1 none, 2 set */
+ 	if (state == 0) {
+-		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++		/*
++		 * 0991: backboardd composites every layer itself (CA_DISABLE_DETACHED=1). Handed to the
++		 * display, an app's full-screen Metal layer and the status bar over it were blended on the
++		 * CPU (0218, ~17 fps); composited, the frame flips without a copy (~35 fps). bluedetached=1
++		 * turns it off.
++		 */
++		int detached = 0;
++		size_t o = 0;
++		if (!PE_parse_boot_argn("bluedetached", &detached, sizeof(detached)) || !detached) {
++			o = strlcpy(spec, "backboardd:CA_DISABLE_DETACHED=1;", sizeof(spec));
++		}
++		(void)PE_parse_boot_argn("sweetenv", spec + o, (int)(sizeof(spec) - o));
++		state = spec[0] ? 2 : 1;
+ 	}
+ 	if (state != 2) {
+ 		return 0;

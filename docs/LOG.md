@@ -853,7 +853,14 @@ The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kern
 
 The screen showed it in horizontal bands of black that moved between boots (`mh1`-`mh6`), although the drawable (`getBytes`) and its IOSurface (CPU) read back whole, and the USERPTR import's pages are the surface's own (all 564 pages). backboardd hands the app's layer to the display as layer 0 (1125x2001) and its own buffer (status bar, transparent elsewhere) as layer 1. `present()` copied layers raw: layer 0 on the CPU (17 ms), then layer 1 by the GPU blit, not waited for, over the whole panel.
 
-**0218**: a layer over another is blended (premultiplied, source over) into a cacheable shadow of the panel, copied out once. Blending straight on the panel took 1.1 s a frame (`mh7`: reading the panel's mapping). Now 39-42 ms a panel copy for the two layers (`mh8`), so the app shows at ~20 fps with a tear where a drawable is reused mid-copy. Next: blend on the GPU.
+**0218**: a layer over another is blended (premultiplied, source over) into a cacheable shadow of the panel, copied out once. Blending straight on the panel took 1.1 s a frame (`mh7`: reading the panel's mapping). Now 39-42 ms a panel copy for the two layers (`mh8`), so the app shows at ~20 fps with a tear where a drawable is reused mid-copy.
+
+**0991**: backboardd always runs with `CA_DISABLE_DETACHED=1` (QuartzCore's switch), so it composites the app layer itself on the GPU and the display flips the result. `bluedetached=1` turns it off.
+
+| MetalHello on screen | shown per 5 s | panel copies |
+| --- | --- | --- |
+| detached, CPU blend (0218, `mh8`) | 84-89 | 84-89, ~40 ms each |
+| composited (0991, `mh10`) | 185-191 flips | 0 |
 
 Reinstalling over an installed copy still fails (containermanagerd `EXISTING_CONTAINER_REPLACE`); test builds were pushed into the installed bundle.
 
