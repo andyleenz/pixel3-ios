@@ -35,6 +35,7 @@
 	CFTimeInterval _start, _lastVsync;
 	NSString *_first;
 	float _late[240], _wait[240], _encode[240], _done[240], _shown[240], _back[240];
+	unsigned char _g[240];
 	void *_slotTex[4];
 	CFTimeInterval _slotAt[4];
 	unsigned _gap[6];
@@ -222,6 +223,7 @@ readback(id<MTLTexture> tex)
 		_wait[k] = (t1 - t0) * 1000;
 		long g = lround((link.timestamp - _lastVsync) / link.duration);
 		_gap[g < 1 ? 0 : g > 5 ? 5 : g]++;
+		_g[k] = g < 0 ? 0 : g > 99 ? 99 : (unsigned char)g;
 		_back[k] = back;
 		_shown[k] = -1;
 		__block float *shown = &_shown[k];
@@ -243,9 +245,17 @@ readback(id<MTLTexture> tex)
 		CFTimeInterval ts = link.timestamp, cbt = t0;
 		[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
 			dispatch_async(dispatch_get_main_queue(), ^{
+				NSMutableString *miss = [NSMutableString string];
+				for (unsigned i = 0, n = 0; i < 240 && n < 16; i++) {
+					if (self->_g[i] < 2) continue;
+					n++;
+					[miss appendFormat:@" #%u gap %u late %.1f wait %.1f enc %.1f prev done %.1f;", i + 61, self->_g[i], self->_late[i], self->_wait[i],
+					    self->_encode[i], i ? self->_done[i - 1] : -1.f];
+				}
+				NSString *head = [NSString stringWithFormat:@"%@metalhello: misses (ms):%@\n", self->_first, miss];
 				note([NSString stringWithFormat:@"%@metalhello: frames 61-300 (ms, median/p90): late %@, nextDrawable %@, "
 				    "encode+commit %@, encode start to completion %@, present to on screen %@, present to drawable back %@ (%u drawables); "
-				    "vsyncs between callbacks 1:%u 2:%u 3:%u 4+:%u; link duration %.3f ms, timestamps %.3f ms apart, %u callbacks in %.1f ms; continuous - absolute %lld ticks\n", self->_first,
+				    "vsyncs between callbacks 1:%u 2:%u 3:%u 4+:%u; link duration %.3f ms, timestamps %.3f ms apart, %u callbacks in %.1f ms; continuous - absolute %lld ticks\n", head,
 				    stat_ms(self->_late, 240), stat_ms(self->_wait, 240), stat_ms(self->_encode, 240), stat_ms(self->_done, 240),
 				    stat_ms(self->_shown, 240), stat_ms(self->_back, 240), (unsigned)self->_layer.maximumDrawableCount,
 				    self->_gap[1], self->_gap[2], self->_gap[3], self->_gap[4] + self->_gap[5], link.duration * 1000,
