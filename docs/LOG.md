@@ -860,6 +860,22 @@ MetalHello ran at ~36 fps though its frame is ~1.3 ms of GPU work. 0219 (`bluetr
 - **0221: DCVS target 50% -> 20%.** The GPU was busy 35-50% on average, so DCVS kept 257-342 MHz, but a frame is a serial chain (app, backboardd's composite of 3 layers in 5 submits, flip) inside one vsync. At 342 MHz the composite alone took ~9 ms.
 - **Left:** with backboardd starting 0.2 ms after each vsync and flipping ~6 ms later, the missed vsyncs (21 of 99 in `tr3`) are ones where the app had no new frame. It submits ~11-12 ms after a vsync, so its CPU side (Metal frontend and runtime) is next.
 
+## 2026-11-25: 60 fps for apps: CoreAnimation's timer on FrameInfo (0222, 0223)
+
+MetalHello now reports, for frames 61-300, the callback's lateness, the `nextDrawable` wait, encode, completion, present-to-screen and the drawable round trip. In `tr7` its frame was 1 ms of CPU but `nextDrawable` waited 16 ms median (p90 33); a drawable came back 62-66 ms after present, so 3 drawables gave ~48 fps. 90 of 240 callbacks were 2 vsyncs apart.
+
+- **Cause.** backboardd never enabled IOMFB vsync notifications: `CADeviceUseVBL` is true only for A8-A10 chip ids (or `CA_FORCE_TIMER=1`). On later chips CoreAnimation's display timer is aligned by DCP FrameInfo presentation times (`IOMFBServer::frame_info_callback` -> `IOMFBDisplay::add_timing` -> `CADisplayTimerAlignPhase`). We sent none, so the timer free-ran at 16.45-16.63 ms against the panel's 16.67 ms (TE at 59.98 Hz) and the app's frames slid across the refresh.
+- **0222.** The vsync tick is armed for the panel's next TE + 1 ms (PP rd_ptr line counter); `bluefb_vsync_te_us=0` restores the 0220 grid. Alone it changed nothing (`tr9`), as CA does not listen to the tick.
+- **0223.** IOMFB selector 74 lists two FrameInfo tags (`Presentation_time`, `Requested_presentation`), 73 takes the mask CA enables (0x3), and each swap's latch sends notification type 3 `[mask | bit 31, swap id, lo, hi, ...]` with the TE it latched at.
+- `CA_FORCE_TIMER=1` (VBL callbacks from our tick) left the UI nearly frozen (`tr11`, 19 flips / 5 s); not pursued.
+
+| Run | One vsync apart (of 240) | `nextDrawable` median/p90 | drawable round trip | flips / 5 s |
+|---|---|---|---|---|
+| `tr7` (0221) | 146 | 16.1 / 32.7 ms | 62 ms (`tr8`) | 204-240 (~44 fps) |
+| `tr13` (0223) | 230 | 15.7 / 16.0 ms | 48.9 ms | 274-303 (~57.5 fps) |
+
+In `tr13`'s trace window 79 of 80 flips are one vsync apart (59.3 fps); GPU busy 21%. Present to on screen is 31.8 ms (presented handlers fire now). Same kernel, apps launched 45 s after install (`apptest ... 3 45`): SpriteHello 51.2 fps (`sk13`; 35 before, launched at 15 s), WebGLHello 57.3 fps (`wgl13`; 45-47).
+
 ## 2026-11-25: WebGL on Metal (WebGLHello)
 
 `tools/apps/webglhello`: a WKWebView page draws a rotating triangle with WebGL. WebKit runs WebGL in `com.apple.WebKit.GPU` (ANGLE on Metal), an XPC service, not an app, so `BlueMetal.bundle` now turns Metal on for it by name. Renderer "Apple GPU", 120 frames in 2.53 s (47.4 fps), centre and corner pixels read back as drawn, no GL error (`wgl4`, no `bluemetal.procs`; `wgl3`: 44.9 fps).

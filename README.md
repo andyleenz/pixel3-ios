@@ -124,11 +124,12 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
    but games, Maps, WebGL and Core Image do. In order:
    1. Done: Metal on by default for apps and WebKit's GPU process (not extensions or daemons; `-NAME` in
       `bluemetal.procs` denies).
-   2. Tests (2026-11-25): a Metal app draws and shows correctly (`tools/apps/metalhello`, ~37 fps,
+   2. Tests (2026-11-25): a Metal app draws and shows correctly (`tools/apps/metalhello`, ~57.5 fps,
       composited by backboardd and flipped without a copy); Maps opens and draws its UI (no network: no
-      tiles); a SpriteKit scene of 330 sprites runs at 35 fps (`tools/apps/spritehello`); WebGL in a WKWebView
-      at 45-47 fps (`tools/apps/webglhello`). Toward 60 fps: vsync now 60 Hz (was 57)
-      and GPU DCVS aims at 20% busy: MetalHello 36 -> 44 fps. Next: the app's CPU side per frame.
+      tiles); a SpriteKit scene of 330 sprites runs at 51 fps (`tools/apps/spritehello`); WebGL in a WKWebView
+      at 57 fps (`tools/apps/webglhello`). For 60 fps: vsync at 60 Hz on the panel's TE, GPU DCVS aims at
+      20% busy, and IOMFB sends CoreAnimation FrameInfo presentation times, which its display timer aligns
+      to (0219-0223; MetalHello 36 -> 44 -> ~57.5 fps).
    3. Later: backboardd on Metal. It unlocks and pages the home screen correctly with as many frames as
       GL on the same swipes (334 vs 327-345; median 36 ms commit to complete, 14 ms recording, 18 ms GPU
       in sysmem); GL stays the compositor until it is clearly faster.
