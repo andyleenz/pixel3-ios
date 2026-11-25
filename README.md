@@ -129,7 +129,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
       tiles); a SpriteKit scene of 330 sprites runs at 51 fps (`tools/apps/spritehello`); WebGL in a WKWebView
       at 57 fps (`tools/apps/webglhello`). For 60 fps: vsync at 60 Hz on the panel's TE, GPU DCVS aims at
       20% busy, and IOMFB sends CoreAnimation FrameInfo presentation times, which its display timer aligns
-      to (0219-0223; MetalHello 36 -> 44 -> ~57.5 fps).
+      to (0219-0223; MetalHello 36 -> 44 -> ~57.5 fps). Since 0226-0228 an app's full-screen Metal layer is
+      a second DPU plane under the status bar (no compositing, no copy): 220-234 of 240 frames one vsync
+      apart, and a kernel check (0227) finds no frame drawn into while on screen.
    3. Later: backboardd on Metal. It unlocks and pages the home screen correctly with as many frames as
       GL on the same swipes (334 vs 327-345; median 36 ms commit to complete, 14 ms recording, 18 ms GPU
       in sysmem); GL stays the compositor until it is clearly faster.

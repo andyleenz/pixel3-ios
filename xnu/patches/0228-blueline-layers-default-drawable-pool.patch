@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0228: layers by default; app pool for GPU-drawn surfaces
+
+bluedpu_layers defaults to 12 (all pool slots but backboardd's 3);
+blue_dpu_layers_ready() for 0992. The app pool serves only surfaces with
+MapCacheAttribute 0 (Metal drawables); CA's CPU-drawn backing stores ask
+for 2 and took 3 of 8 buffers at an app's launch (lp3, pd3: "app pool
+empty", a CPU-copied frame). The first 16 takes are logged with their
+creator and properties; surface names are in the create log.
+---
+diff -ru a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+--- a/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 09:20:38
++++ b/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 09:40:44
+@@ -2210,7 +2210,7 @@
+ 		IOLog("BLUE DPU: flip: off: %d pool buffers, need 2\n", bd_pool_n);
+ 		return 0;
+ 	}
+-	int layers = 0;
++	int layers = 12;        /* 0228: default 12 (all but backboardd's 3); an app held 7 at launch (pd3) */
+ 	PE_parse_boot_argn("bluedpu_layers", &layers, sizeof(layers));
+ 	layers = layers < 0 ? 0 : (layers > BD_POOL_MAX - bd_pool_n ? BD_POOL_MAX - bd_pool_n : layers);
+ 	for (int i = 0; i < layers; i++) {
+@@ -2234,6 +2234,13 @@
+ 	}
+ 	bd_health_baseline(&bd_st, "flip baseline");
+ 	return 1;
++}
++
++/* 0228: kern_exec turns on CoreAnimation's detached layers for backboardd only when the DPU can show two */
++extern "C" int
++blue_dpu_layers_ready(void)
++{
++	return bd_flip_on && bd_layers_n > 0;
+ }
+ 
+ /* ---------------- baseline statistics of the CPU copy ---------------- */
+diff -ru a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-26 09:20:12
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-26 09:41:11
+@@ -87,6 +87,48 @@
+ extern "C" IOBufferMemoryDescriptor *blue_dpu_pool_take_app(uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
+     uint32_t planes, uint32_t offset, uint64_t size);      /* 0226: other processes' full-width surfaces */
+ 
++/*
++ * 0228: the app pool serves GPU-drawn surfaces only. CA names every surface
++ * "QuartzCore" at create (a drawable's name comes later); Metal drawables
++ * ask for the default CPU mapping (MapCacheAttribute 0 or none), CA's
++ * CPU-drawn backing stores for write-combined (2): SpringBoard's took 3 of
++ * the 8 buffers at an app's launch (pd3). The first 16 takes are logged
++ * with their creator and properties.
++ */
++static uint32_t sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def);
++
++static bool
++sweet_surface_gpu_drawn(OSDictionary *props)
++{
++	return sweet_dict_u32(props, "IOSurfaceMapCacheAttribute", 0) == 0;
++}
++
++static uint32_t sweet_surface_pool_logged;
++static void
++sweet_surface_log_props(const char *creator, uint32_t id, OSDictionary *props)
++{
++	char line[480];
++	size_t o = 0;
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++	OSSymbol *k;
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL && o < sizeof(line) - 1) {
++		OSObject *v = props->getObject(k);
++		OSNumber *num = OSDynamicCast(OSNumber, v);
++		OSString *str = OSDynamicCast(OSString, v);
++		const char *kn = k->getCStringNoCopy();
++		if (strncmp(kn, "IOSurface", 9) == 0) {
++			kn += 9;
++		}
++		int n = num != NULL ? snprintf(line + o, sizeof(line) - o, " %s=%llu", kn, num->unsigned64BitValue()) :
++		    str != NULL ? snprintf(line + o, sizeof(line) - o, " %s=%s", kn, str->getCStringNoCopy()) :
++		    snprintf(line + o, sizeof(line) - o, " %s=<%s>", kn, v != NULL ? v->getMetaClass()->getClassName() : "?");
++		o += n > 0 ? (size_t)n : 0;
++	}
++	OSSafeReleaseNULL(it);
++	line[sizeof(line) - 1] = '\0';
++	IOLog("SWEET SURF: pool %s id %u:%s\n", creator, id, line);
++}
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -850,6 +892,7 @@
+ 		}
+ 	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
++		bool pooled = false;
+ 		char creator[32];
+ 		proc_selfname(creator, sizeof(creator));
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+@@ -857,9 +900,10 @@
+ 			if (strcmp(creator, "backboardd") == 0) {
+ 				mem = blue_dpu_pool_take(s->width, s->height, s->bytesPerRow, s->pixelFormat,
+ 				    s->planeCount, s->offset, s->allocSize);
+-			} else {
++			} else if (sweet_surface_gpu_drawn(props)) {
+ 				mem = blue_dpu_pool_take_app(s->width, s->height, s->bytesPerRow, s->pixelFormat,
+ 				    s->planeCount, s->offset, s->allocSize);
++				pooled = mem != NULL;
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+@@ -875,6 +919,8 @@
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
++			} else if (pooled && sweet_surface_pool_logged++ < 16) {
++				sweet_surface_log_props(creator, s->id, props);
+ 			}
+ 		}
+ 	}
+@@ -882,9 +928,11 @@
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u%s -> 0x%x\n",
++		OSString *sn = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u%s%s%s -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), s->wrapped ? " (wraps the caller's memory)" : "", ret);
++		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), s->wrapped ? " (wraps the caller's memory)" : "",
++		    sn != NULL ? " name " : "", sn != NULL ? sn->getCStringNoCopy() : "", ret);
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {

@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 12:00:00 +1100
+Subject: [PATCH] 0992: backboardd detached when the DPU has a second layer
+
+With 0226 the display shows an app's detached Metal layer and the status
+bar over it as two DPU planes, no CPU blend. CA_DISABLE_DETACHED=1 (0991)
+is now added only when BlueDPU has no app buffers (0228), decided at
+backboardd's exec. bluedetached=0/1 forces it either way.
+---
+diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c	2026-11-26 09:20:38
++++ b/bsd/kern/kern_exec.c	2026-11-26 09:21:23
+@@ -455,35 +455,57 @@
+  * several names per entry split by '|' (backboardd's blueeagl plus bluemis for
+  * installd and com.apple.MobileInstallationHelperService; boot-args max 608).
+  */
++extern int blue_dpu_layers_ready(void);
++
+ static int
++sweet_exec_env_add(struct image_params *imgp, int ptr_size, const char *base, const char *var)
++{
++	int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++	if (error) {
++		return error;
++	}
++	if (imgp->ip_argspace < ptr_size) {
++		return E2BIG;
++	}
++	imgp->ip_argspace -= ptr_size;
++	imgp->ip_envc++;
++	printf("SWEET ENV: %s += %s\n", base, var);
++	return 0;
++}
++
++static int
+ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ {
+ 	static char spec[640];
+ 	static int state;       /* 0 not parsed, 1 none, 2 set */
++	static int detached = -1;
+ 	if (state == 0) {
+-		/*
+-		 * 0991: backboardd composites every layer itself (CA_DISABLE_DETACHED=1). Handed to the
+-		 * display, an app's full-screen Metal layer and the status bar over it were blended on the
+-		 * CPU (0218, ~17 fps); composited, the frame flips without a copy (~35 fps). bluedetached=1
+-		 * turns it off.
+-		 */
+-		int detached = 0;
+-		size_t o = 0;
+-		if (!PE_parse_boot_argn("bluedetached", &detached, sizeof(detached)) || !detached) {
+-			o = strlcpy(spec, "backboardd:CA_DISABLE_DETACHED=1;", sizeof(spec));
+-		}
+-		(void)PE_parse_boot_argn("sweetenv", spec + o, (int)(sizeof(spec) - o));
++		(void)PE_parse_boot_argn("bluedetached", &detached, sizeof(detached));
++		(void)PE_parse_boot_argn("sweetenv", spec, (int)sizeof(spec));
+ 		state = spec[0] ? 2 : 1;
+ 	}
+-	if (state != 2) {
+-		return 0;
+-	}
+ 	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
+ 	for (const char *c = path; *c; c++) {
+ 		if (*c == '/') {
+ 			base = c + 1;
+ 		}
+ 	}
++	/*
++	 * 0991: backboardd composites every layer itself (CA_DISABLE_DETACHED=1): an app's
++	 * full-screen Metal layer and the status bar over it handed to the display were blended on
++	 * the CPU (0218, ~17 fps). 0228: with the DPU's second layer (0226) the display takes them
++	 * as two planes, so detached is the default when BlueDPU has app buffers (decided at
++	 * backboardd's exec, after the driver started). bluedetached=0/1 forces it.
++	 */
++	if (strcmp(base, "backboardd") == 0 && !(detached > 0 || (detached < 0 && blue_dpu_layers_ready()))) {
++		int error = sweet_exec_env_add(imgp, ptr_size, base, "CA_DISABLE_DETACHED=1");
++		if (error) {
++			return error;
++		}
++	}
++	if (state != 2) {
++		return 0;
++	}
+ 	for (const char *e = spec; *e; ) {
+ 		size_t n = 0, end = 0;
+ 		while (e[end] && e[end] != ';') {
+@@ -509,16 +531,10 @@
+ 				if (len > 0 && len < sizeof(var)) {
+ 					memcpy(var, p, len);
+ 					var[len] = '\0';
+-					int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++					int error = sweet_exec_env_add(imgp, ptr_size, base, var);
+ 					if (error) {
+ 						return error;
+ 					}
+-					if (imgp->ip_argspace < ptr_size) {
+-						return E2BIG;
+-					}
+-					imgp->ip_argspace -= ptr_size;
+-					imgp->ip_envc++;
+-					printf("SWEET ENV: %s += %s\n", base, var);
+ 				}
+ 				p += len;
+ 				if (p < stop && *p == ',') {

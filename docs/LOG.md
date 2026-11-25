@@ -908,6 +908,13 @@ Shifting backboardd's update can't help: it frees the drawable and composites ~1
 
 So completion on a swap's own latch lets apps draw into the shown buffer in both modes; the 0159 rule stays. The launch glitch seen in `lp3`: the 8 app buffers ran out ("app pool empty"), one swap fell back to the CPU blend. `phonetest.sh` now keeps only the newest 10 runs' images.
 
+**0228, 0992**: two layers by default. backboardd runs detached when BlueDPU has app buffers (decided at its exec; `bluedetached=0/1` forces it), `bluedpu_layers` defaults to 12 (8 fit below 4 GiB). CoreAnimation names every surface "QuartzCore" at create, so drawables are picked by `MapCacheAttribute` 0: SpringBoard's CPU-drawn backing stores (2) had taken 3 of the 8 buffers at launch (`pd3`), and MetalHello holds 7 while it starts.
+
+| Run | Pool takes | Launch | Changed on screen | One vsync apart (of 240) |
+| --- | --- | --- | --- | --- |
+| `pd4` | MetalHello only | layer on from the first frame | 0 of 7874 | 198 (misses #61-71) |
+| `pd5` | MetalHello only | layer on from the first frame | 0 of 7835 | 228 |
+
 Disk: `work/test` held 13.8 GB of per-run boot images (payload, shim, ADT); only the last 10 runs' are kept now.
 
 ## 2026-11-25: WebGL on Metal (WebGLHello)
