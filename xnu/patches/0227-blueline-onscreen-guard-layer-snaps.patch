@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 10:00:00 +1100
+Subject: [PATCH] 0227: on-screen guard; snaps show the layer under
+
+bluefb_guard (default 1): 32 sample rows of each shown surface hashed
+when its flip latches and when the flip replacing it is flushed; a
+changed hash (drawn into while fetched: tearing, stripes) is counted and
+logged. Also counted: rows changed between flip and latch (GPU finished
+late) and between the replacing flip and release. Snaps of a two-layer
+flip (0226) blend the app layer under backboardd's, premultiplied source
+over, as the layer mixer does.
+---
+diff -ru a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-26 08:08:29
++++ b/bsd/dev/sweet_ufs.c	2026-11-26 08:09:06
+@@ -1170,6 +1170,8 @@
+ extern int blue_fb_snapinfo(uintptr_t *pixels, uint32_t *w, uint32_t *h, uint32_t *stride);
+ extern int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
+ extern void blue_dpu_snap_rows(uint32_t lh, int32_t *y0, int32_t *rows);
++extern int blue_dpu_snapinfo_under(uintptr_t *kva, uint32_t *bpr, uint32_t *sy, uint32_t *sh, uint32_t *dy);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ int bluesnap_take(const char *why);
+ 
+ static LCK_MTX_DECLARE(bluesnap_lock, &sweet_ufs_grp);
+@@ -1258,6 +1260,8 @@
+  * (nearest; fit = fit_w columns from fit_x scaled to the panel height, crop =
+  * centred), black outside it. The panel buffer is stale while flipped.
+  */
++static bool bluesnap_two_layers;        /* 0227: the last flipped snap had an app layer under it */
++
+ static uint32_t
+ bluesnap_convert_flipped(uintptr_t px, uint32_t sw, uint32_t sh, uint32_t sbpr, int32_t fit_x, int32_t fit_w,
+     uint32_t w, uint32_t h, uint32_t *ow, uint32_t *oh)
+@@ -1268,6 +1272,14 @@
+ 	uint32_t bytes = *ow * *oh * (bs.bpp / 8);
+ 	uint8_t *out = (uint8_t *)bs.buf;
+ 	int32_t y0, rows;
++	/* 0227: an app layer under the surface (0226): blended as the layer mixer does, premultiplied source over */
++	uintptr_t ux = 0;
++	uint32_t ubpr = 0, usy = 0, ush = 0, udy = 0;
++	bool under = blue_dpu_snapinfo_under(&ux, &ubpr, &usy, &ush, &udy) != 0;
++	bluesnap_two_layers = under;
++	if (under) {
++		FlushPoC_DcacheRegion((vm_offset_t)(ux + (uint64_t)usy * ubpr), (size_t)ush * ubpr);   /* GPU-drawn */
++	}
+ 
+ 	blue_dpu_snap_rows(sh, &y0, &rows);
+ 	for (uint32_t oy = 0; oy < *oh; oy++) {
+@@ -1287,6 +1299,13 @@
+ 				b = p[0];
+ 				g = p[1];
+ 				rd = p[2];
++				if (under && sy >= udy && sy < udy + ush) {
++					const uint8_t *u = (const uint8_t *)(ux + (uint64_t)(usy + sy - udy) * ubpr + (uint64_t)sx * 4);
++					uint32_t ia = 255u - p[3];
++					b = (uint8_t)MIN(255u, b + (u[0] * ia + 127) / 255);
++					g = (uint8_t)MIN(255u, g + (u[1] * ia + 127) / 255);
++					rd = (uint8_t)MIN(255u, rd + (u[2] * ia + 127) / 255);
++				}
+ 			}
+ 			if (bs.bpp == 16) {
+ 				uint16_t v = (uint16_t)((rd >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+@@ -1393,7 +1412,8 @@
+ 		printf("BLUELINE SNAP: #%u %s at %u.%03u s (SpringBoard %d ms): %ux%u, %u bpp, %u KiB "
+ 		    "at block 0x%llx; %u ms to read, %u ms to write%s\n",
+ 		    bs.count, why, ms / 1000, ms % 1000, sb_ms, ow, oh, bs.bpp, bytes >> 10, at,
+-		    conv_ms, write_ms, flipped ? "; from the flipped iOS surface" : "");
++		    conv_ms, write_ms, !flipped ? "" : bluesnap_two_layers ? "; from the flipped iOS surfaces (2 layers)" :
++		    "; from the flipped iOS surface");
+ 		bs.count++;
+ 		bs.used += blocks;
+ 	}
+diff -ru a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+--- a/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 08:08:29
++++ b/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 08:09:06
+@@ -124,6 +124,7 @@
+ extern "C" uint32_t blue_dpu_flip_settle(void);
+ extern "C" int blue_dpu_latch_pending(void);
+ extern "C" int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
++extern "C" int blue_dpu_snapinfo_under(uintptr_t *kva, uint32_t *bpr, uint32_t *sy, uint32_t *sh, uint32_t *dy);
+ extern "C" int blue_dpu_flip_tick(void);
+ extern "C" void blue_dpu_panic(void);
+ extern "C" void blue_dpu_flip_stop(const char *why);
+@@ -1535,6 +1536,7 @@
+ static uint32_t bd_ukey[4];             /* bpr, sy, sh, dy bd_uplan was made for */
+ static int bd_upipe[4];                 /* per top rect: its under pipe */
+ static uint32_t bd_n_layered, bd_n_unlayered;
++static int bd_ushown = -1;              /* 0227: pool slot of the layer under the flipped one, for snaps */
+ 
+ static uint32_t
+ bd_lm_flush(int lm)
+@@ -1655,6 +1657,7 @@
+ 	bd_flip_pa = 0;
+ 	bd_ugeom = false;
+ 	bd_layered = false;
++	bd_ushown = -1;
+ }
+ 
+ /* Something is wrong: no more flips this boot (flip lock held). */
+@@ -1876,6 +1879,7 @@
+ 		return 0;
+ 	}
+ 	bd_n_flip++;
++	bd_ushown = umd != NULL ? uslot : -1;
+ 	bd_clean_us += bd_us(t1 - t0);
+ 	bd_latch_us += (uint64_t)lat;
+ 	bd_latch_max_us = (uint32_t)lat > bd_latch_max_us ? (uint32_t)lat : bd_latch_max_us;
+@@ -1954,6 +1958,27 @@
+ 	}
+ 	*ns = (uint64_t)(line - init) * vs * 1000000000ull / BD_VSYNC_CLK;
+ 	return 1;
++}
++
++/* 0227: the app buffer shown under the flipped one (rows sy..sy+sh at canvas row dy); 0 if none */
++int
++blue_dpu_snapinfo_under(uintptr_t *kva, uint32_t *bpr, uint32_t *sy, uint32_t *sh, uint32_t *dy)
++{
++	if (bd_flip_lock == NULL || !bd_flipped) {
++		return 0;
++	}
++	IOLockLock(bd_flip_lock);
++	int ok = 0;
++	if (bd_flipped && bd_layered && bd_ushown >= 0 && bd_pool[bd_ushown] != NULL) {
++		*kva = (uintptr_t)bd_pool[bd_ushown]->getBytesNoCopy();
++		*bpr = bd_ukey[0];
++		*sy = bd_ukey[1];
++		*sh = bd_ukey[2];
++		*dy = bd_ukey[3];
++		ok = *kva != 0;
++	}
++	IOLockUnlock(bd_flip_lock);
++	return ok;
+ }
+ 
+ /* 0158: a flip flushed whose latch has not been seen (lock-free; vsync timer) */
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 08:08:29
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 08:30:41
+@@ -127,6 +127,64 @@
+ 	return sweet_fb_fake_latch || blue_dpu_latch_pending();
+ }
+ static uint32_t sweet_fb_swapwait_n[2];        /* 0159: SwapWaits answered complete / pending */
++/*
++ * 0227: on-screen guard (bluefb_guard, default 1). A surface's 32 sample rows
++ * are hashed once its flip latched (the DPU fetches it from then on) and
++ * again when the flip replacing it is flushed: a different hash means
++ * something drew into it while it was fetched (tearing, the 0224 stripes).
++ * Checked once more on release ("changed retiring": between the replacing
++ * flip and the release, which may be after the latch). Counted per layer,
++ * the first ones logged. "Finished late": the rows also changed
++ * between the flip and its latch (the GPU still drawing when the swap came;
++ * shown complete only if it finished before the TE).
++ */
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++static uint32_t sweet_fb_guard = 1;
++static uint32_t sweet_fb_guard_n[2][4];        /* [top, under][checked, changed, finished late, changed retiring] */
++static uint64_t
++sweet_fb_rows_hash(SweetSurface *s)
++{
++	uintptr_t kva = s != NULL && sweet_fb_guard ? s->kernelAddress() : 0;
++	if (kva == 0 || s->height == 0 || s->bytesPerElement != 4) {
++		return 0;
++	}
++	uint32_t w8 = s->width * 4 / 8;
++	uint64_t x = 0xcbf29ce484222325ULL;
++	for (uint32_t i = 0; i < 32; i++) {
++		uint32_t y = (uint32_t)(((uint64_t)s->height * (2 * i + 1)) / 64);
++		uintptr_t row = kva + s->offset + (uint64_t)y * s->bytesPerRow;
++		FlushPoC_DcacheRegion((vm_offset_t)row, (size_t)w8 * 8);       /* the GPU wrote DRAM, not the cache */
++		const volatile uint64_t *q = (const volatile uint64_t *)row;
++		for (uint32_t k = 0; k < w8; k++) {
++			x = (x ^ q[k]) * 0x100000001b3ULL;
++		}
++	}
++	return x | 1;
++}
++
++/* on: s leaves the screen now (its replacement just flushed, or unflip); else s is released. The hash now. */
++static uint64_t
++sweet_fb_guard_check(SweetSurface *s, uint64_t hash, int under, bool on)
++{
++	if (s == NULL || hash == 0) {
++		return 0;
++	}
++	uint64_t now = sweet_fb_rows_hash(s);
++	if (!on) {
++		sweet_fb_guard_n[under][3] += now != hash;
++		return now;
++	}
++	sweet_fb_guard_n[under][0]++;
++	if (now != hash) {
++		if (sweet_fb_guard_n[under][1]++ < 16) {
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++			IOLog("SWEET FB: guard: surface %u (%ux%u, %s layer) changed while on screen, at %llu ms\n", s->id,
++			    s->width, s->height, under ? "under" : "top", ns / 1000000);
++		}
++	}
++	return now;
++}
+ extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
+     uint32_t w, uint32_t h, uint32_t fmt);
+ extern "C" int blue_dpu_unflip(const char *why);
+@@ -265,6 +323,9 @@
+ 	SweetSurface *fRetiring;
+ 	SweetSurface *fShownU;          /* 0226: the same for the layer under it (a detached app layer) */
+ 	SweetSurface *fRetiringU;
++	uint64_t      fHash[4];         /* 0227: sample-row hashes of fShown, fRetiring, fShownU, fRetiringU (0: none) */
++	uint64_t      fHashFlip[2];     /* 0227: fShown's, fShownU's at the flip */
++	bool          fHashDue;         /* 0227: fShown(U) flipped, latch not hashed yet */
+ 	/*
+ 	 * 0159 (under fLock): SwapWait. As IOMFB, a swap is complete when its
+ 	 * buffers are released: a later swap's flip has latched. CoreAnimation
+@@ -295,6 +356,7 @@
+ 	void displayHold(SweetSurface *s);
+ 	void displayDrop(bool all);
+ 	void displayHoldUnder(SweetSurface *s);
++	void guardLatched(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void powerStart(void);
+@@ -422,6 +484,7 @@
+ 	PE_parse_boot_argn("bluefb_vsync_te_us", &sweet_fb_te_us, sizeof(sweet_fb_te_us));
+ 	PE_parse_boot_argn("bluefb_swapdone", &sweet_fb_swapdone, sizeof(sweet_fb_swapdone));   /* 0224 */
+ 	PE_parse_boot_argn("bluefb_dtest", &sweet_fb_dtest, sizeof(sweet_fb_dtest));           /* 0225 */
++	PE_parse_boot_argn("bluefb_guard", &sweet_fb_guard, sizeof(sweet_fb_guard));           /* 0227 */
+ 	fVsyncNext = mach_absolute_time();
+ 	armVsync(fVsync);
+ 	powerStart();
+@@ -579,8 +642,9 @@
+ 		}
+ 	}
+ 	if (fb->fFlip && owner_ok) {
+-		if ((fb->fRetiring != NULL || fb->fRetiringU != NULL) && !sweet_fb_latch_pending()) {
++		if ((fb->fRetiring != NULL || fb->fRetiringU != NULL || fb->fHashDue) && !sweet_fb_latch_pending()) {
+ 			fb->displayDrop(false);                 /* 0158: its replacement is fetched now */
++			fb->guardLatched();                     /* 0227 */
+ 		}
+ 		if ((count % 60) == 0 && blue_dpu_flip_tick()) {
+ 			IOLockLock(fb->fLock);
+@@ -903,6 +967,12 @@
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps; SwapWait answered complete %u, pending %u; flip thread: %u replaced while queued, %u GPU waits late\n",
+ 		    sweet_fb_swap_count, sweet_fb_swapwait_n[0], sweet_fb_swapwait_n[1], fQueuedDropped, fGPUWaitLate);
++		if (sweet_fb_guard) {
++			IOLog("SWEET FB: guard: top %u checked, %u changed on screen, %u finished late, %u changed retiring; "
++			    "under %u checked, %u changed on screen, %u finished late, %u changed retiring\n",
++			    sweet_fb_guard_n[0][0], sweet_fb_guard_n[0][1], sweet_fb_guard_n[0][2], sweet_fb_guard_n[0][3],
++			    sweet_fb_guard_n[1][0], sweet_fb_guard_n[1][1], sweet_fb_guard_n[1][2], sweet_fb_guard_n[1][3]);
++		}
+ 	}
+ }
+ 
+@@ -1052,9 +1122,13 @@
+ 	}
+ 	displayDrop(false);     /* the buffer two flips back: its replacement latched before this flip */
+ 	fRetiring = fShown;
++	fHash[1] = sweet_fb_guard_check(fShown, fHash[0], 0, true);
+ 	s->retain();
+ 	sweet_surface_display_use(s, 1);
+ 	fShown = s;
++	fHash[0] = 0;
++	fHashFlip[0] = sweet_fb_rows_hash(s);
++	fHashDue = true;
+ }
+ 
+ /* 0226: s (or none) is the layer under the shown one now. fPresentLock held. */
+@@ -1065,17 +1139,39 @@
+ 		return;
+ 	}
+ 	if (fRetiringU != NULL) {
++		sweet_fb_guard_check(fRetiringU, fHash[3], 1, false);
+ 		sweet_surface_display_use(fRetiringU, -1);
+ 		OSSafeReleaseNULL(fRetiringU);
+ 	}
+ 	fRetiringU = fShownU;
++	fHash[3] = sweet_fb_guard_check(fShownU, fHash[2], 1, true);
+ 	if (s != NULL) {
+ 		s->retain();
+ 		sweet_surface_display_use(s, 1);
+ 	}
+ 	fShownU = s;
++	fHash[2] = 0;
++	fHashFlip[1] = sweet_fb_rows_hash(s);
++	fHashDue = true;
+ }
+ 
++/* 0227: the shown surfaces' flip latched: hash them as fetched. fPresentLock held. */
++void
++AppleCLCD::guardLatched(void)
++{
++	if (!fHashDue) {
++		return;
++	}
++	fHashDue = false;
++	SweetSurface *s[2] = { fShown, fShownU };
++	for (int l = 0; l < 2; l++) {
++		if (s[l] != NULL && fHash[2 * l] == 0 && fHashFlip[l] != 0) {
++			fHash[2 * l] = sweet_fb_rows_hash(s[l]);
++			sweet_fb_guard_n[l][2] += fHash[2 * l] != fHashFlip[l];
++		}
++	}
++}
++
+ /* 0223: swap id is on screen since the last TE: tell CoreAnimation when. fLock held. */
+ void
+ AppleCLCD::frameInfoLatched(uint32_t id)
+@@ -1109,18 +1205,22 @@
+ AppleCLCD::displayDrop(bool all)
+ {
+ 	if (fRetiring != NULL) {
++		sweet_fb_guard_check(fRetiring, fHash[1], 0, false);
+ 		sweet_surface_display_use(fRetiring, -1);
+ 		OSSafeReleaseNULL(fRetiring);
+ 	}
+ 	if (fRetiringU != NULL) {
++		sweet_fb_guard_check(fRetiringU, fHash[3], 1, false);
+ 		sweet_surface_display_use(fRetiringU, -1);
+ 		OSSafeReleaseNULL(fRetiringU);
+ 	}
+ 	if (all && fShown != NULL) {
++		sweet_fb_guard_check(fShown, fHash[0], 0, true);
+ 		sweet_surface_display_use(fShown, -1);
+ 		OSSafeReleaseNULL(fShown);
+ 	}
+ 	if (all && fShownU != NULL) {
++		sweet_fb_guard_check(fShownU, fHash[2], 1, true);
+ 		sweet_surface_display_use(fShownU, -1);
+ 		OSSafeReleaseNULL(fShownU);
+ 	}
+@@ -1164,6 +1264,7 @@
+ 		return false;
+ 	}
+ 	IOLockLock(fPresentLock);
++	guardLatched();
+ 	displayHold(s);
+ 	IOLockLock(fLock);
+ 	if (fSwapPending) {
+@@ -1248,6 +1349,7 @@
+ 		    u ? u->width : 0, u ? u->height : 0, u ? u->pixelFormat : 0, usy, ush, udy) != 0;
+ 	}
+ 	if (ok) {
++		guardLatched();         /* 0227: the previous flip latched before this one was flushed */
+ 		displayHold(s);
+ 		displayHoldUnder(u);
+ 		consoleOnce();

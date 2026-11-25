@@ -898,6 +898,16 @@ Shifting backboardd's update can't help: it frees the drawable and composites ~1
 
 **0226**: `bluedpu_layers=N` (N contiguous app buffers below 4 GiB, 10.4 MB each). A detached swap (full-width app layer 0 under backboardd's full-screen layer 1) is flipped as two layers: idle VIG2/VIG3 fetch the app buffer at blend stage 0, the flipped VIG0/VIG1 move to stage 1, premultiplied source over (register layout from Linux `dpu1`). `lp1` (MetalHello, `bluedetached=1 bluedpu_layers=8 bluefb_swapdone=1`, present when scheduled): layer on, ~58 flips/s, 0 unflips, no underrun or SMMU fault; 230 of 240 frames one vsync apart, drawable wait 15 ms, present to on screen 30 ms. Not yet checked on screen (screenshots capture only layer 1).
 
+**0227**: checks that need no one watching. *On-screen guard* (`bluefb_guard`, default on): 32 sample rows of each shown surface are hashed when its flip latches and again when the flip replacing it is flushed; a change means it was drawn into while the DPU fetched it. *Two-layer snaps*: `bluesnap` blends the app layer under backboardd's as the layer mixer does. `gc2` (composited, `bluefb_swapdone=1`) caught the known stripes in a snap; `gc1` shows the triangle under the status bar.
+
+| Run | Mode | Changed on screen | One vsync apart (of 240) |
+| --- | --- | --- | --- |
+| `gc5` | layers, `swapdone=1` | 391 of 7835 app frames | 222 |
+| `gc6` | layers, `swapdone=0` | 0 of 7875 | 220 (misses mostly in the first 20 frames) |
+| `gc7` | composited, `swapdone=0` | 0 of 8992 | 230 |
+
+So completion on a swap's own latch lets apps draw into the shown buffer in both modes; the 0159 rule stays. The launch glitch seen in `lp3`: the 8 app buffers ran out ("app pool empty"), one swap fell back to the CPU blend. `phonetest.sh` now keeps only the newest 10 runs' images.
+
 Disk: `work/test` held 13.8 GB of per-run boot images (payload, shim, ADT); only the last 10 runs' are kept now.
 
 ## 2026-11-25: WebGL on Metal (WebGLHello)
