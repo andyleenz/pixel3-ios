@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 19:00:00 +1100
+Subject: [PATCH] 0223: IOMFB FrameInfo (presentation times) for CoreAnimation
+
+backboardd never enabled vsync notifications: CADeviceUseVBL is true only
+for A8-A10 chip ids. Later chips pace the display timer on DCP's FrameInfo
+presentation times (frame_info_callback -> add_timing ->
+CADisplayTimerAlignPhase). With none, the timer free-ran at 16.55-16.63 ms
+against the panel's 16.67 ms, so app frames slid across the refresh and
+missed it about one frame in three (MetalHello ~48 fps).
+
+Selector 74 lists two tags, Presentation_time and Requested_presentation;
+selector 73 takes the mask CoreAnimation enables; each swap's latch sends
+notification type 3 with its id and the TE it latched at (the 0222 tick at
+TE + 1 ms now notices latches too).
+---
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 18:26:17
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 18:26:18
+@@ -130,12 +130,28 @@
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBChangeFrameInfo         = 73,   /* 0223: [3, tag mask] */
++	kSweetFBSupportedFrameInfo      = 74,   /* 0223: [index] -> [tag count], tag name (64 bytes) */
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
++#define SWEET_FB_NOTIFY_FRAMEINFO       3   /* 0223 */
++
++/*
++ * 0223: FrameInfo. On A11 and later CoreAnimation paces its display timer
++ * on the presentation times DCP reports per swap (IOMFBServer::
++ * frame_info_callback -> IOMFBDisplay::add_timing); without them the timer
++ * free-runs (16.55-16.63 ms against the panel's 16.67) and app frames slide
++ * across the refresh. IOMobileFramebuffer lists the tags (selector 74),
++ * CoreAnimation enables the ones it wants (selector 73) and takes
++ * notification type 3: [mask | bit 31 (values as lo/hi pairs), swap id,
++ * values in tag order].
++ */
++static const char *const sweet_fb_frameinfo_tags[] = { "Presentation_time", "Requested_presentation" };
++#define SWEET_FB_FRAMEINFO_TAGS 2
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+@@ -233,6 +249,9 @@
+ 	uint32_t      fSwapPendingID;         /* flipped, latch not seen yet */
+ 	bool          fSwapPending;
+ 	uint32_t      fSwapLatchedID;         /* latest swap whose flip latched (shown) */
++	uint32_t      fFrameInfoMask;         /* 0223: tags CoreAnimation enabled */
++	uint32_t      fFrameInfoSent;         /* 0223: the last swap reported */
++	void frameInfoLatched(uint32_t id);
+ 	/*
+ 	 * 0160 (under fLock): SwapEnd queues the swap and returns; fFlipThread
+ 	 * waits for the GPU's writes to its surfaces, then flips (or records it
+@@ -443,6 +462,11 @@
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
++	if (fb->fSwapPending && !blue_dpu_latch_pending()) {      /* 0223: latched at this TE */
++		fb->fSwapLatchedID = fb->fSwapPendingID;
++		fb->fSwapPending = false;
++		fb->frameInfoLatched(fb->fSwapPendingID);
++	}
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+@@ -960,6 +984,7 @@
+ 		IOLockLock(fLock);
+ 		fSwapLatchedID = get32(rec, 0x50) + 1;  /* 0159: copied: complete */
+ 		fSwapPending = false;
++		frameInfoLatched(get32(rec, 0x50));
+ 		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 		fDirty = true;
+ 		IOLockUnlock(fLock);
+@@ -1001,6 +1026,34 @@
+ 	fShown = s;
+ }
+ 
++/* 0223: swap id is on screen since the last TE: tell CoreAnimation when. fLock held. */
++void
++AppleCLCD::frameInfoLatched(uint32_t id)
++{
++	if (fFrameInfoMask == 0 || id == 0 || id == fFrameInfoSent) {
++		return;
++	}
++	fFrameInfoSent = id;
++	uint64_t t = mach_absolute_time(), since, s;
++	if (blue_dpu_te_since(&since)) {
++		nanoseconds_to_absolutetime(since, &s);
++		t -= s;
++	}
++	uint64_t v[2 + 2 * SWEET_FB_FRAMEINFO_TAGS];
++	uint32_t n = 0;
++	v[n++] = 0x80000000u | fFrameInfoMask;
++	v[n++] = id;
++	for (uint32_t b = 0; b < SWEET_FB_FRAMEINFO_TAGS; b++) {
++		if (fFrameInfoMask & (1u << b)) {
++			v[n++] = (uint32_t)t;           /* Presentation_time; Requested_presentation as the same */
++			v[n++] = (uint32_t)(t >> 32);
++		}
++	}
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
++		((IOMobileFramebufferUserClient *)fClients->getObject(i))->notify(SWEET_FB_NOTIFY_FRAMEINFO, v, n);
++	}
++}
++
+ /* Retiring (latched, or all: flipping stopped). fPresentLock held. */
+ void
+ AppleCLCD::displayDrop(bool all)
+@@ -1026,6 +1079,7 @@
+ 		if (fSwapPending && !blue_dpu_latch_pending()) {
+ 			fSwapLatchedID = fSwapPendingID;
+ 			fSwapPending = false;
++			frameInfoLatched(fSwapPendingID);
+ 		}
+ 		bool done = id == 0 || (int32_t)(id - fSwapLatchedID) < 0;
+ 		IOLockUnlock(fLock);
+@@ -1088,11 +1142,13 @@
+ 		/* 0159: the flip waited for the previous latch: that swap is shown (and its predecessor released) */
+ 		if (fSwapPending) {
+ 			fSwapLatchedID = fSwapPendingID;
++			frameInfoLatched(fSwapPendingID);
+ 		}
+ 		fSwapPendingID = get32(rec, 0x50);
+ 		fSwapPending = blue_dpu_latch_pending() != 0;
+ 		if (!fSwapPending) {
+ 			fSwapLatchedID = fSwapPendingID;
++			frameInfoLatched(fSwapPendingID);
+ 		}
+ 		memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);  /* the latest frame, for wake / fallback */
+ 		fDirty = false;
+@@ -1362,6 +1418,7 @@
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
++	const char *structName = NULL;          /* 0223: selector 74's tag name */
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+@@ -1415,6 +1472,24 @@
+ 			    args->scalarInput[0] ? "on" : "off");
+ 		}
+ 		break;
++	case kSweetFBChangeFrameInfo:
++		if (args->scalarInputCount >= 2) {
++			IOLockLock(fFB->fLock);
++			fFB->fFrameInfoMask = (uint32_t)args->scalarInput[1] & ((1u << SWEET_FB_FRAMEINFO_TAGS) - 1);
++			IOLockUnlock(fFB->fLock);
++			IOLog("SWEET FB: frame info [%llu, %#llx] -> mask %#x\n", args->scalarInput[0], args->scalarInput[1],
++			    fFB->fFrameInfoMask);
++		}
++		break;
++	case kSweetFBSupportedFrameInfo:
++		if (args->scalarInputCount < 1 || args->scalarInput[0] >= SWEET_FB_FRAMEINFO_TAGS) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		out[0] = SWEET_FB_FRAMEINFO_TAGS;
++		outCount = 1;
++		structName = sweet_fb_frameinfo_tags[args->scalarInput[0]];
++		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1 && fFB->fPowerMode != 0) {
+ 			bool off = args->scalarInput[0] == 0;
+@@ -1453,6 +1528,9 @@
+ 	}
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
++		if (structName != NULL && args->structureOutputSize > 0) {
++			strlcpy((char *)args->structureOutput, structName, args->structureOutputSize);
++		}
+ 	}
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {

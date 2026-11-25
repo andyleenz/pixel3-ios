@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 18:40:00 +1100
+Subject: [PATCH] 0222: vsync ticks locked to the panel's TE
+
+The panel refreshes on its own TE at 59.98 Hz (line clock 129729 Hz);
+the 0220 grid runs at 60.000 Hz and drifts against it. A tick just
+before the latch finds the last swap incomplete, so backboardd keeps
+the app's drawable one more frame: MetalHello waited 16 ms median for
+nextDrawable and a drawable took 62 ms to come back (3 drawables, ~48
+fps). Each tick is now armed for the next TE (rd_ptr line counter,
+blue_dpu_te_since) plus bluefb_vsync_te_us (default 1000; 0 = the 0220
+grid).
+---
+diff -ru a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+--- a/iokit/Kernel/arm/BlueDPU.cpp	2026-11-25 17:55:54
++++ b/iokit/Kernel/arm/BlueDPU.cpp	2026-11-25 17:55:54
+@@ -1723,6 +1723,28 @@
+ 	return us;
+ }
+ 
++/*
++ * 0222: where the panel is in its refresh, for the vsync timer
++ * (SweetFramebuffer.cpp): ns since the last TE, from the rd_ptr line
++ * counter (reset to init on TE, one line per sync_vsync count of the
++ * 19.2 MHz vsync clock). 0 when no pingpong runs on TE.
++ */
++extern "C" int
++blue_dpu_te_since(uint64_t *ns)
++{
++	if (bd_mdss == NULL || bd_st.pp < 0) {
++		return 0;
++	}
++	uint32_t ppb = PP_BASE(bd_st.pp);
++	uint32_t vs = mdp_rd(ppb + PP_SYNC_CONFIG_VSYNC) & 0xffff, init = mdp_rd(ppb + PP_VSYNC_INIT_VAL) & 0xffff;
++	uint32_t line = mdp_rd(ppb + PP_INT_COUNT_VAL) & 0xffff;
++	if (vs == 0 || line < init) {
++		return 0;
++	}
++	*ns = (uint64_t)(line - init) * vs * 1000000000ull / BD_VSYNC_CLK;
++	return 1;
++}
++
+ /* 0158: a flip flushed whose latch has not been seen (lock-free; vsync timer) */
+ int
+ blue_dpu_latch_pending(void)
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 17:55:54
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 17:56:09
+@@ -103,6 +103,8 @@
+ /* blueline zero-copy present (BlueDPU.cpp, bluedpu_flip=1, patch 0145) */
+ extern "C" int blue_dpu_flip_init(int fit);
+ extern "C" int blue_dpu_latch_pending(void);  /* 0158 */
++extern "C" int blue_dpu_te_since(uint64_t *ns);        /* 0222 */
++static uint32_t sweet_fb_te_us = 1000;  /* 0222: tick this long after TE (bluefb_vsync_te_us; 0 = free grid) */
+ static uint32_t sweet_fb_swapwait_n[2];        /* 0159: SwapWaits answered complete / pending */
+ extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
+     uint32_t w, uint32_t h, uint32_t fmt);
+@@ -370,6 +372,7 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	PE_parse_boot_argn("bluefb_vsync_te_us", &sweet_fb_te_us, sizeof(sweet_fb_te_us));
+ 	fVsyncNext = mach_absolute_time();
+ 	armVsync(fVsync);
+ 	powerStart();
+@@ -544,8 +547,28 @@
+ void
+ AppleCLCD::armVsync(IOTimerEventSource *timer)
+ {
+-	uint64_t period, now = mach_absolute_time();
++	uint64_t period, now = mach_absolute_time(), since;
+ 	nanoseconds_to_absolutetime(16666667ull, &period);   /* 60 Hz */
++	/*
++	 * 0222: follow the panel. Its TE runs at 59.98 Hz on its own clock, so a
++	 * free 60 Hz grid drifts against the latch; a tick just before the latch
++	 * finds the last swap incomplete and backboardd keeps the app's drawable
++	 * another frame. Each tick is armed for the next TE plus bluefb_vsync_te_us.
++	 */
++	if (sweet_fb_te_us != 0 && blue_dpu_te_since(&since)) {
++		uint64_t s, off;
++		nanoseconds_to_absolutetime(since, &s);
++		nanoseconds_to_absolutetime((uint64_t)sweet_fb_te_us * 1000, &off);
++		uint64_t next = now - s + period + off;
++		if (next < now + period / 4) {
++			next += period;         /* this frame's tick has run (or is due now) */
++		} else if (next > now + period + period / 4) {
++			next -= period;
++		}
++		fVsyncNext = next;
++		timer->wakeAtTime(fVsyncNext);
++		return;
++	}
+ 	fVsyncNext += period;
+ 	if (fVsyncNext <= now) {
+ 		fVsyncNext += ((now - fVsyncNext) / period + 1) * period;

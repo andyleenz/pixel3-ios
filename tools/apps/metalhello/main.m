@@ -1,9 +1,11 @@
 /*
  * MetalHello.app - an app that draws with Metal in its own process: MTLCreateSystemDefaultDevice, a
  * CAMetalLayer, a spinning triangle each display frame (CADisplayLink), drawables presented to backboardd.
- * After 60 presented frames (or at once if there is no device) it writes Documents/hello.txt with the
- * device's name, the frame count and a readback of frame 60's drawable (rows cleared, rows left
- * untouched, the first row runs), which tools/bluerun apptest waits for.
+ * At frame 300 (at once if there is no device) it writes Documents/hello.txt, which tools/bluerun apptest
+ * waits for: the device's name, the time to 60 frames and a readback of frame 60's drawable (rows cleared,
+ * rows left untouched, the first row runs), and where frames
+ * 61-300 spent their time: the callback's lateness after its vsync, the nextDrawable wait, encoding and
+ * commit, encode start to completion (medians and 90th percentiles, ms) and the vsyncs between callbacks.
  *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
  */
@@ -11,6 +13,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
+#include <mach/mach_time.h>
 
 @interface SpinView : UIView
 @end
@@ -29,7 +32,27 @@
 	CAMetalLayer *_layer;
 	unsigned _presented, _completed;
 	BOOL _written;
-	CFTimeInterval _start;
+	CFTimeInterval _start, _lastVsync;
+	NSString *_first;
+	float _late[240], _wait[240], _encode[240], _done[240], _shown[240], _back[240];
+	void *_slotTex[4];
+	CFTimeInterval _slotAt[4];
+	unsigned _gap[6];
+	CFTimeInterval _ts0, _cb0;
+}
+
+static NSString *
+stat_ms(float *v, unsigned n)
+{
+	float s[240];
+	memcpy(s, v, n * sizeof *s);
+	for (unsigned i = 1; i < n; i++)
+		for (unsigned j = i; j > 0 && s[j - 1] > s[j]; j--) {
+			float t = s[j];
+			s[j] = s[j - 1];
+			s[j - 1] = t;
+		}
+	return [NSString stringWithFormat:@"%.1f/%.1f", s[n / 2], s[n * 9 / 10]];
 }
 
 static void
@@ -156,9 +179,20 @@ readback(id<MTLTexture> tex)
 
 - (void)frame:(CADisplayLink *)link
 {
+	CFTimeInterval t0 = CACurrentMediaTime();
 	id<CAMetalDrawable> drawable = [_layer nextDrawable];
+	CFTimeInterval t1 = CACurrentMediaTime();
 	if (drawable == nil)
 		return;
+	/* how long since this drawable's texture was last presented (its trip through backboardd) */
+	void *tex = (__bridge void *)drawable.texture;
+	float back = 0;
+	int slot = -1;
+	for (int i = 0; i < 4; i++)
+		if (_slotTex[i] == tex || (slot < 0 && _slotTex[i] == NULL))
+			slot = i;
+	if (slot >= 0 && _slotTex[slot] == tex)
+		back = (t1 - _slotAt[slot]) * 1000;
 	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 	rp.colorAttachments[0].texture = drawable.texture;
 	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -178,17 +212,62 @@ readback(id<MTLTexture> tex)
 			__atomic_add_fetch(&me->_completed, 1, __ATOMIC_RELAXED);
 	}];
 	[cb presentDrawable:drawable];
+	if (slot >= 0) {
+		_slotTex[slot] = tex;
+		_slotAt[slot] = CACurrentMediaTime();
+	}
+	unsigned k = _presented >= 60 && _presented < 300 ? _presented - 60 : 240;
+	if (k < 240) {
+		_late[k] = (t0 - link.timestamp) * 1000;
+		_wait[k] = (t1 - t0) * 1000;
+		long g = lround((link.timestamp - _lastVsync) / link.duration);
+		_gap[g < 1 ? 0 : g > 5 ? 5 : g]++;
+		_back[k] = back;
+		_shown[k] = -1;
+		__block float *shown = &_shown[k];
+		CFTimeInterval at = CACurrentMediaTime();
+		[drawable addPresentedHandler:^(id<MTLDrawable> d) {
+			*shown = d.presentedTime > 0 ? (d.presentedTime - at) * 1000 : -1;
+		}];
+		__block float *done = &_done[k];
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+			*done = (CACurrentMediaTime() - t1) * 1000;
+		}];
+	}
+	_lastVsync = link.timestamp;
+	if (_presented == 60) {
+		_ts0 = link.timestamp;
+		_cb0 = t0;
+	}
+	if (_presented == 299) {
+		CFTimeInterval ts = link.timestamp, cbt = t0;
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+			dispatch_async(dispatch_get_main_queue(), ^{
+				note([NSString stringWithFormat:@"%@metalhello: frames 61-300 (ms, median/p90): late %@, nextDrawable %@, "
+				    "encode+commit %@, encode start to completion %@, present to on screen %@, present to drawable back %@ (%u drawables); "
+				    "vsyncs between callbacks 1:%u 2:%u 3:%u 4+:%u; link duration %.3f ms, timestamps %.3f ms apart, %u callbacks in %.1f ms; continuous - absolute %lld ticks\n", self->_first,
+				    stat_ms(self->_late, 240), stat_ms(self->_wait, 240), stat_ms(self->_encode, 240), stat_ms(self->_done, 240),
+				    stat_ms(self->_shown, 240), stat_ms(self->_back, 240), (unsigned)self->_layer.maximumDrawableCount,
+				    self->_gap[1], self->_gap[2], self->_gap[3], self->_gap[4] + self->_gap[5], link.duration * 1000,
+				    (ts - self->_ts0) * 1000 / (self->_gap[1] + 2 * self->_gap[2] + 3 * self->_gap[3] + 4 * self->_gap[4] + 5 * self->_gap[5]),
+				    240u, (cbt - self->_cb0) * 1000, (long long)(mach_continuous_time() - mach_absolute_time())]);
+			});
+		}];
+	}
 	if (++_presented == 60 && !_written) {
 		_written = YES;
 		id<MTLTexture> tex = drawable.texture;
 		id<MTLDevice> dev = _device;
 		CFTimeInterval start = _start;
 		[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-			note([NSString stringWithFormat:@"metalhello: device %@, 60 frames presented in %.2f s, %u completed; %@\n",
-			    dev.name, CACurrentMediaTime() - start, me_completed(self), readback(tex)]);
+			NSString *line = [NSString stringWithFormat:@"metalhello: device %@, 60 frames presented in %.2f s, %u completed; %@\n",
+			    dev.name, CACurrentMediaTime() - start, me_completed(self), readback(tex)];
+			dispatch_async(dispatch_get_main_queue(), ^{ self->_first = line; });  /* written with frame 300's timings */
 		}];
 	}
 	[cb commit];
+	if (k < 240)
+		_encode[k] = (CACurrentMediaTime() - t1) * 1000;
 }
 @end
 

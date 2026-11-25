@@ -2,9 +2,10 @@
  * apptest - install an app bundle through installd (miinstall), launch it by bundle ID and
  * check that it ran (Hello.app writes Documents/hello.txt in its data container).
  *
- *   apptest /private/var/tmp/Hello.app [BUNDLE_ID] [DOMAIN]
+ *   apptest /private/var/tmp/Hello.app [BUNDLE_ID] [DOMAIN] [SETTLE_S]
  *
- * Defaults: dev.blueline.hello, domain 2 (user; 1 = system needs a system-app entitlement). Prints "APPTEST: PASS" or the step that failed.
+ * SETTLE_S: seconds between install and launch (default 15; more lets the boot-time CPU load pass
+ * before an app measures frame times). Defaults: dev.blueline.hello, domain 2 (user; 1 = system needs a system-app entitlement). Prints "APPTEST: PASS" or the step that failed.
  * Built by tools/bluerun/build.sh-style flags, signed with apptest.ent.
  *
  * The launch is ios-flame's phone/tools/openapp.m (FBSOpenApplicationService, MIT),
@@ -106,6 +107,7 @@ main(int argc, char **argv)
 		}
 		NSString *bid = argc > 2 ? @(argv[2]) : @"dev.blueline.hello";
 		char *domain = argc > 3 ? argv[3] : "2";
+		int settle = argc > 4 ? atoi(argv[4]) : 15;
 		setvbuf(stdout, NULL, _IOLBF, 0);
 
 		char *mi[] = { "/usr/local/bin/miinstall", domain, argv[1], NULL };
@@ -125,7 +127,7 @@ main(int argc, char **argv)
 		 * let it settle, then try up to three times, 10 s apart */
 		NSString *exe = [NSDictionary dictionaryWithContentsOfURL:
 		    [p.bundleURL URLByAppendingPathComponent:@"Info.plist"]][@"CFBundleExecutable"] ?: @"Hello";
-		sleep(15);
+		sleep(settle > 0 ? settle : 15);
 		for (int attempt = 1; attempt <= 3; attempt++) {
 			if (!open_app(bid)) {
 				BOOL opened = [[LSApplicationWorkspace defaultWorkspace] openApplicationWithBundleID:bid];
