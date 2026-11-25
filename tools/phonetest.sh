@@ -89,6 +89,17 @@ out=work/test; mkdir -p "$out"
 t0=$(date +%s)
 say() { printf '[%3ds] %s\n' $(( $(date +%s) - t0 )) "$*"; }
 
+# Each run leaves ~120 MB of rebuildable images (payload, shim, ADT, push bundle); keep the newest
+# 10 of each kind (PHONETEST_KEEP), never this run's, never logs or snaps.
+keep=${PHONETEST_KEEP:-10}
+for pat in '*-payload.bin' '*-shim.img' '*.adt' '*-push.bin'; do
+	ls -t "$out"/$pat 2>/dev/null | tail -n +$(( keep + 1 )) | while read -r f; do
+		case "$(basename "$f")" in "$name-"*|"$name.adt") ;; *) rm -f -- "$f" ;; esac
+	done
+done
+free_gb=$(df -g "$out" | awk 'NR == 2 { print $4 }')
+[ "${free_gb:-99}" -ge 10 ] || say "warning: $free_gb GB free on the disk holding $out"
+
 if [ "$quick" = 1 ]; then
 	say "quick kernel build"
 	tools/build-xnu.sh --quick work/kbuild > "$out/$name-build.txt" 2>&1 || { tail -20 "$out/$name-build.txt"; exit 1; }
