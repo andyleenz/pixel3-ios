@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 13:30:00 +1100
+Subject: [PATCH] 0218: the display blends a layer over another
+
+An app drawing with Metal (MetalHello, CAMetalLayer) showed in horizontal
+bands of black that moved between boots, though its drawable and IOSurface
+read back whole. backboardd hands the app's full-screen layer to the
+display as layer 0 and its own buffer (status bar, transparent elsewhere)
+as layer 1. present() copied each layer raw: layer 0 on the CPU (17 ms,
+not the size the GPU blit takes), then layer 1 with the GPU blit, not
+waited for, over the whole panel. Layers over another are now blended
+(premultiplied BGRA, source over) on the CPU, into a cacheable shadow of
+the panel copied out once (reading the panel itself took 1.1 s a frame).
+---
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 13:00:13
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 13:23:50
+@@ -34,6 +34,29 @@
+  */
+ #include "SweetSurface.h"
+ 
++/*
++ * 0218: a layer over another is blended, not copied: premultiplied BGRA, source over. backboardd hands an app's
++ * full-screen CAMetalLayer to the display as layer 0 and its own mostly transparent buffer (status bar) as layer 1;
++ * copied raw, layer 1's clear pixels showed as black bands over the app.
++ */
++static inline uint32_t
++sweet_fb_over(uint32_t s, uint32_t d)
++{
++	uint32_t a = s >> 24;
++	if (a == 0xff) {
++		return s;
++	}
++	if (a == 0) {
++		return d;
++	}
++	uint32_t k = 255 - a;
++	uint32_t rb = (d & 0x00ff00ffu) * k + 0x00800080u;
++	rb = ((rb + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++	uint32_t ag = ((d >> 8) & 0x00ff00ffu) * k + 0x00800080u;
++	ag = (ag + ((ag >> 8) & 0x00ff00ffu)) & 0xff00ff00u;
++	return s + rb + ag;
++}
++
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ /* blueline DPU probe and copy statistics (BlueDPU.cpp, boot-arg bluedpu) */
+ extern "C" void blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride,
+@@ -160,6 +183,8 @@
+ 	int32_t       fFitX, fFitW;             /* panel columns it covers */
+ 	uint16_t      fFitCol[1080];            /* panel column -> logical column */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	uintptr_t     fTarget;          /* 0218: where present() draws: fPixels, or fShadow when layers stack */
++	IOBufferMemoryDescriptor *fShadow;      /* 0218: cacheable panel-sized buffer (the panel is slow to read) */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -232,7 +257,7 @@
+ 	bool swapFlip(const uint8_t *rec);
+ 	void consoleOnce(void);
+ 	void present(const uint8_t *rec);
+-	void presentFit(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++	void presentFit(SweetSurface *s, uintptr_t src, uint32_t bpe, bool blend, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ public:
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+@@ -1036,7 +1061,28 @@
+ 
+ 	consoleOnce();
+ 
++	/*
++	 * 0218: layers that stack are drawn into a cacheable shadow of the panel and copied out once: blending
++	 * reads what is under it, and reading the panel's own mapping took over a second a frame.
++	 */
++	uint32_t nlayers = 0;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		nlayers += (mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0;
++	}
++	fTarget = fPixels;
++	if (nlayers > 1) {
++		if (fShadow == NULL) {
++			fShadow = IOBufferMemoryDescriptor::withCapacity((vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
++			if (fShadow != NULL) {
++				bzero(fShadow->getBytesNoCopy(), (size_t)fRowBytes * fHeight);
++			}
++		}
++		if (fShadow != NULL) {
++			fTarget = (uintptr_t)fShadow->getBytesNoCopy();
++		}
++	}
++	bool drawn = false;     /* 0218: a layer is under this one: blend */
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+ 		const uint8_t *b = rec + 0xc4 + 16 * layer;
+@@ -1075,10 +1121,12 @@
+ 			/* 0147: the GPU's 2D engine (bluegpu=8, BlueGPUPresent.cpp); false = the CPU copy */
+ 			extern bool blue_gpu_present(SweetSurface *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+ 			    uint64_t, uint32_t, uint32_t, uint32_t, int32_t, int32_t, uint32_t, uint32_t);
+-			if (!blue_gpu_present(s, sx, sy, dx, dy, w, h, fPhys, fWidth, fHeight, fRowBytes, fFitX, fFitW,
++			/* 0218: the GPU's blit copies; a layer over another is blended on the CPU */
++			if (drawn || fTarget != fPixels || !blue_gpu_present(s, sx, sy, dx, dy, w, h, fPhys, fWidth, fHeight, fRowBytes, fFitX, fFitW,
+ 			    fLogicalW, fLogicalH)) {
+-				presentFit(s, src, bpe, sx, sy, dx, dy, w, h);
++				presentFit(s, src, bpe, drawn, sx, sy, dx, dy, w, h);
+ 			}
++			drawn = true;
+ 			s->release();
+ 			continue;
+ 		}
+@@ -1115,13 +1163,24 @@
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++				uint32_t *out = (uint32_t *)(fTarget + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
++				const uint32_t *in = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow +
++				    (uint64_t)sx * 4);
++				if (drawn) {    /* 0218 */
++					for (int32_t x = 0; x < w; x++) {
++						out[x] = sweet_fb_over(in[x], out[x]);
++					}
++				} else {
++					memcpy(out, in, (size_t)w * 4);
++				}
+ 			}
++			drawn = true;
+ 		}
+ 		s->release();
+ 	}
++	if (fTarget != fPixels) {       /* 0218 */
++		memcpy((void *)fPixels, (const void *)fTarget, (size_t)fRowBytes * fHeight);
++	}
+ }
+ 
+ /*
+@@ -1130,7 +1189,7 @@
+  * panel column the logical column of fFitCol. The bars stay black.
+  */
+ void
+-AppleCLCD::presentFit(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++AppleCLCD::presentFit(SweetSurface *s, uintptr_t src, uint32_t bpe, bool blend, int32_t sx, int32_t sy,
+     int32_t dx, int32_t dy, int32_t w, int32_t h)
+ {
+ 	if (src == 0 || bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->memory == NULL) {
+@@ -1156,15 +1215,16 @@
+ 		int32_t ly = (int32_t)((int64_t)py * fLogicalH / fHeight) - dy;
+ 		ly = ly < 0 ? 0 : (ly >= h ? h - 1 : ly);
+ 		const uint32_t *row = (const uint32_t *)(src + s->offset + (uint64_t)(sy + ly) * s->bytesPerRow) + sx;
+-		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		uint32_t *out = (uint32_t *)(fTarget + (uint64_t)py * fRowBytes);
+ 		for (int32_t px = px0; px < px1; px++) {
+ 			int32_t lx = (int32_t)fFitCol[px] - dx;
+-			out[px] = row[lx < 0 ? 0 : (lx >= w ? w - 1 : lx)];
++			uint32_t v = row[lx < 0 ? 0 : (lx >= w ? w - 1 : lx)];
++			out[px] = blend ? sweet_fb_over(v, out[px]) : v;     /* 0218 */
+ 		}
+ 	}
+-	if (dx == 0 && fFitX > 0) {		/* a full-width layer: keep the bars black */
++	if (dx == 0 && fFitX > 0 && !blend) {		/* a full-width layer: keep the bars black */
+ 		for (int32_t py = py0; py < py1; py++) {
+-			uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++			uint32_t *out = (uint32_t *)(fTarget + (uint64_t)py * fRowBytes);
+ 			for (int32_t px = 0; px < fFitX; px++) {
+ 				out[px] = 0xff000000u;
+ 				out[fWidth - 1 - px] = 0xff000000u;

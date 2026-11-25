@@ -845,6 +845,18 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: an app draws with Metal (MetalHello, 0218)
+
+![MetalHello on the phone](screenshots/2026-11-25-metalhello.png)
+
+`tools/apps/metalhello`: a UIKit app with a `CAMetalLayer`, a spinning triangle each display frame. Opted in by name (`/usr/local/etc/bluemetal.procs`), installed and launched by `apptest` with `blueapps=1`. `MTLCreateSystemDefaultDevice` gives `Turnip Adreno (TM) 630`; 60 frames presented in 1.7-2.3 s, all completed (`mh1`-`mh8`).
+
+The screen showed it in horizontal bands of black that moved between boots (`mh1`-`mh6`), although the drawable (`getBytes`) and its IOSurface (CPU) read back whole, and the USERPTR import's pages are the surface's own (all 564 pages). backboardd hands the app's layer to the display as layer 0 (1125x2001) and its own buffer (status bar, transparent elsewhere) as layer 1. `present()` copied layers raw: layer 0 on the CPU (17 ms), then layer 1 by the GPU blit, not waited for, over the whole panel.
+
+**0218**: a layer over another is blended (premultiplied, source over) into a cacheable shadow of the panel, copied out once. Blending straight on the panel took 1.1 s a frame (`mh7`: reading the panel's mapping). Now 39-42 ms a panel copy for the two layers (`mh8`), so the app shows at ~20 fps with a tear where a drawable is reused mid-copy. Next: blend on the GPU.
+
+Reinstalling over an installed copy still fails (containermanagerd `EXISTING_CONTAINER_REPLACE`); test builds were pushed into the installed bundle.
+
 ## 2026-11-25: Metal on par with GL on home-screen swipes (am-0004)
 
 The encoding-thread sampler during swipes (`bbm20`, symbolized against the unstripped bluevk) put ~16% of busy samples in `tu_CmdCopyBufferToImage2`'s per-row loop and ~14% in `tu_cs_reserve_space` -> `msm_bo_map` (command-stream growth). A6xx copies a buffer to an image one row per blit when the source address or pitch isn't 64-byte aligned. The copies were shadow refreshes: CoreAnimation lays images out in MTLBuffers with rows aligned to `minimumLinearTextureAlignmentForPixelFormat:`, the runtime answered Metal's 16, Turnip can't import 16/32-byte pitches, so the runtime shadowed them (`NATIVE_METAL_WARNINGS=1`: 142 shadowed, rows of 224, 160, 288 ... bytes, `bbm23`). USERPTR imports themselves cost 0.35 ms a frame (`BLUEDRM_STATS=1`, `bbm22`).
