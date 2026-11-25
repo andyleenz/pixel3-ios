@@ -125,8 +125,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
    1. CPU cost per command buffer (Turnip re-maps existing command-stream BOs through a kernel call).
    2. Metal on by default in app processes (a deny-list instead of `BLUE_METAL=1`).
    3. Tests: Maps, WebGL in Safari, a SpriteKit/Metal sample app.
-   4. Later: backboardd on Metal (median 31 ms commit to complete: half recording, half GPU in sysmem);
-      GL stays the compositor until it is faster.
+   4. Later: backboardd on Metal. It unlocks and pages the home screen correctly, at ~15% fewer frames
+      than GL (median 38 ms commit to complete: 12 ms recording, 20 ms GPU in sysmem); GL stays the
+      compositor until it is faster.
 2. Installing apps: self-signed apps install through installd and launch (Hello.app, 2026-11-24,
    with `blueapps=1`; `tools/apps/bluemis`). Next: reinstall over an installed copy, IPA files, a
    better stand-in for the Secure Enclave. FairPlay-encrypted App Store apps are out of reach (their

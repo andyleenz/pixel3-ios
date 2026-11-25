@@ -845,6 +845,19 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: home screen on Metal; Metal vs GL with the same swipes
+
+![home screen, backboardd on Metal](screenshots/2026-11-25-homescreen-metal.png)
+
+Boot-only runs render ~20 frames, mostly first-use cost. `bluetouchscript` unlock at sb+34 (the locked display sleeps ~sb+40), then three home-screen page swipes 3 s apart; same script on Metal (`bbm19`) and GL (`gl11`). Both unlock and page correctly; home screen pixels match.
+
+| 5 s windows from the unlock | flips | peak window |
+| --- | --- | --- |
+| GL (`gl11`) | 99, 147, 85, 14 = 345 | 147 (29 fps) |
+| Metal (`bbm19`) | 37, 90, 110, 55 = 292 | 110 (22 fps) |
+
+Metal frames on the home screen (258 commits, median 37 draws): encoding thread `q` 12.5 ms (p90 31), GPU 20 ms (p90 28), commit to complete 38 ms (p90 63). Encoding cost stays after warm-up, so it is per frame, not first use.
+
 ## 2026-11-25: where backboardd's Metal frame time goes (am-0003)
 
 `NATIVE_METAL_STAGES=1` (am-0003) prints each render commit's stages at completion. `bbm11`, 48 commits (boot to lock screen):
