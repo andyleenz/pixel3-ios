@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 23:00:00 +1100
+Subject: [PATCH] 0225: bluefb_dtest, detached-layer timing without blending
+
+bluefb_dtest=1 (with bluedetached=1) takes a swap of several layers as
+flipped without showing it: the display holds layer 0's surface and the
+swap latches at the next TE. Measures CoreAnimation's detached path before
+the DPU blends layers. MetalHello: 0159 rule 30 fps (dt1, dt2); with
+bluefb_swapdone=1 and present-when-scheduled 240 of 240 frames one vsync
+apart, drawable wait 15 ms (dt3).
+---
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 21:53:20
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 21:53:20
+@@ -112,6 +112,20 @@
+  * drawable reused while still scanned out.
+  */
+ static uint32_t sweet_fb_swapdone = 0;
++/*
++ * 0225 (test): bluefb_dtest=1 takes a swap of several layers with layer 0
++ * (a detached app layer) as flipped without showing it: the display holds
++ * the surface and the swap latches at the next TE, so CoreAnimation's
++ * detached timing can be measured before the DPU blends layers. The panel
++ * keeps its last frame. Use with bluedetached=1.
++ */
++static uint32_t sweet_fb_dtest = 0;
++static volatile bool sweet_fb_fake_latch;
++static inline bool
++sweet_fb_latch_pending(void)
++{
++	return sweet_fb_fake_latch || blue_dpu_latch_pending();
++}
+ static uint32_t sweet_fb_swapwait_n[2];        /* 0159: SwapWaits answered complete / pending */
+ extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
+     uint32_t w, uint32_t h, uint32_t fmt);
+@@ -259,6 +273,7 @@
+ 	uint32_t      fFrameInfoMask;         /* 0223: tags CoreAnimation enabled */
+ 	uint32_t      fFrameInfoSent;         /* 0223: the last swap reported */
+ 	void frameInfoLatched(uint32_t id);
++	bool fakeFlip(const uint8_t *rec, uint32_t id);
+ 	/*
+ 	 * 0160 (under fLock): SwapEnd queues the swap and returns; fFlipThread
+ 	 * waits for the GPU's writes to its surfaces, then flips (or records it
+@@ -400,6 +415,7 @@
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	PE_parse_boot_argn("bluefb_vsync_te_us", &sweet_fb_te_us, sizeof(sweet_fb_te_us));
+ 	PE_parse_boot_argn("bluefb_swapdone", &sweet_fb_swapdone, sizeof(sweet_fb_swapdone));   /* 0224 */
++	PE_parse_boot_argn("bluefb_dtest", &sweet_fb_dtest, sizeof(sweet_fb_dtest));           /* 0225 */
+ 	fVsyncNext = mach_absolute_time();
+ 	armVsync(fVsync);
+ 	powerStart();
+@@ -470,7 +486,8 @@
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+-	if (fb->fSwapPending && !blue_dpu_latch_pending()) {      /* 0223: latched at this TE */
++	sweet_fb_fake_latch = false;                              /* 0225: a faked flip latches at this TE */
++	if (fb->fSwapPending && !sweet_fb_latch_pending()) {      /* 0223: latched at this TE */
+ 		fb->fSwapLatchedID = fb->fSwapPendingID;
+ 		fb->fSwapPending = false;
+ 		fb->frameInfoLatched(fb->fSwapPendingID);
+@@ -556,7 +573,7 @@
+ 		}
+ 	}
+ 	if (fb->fFlip && owner_ok) {
+-		if (fb->fRetiring != NULL && !blue_dpu_latch_pending()) {
++		if (fb->fRetiring != NULL && !sweet_fb_latch_pending()) {
+ 			fb->displayDrop(false);                 /* 0158: its replacement is fetched now */
+ 		}
+ 		if ((count % 60) == 0 && blue_dpu_flip_tick()) {
+@@ -1084,7 +1101,7 @@
+ 	uint64_t t0 = mach_absolute_time(), ns = 0;
+ 	for (;;) {
+ 		IOLockLock(fLock);
+-		if (fSwapPending && !blue_dpu_latch_pending()) {
++		if (fSwapPending && !sweet_fb_latch_pending()) {
+ 			fSwapLatchedID = fSwapPendingID;
+ 			fSwapPending = false;
+ 			frameInfoLatched(fSwapPendingID);
+@@ -1105,7 +1122,33 @@
+ 	}
+ }
+ 
++/* 0225: a flip of surface id that only the bookkeeping sees (bluefb_dtest) */
+ bool
++AppleCLCD::fakeFlip(const uint8_t *rec, uint32_t id)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL) {
++		return false;
++	}
++	IOLockLock(fPresentLock);
++	displayHold(s);
++	IOLockLock(fLock);
++	if (fSwapPending) {
++		fSwapLatchedID = fSwapPendingID;
++		frameInfoLatched(fSwapPendingID);
++	}
++	fSwapPendingID = get32(rec, 0x50);
++	fSwapPending = true;
++	sweet_fb_fake_latch = true;
++	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fDirty = false;
++	IOLockUnlock(fLock);
++	IOLockUnlock(fPresentLock);
++	s->release();
++	return true;
++}
++
++bool
+ AppleCLCD::swapFlip(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104), id = 0;
+@@ -1116,6 +1159,9 @@
+ 			layer = (int)l;
+ 			id = get32(rec, 0x54 + 4 * l);
+ 		}
++	}
++	if (sweet_fb_dtest && n >= 2 && (mask & 1) && get32(rec, 0x54) != 0) {
++		return fakeFlip(rec, get32(rec, 0x54));         /* 0225 */
+ 	}
+ 	if (n != 1) {
+ 		return false;

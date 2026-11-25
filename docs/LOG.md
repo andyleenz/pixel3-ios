@@ -884,7 +884,19 @@ MetalHello now lists each missed vsync with that frame's stages (`tr14`). The ca
 - **Metal present when scheduled** (not after completion): with `bluefb_swapdone=1` MetalHello ran 59.2 fps (`tr17`, 238 of 240 frames one vsync apart); alone 57.7 fps (`tr22`). Not kept.
 - `sweetenv=MetalHello:...` stops SpringBoard launching the app ("not trusted"), as `CA_FORCE_TIMER` did for backboardd.
 
-Next: backboardd compositing later in the frame (CoreAnimation's update phase), or the app's frame reaching backboardd before its update.
+Shifting backboardd's update can't help: it frees the drawable and composites ~1 ms apart in one pass, and both follow the timing we report. IOMobileFramebuffer has no swap-complete notification (SwapWait polling only). iOS's route is detached layers (`IOMFBDisplay::release_detached_handle`, `presents_metal_layer_on_finish`): a full-screen CAMetalLayer goes to the display as its own plane, which 0991 turns off for lack of hardware blending.
+
+**0225 (test)**: `bluefb_dtest=1` with `bluedetached=1` takes a multi-layer swap as flipped without showing it (display holds layer 0's surface, latch at the next TE), to time CoreAnimation's detached path before the DPU blends layers.
+
+| Run | Setup | One vsync apart (of 240) | `nextDrawable` | drawable round trip |
+| --- | --- | --- | --- | --- |
+| `dt1` | detached | 47 (~30 fps) | 31.5 ms | 98 ms |
+| `dt2` | + present when scheduled | 43 | 30.9 ms | 98 ms |
+| `dt3` | + `bluefb_swapdone=1` | 240 | 15.0 ms | 48 ms |
+
+`dt1`/`dt2`: CA submits swap N once N-2 is complete; its swap lands just after the TE, latches a frame late, and the app settles at every other frame. `dt3`: steady 60, present to on screen 30 ms. Next: DPU hardware blending of the two detached layers (app, status bar), then this check on screen (the 0224 rule striped in composited mode). Present-when-scheduled is parked in `gpu/metal/patches/held/`.
+
+Disk: `work/test` held 13.8 GB of per-run boot images (payload, shim, ADT); only the last 10 runs' are kept now.
 
 ## 2026-11-25: WebGL on Metal (WebGLHello)
 

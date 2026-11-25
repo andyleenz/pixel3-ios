@@ -1,0 +1,24 @@
+Present a drawable once its command buffer is submitted (scheduled), not after GPU completion, as Metal does (NATIVE_METAL_PRESENT_COMPLETED=1: after completion). pixel3-ios: 0.5-6 ms earlier to backboardd.
+
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -3693,8 +3693,17 @@
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+ // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
+-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
+-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
++// pixel3-ios (NATIVE_METAL_PRESENT_COMPLETED=1: after completion): present once the work is submitted, as Metal does. One GPU ring runs
++// every process's submits in order, so the compositor's reads queue behind this buffer's writes, and a flip waits for its last write.
++static bool presentCompleted(void) {static const bool on=getenv("NATIVE_METAL_PRESENT_COMPLETED")!=NULL;return on;}
++- (void)presentDrawable:(id<MTLDrawable>)drawable {
++ if(presentCompleted())[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];
++ else [self addScheduledHandler:^(id<MTLCommandBuffer>){[drawable present];}];
++}
++- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {
++ if(presentCompleted())[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];
++ else [self addScheduledHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];
++}
+ - (void)enqueue {}
+ - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
+  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
