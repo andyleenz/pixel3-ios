@@ -876,6 +876,16 @@ MetalHello now reports, for frames 61-300, the callback's lateness, the `nextDra
 
 In `tr13`'s trace window 79 of 80 flips are one vsync apart (59.3 fps); GPU busy 21%. Present to on screen is 31.8 ms (presented handlers fire now). Same kernel, apps launched 45 s after install (`apptest ... 3 45`): SpriteHello 51.2 fps (`sk13`; 35 before, launched at 15 s), WebGLHello 57.3 fps (`wgl13`; 45-47).
 
+## 2026-11-25: the last few percent: drawable slack (0224)
+
+MetalHello now lists each missed vsync with that frame's stages (`tr14`). The callbacks were on time; the display link skipped 1-3 vsyncs after frames whose `nextDrawable` waited 13-15 ms. A trace event for SwapWait (`Q`, 0224) shows the cycle: backboardd hears that swap N is complete when swap N+1 latches, frees the app's old drawable in its next update and composites in that same pass. The app's next frame always lands in the following update, so a drawable comes back after 3 frames (49 ms), and with 3 drawables there is no slack.
+
+- **0224 `bluefb_swapdone=1`**: swap complete on its own latch. GL home swipes looked right (`gl13`: 336 flips, latch holds 176 -> 81), but MetalHello showed occasional black stripes on the phone (`tr20`; none with 0, `tr21`). CoreAnimation reuses a completed swap's buffers, so 0159's rule is the right one. Off by default.
+- **Metal present when scheduled** (not after completion): with `bluefb_swapdone=1` MetalHello ran 59.2 fps (`tr17`, 238 of 240 frames one vsync apart); alone 57.7 fps (`tr22`). Not kept.
+- `sweetenv=MetalHello:...` stops SpringBoard launching the app ("not trusted"), as `CA_FORCE_TIMER` did for backboardd.
+
+Next: backboardd compositing later in the frame (CoreAnimation's update phase), or the app's frame reaching backboardd before its update.
+
 ## 2026-11-25: WebGL on Metal (WebGLHello)
 
 `tools/apps/webglhello`: a WKWebView page draws a rotating triangle with WebGL. WebKit runs WebGL in `com.apple.WebKit.GPU` (ANGLE on Metal), an XPC service, not an app, so `BlueMetal.bundle` now turns Metal on for it by name. Renderer "Apple GPU", 120 frames in 2.53 s (47.4 fps), centre and corner pixels read back as drawn, no GL error (`wgl4`, no `bluemetal.procs`; `wgl3`: 44.9 fps).
