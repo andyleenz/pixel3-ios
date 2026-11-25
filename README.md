@@ -123,8 +123,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
    Most apps don't need Metal (their views are drawn by CoreGraphics and composited by backboardd, on GL),
    but games, Maps, WebGL and Core Image do. In order:
    1. Done: Metal on by default for apps (not extensions or daemons; `-NAME` in `bluemetal.procs` denies).
-   2. Tests: a Metal app draws and shows correctly (`tools/apps/metalhello`, 2026-11-25; ~37 fps,
-      composited by backboardd and flipped without a copy). Then Maps, WebGL in Safari, a SpriteKit game.
+   2. Tests (2026-11-25): a Metal app draws and shows correctly (`tools/apps/metalhello`, ~37 fps,
+      composited by backboardd and flipped without a copy); Maps opens and draws its UI (no network: no
+      tiles); a SpriteKit scene of 330 sprites runs at 35 fps (`tools/apps/spritehello`). Next: WebGL in Safari.
    3. Later: backboardd on Metal. It unlocks and pages the home screen correctly with as many frames as
       GL on the same swipes (334 vs 327-345; median 36 ms commit to complete, 14 ms recording, 18 ms GPU
       in sysmem); GL stays the compositor until it is clearly faster.

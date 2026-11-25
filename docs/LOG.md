@@ -845,6 +845,14 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: SpriteKit at 35 fps (SpriteHello)
+
+`tools/apps/spritehello`: 300 sprites moved and spun by actions, 30 physics boxes, a CoreText label. 180 frames in 5.1 s (35.3 fps), physics 2.8 ms a frame (`sk9`).
+
+The first scene (300 boxes piled by gravity while actions spun them) ran at 1-1.6 fps. Each frame was ~12 ms of Metal work and `nextDrawable` never waited; samples of the main thread (symbolicated with `ipsw dyld a2s`) were in Box2D (`b2World::Step`, `b2ContactManager::Collide`), 39-824 ms a step. A scene problem, not Metal.
+
+![SpriteKit](screenshots/2026-11-25-spritekit.png)
+
 ## 2026-11-25: Metal on by default for apps
 
 `BlueMetal.bundle` now gives a device to the executable of an `.app` under `/Applications` or an installed app's container, without opting in. Extensions stay off: with them on, FitnessWidget (a widget) loaded the stack and was killed 3 times (`mh11`). Daemons stay off (backboardd composites on GL). `/usr/local/etc/bluemetal.procs`: `NAME` opts in, `-NAME` refuses; `BLUE_METAL=0/1` overrides both.
