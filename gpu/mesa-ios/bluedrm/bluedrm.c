@@ -433,11 +433,49 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 	return 0;
 }
 
+/* BLUEDRM_STATS=1: every 64 USERPTR imports, their count, bytes, time and how many were of an
+ * address imported before (of the last 256), to stderr */
+static void
+user_memory_stats(const void *address, uint64_t size, int64_t ns)
+{
+	static int on = -1;
+	static unsigned n, again, sizes[4];
+	static uint64_t bytes, total_ns;
+	static uintptr_t seen[256];
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+	if (on < 0)
+		on = getenv("BLUEDRM_STATS") != NULL;
+	if (!on)
+		return;
+	pthread_mutex_lock(&lock);
+	for (unsigned i = 0; i < 256; i++)
+		if (seen[i] == (uintptr_t)address) {
+			again++;
+			break;
+		}
+	seen[n & 255] = (uintptr_t)address;
+	sizes[n & 3] = (unsigned)(size >> 10);
+	n++;
+	bytes += size;
+	total_ns += ns;
+	if ((n & 63) == 0)
+		fprintf(stderr, "bluedrm: userptr %u imports (%u again), %llu MiB, %llu us total; last KiB %u %u %u %u\n",
+		        n, again, (unsigned long long)(bytes >> 20), (unsigned long long)(total_ns / 1000),
+		        sizes[0], sizes[1], sizes[2], sizes[3]);
+	pthread_mutex_unlock(&lock);
+}
+
+static int64_t now_ns(void);
+
 EXPORT int
 bluedrm_user_memory(int fd, const void *address, uint64_t size, uint32_t *handle)
 {
 	struct blue_gpu_userptr r = { .address = (uintptr_t)address, .size = size };
+	int64_t t0 = now_ns();
 	int error = call(BLUE_GPU_SEL_USERPTR, &r, sizeof(r));
+
+	user_memory_stats(address, size, now_ns() - t0);
 
 	(void)fd;
 	if (error != 0) {

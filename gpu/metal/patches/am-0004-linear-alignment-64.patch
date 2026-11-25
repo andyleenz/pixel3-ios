@@ -1,0 +1,25 @@
+Linear texture alignment of 64 bytes, the A6xx pitch (NATIVE_METAL_LINEAR16=1: the runtime's 16). pixel3-ios: textures over buffers shadowed.
+
+--- a/NativeBridgeMetalFrontend.mm	2026-11-25 11:49:46
++++ b/NativeBridgeMetalFrontend.mm	2026-11-25 11:49:47
+@@ -5324,6 +5324,12 @@
+  // A log line, not a problem: as a problem it stood in every client's one problem row in place of the client's own refusal.
+  GLOG(@"native-metal: base limits: %u fields of %zu bytes filled from the device's answers",filled,size);
+ }
++// pixel3-ios (NATIVE_METAL_LINEAR16=1 turns it off): rows of a texture over a buffer at 64 bytes, the A6xx pitch. With Metal's 16
++// (the runtime's answer) CoreAnimation lays images out in 16-byte rows, Turnip can't take them, and every one is shadowed.
++static NSUInteger linear64Answer(id self,SEL cmd,NSUInteger arg) {
++ const NSUInteger a=countArgAnswer(self,cmd,arg);
++ return a&&a<64?64:a;
++}
+ static void installAnswers(Class cls) {
+  uint32_t kind=0;
+  for(size_t i=0;const char *name=nmb_device_answer_selector(i,&kind);i++) {
+@@ -5515,6 +5521,7 @@
+  unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
+  for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
+  free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
++ if(!getenv("NATIVE_METAL_LINEAR16"))class_replaceMethod(cls,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),(IMP)linear64Answer,"Q24@0:8Q16");
+  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
+  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
+  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);

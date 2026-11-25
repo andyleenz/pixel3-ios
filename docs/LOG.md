@@ -845,6 +845,18 @@ First GPU work on the phone not from gallium freedreno. Runs `work/test/vk1..3.t
 
 The fake BlueGPU ignored queue ids; it now checks per-queue fences like the kernel (0153 `bg_wait_fence`), so `VK=1 HOST=1 ./build-mesa-ios.sh` catches vk2's bug. `BLUEDRM_DEBUG=1` logs each submit's queue and fence.
 
+## 2026-11-25: Metal on par with GL on home-screen swipes (am-0004)
+
+The encoding-thread sampler during swipes (`bbm20`, symbolized against the unstripped bluevk) put ~16% of busy samples in `tu_CmdCopyBufferToImage2`'s per-row loop and ~14% in `tu_cs_reserve_space` -> `msm_bo_map` (command-stream growth). A6xx copies a buffer to an image one row per blit when the source address or pitch isn't 64-byte aligned. The copies were shadow refreshes: CoreAnimation lays images out in MTLBuffers with rows aligned to `minimumLinearTextureAlignmentForPixelFormat:`, the runtime answered Metal's 16, Turnip can't import 16/32-byte pitches, so the runtime shadowed them (`NATIVE_METAL_WARNINGS=1`: 142 shadowed, rows of 224, 160, 288 ... bytes, `bbm23`). USERPTR imports themselves cost 0.35 ms a frame (`BLUEDRM_STATS=1`, `bbm22`).
+
+**am-0004**: the frontend answers at least 64 (`NATIVE_METAL_LINEAR16=1`: 16). CoreAnimation follows it: 6 shadowed (`bbm24`). Pixels unchanged (`cab25a8`, `cab25rgba` match `cab20`/`cab22`).
+
+| Same swipes, frames with 20+ draws | flips | recording med/p90 | GPU | commit to complete |
+| --- | --- | --- | --- | --- |
+| 16-byte rows (`bbm21`) | 290 | 16.3/32.9 ms | 24.9/31.4 | 48.9/68.4 |
+| 64-byte rows (`bbm25`) | 334 | 13.8/23.6 | 17.7/25.4 | 36.1/47.2 |
+| GL (`gl11`, `gl12`) | 345, 327 | | | |
+
 ## 2026-11-25: Metal flicker on the home screen (0217)
 
 Page swipes flickered with backboardd on Metal (seen on the phone, `bbm20`), not on GL. The display's stats showed why: "GPU held for a latch" 156 times on GL (`gl11`), 0 on Metal (`bbm19`). metal2vulkan imports IOSurfaces as USERPTR (Mesa 0008), so the kernel treated backboardd's display buffers as plain memory: a flip didn't wait for the GPU's last write (0160 `gpuWriteFence`), and a submit drawing into the buffer still being fetched didn't wait for the latch (0157/0158).
