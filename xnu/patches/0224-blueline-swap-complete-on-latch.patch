@@ -1,29 +1,28 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 25 Nov 2026 21:00:00 +1100
-Subject: [PATCH] 0224: a swap is complete once its own flip latched
+Subject: [PATCH] 0224: optional swap-complete-on-own-latch; SwapWait trace
 
-0159 answered SwapWait complete only after the next swap latched.
-DCP's swap_complete means the swap is on screen. backboardd's buffers
-come back a frame earlier: GPU latch holds on the GL home-screen swipes
-176 -> 81, flips unchanged (336). MetalHello flips per 5 s 274-303 ->
-280-299. bluefb_swapdone=0 restores 0159. Trace event Q: SwapWait id
-and whether it answered complete.
+bluefb_swapdone=1 answers SwapWait complete once the swap's own flip
+latched (DCP's swap_complete) instead of the next swap's (0159). GL home
+swipes looked right (gl13, latch holds 176 -> 81), but a direct-flipped
+Metal app showed occasional black stripes (tr20; none with 0, tr21), so
+it is off by default. Trace event Q: SwapWait id, answered complete.
 ---
 diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 20:23:12
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 20:23:12
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-25 21:05:42
 @@ -105,6 +105,13 @@
  extern "C" int blue_dpu_latch_pending(void);  /* 0158 */
  extern "C" int blue_dpu_te_since(uint64_t *ns);        /* 0222 */
  static uint32_t sweet_fb_te_us = 1000;  /* 0222: tick this long after TE (bluefb_vsync_te_us; 0 = free grid) */
 +/*
-+ * 0224: a swap is complete once it is on screen (its own flip latched), as
-+ * DCP's swap_complete. 0159 waited for the next swap's latch: CoreAnimation
-+ * then freed an app's drawable a frame late (3 frames round trip with 3
-+ * drawables, no slack). bluefb_swapdone=0: the 0159 rule.
++ * 0224: bluefb_swapdone=1 answers a swap complete once its own flip latched
++ * (DCP's swap_complete) instead of the next swap's (0159). Off: a direct-
++ * flipped Metal app then showed black stripes now and then (tr20), its
++ * drawable reused while still scanned out.
 + */
-+static uint32_t sweet_fb_swapdone = 1;
++static uint32_t sweet_fb_swapdone = 0;
  static uint32_t sweet_fb_swapwait_n[2];        /* 0159: SwapWaits answered complete / pending */
  extern "C" int blue_dpu_flip(IOMemoryDescriptor *md, uintptr_t kva, uint32_t offset, uint32_t bpr,
      uint32_t w, uint32_t h, uint32_t fmt);
