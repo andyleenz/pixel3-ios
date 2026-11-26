@@ -1,0 +1,73 @@
+blueline: Wi-Fi pdev parameters as ath10k_start sets them (bluewifi_pdev=1)
+
+PMF QoS, dynamic bandwidth, idle power save, tx/rx chain masks to every RF chain
+((1 << num_rf_chains) - 1), ARP AC override off, ANI on, before the regdomain.
+wifi5g2: all sent, 5 GHz scans still never start, so off by default. The WMI
+queue (commands waiting for credit) grows from 6 to 16: with 6 the scan after
+them was dropped (wifi5g1).
+
+--- a/bsd/dev/blueline_wifi.c	2026-11-26 17:23:16
++++ b/bsd/dev/blueline_wifi.c	2026-11-26 17:31:08
+@@ -2944,7 +2944,7 @@
+ }
+ 
+ /* WMI waits here while the endpoint has no credit */
+-#define WMIQ_LEN 6
++#define WMIQ_LEN 16	/* 0236: was 6; the pdev parameters, regdomain, channel list, vdev and scan go out together */
+ #define WMIQ_MAX 2040
+ static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
+ static uint16_t wmiq_len[WMIQ_LEN];
+@@ -3104,6 +3104,8 @@
+ #define TAG_HAL_REG_CAPS    0x21
+ #define TAG_PDEV_SET_RD_CMD 0x51
+ #define CMD_PDEV_SET_RD     0x4001
++#define TAG_PDEV_SET_PARAM  0x52	/* 0236 */
++#define CMD_PDEV_SET_PARAM  0x4003
+ #define CMD_ECHO            0x1d001
+ #define CMD_PDEV_SET_HW_MODE 0x401e	/* qcacld fw-api wmi_unified.h */
+ #define TAG_PDEV_SET_HW_MODE 0x203
+@@ -3197,6 +3199,8 @@
+ 	wmi_hex_n(what, d, len, 128);
+ }
+ 
++static uint32_t wmi_rf_chains;	/* SERVICE_READY's num_rf_chains (0236) */
++
+ static void
+ wmi_svc_ready(const uint8_t *p, uint32_t len)
+ {
+@@ -3214,6 +3218,7 @@
+ 			memcpy(&a0, v + 4, 4);
+ 			memcpy(&rf, v + 4 + 24 + 8, 4);
+ 			RLOG("wmi: fw %08x abi %08x rf_chains %u", fw, a0, rf);
++			wmi_rf_chains = rf;
+ 		} else if (tag == TAG_HAL_REG_CAPS && l >= 36) {
+ 			uint32_t r[9];
+ 			memcpy(r, v, sizeof(r));
+@@ -3441,6 +3446,27 @@
+ 	(void)PE_parse_boot_argn("bluewifi_scanmode", &scan_mode, sizeof(scan_mode));
+ 	RLOG("scan: mode %#x (1: no host channel list, 2: no channels in the scan = the firmware's own, 4: no regdomain)",
+ 	    scan_mode);
++	uint32_t pdev = 0;	/* boot-arg bluewifi_pdev=1: send them (wifi5g2: 5 GHz scans still do not start) */
++	(void)PE_parse_boot_argn("bluewifi_pdev", &pdev, sizeof(pdev));
++	if (pdev) {
++		/*
++		 * 0236: what ath10k_start sets before ath10k_regd_update (wmi-tlv.h pdev params): PMF QoS, dynamic
++		 * bandwidth, idle power save, both chain masks to every RF chain (__ath10k_set_antenna with
++		 * supp_tx_chainmask = (1 << num_rf_chains) - 1), no ARP AC override, ANI on.
++		 */
++		uint32_t mask = wmi_rf_chains >= 1 && wmi_rf_chains <= 4 ? (1u << wmi_rf_chains) - 1u : 0x3u;
++		const uint32_t pp[][2] = { { 0x22, 1 }, { 0x0a, 1 }, { 0x2c, 1 }, { 0x01, mask }, { 0x02, mask },
++			                   { 0x23, 0 }, { 0x25, 1 } };
++		unsigned sent = 0;
++		for (unsigned i = 0; i < sizeof(pp) / sizeof(pp[0]); i++) {
++			uint8_t r[4 + 12], *q = wmi_put_tlv(r, TAG_PDEV_SET_PARAM, 12);
++			q = put32(q, 0);		/* pdev */
++			q = put32(q, pp[i][0]);
++			(void)put32(q, pp[i][1]);
++			sent += wmi_send(CMD_PDEV_SET_PARAM, r, sizeof(r)) ? 1u : 0u;
++		}
++		RLOG("scan: %u of 7 pdev params sent (chain masks %#x)", sent, mask);
++	}
+ 	if ((scan_mode & 4) == 0) {
+ 		/* ath10k_regd_update (ath10k_start): the regulatory domain before any channel or vdev */
+ 		uint32_t rd = wmi_eeprom_rd, ctl = 0x10;	/* CTL_FCC */

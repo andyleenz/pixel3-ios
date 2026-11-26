@@ -7,7 +7,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 |---|---|---|---|
 | Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; plug-in frames reach apps (cam32). Next: sensor frames in apps, then assetsd/Photos so captures save; force JPEG/H.264 (no HEIC/HEVC encoder) | hours |
 | Thermals to thermalmonitord | runs, uncalibrated | 0235 (`bluethermal=1`) + the launchd job: loop runs, reads all sensors, but goes to pressure 20 / backlight 90% at boot (SDM845 die hotter than the A11 tables). Next: scale or offset the die readings to the skin model, then on by default | 0.5 day |
-| Wi-Fi 5 GHz | small | untried: second 3.3 V rail (L23A on other SDM845 boards; only L25A tried), then board data, then WMI diff against Linux on this phone; radio in the default boot | hours-1 day |
+| Wi-Fi 5 GHz | needs a reference | ruled out: second rail (stock DT has ch0 only), board data, regulatory (firmware allows ch 36), ath10k pdev params (0236). Next: WMI trace from Android/Linux on this phone to diff; radio in the default boot | 1-2 days |
 | Cellular control, SMS | realistic | UniXNU/QcomBaseband (BSD-2, SC7180, iOS 17): `/baseband` ADT node, AppleBaseband classes, QMUX-QRTR bridge; board layer exists (0149, 0165, 0166); ends the CommCenter crash loop | 3-5 days |
 | Mobile data | more work | IPA v3.5.1 + GSI (Linux `drivers/net/ipa` has SDM845) | +4-6 days |
 | Bluetooth | realistic | WCN3990 on a GENI UART (FIFO mode), init as Linux `btqca.c` / `hci_qca.c` (GPL: reimplement or keep in userland); UniXNU/QcaBluetooth replaces BlueTool's firmware step | 2-4 days |
@@ -26,7 +26,7 @@ reinstall does not work.
 
 ## Order
 
-1. Overnight soak and the one-boot L23A test for 5 GHz.
+1. Overnight soak (the L23A test is moot: stock DT has one 3.3 V rail).
 2. Camera sensor frames in apps, then Photos.
 3. Thermals.
 4. 5 GHz, radio in the default boot.

@@ -1373,6 +1373,17 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
 - `tools/oslog-pull.sh`: the phone's os_log over bluesh, parsed with mandiant/macos-UnifiedLogs (Apple's
   `log show` refuses the partial archive). `tools/bluerun/envrun.c`: env(1) for the phone.
 
+**5 GHz (2026-11-26).** Ruled out:
+- A second 3.3 V rail: Google's own device tree (read in LineageOS recovery, `/proc/device-tree/soc/qcom,icnss@18800000`)
+  gives the WCN3990 only `vdd-3.3-ch0` (L25, 3.104-3.312 V). L23 has no consumer there, so the L23A test was dropped.
+- Board data: the vendor image's `bdwlan-blueline.bin` is the one sent (EVT variants are the same size).
+- Regulatory: REG_CHAN_LIST_CC (0x3a001, once per PHY) gives US (840), domain 0x3a, FCC DFS; rules 2402-2472,
+  5170-5250 (no flags), 5250-5330 and 5490-5730 (radar). Channel 36 is allowed.
+- 0236 (`bluewifi_pdev=1`): the pdev parameters ath10k_start sets (chain masks 0x3 for 2 RF chains, PMF QoS,
+  dynamic BW, idle PS, ANI): all accepted, scans with 5 GHz channels still never start (wifi5g2). The WMI queue
+  held 6 commands; with these the scan was dropped (wifi5g1). Now 16.
+Next: a WMI trace from a Linux/Android boot to diff (needs a boot that keeps userdata).
+
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;
 HEVC has no encoder (`VTCompressionSessionCreate` -12908, `kVTCouldNotFindVideoEncoderErr`). iOS has no
