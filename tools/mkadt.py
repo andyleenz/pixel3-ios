@@ -300,8 +300,27 @@ def wlan_firmware(d):
     return mdsp, bdf
 
 
+def modem_fs(d):
+    """Every file under DIR (the vendor image's /rfs/msm/mpss/readonly/vendor, or a subset), as one blob for
+    /blueline-modemfs "files": u32 path bytes (NUL, padded to 4), u32 file bytes, path, file padded to 4.
+    The kernel's TFTP server (0241) serves each as /readonly/vendor/<path>."""
+    out, n = bytearray(), 0
+    for root, dirs, files in os.walk(d):
+        dirs.sort()
+        for f in sorted(files):
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, d).encode()
+            data = open(full, 'rb').read()
+            path = rel + b'\0' * (4 - len(rel) % 4)
+            out += struct.pack('<II', len(path), len(data)) + path + data + b'\0' * (-len(data) % 4)
+            n += 1
+    if not n:
+        sys.exit('--modem-fs %s: no files' % d)
+    return bytes(out), n
+
+
 def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None,
-          haptic_fw=None, wlan_fw=None, adsp_fw=None, baseband=False):
+          haptic_fw=None, wlan_fw=None, adsp_fw=None, baseband=False, modemfs=None):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -465,6 +484,10 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
         # Read by bsd/dev/blueline_wifi.c (0167): served to the modem's WLAN PD over TFTP, and the board file.
         extra.append(node('blueline-wlan', {'wlanmdsp': wlan_fw[0], 'bdwlan': wlan_fw[1]}))
 
+    if modemfs is not None:
+        # Read by bsd/dev/blueline_wifi.c (0241): served to the modem over TFTP as /readonly/vendor/<path>.
+        extra.append(node('blueline-modemfs', {'files': modemfs}))
+
     if haptic_fw is not None:
         # Read by bsd/dev/blueline_haptic.c (0150) at bluehaptic=2.
         extra.append(node('blueline-haptic', {'wmfw': haptic_fw[0], 'wavetable': haptic_fw[1]}))
@@ -490,6 +513,9 @@ if __name__ == '__main__':
                     help='add /blueline-adsp: DIR/adsp.mdt and adsp.bNN (from vendor /firmware)')
     ap.add_argument('--wlan-fw', metavar='DIR',
                     help='add /blueline-wlan: DIR/wlanmdsp.mbn and DIR/bdwlan-blueline.bin (from vendor /firmware)')
+    ap.add_argument('--modem-fs', metavar='DIR',
+                    help='add /blueline-modemfs: every file under DIR, served to the modem as /readonly/vendor/<path> '
+                         '(DIR: a copy of the vendor image\'s /rfs/msm/mpss/readonly/vendor, e.g. its mbn/ MCFG files)')
     ap.add_argument('--haptic-fw', metavar='DIR',
                     help='add /blueline-haptic "wmfw" + "wavetable" from DIR/cs40l20.wmfw, cs40l20.bin')
     ap.add_argument('--canvas', default='1125x2250', metavar='WxH',
@@ -515,8 +541,10 @@ if __name__ == '__main__':
     haptic_fw = haptic_firmware(a.haptic_fw) if a.haptic_fw else None
     wlan_fw = wlan_firmware(a.wlan_fw) if a.wlan_fw else None
     adsp_fw = adsp_firmware(a.adsp_fw) if a.adsp_fw else None
+    modemfs = modem_fs(a.modem_fs) if a.modem_fs else None
     root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw,
-                 haptic_fw=haptic_fw, wlan_fw=wlan_fw, adsp_fw=adsp_fw, baseband=a.baseband)
+                 haptic_fw=haptic_fw, wlan_fw=wlan_fw, adsp_fw=adsp_fw, baseband=a.baseband,
+                 modemfs=modemfs[0] if modemfs else None)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
@@ -524,6 +552,8 @@ if __name__ == '__main__':
     print('%s: %d bytes' % (a.out, len(blob)), file=sys.stderr)
     if wlan_fw is not None:
         print('  /blueline-wlan wlanmdsp %d bytes, bdwlan %d bytes' % (len(wlan_fw[0]), len(wlan_fw[1])), file=sys.stderr)
+    if modemfs is not None:
+        print('  /blueline-modemfs %d files, %d bytes' % (modemfs[1], len(modemfs[0])), file=sys.stderr)
     if haptic_fw is not None:
         print('  /blueline-haptic wmfw %d bytes, wavetable %d bytes' % (len(haptic_fw[0]), len(haptic_fw[1])),
               file=sys.stderr)

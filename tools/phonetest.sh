@@ -131,6 +131,9 @@ case " $base $extra " in
 esac
 case " $base $extra " in *" sweetfb_native=1 "*) fw+=(--canvas 1080x2160) ;; esac	# iOS draws the panel's own size
 case " $base $extra " in *" bluecell=1 "*) fw+=(--baseband) ;; esac	# /baseband: the cellular CommCenter job (0238)
+# /blueline-modemfs: the modem's MCFG files for TFTP (0241), from work/fw/modem/ro (a subset of the vendor
+# image's /rfs/msm/mpss/readonly/vendor; tools/modem-fs.sh)
+case " $base $extra " in *" bluecell=1 "*) [ -d work/fw/modem/ro ] && fw+=(--modem-fs work/fw/modem/ro) ;; esac
 python3 tools/mkadt.py --ufs --cpus 8 --iphone work/DeviceTree.d22ap.im4p "${fw[@]}" "$out/$name.adt" > /dev/null
 python3 tools/mkpayload.py "$kernel" "$out/$name.adt" "$out/$name-payload.bin" --cmdline "$base $extra" > /dev/null
 PATH=/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH p2-shim/build.sh "$out/$name-payload.bin" stock/boot.img > "$out/$name-shim.txt" 2>&1

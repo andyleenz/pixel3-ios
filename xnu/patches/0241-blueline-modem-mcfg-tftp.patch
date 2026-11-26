@@ -1,0 +1,67 @@
+0241: the TFTP server (0167) also serves /readonly/vendor/<path> from the ADT's /blueline-modemfs
+"files" (tools/mkadt.py --modem-fs): the vendor image's /rfs/msm/mpss/readonly/vendor tree, the modem's
+MCFG hardware config (mcfg.version, mbn/mcfg_hw). cell4: the modem asked for mbn_hw.dig and mbn_sw.dig,
+got "not found", and stayed offline (DMS online request: QMI_ERR_DEVICE_NOT_READY).
+
+diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c	2026-11-27 09:59:22
++++ b/bsd/dev/blueline_wifi.c	2026-11-27 09:59:35
+@@ -1722,6 +1722,7 @@
+  */
+ #define TFTP_MAX_BLKSIZE	1024u
+ #define TFTP_RO_PREFIX		"/readonly/firmware/image/"
++#define TFTP_VENDOR_PREFIX	"/readonly/vendor/"	/* 0241: the modem's MCFG files, from /blueline-modemfs */
+ #define TFTP_RW_PREFIX		"/readwrite/"
+ #define TFTP_RW_FILES		8
+ #define TFTP_RW_MAX		(256u * 1024u)
+@@ -1804,10 +1805,50 @@
+ 	}
+ }
+ 
++/*
++ * 0241: /readonly/vendor/<path> from the ADT's /blueline-modemfs "files" (tools/mkadt.py --modem-fs): entries
++ * of u32 path bytes (with its NUL, rounded up to 4), u32 file bytes, the path, then the file rounded up to 4.
++ * These are the vendor image's /rfs/msm/mpss/readonly/vendor files (MCFG: mcfg.version, mbn/mcfg_hw/...).
++ */
++static bool
++t_open_vendor(struct tftp_xfer *x, const char *rel)
++{
++	DTEntry node;
++	void const *p = NULL;
++	unsigned int size = 0;
++
++	if (x->write || SecureDTLookupEntry(NULL, "/blueline-modemfs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "files", &p, &size) != kSuccess) {
++		return false;
++	}
++	const uint8_t *b = p, *end = b + size;
++	while ((size_t)(end - b) >= 8) {
++		uint32_t pl, fl;
++		memcpy(&pl, b, 4);
++		memcpy(&fl, b + 4, 4);
++		uint64_t fl4 = ((uint64_t)fl + 3) & ~3ull;
++		if (pl == 0 || (pl & 3) || (uint64_t)(end - b) < 8 + (uint64_t)pl + fl4) {
++			printf("BLUELINE WIFI: tftp: /blueline-modemfs files malformed\n");
++			return false;
++		}
++		const char *name = (const char *)(b + 8);
++		if (name[pl - 1] == 0 && strcmp(name, rel) == 0) {
++			x->src = b + 8 + pl;
++			x->size = fl;
++			return true;
++		}
++		b += 8 + pl + fl4;
++	}
++	return false;
++}
++
+ /* The file a path names: read from the ADT or a RAM file; write into a RAM file. */
+ static bool
+ t_open(struct tftp_xfer *x, const char *path)
+ {
++	if (strncmp(path, TFTP_VENDOR_PREFIX, strlen(TFTP_VENDOR_PREFIX)) == 0) {
++		return t_open_vendor(x, path + strlen(TFTP_VENDOR_PREFIX));
++	}
+ 	if (strncmp(path, TFTP_RO_PREFIX, strlen(TFTP_RO_PREFIX)) == 0) {
+ 		const char *rest = path + strlen(TFTP_RO_PREFIX), *base = strrchr(rest, '/');
+ 		char name[48];
