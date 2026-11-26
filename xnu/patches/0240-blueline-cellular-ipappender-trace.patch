@@ -1,0 +1,81 @@
+0240: AppleIPAppender published at boot also with bluecell=1 (ApplePDPHelper in CommCenter
+dereferences a null connection without it: cell1's crash loop); its methods refused until the
+bridge is up. Trace of the first 64 AppleBaseband calls (process, selector, scalars, result).
+
+diff -urN a/iokit/Kernel/arm/MiniIPAppender.cpp b/iokit/Kernel/arm/MiniIPAppender.cpp
+--- a/iokit/Kernel/arm/MiniIPAppender.cpp	2026-11-27 08:31:37
++++ b/iokit/Kernel/arm/MiniIPAppender.cpp	2026-11-27 08:31:48
+@@ -41,9 +41,6 @@
+ 	if (!on) {
+ 		return;
+ 	}
+-	if (coachz_baseband_enabled()) {
+-		return;	/* the bridge publishes it with the rest */
+-	}
+ 	if (coachz_ipappender_publish()) {
+ 		IOLog("BLUE PDP: AppleIPAppender published (every method unsupported; bluepdp=0 leaves it out)\n");
+ 	} else {
+diff -urN a/iokit/Kernel/arm/baseband/coachz_baseband.cpp b/iokit/Kernel/arm/baseband/coachz_baseband.cpp
+--- a/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-27 08:31:37
++++ b/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-27 08:48:08
+@@ -9,6 +9,7 @@
+ // coachz_baseband_poll gives it. User threads only queue. One lock covers the bridge state and the queues; user memory is copied
+ // outside it, and asynchronous reads complete on a thread call.
+ #include <sys/errno.h>	/* blueline 0238 */
++#include <sys/proc.h>	/* blueline 0240: proc_name for the call trace */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOLib.h>
+@@ -1039,6 +1040,16 @@
+     }
+     IOLockUnlock(bb_lock);
+     if (result == CBC_UNSUPPORTED) printf("COACHZ baseband: AppleBaseband selector %u unsupported\n", selector);
++    {   // blueline 0240: the first 64 calls, to see what ABM asks before it opens a channel
++      static uint32_t traced;
++      if (traced++ < 64) {
++        char who[32];
++        proc_name(proc_selfpid(), who, sizeof who);
++        printf("COACHZ baseband: %s AppleBaseband sel %u in %u [%llx %llx] -> %d out %u [%llx %llx]\n", who, selector,
++               args->scalarInputCount, args->scalarInputCount > 0 ? args->scalarInput[0] : 0ull,
++               args->scalarInputCount > 1 ? args->scalarInput[1] : 0ull, result, nout, out[0], out[1]);
++      }
++    }
+     for (uint32_t i = 0; i < nout; i++) args->scalarOutput[i] = out[i];
+     args->scalarOutputCount = nout;
+     return result;
+@@ -1075,7 +1086,7 @@
+   IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
+   {
+     if (!args) return kIOReturnBadArgument;
+-    if (!coachz_baseband_enabled()) {   // blueline 0238: MiniIPAppender's stand-in (no baseband): every method refused
++    if (!coachz_baseband_enabled() || !bb_published) {   // blueline 0238: no baseband (or, 0240, not up yet): every method refused
+       static uint32_t refused;
+       if (refused++ < 16) printf("BLUE PDP: method %u: unsupported\n", selector);
+       return kIOReturnUnsupported;
+@@ -1154,11 +1165,15 @@
+   return service;
+ }
+ 
+-// blueline 0238: MiniIPAppenderStart's AppleIPAppender when the bridge is off (bluecell=0).
++// blueline 0238/0240: the one AppleIPAppender, published at boot by MiniIPAppenderStart: ApplePDPHelper (CommCenter)
++// dereferences a null connection when the service is missing (cell1: CommCenter crash loop while the modem came up).
+ extern "C" bool coachz_ipappender_publish(void)
+ {
++  static int done;
++  if (done) return true;
+   IOService *provider = IOService::getResourceService();
+-  return provider && bb_publish<AppleIPAppender>(provider);
++  done = provider && bb_publish<AppleIPAppender>(provider);
++  return done;
+ }
+ 
+ // The modem's QRTR is up (GLINK started): publish the services ABM looks for. `send` and `del_client` run on the Wi-Fi thread only.
+@@ -1175,7 +1190,7 @@
+   made += provider && bb_publish<AppleBasebandPCIControl>(provider);
+   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) made += provider && bb_publish<AppleBasebandPCIInterface>(provider, c);
+   made += provider && bb_publish<AppleBasebandPCIMAVPDPManager>(provider);
+-  made += provider && bb_publish<AppleIPAppender>(provider);
++  made += coachz_ipappender_publish();
+   bb_published = 1;
+   printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl, %u channels, the PDP manager, AppleIPAppender)\n", made, 4u + CBH_PUBLISHED, CBH_PUBLISHED);
+ }
