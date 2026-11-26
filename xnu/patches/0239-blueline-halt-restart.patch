@@ -1,0 +1,159 @@
+0239: iOS's own restart and halt reach the hardware (PE_halt_restart was unset:
+reboot(2), launchd, SpringBoard and thermalmonitord shut downs spun forever off USB).
+Restart: PSCI SYSTEM_RESET to recovery. Halt: to recovery in a test boot, else
+PSCI SYSTEM_OFF. BlueThermal: board thermistor readings outside 5-70 C fall back
+to the battery's temperature.
+
+diff -urN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-27 00:07:01
++++ b/bsd/dev/sweet_ufs.c	2026-11-27 00:08:01
+@@ -142,6 +142,7 @@
+ extern void blueline_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ static void bluereboot_arm(void);
++static void bluehalt_arm(void);
+ static void bluereboot_after_gpu(void);
+ static void blue_when_init(void);
+ static void bluesnap_arm(void);
+@@ -815,6 +816,7 @@
+ 	blue_when_init();
+ 	bluesnap_arm();
+ 	bluereboot_arm();
++	bluehalt_arm();
+ 	sweet_sample_start();
+ 	/* Pixel 3 hardware keys (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	blueline_cpufreq_init();
+@@ -1805,16 +1807,19 @@
+ 	return br.reason == 2 ? "bootloader" : "recovery";
+ }
+ 
++/* late: from PE_halt_restart (0239), after the shutdown: no sync, sleep or snapshot, the log lock only if free */
+ static void
+-bluereboot_fire(const char *why)
++bluereboot_fire_how(const char *why, bool late)
+ {
+ 	uint8_t before = 0, after = 0;
+ 
+-	if (br.when != BR_GPU) {
++	if (late) {
++		/* nothing: the file systems are synced and unmounted, threads may not run again */
++	} else if (br.when != BR_GPU) {
+ 		(void)sync_internal();          /* waits for the sync, at most 5 s */
+ 		bluereboot_sleep(1);            /* as sweet_usb.c "reboot": journal */
+ 	}
+-	if (bs.on_reboot) {
++	if (bs.on_reboot && !late) {
+ 		(void)bluesnap_take("before reboot");
+ 	}
+ 	int pon = blueline_pon_set_reboot_reason(br.reason, &before, &after);
+@@ -1831,8 +1836,13 @@
+ 
+ 	blueline_wdt_prepare_reset("bluereboot");
+ 
+-	lck_mtx_lock(&sweet_ufs_lock);
+-	int error = sweet_log_running ? sweet_log_write_locked() : 0;
++	bool locked = true;
++	if (late) {
++		locked = lck_mtx_try_lock(&sweet_ufs_lock);
++	} else {
++		lck_mtx_lock(&sweet_ufs_lock);
++	}
++	int error = sweet_log_running && locked ? sweet_log_write_locked() : 0;
+ 	if (!error) {
+ 		blueline_wdt_suspend();         /* patch 0148: off right before the reset */
+ 		register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
+@@ -1842,11 +1852,19 @@
+ 		error = (int)(int32_t)x0;
+ 		blueline_wdt_resume();
+ 	}
+-	lck_mtx_unlock(&sweet_ufs_lock);
++	if (locked) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
+ 	/* Only on failure: carry on booting rather than poke PS_HOLD. */
+ 	printf("BLUELINE REBOOT: did not reset (log write or PSCI result %d)\n", error);
+ }
+ 
++static void
++bluereboot_fire(const char *why)
++{
++	bluereboot_fire_how(why, false);
++}
++
+ static int
+ bluereboot_find_springboard(proc_t p, void *arg)
+ {
+@@ -1938,6 +1956,56 @@
+  * runner (tools/bluerun: sysctl kern.bluedone=1 with bluerun_end=reboot) or a kernel test
+  * (blue_test_done()). Nothing happens unless bluereboot= is set.
+  */
++/*
++ * (0239) iOS's own restart and shut down. Nothing on this board set PE_halt_restart, so reboot(2), launchd's
++ * reboot, SpringBoard's power off and thermalmonitord's emergency shut down all ended in halt_all_cpus()
++ * spinning with USB already down (therm8: off the bus for good, the watchdog still petted from the other
++ * CPUs). Now a restart is PSCI SYSTEM_RESET to recovery (iOS is RAM-booted: a plain boot never comes back
++ * to it); a halt is too in a test boot (bluereboot= or bluewdt_recovery=1), else PSCI SYSTEM_OFF.
++ * Panics keep 0148's path (the watchdog bites). Other types: -1 as before.
++ */
++#define PSCI_SYSTEM_OFF         0x84000008ull
++enum { BH_HALT = 0, BH_RESTART = 1, BH_UPS_HALT = 3 };	/* kPEHaltCPU, kPERestartCPU, kPEUPSDelayHaltCPU */
++static int bluehalt_test;
++
++static int
++bluehalt_restart(unsigned int type)
++{
++	if (type != BH_HALT && type != BH_RESTART && type != BH_UPS_HALT) {
++		return -1;
++	}
++	bool restart = type == BH_RESTART;
++	if (restart || bluehalt_test) {
++		if (br.reason == 0) {
++			br.reason = 1;
++		}
++		bluereboot_fire_how(restart ? "iOS restart" : "iOS halt (test boot: to recovery instead)", true);
++		return -1;
++	}
++	printf("BLUELINE REBOOT: iOS halt: PSCI SYSTEM_OFF\n");
++	blueline_wdt_suspend();
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_OFF;
++	__asm__ volatile ("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	blueline_wdt_resume();
++	return -1;
++}
++
++extern int (*PE_halt_restart)(unsigned int type);
++
++static void
++bluehalt_arm(void)
++{
++	uint32_t rec = 0;
++	(void)PE_parse_boot_argn("bluewdt_recovery", &rec, sizeof(rec));
++	bluehalt_test = br.when != BR_OFF || rec != 0;
++	if (PE_halt_restart == NULL) {
++		PE_halt_restart = bluehalt_restart;
++	}
++	printf("BLUELINE REBOOT: iOS restart -> recovery, halt -> %s\n", bluehalt_test ? "recovery" : "power off");
++}
++
+ static int bluedone_fired;
+ void blue_test_done(const char *why);
+ void
+diff -urN a/iokit/Kernel/arm/hid/BlueThermal.cpp b/iokit/Kernel/arm/hid/BlueThermal.cpp
+--- a/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-27 00:08:41
++++ b/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-27 00:08:41
+@@ -187,6 +187,13 @@
+ 			uint16_t code;
+ 			int v = 0;
+ 			ok = blue_adc_convert(ch, &code) && code <= 0x7fffu && blue_ntc((int)((uint32_t)code * 1875u / 0x4000u), &v);
++			/* (0239) a board thermistor reads room to warm: outside 5-70 C is a wrong channel or scale, and fed
++			 * to thermalmonitord it is an emergency shut down (therm8). The battery's temperature instead. */
++			if (ok && (v < 50 || v > 700)) {
++				printf("BLUELINE THERMAL: ADC ch 0x%02x code 0x%04x = %d.%d C: implausible, battery instead\n",
++				    ch, code, v / 10, (v < 0 ? -v : v) % 10);
++				ok = false;
++			}
+ 			blue_adc_cache[i].ch = ch;
+ 			blue_adc_cache[i].ok = ok;
+ 			blue_adc_cache[i].dc = v;

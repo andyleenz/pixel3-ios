@@ -1379,6 +1379,17 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**therm8 lost the phone; 0239 (2026-11-27).**
+- therm8 (0237, `bluethermal=1`, thermalmonitord): no recovery after 66 min and nothing on USB (no adb,
+  fastboot or recovery). 0148's watchdog (on in every test boot) and bluereboot's timers did not bring it back.
+- Gap found: nothing on this board set `PE_halt_restart`, so iOS's own restart or shut down (reboot(2),
+  launchd, SpringBoard, thermalmonitord's emergency shut down) ended in `halt_all_cpus()` spinning after
+  IOKit had stopped USB. Suspected cause: a wrong board-thermistor reading from 0237 and a thermal shut down.
+  Unconfirmed until the log is read from recovery.
+- 0239: restart is PSCI SYSTEM_RESET to recovery (iOS is RAM-booted), halt too in a test boot (`bluereboot=`
+  or `bluewdt_recovery=1`), else PSCI SYSTEM_OFF; the log is written first if its lock is free. BlueThermal
+  drops ADC readings outside 5-70 C (battery temperature instead, logged). Builds.
+
 **Cellular control plane, prepared (2026-11-26, not yet booted).**
 - Reference: UniXNU/QcomBaseband (BSD-2, dd0199cf3300; SC7180, iPadOS 17): AppleBaseband,
   AppleBasebandPCIControl, the PCIe channel interfaces, PDP manager and AppleIPAppender, bridging ABM's QMUX
