@@ -1379,16 +1379,19 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
-**therm8 lost the phone; 0239 (2026-11-27).**
-- therm8 (0237, `bluethermal=1`, thermalmonitord): no recovery after 66 min and nothing on USB (no adb,
-  fastboot or recovery). 0148's watchdog (on in every test boot) and bluereboot's timers did not bring it back.
-- Gap found: nothing on this board set `PE_halt_restart`, so iOS's own restart or shut down (reboot(2),
-  launchd, SpringBoard, thermalmonitord's emergency shut down) ended in `halt_all_cpus()` spinning after
-  IOKit had stopped USB. Suspected cause: a wrong board-thermistor reading from 0237 and a thermal shut down.
-  Unconfirmed until the log is read from recovery.
-- 0239: restart is PSCI SYSTEM_RESET to recovery (iOS is RAM-booted), halt too in a test boot (`bluereboot=`
+**therm8, 0239 (2026-11-27).**
+- 0237 works: every board sensor (PMU tdev1-5, tcal, TG0V) first read 31.6 C (battery 32.7 C), where it was
+  55-69 C from TSENS. The ADC start-up lines had left the log ring by the end of the hour.
+- The phone was not hung: its timed reset fired at 3620 s ("SpringBoard: to recovery ... PSCI SYSTEM_RESET").
+  The Mac had gone into clamshell sleep at 22:51 (pmset log). That cut USB power ("USB out" in the battery
+  lines from sample #13 on, 99% to 84% over the hour), so recovery came up with no host and phonetest gave up.
+- phonetest: `caffeinate -ims` for the run; a wait-loop gap over 60 s is reported as Mac sleep, and the
+  timeout message counts pmset Sleep entries since the boot. caffeinate cannot stop lid-close sleep.
+- Found while looking: nothing on this board set `PE_halt_restart`, so iOS's own restart or shut down
+  (reboot(2), launchd, SpringBoard, thermalmonitord) ends in `halt_all_cpus()` spinning with USB stopped.
+  0239: restart is PSCI SYSTEM_RESET to recovery (iOS is RAM-booted), halt too in a test boot (`bluereboot=`
   or `bluewdt_recovery=1`), else PSCI SYSTEM_OFF; the log is written first if its lock is free. BlueThermal
-  drops ADC readings outside 5-70 C (battery temperature instead, logged). Builds.
+  drops ADC readings outside 5-70 C (battery temperature instead, logged). Builds, untested.
 
 **Cellular control plane, prepared (2026-11-26, not yet booted).**
 - Reference: UniXNU/QcomBaseband (BSD-2, dd0199cf3300; SC7180, iPadOS 17): AppleBaseband,

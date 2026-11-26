@@ -91,6 +91,14 @@ cmdline="$base $extra"	# XNU's boot-args line holds 607 bytes (mkpayload.py refu
 out=work/test; mkdir -p "$out"
 t0=$(date +%s)
 say() { printf '[%3ds] %s\n' $(( $(date +%s) - t0 )) "$*"; }
+# The Mac must stay awake: sleeping cuts USB power, and the phone then runs (and ends in recovery) with no
+# host (therm8: lid closed at 22:51, "USB out" in the phone's log, recovery unseen). caffeinate stops idle
+# sleep for this run; it cannot stop lid-close sleep, which the wait loop below detects and reports.
+caffeinate -ims -w $$ > /dev/null 2>&1 &
+mac_slept() {	# seconds the Mac slept since EPOCH (pmset's log), 0 if none
+	pmset -g log 2>/dev/null | awk -v since="$(date -r "$1" '+%Y-%m-%d %H:%M:%S')" '
+		$4 == "Sleep" && ($1 " " $2) >= since { n++ } END { print n + 0 }'
+}
 limit() {	# SECONDS CMD...: run CMD, kill it after SECONDS (fastboot can hang on a wedged USB link)
 	local secs=$1; shift
 	perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
@@ -165,8 +173,20 @@ tools/fbboot.sh "$out/$name-shim.img" 3 > "$out/$name-fastboot.txt" 2>&1 || { ca
 
 say "waiting for recovery (up to $wait min)"
 end=$(( $(date +%s) + wait * 60 ))
+boot_at=$(date +%s); last=$boot_at
 until adb devices | grep -q 'recovery$'; do
-	[ "$(date +%s)" -lt "$end" ] || { say "no recovery after $wait min (hung, or still in iOS)"; exit 1; }
+	now=$(date +%s)
+	if [ $(( now - last )) -gt 60 ]; then	# a 3 s loop that took over a minute: the Mac was asleep
+		say "the Mac was asleep for ~$(( now - last )) s (USB unpowered): the phone may be in recovery unseen"
+		end=$(( end + now - last ))	# the phone's own reboot timers kept running; give it back the time anyway
+	fi
+	last=$now
+	if [ "$now" -ge "$end" ]; then
+		n=$(mac_slept "$boot_at")
+		[ "$n" -gt 0 ] && say "the Mac slept $n time(s) during this run (lid closed?): USB lost power, so this is not a phone hang"
+		say "no recovery after $wait min (hung, still in iOS, or recovery unseen: check the phone's screen)"
+		exit 1
+	fi
 	sleep 3
 done
 # raw PM8998 RTC count as recovery's kernel sees it, with the Mac's clock, for bluertc_offset
