@@ -928,6 +928,16 @@ Other apps on the layered path (`bluemetal.dylib` without am-0005): MetalHello `
 | `pd6` | MetalHello | layers, 0230 | 596 MHz | 230 of 240 one vsync apart; render median 9.3 ms (11.5 before) |
 | `wgl15` | WebGL | composited (GPU process) | 710 MHz | 55.3 fps |
 
+SpriteKit still capped at ~40 fps layered (`sk17`-`sk20`: 202 flips per 5 s in every window), with 3 drawables and `presentsWithTransaction` 0. SpriteHello now also reports frames 121-300 and the vsyncs between updates. `sk22`: 40.5 fps, gaps 1:120 2:32 3:28 (bursts of three, then a wait for a drawable). The SpriteKit runs used the stock `bluemetal.dylib`, which presents a drawable when its command buffer completes; with am-0005 (present when scheduled) `sk23` ran at 60.6 fps, all 180 updates one vsync apart. am-0005 is now in the build (out of `patches/held`).
+
+| Run | App | Result |
+| --- | --- | --- |
+| `sk24` | SpriteKit | frames 121-300 60.5 fps, all one vsync apart; 0 drawn on screen |
+| `pd7` | MetalHello | 223 of 240 one vsync apart; render median 6.4 ms |
+| `wgl16` | WebGL | 53.5 fps (GPU process, composited) |
+
+At launch MetalHello holds 8 drawable surfaces for a moment (`pd7`, ids 68-78) and only 8 contiguous app buffers fit below 4 GiB: 2-3 frames per run are copied instead of flipped. The way out is the DPU reading through its SMMU, so any surface can be scanned out.
+
 Disk: `work/test` held 13.8 GB of per-run boot images (payload, shim, ADT); only the last 10 runs' are kept now.
 
 ## 2026-11-25: WebGL on Metal (WebGLHello)

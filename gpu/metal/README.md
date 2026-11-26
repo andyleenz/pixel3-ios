@@ -24,6 +24,7 @@ Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/m
 | `patches/am-0002-*` | Debug: `NATIVE_METAL_ART=1` prints one-byte textures over buffers as text art of their bytes, and textures at rows off 64 bytes |
 | `patches/am-0003-*` | Debug: `NATIVE_METAL_STAGES=1` prints each render commit's stage times (encoding thread, runtime commit, scheduling, GPU) and per-call encode times; `NATIVE_METAL_SAMPLE=1` samples the encoding thread's stack |
 | `patches/am-0004-*` | Linear texture alignment of 64 bytes (A6xx pitch): CoreAnimation's images in buffers import without shadow copies (`NATIVE_METAL_LINEAR16=1`: 16) |
+| `patches/am-0005-*` | `presentDrawable:` presents once the command buffer is scheduled, as Metal does, not after completion (`NATIVE_METAL_PRESENT_COMPLETED=1`: after). Needed with the DPU's second layer: presenting at completion added about a frame to each drawable's round trip, SpriteKit 40.5 -> 60.6 fps steady (sk22, sk23) |
 | `m2vbatch.py` | translates every function of a metallib: `M2V_PROFILE=turnip-a630 python3 m2vbatch.py SCRATCH LIB TAG` |
 
 The captures come from the Mac: the host build of the same Turnip (`VK=1 HOST=1`) over the fake BlueGPU,
