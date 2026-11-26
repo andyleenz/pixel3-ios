@@ -1,0 +1,99 @@
+0242: the bridge holds a DMS SET_OPERATING_MODE answer of QMI_ERR_DEVICE_NOT_READY and sends the request
+again each second, for at most 8 s (ABM's timeout is 10 s). cell6: CommCenter's one online request came at
+47.7 s, while the modem was still loading its MCFG files (0241), and was never repeated.
+
+diff -urN a/iokit/Kernel/arm/baseband/coachz_baseband.cpp b/iokit/Kernel/arm/baseband/coachz_baseband.cpp
+--- a/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-27 10:35:30
++++ b/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-27 10:35:30
+@@ -324,8 +324,72 @@
+ static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
+ 
+ // A request for the modem, with the data port named as this modem has it.
++// 0242: DMS SET_OPERATING_MODE (online) answered QMI_ERR_DEVICE_NOT_READY while the modem is still loading its
++// MCFG files over TFTP (0241; cell6: the one request at 47.7 s, MCFG done a few seconds later, never asked again).
++// The answer is held and the request sent again each second, for at most 8 s (ABM waits 10 s), then passed on.
++#define BB_DMS_SVC          2u
++#define BB_DMS_SET_OP_MODE  0x2eu
++#define BB_QMI_NOT_READY    0x34u
++static struct {
++  uint8_t *data;
++  uint32_t len, local_port, node, port, tries, first_ms, retry_ms;
++  bool waiting;
++} bb_opmode;
++
++static void bb_opmode_note(const struct cbq_result &r, const uint8_t *sdu)
++{
++  if (r.service != BB_DMS_SVC || r.len < 7 || sdu[0] != 0 || cbd_rd16(sdu + 3) != BB_DMS_SET_OP_MODE) return;
++  if (bb_opmode.data) IOFreeData(bb_opmode.data, bb_opmode.len);
++  bb_opmode.data = static_cast<uint8_t *>(IOMallocData(r.len));
++  if (!bb_opmode.data) return;
++  memcpy(bb_opmode.data, sdu, r.len);
++  bb_opmode.len = r.len;
++  bb_opmode.local_port = r.local_port;
++  bb_opmode.node = r.node;
++  bb_opmode.port = r.port;
++  bb_opmode.tries = 0;
++  bb_opmode.first_ms = bb_now_ms();
++  bb_opmode.waiting = false;
++}
++
++// The modem's answer: true when held for a retry.
++static bool bb_opmode_answer(uint32_t dst_port, uint32_t service, const uint8_t *sdu, uint32_t size)
++{
++  if (!bb_opmode.data || service != BB_DMS_SVC || dst_port != bb_opmode.local_port || size < 7 || sdu[0] != 2 ||
++      cbd_rd16(sdu + 3) != BB_DMS_SET_OP_MODE) return false;
++  uint32_t error = 0;
++  for (uint32_t o = 7; o + 3 <= size;) {
++    const uint32_t tl = cbd_rd16(sdu + o + 1);
++    if (o + 3 + tl > size) break;
++    if (sdu[o] == 2 && tl >= 4) error = cbd_rd16(sdu + o + 5);
++    o += 3 + tl;
++  }
++  const uint32_t now = bb_now_ms();
++  if (error == BB_QMI_NOT_READY && now - bb_opmode.first_ms < 8000) {
++    bb_opmode.tries++;
++    bb_opmode.waiting = true;
++    bb_opmode.retry_ms = now + 1000;
++    if (bb_opmode.tries <= 8) printf("COACHZ baseband: DMS SET_OPERATING_MODE: device not ready, again in 1 s (%u)\n", bb_opmode.tries);
++    return true;
++  }
++  printf("COACHZ baseband: DMS SET_OPERATING_MODE: error 0x%x after %u retries, %u ms\n", error, bb_opmode.tries, now - bb_opmode.first_ms);
++  IOFreeData(bb_opmode.data, bb_opmode.len);
++  bb_opmode.data = nullptr;
++  bb_opmode.waiting = false;
++  return false;
++}
++
++static void bb_opmode_poll(void)
++{
++  if (bb_opmode.data && bb_opmode.waiting && (int32_t)(bb_now_ms() - bb_opmode.retry_ms) >= 0) {
++    bb_opmode.waiting = false;
++    bb_queue_tx(bb_opmode.local_port, bb_opmode.node, bb_opmode.port, bb_opmode.data, bb_opmode.len);
++  }
++}
++
+ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
+ {
++  bb_opmode_note(r, sdu);
+   if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
+   bb_sim_request(r, sdu);
+   if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
+@@ -1227,6 +1291,10 @@
+     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
+   } else if (r.kind == CBQ_TO_HOST) {
+     if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
++    if (bb_opmode_answer(dst_port, r.service, static_cast<const uint8_t *>(body), size)) {
++      IOLockUnlock(bb_lock);
++      return 1;
++    }
+     // A temporary eUICC card-status indication is not the restored logical SIM.
+     const uint8_t *sdu = static_cast<const uint8_t *>(body);
+     if (bb_esim.freeze && r.service == CBE_SVC_UIM && size >= 7 &&
+@@ -1255,6 +1323,7 @@
+   uint32_t n = 0, released[16], r = 0, port;
+   IOLockLock(bb_lock);
+   bb_esim_step();
++  bb_opmode_poll();
+   while (bb_tx_count && n < 16) {
+     batch[n++] = bb_txq[bb_tx_head];
+     bb_tx_head = (bb_tx_head + 1) % BB_TX;

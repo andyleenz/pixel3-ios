@@ -1379,6 +1379,19 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**Radio offline: MCFG over TFTP (0241, 0242; cell5-7, 2026-11-27).**
+- cell4: CommCenter's online request (DMS SET_OPERATING_MODE) got QMI_ERR_DEVICE_NOT_READY; modem stays
+  kOffline, so no network search with or without a SIM. rmtfs was fine (all four EFS partitions read).
+- The modem's TFTP reads of `/readonly/vendor/mbn/mcfg_hw/mbn_hw.dig` and `mcfg_sw/mbn_sw.dig` got "not
+  found". Android serves these from the vendor image's `/rfs/msm/mpss/readonly/vendor`. 0241 serves
+  `/readonly/vendor/<path>` from the ADT's `/blueline-modemfs` (`tools/modem-fs.sh`, `mkadt --modem-fs`).
+- cell5 (hw set): `mbn_hw.dig` read, no hardware MBN fetched (digest matches EFS); `mbn_sw.dig` retried 10
+  times, then given up. Online still refused.
+- cell6 (all 148 files, 9.9 MB; ADT 26 MB): the modem reads `mbn_sw.txt`, every carrier MBN and
+  `mcfg.version`. Online still refused: the one request came at 47.7 s, before the MCFG load ended, and
+  CommCenter did not ask again.
+- 0242: the bridge holds a DEVICE_NOT_READY answer and resends the request each second for up to 8 s.
+
 **cell4: Apple's baseband manager boots the Pixel's modem (2026-11-27).**
 - Mav17 in the preboot path: `boot.mod: Baseband bootup succeeded`, Booted -> IsReady (971 ms; the image
   "push" is the bridge's no-op, the modem was already running), transport client started.
