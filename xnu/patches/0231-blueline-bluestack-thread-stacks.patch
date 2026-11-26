@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 17:30:00 +1100
+Subject: [PATCH] 0231: bluestack= thread stacks, kern.bluesay console lines
+
+For daemons that hang rather than crash (CamHello's discovery session
+waits on mediaserverd, cam2): every thread's pc, lr and frame-pointer
+backtrace of each process named NAME, SECS seconds into boot and 3 s
+later, with the shared cache slide, as STACK lines.
+
+kern.bluesay: any process writes a line to the console as
+"SAY name[pid]: text" (mediaserverd plugins and apps have no
+/dev/console).
+---
+diff -ru a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-26 13:01:40
++++ b/bsd/dev/sweet_ufs.c	2026-11-26 13:19:53
+@@ -45,6 +45,88 @@
+ #include <machine/atomic.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++/*
++ * 0231: bluestack=NAME[,NAME...]:SECS (default 60 s): every thread's user stack of each process named NAME
++ * (p_comm), SECS seconds after this point in boot and again 3 s later, as "STACK" lines
++ * (osfmk/kern/exception.c). For daemons that hang: a stack that is the same twice is where it waits.
++ */
++extern void sweet_stack_task(task_t task, const char *name, int pid);
++static char sweet_stack_name[64];	/* ",a,b," */
++static int sweet_stack_secs = 60;
++
++static int
++sweet_stack_one(proc_t p, __unused void *arg)
++{
++	char key[MAXCOMLEN + 3];
++	snprintf(key, sizeof(key), ",%s,", p->p_comm);
++	if (strnstr(sweet_stack_name, key, sizeof(sweet_stack_name)) != NULL) {
++		task_t t = proc_task(p);
++		if (t != TASK_NULL) {
++			sweet_stack_task(t, p->p_comm, proc_getpid(p));
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++sweet_stack_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (int round = 1; round <= 2; round++) {
++		delay_for_interval((round == 1 ? sweet_stack_secs : 3) * 1000, NSEC_PER_MSEC);
++		printf("STACK round %d: %s\n", round, sweet_stack_name);
++		proc_iterate(PROC_ALLPROCLIST, sweet_stack_one, NULL, NULL, NULL);
++	}
++}
++
++/*
++ * 0231: kern.bluesay, write-only for any process: the string goes to the console as
++ * "SAY name[pid]: text". A log line for code that has no /dev/console (daemons running as mobile, such
++ * as plugins in mediaserverd; apps).
++ */
++static int
++sysctl_bluesay SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[512];
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	size_t n = req->newlen < sizeof(buf) - 1 ? req->newlen : sizeof(buf) - 1;
++	int error = SYSCTL_IN(req, buf, n);
++	if (error != 0) {
++		return error;
++	}
++	buf[n] = 0;
++	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == 0)) {
++		buf[--n] = 0;
++	}
++	proc_t p = current_proc();
++	printf("SAY %s[%d]: %s\n", p->p_comm, proc_getpid(p), buf);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, bluesay, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_bluesay, "A", "print a line on the console (0231)");
++
++static void
++sweet_stack_start(void)
++{
++	char arg[48];
++	if (!PE_parse_boot_argn("bluestack", arg, sizeof(arg))) {
++		return;
++	}
++	char *c = strchr(arg, ':');
++	if (c != NULL) {
++		*c = 0;
++		sweet_stack_secs = (int)strtoul(c + 1, NULL, 10);
++	}
++	snprintf(sweet_stack_name, sizeof(sweet_stack_name), ",%s,", arg);
++	thread_t th;
++	if (kernel_thread_start(sweet_stack_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("STACK: %s in %d s\n", sweet_stack_name, sweet_stack_secs);
++	}
++}
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -756,6 +838,8 @@
+ 		extern void blueline_camera_start(void);
+ 		blueline_camera_start();
+ 	}
++	/* bluestack=NAME:SECS: NAME's thread stacks SECS s after boot, twice 3 s apart (0231). */
++	sweet_stack_start();
+ 	/* Wi-Fi stage 1: SCM queries and read-only state, off unless bluewifi=1 (blueline_wifi.c). */
+ 	blueline_wifi_probe();
+ 	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
+diff -ru a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c	2026-11-26 13:01:40
++++ b/osfmk/kern/exception.c	2026-11-26 13:01:40
+@@ -879,6 +879,55 @@
+ }
+ 
+ /*
++ * 0231: every thread's user stack of a task (bluestack=, bsd/dev/sweet_ufs.c), for a process that hangs
++ * rather than crashes: pc, lr and a frame-pointer backtrace read through the task's map, with the shared
++ * cache slide and the main binary's header as for crashes. Threads running in user space show their last
++ * kernel entry.
++ */
++void sweet_stack_task(task_t task, const char *name, int pid);
++
++void
++sweet_stack_task(task_t task, const char *name, int pid)
++{
++	uint64_t slide = 0;
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	printf("STACK %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	task_lock(task);
++	thread_t th;
++	int n = 0;
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		if (n++ >= 64) {
++			break;
++		}
++		arm_saved_state_t *ss = find_user_regs(th);
++		if (ss == NULL || !is_saved_state64(ss)) {
++			continue;
++		}
++		uint64_t fp = get_saved_state_fp(ss);
++		char line[320];
++		int k = snprintf(line, sizeof(line), "STACK %s t%llu pc 0x%llx lr 0x%llx bt", name, thread_tid(th),
++		    get_saved_state_pc(ss), get_saved_state_lr(ss));
++		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && k < (int)sizeof(line) - 20; i++) {
++			uint64_t fr[2];
++			if (vm_map_read_user(task->map, (vm_map_offset_t)fp, fr, sizeof(fr)) != KERN_SUCCESS) {
++				break;
++			}
++			k += snprintf(line + k, sizeof(line) - k, " 0x%llx", fr[1]);
++			if (fr[0] <= fp) {
++				break;
++			}
++			fp = fr[0];
++		}
++		printf("%s\n", line);
++	}
++	task_unlock(task);
++}
++
++/*
+  * SWEET: for a process named in boot-arg sweetscan (comma separated,
+  * default "backboardd,SpringBoard"; "-" = off) that dies with SIGABRT or
+  * SIGTRAP (BSAssert / NSAssert style failures) print the printable text runs

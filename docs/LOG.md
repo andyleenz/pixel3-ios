@@ -1218,3 +1218,51 @@ WebGL takes a new 1125x1941 surface each frame (~8800 a run, `wgl14`-`wgl16`). A
 All three in one boot on the clean kernel (`b3`, 160 s start to result): MetalHello 234 of 240 one vsync apart; SpriteKit frames 121-300 60.6 fps, all one vsync apart; WebGL 59.1 fps, 178 of 179.
 
 Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s window while backboardd still composites the launch animation; after it no creates and 0 panel copies (`pd7`). 2-3 copied frames a launch; not worth SMMU scanout now.
+
+### Camera into iOS: where frames can enter (2026-11-26)
+
+`tools/apps/camhello` (AVFoundation: access, device list, a BGRA video data output for 8 s; one line to
+`hello.txt` and, through `kern.bluesay`, to the console) is the test for each camera step.
+
+- **cam1-3: the first AVFoundation call never returns.** New kernel aid 0231 `bluestack=NAME[,NAME]:SECS`
+  prints every user thread's backtrace twice, 3 s apart (symbolicated with `ipsw dyld a2s` and the slide it
+  prints). CamHello's main thread waits for a reply in `FigCaptureSourceRemoteCopyCaptureSources` ->
+  `FigXPCRemoteClientCreate`; mediaserverd, which vends `com.apple.coremedia.capturesource`, has every thread
+  idle.
+- **cam4: TCC first.** With the access request moved first, tccd waits in `CFUserNotificationReceiveResponse`
+  (the camera alert, which nobody taps on a test boot). apptest now has `com.apple.private.tcc.manager`,
+  resets the TCC services an app's Info.plist names and prints the TCC.db rows.
+- **cam5-10: tccd says denied.** A bundle-ID grant (`TCCAccessSetForBundleId`: `auth_value=2`, no `csreq`), no
+  row at all, and `com.apple.private.tcc.allow` all give `TCCAccessPreflight` = 1 (denied). Open.
+- **The plug-in slot.** `FigCaptureGetCaptureDeviceCreateFunction` (CMCapture) walks
+  `{AppleH13CamIn, /System/Library/MediaCapture/H13ISP.mediacapture, H13ISPCaptureDeviceCreate}`, then H10, H9,
+  H6: `IOServiceMatching(class)` -> `dlopen(path)` -> `dlsym(constructor)`. The H10 plug-in (iPhone X) is in the
+  shared cache and needs Apple's ISP; the H13 path is free. 0232 registers a stub `AppleH13CamIn`
+  (`bluecamsvc=0` off), so a plug-in of ours at that path is what mediaserverd loads: every app, Camera.app
+  included, then uses the normal capture path (no per-app shim).
+- **The interface** (from the H10 plug-in's symbols): a `FigCaptureDevice` and `FigCaptureStream`s made with
+  `CMDerivedObjectCreate` (WebKit's `CMBaseClass` layout). Device: Invalidate, Finalize, CopyProperty,
+  SetProperty; class v3: CreateProcessingSession, RequestStreams, RelinquishStreams, PerformPearlCalibration.
+  Stream: Finalize, CopyProperty, SetProperty; class v2: Start, Stop, AddAttachmentsToSampleBuffer. Frames go
+  to the client's `kFigCaptureStreamProperty_BufferQueue`. The H10 plug-in uses 8 device and 172 stream
+  properties; the camera list and formats come from `CMCapture.framework/D22/AVCaptureSession.plist`
+  (`T8110SIM/` has a minimal two-camera set for an ISP simulator).
+
+- **Why the client never gets an answer.** `FigCaptureSourceServerStart` starts the listener unconditionally
+  after `FigCaptureSourceInitialize`, and `FigMediaServerStart` calls `FigStartCaptureServers` by default
+  (`StartRecorderServer` absent = true). That function first needs `CFBundleGetBundleWithIdentifier
+  ("com.apple.CMCapture")`; nothing mediaserverd links pulls CMCapture in (MediaToolbox -> CMCaptureCore only),
+  and if the lookup fails it only logs. mediaserverd's threads are all idle while CamHello waits, which fits the
+  listener never having been started. Unconfirmed.
+- `tools/camera/bluecam`: stage 1 of the plug-in (`H13ISP.mediacapture`, device object only, logs every call).
+
+Next: confirm whether mediaserverd loads the plug-in at all; then fill in the properties CMCapture asks for
+until AVFoundation lists the two cameras; then the kernel frame ring.
+
+**Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
+`VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;
+HEVC has no encoder (`VTCompressionSessionCreate` -12908, `kVTCouldNotFindVideoEncoderErr`). iOS has no
+software encoder for either; the SDM845 encoder (Venus) has no iOS driver.
+
+**Stability count (2026-11-26).** The 183 test boots of 2026-11-25/26 (each 2-5 min, apps launched in most):
+0 SpringBoard crashes; backboardd crashed (14 times) only in msys4, an experimental Metal build.

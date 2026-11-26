@@ -10,6 +10,10 @@
  * each is then killed before the next starts, so its surfaces go back first.
  * Defaults: dev.blueline.hello, domain 2 (user; 1 = system needs a system-app entitlement).
  * Prints "APPTEST: start ID" / "APPTEST: end ID" around each app and "APPTEST: PASS" or the step that failed.
+ * TCC state of the privacy services the app's Info.plist names (camera, microphone, photos) is reset
+ * before the launch, and its TCC.db rows printed. tccd ignores bundle-ID grants for ad-hoc apps (still
+ * "denied", cam5-7), so test apps carry com.apple.private.tcc.allow instead; without it tccd waits on an
+ * alert nobody taps, and AVFoundation's first call waits with it (cam4).
  * Built by tools/bluerun/build.sh-style flags, signed with apptest.ent.
  *
  * The launch is ios-flame's phone/tools/openapp.m (FBSOpenApplicationService, MIT),
@@ -19,6 +23,7 @@
  */
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <sqlite3.h>
 #include <spawn.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
@@ -103,6 +108,83 @@ run(const char *path, char *const argv[])
 
 static int test_one(char *path, NSString *bid, char *domain, int settle, int hold, BOOL kill_after);
 
+/* reset each TCC service whose usage string the app's Info.plist has (TCC.framework, private; needs
+ * com.apple.private.tcc.manager) */
+/* every TCC.db row, in any table, that names BID or the camera (diagnostic: what tccd decides from) */
+static void
+dump_tcc_rows(NSString *bid)
+{
+	sqlite3 *db;
+	if (sqlite3_open_v2("/private/var/mobile/Library/TCC/TCC.db", &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+		printf("APPTEST: TCC.db: %s\n", sqlite3_errmsg(db));
+		return;
+	}
+	NSMutableArray *tables = [NSMutableArray array];
+	sqlite3_stmt *st;
+	if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type = 'table'", -1, &st, NULL) == SQLITE_OK) {
+		while (sqlite3_step(st) == SQLITE_ROW)
+			[tables addObject:@((const char *)sqlite3_column_text(st, 0))];
+		sqlite3_finalize(st);
+	}
+	printf("APPTEST: TCC.db tables: %s\n", [tables componentsJoinedByString:@" "].UTF8String);
+	for (NSString *t in tables) {
+		NSString *q = [NSString stringWithFormat:@"SELECT * FROM \"%@\"", t];
+		if (sqlite3_prepare_v2(db, q.UTF8String, -1, &st, NULL) != SQLITE_OK)
+			continue;
+		int rows = 0;
+		while (sqlite3_step(st) == SQLITE_ROW) {
+			rows++;
+			NSMutableString *row = [NSMutableString stringWithFormat:@"APPTEST: TCC.db %@:", t];
+			BOOL hit = NO;
+			for (int c = 0; c < sqlite3_column_count(st); c++) {
+				int ty = sqlite3_column_type(st, c);
+				[row appendFormat:@" %s=", sqlite3_column_name(st, c)];
+				if (ty == SQLITE_BLOB)
+					[row appendFormat:@"<%d bytes>", sqlite3_column_bytes(st, c)];
+				else if (ty == SQLITE_NULL)
+					[row appendString:@"NULL"];
+				else {
+					const char *v = (const char *)sqlite3_column_text(st, c);
+					[row appendFormat:@"%s", v];
+					if (strstr(v, bid.UTF8String) || strstr(v, "Camera") || strstr(v, "camhello"))
+						hit = YES;
+				}
+			}
+			if (hit)
+				printf("%s\n", row.UTF8String);
+		}
+		sqlite3_finalize(st);
+		printf("APPTEST: TCC.db %s: %d rows\n", t.UTF8String, rows);
+	}
+	sqlite3_close(db);
+}
+
+static void
+reset_tcc(NSString *bid, NSDictionary *info)
+{
+	void *tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_NOW);
+	Boolean (*reset)(CFStringRef, CFStringRef) = tcc ? dlsym(tcc, "TCCAccessResetForBundleId") : NULL;
+	CFArrayRef (*info_of)(CFStringRef) = tcc ? dlsym(tcc, "TCCAccessCopyInformationForBundleId") : NULL;
+	if (reset == NULL || info_of == NULL) {
+		printf("APPTEST: TCC: no TCCAccessResetForBundleId\n");
+		return;
+	}
+	NSDictionary *keys = @{ @"NSCameraUsageDescription": @"kTCCServiceCamera",
+				@"NSMicrophoneUsageDescription": @"kTCCServiceMicrophone",
+				@"NSPhotoLibraryUsageDescription": @"kTCCServicePhotos" };
+	NSArray *before = CFBridgingRelease(info_of((__bridge CFStringRef)bid));
+	printf("APPTEST: TCC before: %s\n", [[before description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String);
+	dump_tcc_rows(bid);
+	for (NSString *k in keys)
+		if (info[k] != nil) {
+			Boolean r = reset((__bridge CFStringRef)keys[k], (__bridge CFStringRef)bid);
+			printf("APPTEST: TCC: %s reset %d\n", [keys[k] UTF8String], r);
+		}
+	NSArray *after = CFBridgingRelease(info_of((__bridge CFStringRef)bid));
+	dump_tcc_rows(bid);
+	printf("APPTEST: TCC after: %s\n", [[after description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -152,8 +234,9 @@ test_one(char *path, NSString *bid, char *domain, int settle, int hold, BOOL kil
 		[[NSFileManager defaultManager] removeItemAtPath:txt error:nil];
 		/* right after boot SpringBoard answered the open with an XPC error (app11):
 		 * let it settle, then try up to three times, 20 s apart */
-		NSString *exe = [NSDictionary dictionaryWithContentsOfURL:
-		    [p.bundleURL URLByAppendingPathComponent:@"Info.plist"]][@"CFBundleExecutable"] ?: @"Hello";
+		NSDictionary *info = [NSDictionary dictionaryWithContentsOfURL:[p.bundleURL URLByAppendingPathComponent:@"Info.plist"]];
+		NSString *exe = info[@"CFBundleExecutable"] ?: @"Hello";
+		reset_tcc(bid, info);
 		sleep(settle > 0 ? settle : 15);
 		for (int attempt = 1; attempt <= 3; attempt++) {
 			if (!open_app(bid)) {

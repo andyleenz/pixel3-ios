@@ -35,5 +35,5 @@ for src in bluerun.c hello.c ${extra[@]+"${extra[@]}"}; do
 done
 # apptest (Objective-C): install, launch and check apps (tools/bluerun/apptest.m)
 xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc \
-	-framework Foundation -framework MobileCoreServices -o out/apptest apptest.m
+	-framework Foundation -framework MobileCoreServices -lsqlite3 -o out/apptest apptest.m
 ENTITLEMENTS=apptest.ent sign out/apptest

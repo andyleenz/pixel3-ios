@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 18:30:00 +1100
+Subject: [PATCH] 0232: AppleH13CamIn service so CMCapture loads our plug-in
+
+CMCapture picks the capture device constructor by the first ISP class
+IOServiceMatching finds (H13, H10, H9, H6) and dlopens
+/System/Library/MediaCapture/H<n>ISP.mediacapture. H13's path is free on
+D22, so a stub AppleH13CamIn makes mediaserverd load our plug-in there.
+Off with bluecamsvc=0.
+---
+diff -ruN a/iokit/Kernel/arm/BlueCamIn.cpp b/iokit/Kernel/arm/BlueCamIn.cpp
+--- a/iokit/Kernel/arm/BlueCamIn.cpp	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/BlueCamIn.cpp	2026-11-26 13:23:18
+@@ -0,0 +1,43 @@
++/*
++ * 0232: the camera service CMCapture looks for.
++ *
++ * mediaserverd's CMCapture (FigCaptureGetCaptureDeviceCreateFunction) walks a table of ISP generations,
++ * {IOKit class, plug-in, constructor}: AppleH13CamIn, /System/Library/MediaCapture/H13ISP.mediacapture,
++ * H13ISPCaptureDeviceCreate first, then H10, H9 and H6. For the first class IOServiceMatching finds, it
++ * dlopens the plug-in and calls the constructor for its FigCaptureDevice. The H10 plug-in is in the
++ * shared cache (iPhone X) and needs Apple's ISP; H13's path is free, so this service makes CMCapture load
++ * our own plug-in from that path (tools/camera/bluecam). Without the plug-in file the dlopen fails, CMCapture
++ * logs it and goes on to the next entry, as before.
++ *
++ * Off with boot-arg bluecamsvc=0. Frames will come through a user client here (later stage).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class AppleH13CamIn : public IOService {
++	OSDeclareDefaultStructors(AppleH13CamIn);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleH13CamIn, IOService);
++
++bool
++AppleH13CamIn::start(IOService *provider)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("bluecamsvc", &on, sizeof(on));
++	if (!on || !IOService::start(provider)) {
++		return false;
++	}
++	setProperty("BlueCam", "pixel 3 camss stand-in for CMCapture (0232)");
++	registerService();
++	IOLog("BLUECAM: AppleH13CamIn registered (CMCapture loads H13ISP.mediacapture)\n");
++	return true;
++}
++#endif
+diff -ruN a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp	2026-11-26 13:23:17
++++ b/iokit/KernelConfigTables.cpp	2026-11-26 13:23:18
+@@ -63,6 +63,11 @@
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleH13CamIn;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleH13CamIn;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-26 13:23:17
++++ b/iokit/conf/files.arm64	2026-11-26 13:23:18
+@@ -15,6 +15,7 @@
+ iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/BlueCamIn.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/BlueBattery.cpp                                 optional iokitcpp

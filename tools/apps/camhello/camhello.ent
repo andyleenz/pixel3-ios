@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key><string>BLUELINE00.dev.blueline.camhello</string>
+	<key>com.apple.developer.team-identifier</key><string>BLUELINE00</string>
+	<key>get-task-allow</key><true/>
+	<!-- tccd answers "denied" for ad-hoc apps even with a bundle-ID grant in TCC.db (cam5-7); Apple's own apps
+	     use this exemption -->
+	<key>com.apple.private.tcc.allow</key><array><string>kTCCServiceCamera</string></array>
+</dict>
+</plist>

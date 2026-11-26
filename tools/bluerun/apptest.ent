@@ -8,6 +8,7 @@
 	<key>com.apple.private.security.container-manager</key><true/>
 	<key>com.apple.private.MobileContainerManager.allowed</key><true/>
 	<key>com.apple.frontboardservices.display-layout-monitor</key><true/>
+	<key>com.apple.private.tcc.manager</key><true/>
 	<key>platform-application</key><true/>
 </dict>
 </plist>
