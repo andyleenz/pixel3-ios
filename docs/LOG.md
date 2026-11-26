@@ -1379,6 +1379,23 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**Cellular boots cell1-3 (2026-11-27).**
+- cell1 (`bluewifi=4`): wrong level, the modem only probed (stage 2 step 1). No QRTR, so the bridge never
+  published; CommCenter crash loop (48) in `ApplePDPHelperInterface::callStructMethod`, a mutex on a null
+  connection: ApplePDPHelper opens `AppleIPAppender`, which 0238 left to the bridge.
+- cell2 (`bluewifi=6 bluewifi_step=4 bluewifi_watch=0 bluecell=1`): modem up, GLINK/IPCRTR open, 38 QMI
+  services announced, the bridge published 22 services, one QMI exchange (UIM 0x47) answered, no CommCenter
+  crash. ABM opened no channel.
+- 0240: AppleIPAppender published at boot in every case (methods refused until the bridge is up); trace of
+  the first 64 AppleBaseband calls. cell3: CommCenter and abm-helper call selectors 3, 15, 22, 23, 32, all
+  answered.
+- iOS log (tools/oslog-pull.sh mid-run, with the dyld cache, CommCenter and abm-helper uuidtext): ABM sets up
+  QMux on MAV_ROUTER_QMI_0, then `boot.mod: Failed on preparation for booting!` and declares the baseband
+  dead. The check is `BootControllerLegacy::prepare`: stat of
+  `capabilities::bb::radio::getPersonalizedFirmwarePath()`, which on the phone (a dlsym test, fwpath) is
+  `/private/preboot/<boot-manifest-hash>/usr/local/standalone/firmware/Baseband/Mav17`. The hash is mkadt's
+  fixed `boot-manifest-hash`. cell4 pushes Mav17 there, plus a logging profile with private data on.
+
 **therm8, 0239 (2026-11-27).**
 - 0237 works: every board sensor (PMU tdev1-5, tcal, TG0V) first read 31.6 C (battery 32.7 C), where it was
   55-69 C from TSENS. The ADC start-up lines had left the log ring by the end of the hour.
