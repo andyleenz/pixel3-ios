@@ -8,6 +8,7 @@
  */
 #import <Metal/Metal.h>
 #import <SpriteKit/SpriteKit.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
 #include <mach/mach_time.h>
 
@@ -25,9 +26,11 @@ now_ms(void)
 
 @implementation Scene {
 	unsigned _frames;
-	CFTimeInterval _start;
-	double _updateAt, _physicsMs;
+	CFTimeInterval _start, _first180, _steady;   /* frame 1, frame 181, frame 121 */
+	double _updateAt, _physicsMs, _physics180;
 	BOOL _written;
+	CFTimeInterval _prev;
+	unsigned _gaps[5];      /* frames 121-300: vsyncs between updates, 1 2 3 4 5+ */
 }
 
 - (void)didSimulatePhysics
@@ -73,11 +76,33 @@ now_ms(void)
 	_updateAt = now_ms();
 	if (_frames++ == 0)
 		_start = now;
-	if (_frames == 181 && !_written) {
+	if (_frames == 121)
+		_steady = now;
+	if (_frames > 121 && _frames <= 301) {
+		long g = lround((now - _prev) * 60.0);
+		_gaps[g < 1 ? 0 : (g > 5 ? 4 : g - 1)]++;
+	}
+	_prev = now;
+	if (_frames == 181) {
+		_first180 = now - _start;
+		_physics180 = _physicsMs / 181;
+	}
+	/* frames 121-300 too: the first 120 include the launch */
+	if (_frames == 301 && !_written) {
 		_written = YES;
 		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-		NSString *line = [NSString stringWithFormat:@"spritehello: device %@, 180 frames in %.2f s (%.1f fps), physics %.1f ms a frame, %lu nodes\n",
-		    dev ? dev.name : @"none", now - _start, 180 / (now - _start), _physicsMs / 181, (unsigned long)self.children.count];
+		CALayer *layer = self.view.layer;
+		NSString *drawables = [layer isKindOfClass:[CAMetalLayer class]] ?
+		    [NSString stringWithFormat:@"CAMetalLayer, %lu drawables, presentsWithTransaction %d, %.0fx%.0f",
+		    (unsigned long)((CAMetalLayer *)layer).maximumDrawableCount, ((CAMetalLayer *)layer).presentsWithTransaction,
+		    ((CAMetalLayer *)layer).drawableSize.width, ((CAMetalLayer *)layer).drawableSize.height] :
+		    NSStringFromClass(layer.class);
+		drawables = [drawables stringByAppendingFormat:@"; vsyncs between updates 1:%u 2:%u 3:%u 4:%u 5+:%u",
+		    _gaps[0], _gaps[1], _gaps[2], _gaps[3], _gaps[4]];
+		NSString *line = [NSString stringWithFormat:@"spritehello: device %@, 180 frames in %.2f s (%.1f fps), physics %.1f ms a frame, %lu nodes; "
+		    "frames 121-300 %.1f fps; layer %@\n",
+		    dev ? dev.name : @"none", _first180, 180 / _first180, _physics180, (unsigned long)self.children.count,
+		    180 / (now - _steady), drawables];
 		NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 		[[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
 		[line writeToFile:[docs stringByAppendingPathComponent:@"hello.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
