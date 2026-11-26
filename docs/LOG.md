@@ -1347,8 +1347,14 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   converts RAW through per-channel tables.
 - cam31 (device frames): apptest stopped after miinstall (LaunchServices step never returned); not a camera result.
 
-Next: the plug-in reads the device (2x2 cell debayer, grey-world white balance, gain to a
-green target, gamma) into the pool buffers; `/private/var/tmp/bluecam_synthetic` keeps the synthetic frames.
+- cam34: **sensor frames in an app.** mediaserverd opens `/dev/blueline-camera`; CamHello gets 130 frames,
+  16.5 fps, 1920x1080 BGRA. WM0's 0x2200 holds the address of the frame just done (every done matched: no
+  missed dones). The per-pixel conversion was the limit.
+- cam35: the conversion makes each row of cells once and reuses it for the output rows that map to it, in 8
+  bands on all cores: 6-7 ms a 1080p frame. CamHello: **229 frames, 29.8 fps, 0 dropped**. Picture black
+  (centre mean 0, auto gain at its 32x limit): lens face down; a lit scene is still to be shown.
+
+Next: a lit scene (one frame saved as PGM), the preview layer on screen, then photos (assetsd).
 
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;

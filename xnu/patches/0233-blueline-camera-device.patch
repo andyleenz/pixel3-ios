@@ -356,9 +356,9 @@ diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
 +		lck_mtx_lock(&dev_lock);
 +		if (dev_hwn > 0) {
 +			struct dev_buf *d = &dev_buf[dev_hwq[0]];
-+			/* (a check: a missed done would leave the model one buffer behind the write master's address) */
++			/* (a check: 0x2200 holds the address of the frame just done (camdev, cam34); a missed done shows as another) */
 +			uint32_t wa = rd32(vfe + 0x2200);
-+			if (dev_hwn > 1 && wa != (uint32_t)dev_buf[dev_hwq[1]].pa && dev_mismatch++ < 5) {
++			if (wa != (uint32_t)d->pa && dev_mismatch++ < 5) {
 +				printf("BLUE CAM: dev: frame %llu: WM0 at 0x%x, the model has 0x%llx next (done 0x%llx), period %llu ms\n",
 +				    dev_frames + 1, wa, dev_buf[dev_hwq[1]].pa, d->pa, period);
 +			}

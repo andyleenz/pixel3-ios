@@ -478,7 +478,7 @@ fillRaw(CVPixelBufferRef pb, const struct blueline_camera_frame *f, const uint8_
 	size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
 	OSType pf = CVPixelBufferGetPixelFormatType(pb);
 	uint32_t cw = f->width / 2, ch = f->height / 2;
-	int black8 = (int)f->black / 4, rgb[3];
+	int black8 = (int)f->black / 4;
 	uint8_t lut[3][272];	/* cell value + 16 (black-subtracted 8-bit, -16..255) -> output, gains and gamma folded in */
 	for (int k = 0; k < 3; k++) {
 		float m = isp.wb[k] * isp.gain * 4;
@@ -499,29 +499,56 @@ fillRaw(CVPixelBufferRef pb, const struct blueline_camera_frame *f, const uint8_
 	uint8_t *cp = nv ? CVPixelBufferGetBaseAddressOfPlane(pb, 1) : NULL;
 	size_t bpr = bgra ? CVPixelBufferGetBytesPerRow(pb) : nv ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0) : 0;
 	size_t cs = nv ? CVPixelBufferGetBytesPerRowOfPlane(pb, 1) : 0;
-	for (size_t y = 0; base && y < h; y++) {
-		uint32_t cy = (uint32_t)(y * ch / h);
-		uint8_t *row = base + y * bpr;
-		for (size_t x = 0; x < w; x++) {
-			cell(f, raw, xs[x], cy, black8, rgb);
-			uint8_t o[3];
-			for (int k = 0; k < 3; k++)
-				o[k] = lut[k][rgb[k] < -16 ? 0 : rgb[k] + 16];
-			if (bgra) {
-				row[4 * x] = o[2], row[4 * x + 1] = o[1], row[4 * x + 2] = o[0], row[4 * x + 3] = 255;
-				continue;
+	/*
+	 * Bands of rows on all cores. Each band converts a row of cells once (into BGRA words) and reuses it for every
+	 * output row that maps to it: 1080p from 1008x756 cells is ~1.4 rows a cell row, ~1.9 pixels a cell.
+	 */
+	enum { BANDS = 8 };
+	const uint8_t (*L)[272] = (const uint8_t (*)[272])lut;
+	if (base)
+		dispatch_apply(BANDS, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t band) {
+			size_t y0 = h * band / BANDS, y1 = h * (band + 1) / BANDS;
+			if (nv)
+				y0 &= ~(size_t)1, y1 = band == BANDS - 1 ? h : (y1 & ~(size_t)1);	/* chroma rows stay in one band */
+			uint32_t *cells = malloc(cw * sizeof *cells);
+			if (cells == NULL)
+				return;
+			uint32_t have = UINT32_MAX;
+			for (size_t y = y0; y < y1; y++) {
+				uint32_t cy = (uint32_t)(y * ch / h);
+				if (cy != have) {
+					int rgb[3];
+					for (uint32_t c = 0; c < cw; c++) {
+						cell(f, raw, c, cy, black8, rgb);
+						uint32_t r = L[0][rgb[0] < -16 ? 0 : rgb[0] + 16], g = L[1][rgb[1] < -16 ? 0 : rgb[1] + 16],
+						    b = L[2][rgb[2] < -16 ? 0 : rgb[2] + 16];
+						cells[c] = b | g << 8 | r << 16 | 0xffu << 24;	/* BGRA in memory */
+					}
+					have = cy;
+				}
+				uint8_t *row = base + y * bpr;
+				if (bgra) {
+					uint32_t *o32 = (uint32_t *)row;
+					for (size_t x = 0; x < w; x++)
+						o32[x] = cells[xs[x]];
+					continue;
+				}
+				for (size_t x = 0; x < w; x++) {
+					uint32_t v = cells[xs[x]];
+					int R = (v >> 16) & 0xff, G = (v >> 8) & 0xff, B = v & 0xff;
+					int Y = (77 * R + 150 * G + 29 * B) >> 8;	/* BT.601 */
+					row[x] = full ? (uint8_t)Y : (uint8_t)(16 + (Y * 219 >> 8));
+					if ((y & 1) == 0 && (x & 1) == 0) {
+						int cb = (-43 * R - 85 * G + 128 * B) >> 8, cr = (128 * R - 107 * G - 21 * B) >> 8;
+						if (!full)
+							cb = cb * 224 >> 8, cr = cr * 224 >> 8;
+						cp[(y / 2) * cs + x] = (uint8_t)(cb + 128);
+						cp[(y / 2) * cs + x + 1] = (uint8_t)(cr + 128);
+					}
+				}
 			}
-			int Y = (77 * o[0] + 150 * o[1] + 29 * o[2]) >> 8;	/* BT.601 full range */
-			row[x] = full ? (uint8_t)Y : (uint8_t)(16 + (Y * 219 >> 8));
-			if ((y & 1) == 0 && (x & 1) == 0) {
-				int cb = ((-43 * o[0] - 85 * o[1] + 128 * o[2]) >> 8), cr = ((128 * o[0] - 107 * o[1] - 21 * o[2]) >> 8);
-				if (!full)
-					cb = cb * 224 >> 8, cr = cr * 224 >> 8;
-				cp[(y / 2) * cs + x] = (uint8_t)(cb + 128);
-				cp[(y / 2) * cs + x + 1] = (uint8_t)(cr + 128);
-			}
-		}
-	}
+			free(cells);
+		});
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	free(xs);
 }
@@ -604,8 +631,13 @@ frameThread(void *arg)
 				CVPixelBufferRef pb = pbs[i];
 				if (pb == NULL)
 					continue;
-				if (raw)
+				if (raw) {
+					uint64_t c0 = mach_absolute_time();
 					fillRaw(pb, f, raw);
+					if (n < 3 || n % 150 == 0)
+						say("frame %u: %zux%zu filled in %.1f ms", n, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
+						    (mach_absolute_time() - c0) * (double)tb.numer / tb.denom / 1e6);
+				}
 				else
 					fillSynthetic(pb, n, fps);
 				CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
