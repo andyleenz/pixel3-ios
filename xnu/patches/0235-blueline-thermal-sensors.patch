@@ -1,0 +1,245 @@
+blueline: SoC temperatures for thermalmonitord (bluethermal=1)
+
+BlueThermal on IOResources makes one HID temperature service (0xFF00, 0x05) per
+sensor name in D22AP-Info.plist that SDM845 TSENS can stand for (Gold, Silver,
+L3, GPU, always-on, memory, Wi-Fi, camera, video, modem); copyEvent answers
+kIOHIDEventTypeTemperature with the reading (first, mean or highest).
+
+--- a/iokit/KernelConfigTables.cpp	2026-11-26 16:44:11
++++ b/iokit/KernelConfigTables.cpp	2026-11-26 16:44:12
+@@ -88,6 +88,11 @@
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = BlueThermal;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = BlueThermal;"
++    "   },"
++    "   {"
+     "     'IOClass'         = BlueFakeAccel;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = BlueFakeAccel;"
+--- a/iokit/conf/files.arm64	2026-11-26 16:44:11
++++ b/iokit/conf/files.arm64	2026-11-26 16:44:12
+@@ -27,6 +27,7 @@
+ iokit/Kernel/arm/MiniIPAppender.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
++iokit/Kernel/arm/hid/BlueThermal.cpp                             optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+--- a/iokit/Kernel/arm/hid/BlueThermal.cpp	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-26 16:44:11
+@@ -0,0 +1,211 @@
++/*
++ * Pixel 3 (blueline): SoC temperatures for thermalmonitord (patch 0235). Boot-arg bluethermal=1 turns it on.
++ *
++ * thermalmonitord (iOS 16.7.16) takes its sensor list from /System/Library/ThermalMonitor/D22AP-Info.plist
++ * ("Sensors": 4CharCode, matchName) and finds each sensor through an IOHIDEventSystemClient: a HID service
++ * whose Product is the matchName, read with IOHIDServiceClientCopyEvent(kIOHIDEventTypeTemperature) (the
++ * same services Apple's PMU and PMGR drivers publish, usage pair (0xFF00, 0x05)).
++ *
++ * BlueThermal, on IOResources, makes one BlueThermalSensor per name below; each answers copyEvent with the
++ * SDM845 TSENS sensors it stands for (TSENS v2 TM status, 12-bit signed, 0.1 C): the first, the mean ("Avg:")
++ * or the highest ("Max:"). The mapping is by role, not by position on the die: Apple's P-core and GPU die
++ * sensors take the Gold cluster and the GPU, the E-core ACC sensor the Silver cluster, the PMU's the
++ * always-on, Wi-Fi, camera, video and modem sensors. Sensors without a reading answer nothing (no event).
++ * Battery (TG0B, TG0V), microphones and synthetic skin sensors are not provided.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++#include "IOHIDEventService.h"
++#include "IOHIDEvent.h"
++#include "IOHIDKeys.h"
++
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define BLUE_TSENS0_TM		0x0c263000u	/* 13 sensors: 1-4 cpu0-3, 5-6 L3, 7-10 cpu4-7, 11-12 GPU */
++#define BLUE_TSENS1_TM		0x0c265000u	/* 8 sensors: 0 aoss1, 1 modem DSP, 2 memory, 3 Wi-Fi, 4 HVX, 5 camera, 6 video, 7 modem */
++#define BLUE_TM_STATUS		0x0a0u
++#define BLUE_TEMP_PAGE		0xFF00u		/* kHIDPage_AppleVendor */
++#define BLUE_TEMP_USAGE		0x05u		/* kHIDUsage_AppleVendor_TemperatureSensor */
++
++enum { kFirst, kAvg, kMax };
++#define S0(n)	(n)			/* tsens0 sensor n */
++#define S1(n)	(0x10 | (n))		/* tsens1 sensor n */
++
++static const struct blue_tz {
++	const char *name;
++	uint8_t how, n, ids[4];
++} blue_tz[] = {
++	{ "PMGR SOC Die Temp Sensor0", kFirst, 2, { S0(7), S0(8) } },
++	{ "Avg: PMGR SOC Die Temp Sensor0", kAvg, 2, { S0(7), S0(8) } },
++	{ "Max: PMGR SOC Die Temp Sensor0", kMax, 2, { S0(7), S0(8) } },
++	{ "PMGR SOC Die Temp Sensor1", kFirst, 2, { S0(9), S0(10) } },
++	{ "Avg: PMGR SOC Die Temp Sensor1", kAvg, 2, { S0(9), S0(10) } },
++	{ "Max: PMGR SOC Die Temp Sensor1", kMax, 2, { S0(9), S0(10) } },
++	{ "PMGR SOC Die Temp Sensor2", kFirst, 1, { S0(11) } },
++	{ "Avg: PMGR SOC Die Temp Sensor2", kAvg, 1, { S0(11) } },
++	{ "Max: PMGR SOC Die Temp Sensor2", kMax, 1, { S0(11) } },
++	{ "PMGR SOC Die Temp Sensor3", kFirst, 1, { S0(12) } },
++	{ "Avg: PMGR SOC Die Temp Sensor3", kAvg, 1, { S0(12) } },
++	{ "Max: PMGR SOC Die Temp Sensor3", kMax, 1, { S0(12) } },
++	{ "ACC Temp Sensor0", kFirst, 4, { S0(1), S0(2), S0(3), S0(4) } },
++	{ "Avg: ACC Temp Sensor0", kAvg, 4, { S0(1), S0(2), S0(3), S0(4) } },
++	{ "Max: ACC Temp Sensor0", kMax, 4, { S0(1), S0(2), S0(3), S0(4) } },
++	{ "ACC Temp Sensor1", kFirst, 1, { S0(5) } },
++	{ "Avg: ACC Temp Sensor1", kAvg, 1, { S0(5) } },
++	{ "Max: ACC Temp Sensor1", kMax, 1, { S0(5) } },
++	{ "ACC Temp Sensor2", kFirst, 1, { S0(6) } },
++	{ "Avg: ACC Temp Sensor2", kAvg, 1, { S0(6) } },
++	{ "Max: ACC Temp Sensor2", kMax, 1, { S0(6) } },
++	{ "NAND CH0 temp", kFirst, 1, { S1(2) } },
++	{ "PMU tdev1", kFirst, 1, { S1(0) } },
++	{ "PMU tdev2", kFirst, 1, { S1(3) } },
++	{ "PMU tdev3", kFirst, 1, { S1(5) } },
++	{ "PMU tdev4", kFirst, 1, { S1(6) } },
++	{ "PMU tdev5", kFirst, 1, { S1(7) } },
++	{ "PMU tcal", kFirst, 1, { S0(0) } },
++	{ "PMU tjunc", kMax, 4, { S0(7), S0(8), S0(9), S0(10) } },
++};
++#define BLUE_TZ_N	(sizeof(blue_tz) / sizeof(blue_tz[0]))
++
++static vm_offset_t blue_tm[2];
++
++/* One TSENS sensor in 0.1 C; false when it has no valid reading. */
++static bool
++blue_tsens(uint8_t id, int *dc)
++{
++	vm_offset_t tm = blue_tm[id >> 4];
++	if (!tm) {
++		return false;
++	}
++	uint32_t st = *(volatile uint32_t *)(tm + BLUE_TM_STATUS + 4u * (id & 0xfu));
++	if (!((st >> 21) & 1u)) {
++		return false;
++	}
++	int v = (int)(st & 0xfffu);
++	*dc = v & 0x800 ? v - 0x1000 : v;
++	return true;
++}
++
++static bool
++blue_tz_read(const struct blue_tz *z, int *dc)
++{
++	int sum = 0, max = -10000, got = 0, v;
++	for (uint8_t i = 0; i < z->n; i++) {
++		if (blue_tsens(z->ids[i], &v)) {
++			if (got == 0 && z->how == kFirst) {
++				*dc = v;
++				return true;
++			}
++			sum += v;
++			max = v > max ? v : max;
++			got++;
++		}
++	}
++	if (got == 0) {
++		return false;
++	}
++	*dc = z->how == kMax ? max : sum / got;
++	return true;
++}
++
++class BlueThermalSensor : public IOHIDEventService {
++	OSDeclareDefaultStructors(BlueThermalSensor);
++public:
++	bool initWith(unsigned index);
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = NULL,
++	    IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return BLUE_TEMP_PAGE; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return BLUE_TEMP_USAGE; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x7400u + fIndex; }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 1000000; }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString(blue_tz[fIndex].name); }
++private:
++	unsigned fIndex, fReads;
++};
++OSDefineMetaClassAndStructors(BlueThermalSensor, IOHIDEventService);
++
++bool
++BlueThermalSensor::initWith(unsigned index)
++{
++	fIndex = index;
++	return init();
++}
++
++bool
++BlueThermalSensor::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty("Transport", "SPU");
++	registerService();
++	return true;
++}
++
++IOHIDEvent *
++BlueThermalSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	int dc;
++	if (type != kIOHIDEventTypeTemperature || !blue_tz_read(&blue_tz[fIndex], &dc)) {
++		return NULL;
++	}
++	if (fReads++ == 0) {
++		IOLog("BLUELINE THERMAL: first read of \"%s\": %d.%d C\n", blue_tz[fIndex].name, dc / 10, (dc < 0 ? -dc : dc) % 10);
++	}
++	return IOHIDEvent::temperatureEvent(mach_absolute_time(), (IOFixed)((dc * 65536) / 10));
++}
++
++IOReturn
++BlueThermalSensor::setProperties(OSObject *properties)
++{
++	(void)properties;	/* ReportInterval and the like: readings are taken when asked for */
++	return kIOReturnSuccess;
++}
++
++class BlueThermal : public IOService {
++	OSDeclareDefaultStructors(BlueThermal);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(BlueThermal, IOService);
++
++bool
++BlueThermal::start(IOService *provider)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("bluethermal", &on, sizeof(on));
++	if (!on || !IOService::start(provider)) {
++		return false;
++	}
++	blue_tm[0] = ml_io_map(BLUE_TSENS0_TM, 0x200);
++	blue_tm[1] = ml_io_map(BLUE_TSENS1_TM, 0x200);
++	if (!blue_tm[0] || !blue_tm[1]) {
++		IOLog("BLUELINE THERMAL: TSENS map failed\n");
++		return false;
++	}
++	unsigned made = 0;
++	for (unsigned i = 0; i < BLUE_TZ_N; i++) {
++		BlueThermalSensor *s = new BlueThermalSensor;
++		if (s && s->initWith(i) && s->attach(this)) {
++			if (s->start(this)) {
++				made++;
++			} else {
++				s->detach(this);
++			}
++		}
++		OSSafeReleaseNULL(s);
++	}
++	int dc = 0;
++	bool ok = blue_tz_read(&blue_tz[0], &dc);
++	IOLog("BLUELINE THERMAL: %u of %u temperature services (usage pair 0x%x 0x%x); %s %s%d.%d C\n", made,
++	    (unsigned)BLUE_TZ_N, BLUE_TEMP_PAGE, BLUE_TEMP_USAGE, blue_tz[0].name, ok ? "" : "no reading ",
++	    dc / 10, (dc < 0 ? -dc : dc) % 10);
++	registerService();
++	return true;
++}
