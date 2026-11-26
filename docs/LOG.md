@@ -1379,6 +1379,15 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**cell4: Apple's baseband manager boots the Pixel's modem (2026-11-27).**
+- Mav17 in the preboot path: `boot.mod: Baseband bootup succeeded`, Booted -> IsReady (971 ms; the image
+  "push" is the bridge's no-op, the modem was already running), transport client started.
+- CommCenter's stack then runs over the bridge to the Pixel's own modem firmware: QMI CTL, WDS, NAS, DMS,
+  QOS, UIM and Apple's AWD/BSP services; the modem answers (some QMI_ERR_NOT_SUPPORTED / DEVICE_NOT_READY
+  for Apple-specific requests: RF/factory calibration, field test, operating mode at first).
+- UIM GetCardStatus: "SIM card absent (tray present)", kSimStateNoSim; registration kUnknown. Next: a SIM
+  in the tray (or the modem's own view of the slot), then NAS registration.
+
 **Cellular boots cell1-3 (2026-11-27).**
 - cell1 (`bluewifi=4`): wrong level, the modem only probed (stage 2 step 1). No QRTR, so the bridge never
   published; CommCenter crash loop (48) in `ApplePDPHelperInterface::callStructMethod`, a mutex on a null
