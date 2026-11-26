@@ -1,0 +1,18 @@
+0243: the bridge's QMI trace prints DMS answers and indications in hex (operating mode, offline reason).
+
+diff -urN a/iokit/Kernel/arm/baseband/coachz_baseband.cpp b/iokit/Kernel/arm/baseband/coachz_baseband.cpp
+--- a/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-27 10:53:23
++++ b/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-27 10:53:23
+@@ -175,6 +175,12 @@
+   bb_trace_lines++;
+   printf("COACHZ qmi: %s ch %u svc 0x%x cid %u type %u msg 0x%x txn %u len %u err 0x%x n %u t %u\n",
+          dir, channel, service, cid, type, message, txn, n, error, count, bb_now_ms());
++  // 0243: DMS answers and indications in full (operating mode, offline reason, hardware restriction)
++  if (service == 2u && type != 0u && n <= 96u) {
++    char hex[3 * 96 + 1];
++    for (uint32_t i = 0; i < n; i++) snprintf(hex + 3 * i, 4, " %02x", sdu[i]);
++    printf("COACHZ qmi: DMS msg 0x%x:%s\n", message, hex);
++  }
+ }
+ // A QMUX frame (I/F type 1, length, flags, service, client id, then the SDU).
+ static void bb_trace_frame(const char *dir, uint32_t channel, const uint8_t *frame, uint32_t len)

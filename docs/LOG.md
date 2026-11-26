@@ -1391,6 +1391,9 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   `mcfg.version`. Online still refused: the one request came at 47.7 s, before the MCFG load ended, and
   CommCenter did not ask again.
 - 0242: the bridge holds a DEVICE_NOT_READY answer and resends the request each second for up to 8 s.
+- cell7: 8 resends over 8 s, the last two after the MCFG load ended; all DEVICE_NOT_READY. Not (only) timing.
+  DMS GET_OPERATING_MODE's answer has the mode TLV alone (no offline-reason TLV); ABM logs the mode as
+  "Unknown". 0243 dumps DMS answers in hex.
 
 **cell4: Apple's baseband manager boots the Pixel's modem (2026-11-27).**
 - Mav17 in the preboot path: `boot.mod: Baseband bootup succeeded`, Booted -> IsReady (971 ms; the image
