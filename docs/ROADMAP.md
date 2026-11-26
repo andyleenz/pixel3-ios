@@ -10,7 +10,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 | Wi-Fi 5 GHz | needs a reference | ruled out: second rail (stock DT has ch0 only), board data, regulatory (firmware allows ch 36), ath10k pdev params (0236). Next: WMI trace from Android/Linux on this phone to diff; radio in the default boot | 1-2 days |
 | Cellular control, SMS | in progress | 0238 (`bluecell=1`): QcomBaseband bridge on our QRTR, builds; iOS 16.7 selectors match the reference; `mkadt --baseband`; Mav17 firmware fetched. Next: first boot (ABM boot, QMUX clients, SIM, registration) | 2-4 days |
 | Mobile data | more work | IPA v3.5.1 + GSI (Linux `drivers/net/ipa` has SDM845) | +4-6 days |
-| Bluetooth | realistic | WCN3990 on a GENI UART (FIFO mode), init as Linux `btqca.c` / `hci_qca.c` (GPL: reimplement or keep in userland); UniXNU/QcaBluetooth replaces BlueTool's firmware step | 2-4 days |
+| Bluetooth | realistic | WCN3990 on a GENI UART (FIFO mode), init as Linux `btqca.c` / `hci_qca.c` (GPL: reimplement or keep in userland). UniXNU/QcaBluetooth (fa52814) is WCN7850 on iPadOS 27 with Linux code in its kernel and a patched bluetoothd; reusable as design (UART.SK pipe, BlueTool XPC stand-in, Type0 capabilities), not as code; iOS 16 bluetoothd transport still to check | 2-4 days |
 | Sensors / CoreMotion | heaviest | iOS side known (0135 HID usages); hardware behind the SLPI: boot it (0186 loader), FastRPC sensor registry (never write persist), QMI sensor client | ~1 week |
 | Auto-brightness | after sensors | ALS over the same SLPI stream to HID (0xff00/4) | +0.5 day |
 | Microphone | hard-ish | SLIMbus NGD + WCD934x + AFE TX port, input stream in the audio HAL | 3-5 days |

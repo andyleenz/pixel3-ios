@@ -91,6 +91,10 @@ cmdline="$base $extra"	# XNU's boot-args line holds 607 bytes (mkpayload.py refu
 out=work/test; mkdir -p "$out"
 t0=$(date +%s)
 say() { printf '[%3ds] %s\n' $(( $(date +%s) - t0 )) "$*"; }
+limit() {	# SECONDS CMD...: run CMD, kill it after SECONDS (fastboot can hang on a wedged USB link)
+	local secs=$1; shift
+	perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+}
 
 # Each run leaves ~120 MB of rebuildable images (payload, shim, ADT, push bundle); keep the newest
 # 10 of each kind (PHONETEST_KEEP), never this run's, never logs or snaps.
@@ -131,9 +135,11 @@ if [ ${#pushes[@]} -gt 0 ]; then
 	if ! adb devices | grep -q 'recovery$'; then
 		# slot B's boot is LineageOS recovery: a plain restart lands there (docs/TESTING.md)
 		say "getting the phone to recovery for the push"
-		fastboot devices | grep -q fastboot || { say "phone is neither in recovery nor in fastboot"; exit 1; }
-		fastboot --set-active=b > /dev/null 2>&1 || true
-		fastboot reboot > /dev/null 2>&1
+		limit 10 fastboot devices | grep -q fastboot || { say "phone is neither in recovery nor in fastboot"; exit 1; }
+		limit 15 fastboot getvar product > /dev/null 2>&1 ||
+			{ say "fastboot sees the phone but it does not answer: replug the USB cable or hold Power + Volume Down"; exit 1; }
+		limit 15 fastboot --set-active=b > /dev/null 2>&1 || true
+		limit 15 fastboot reboot > /dev/null 2>&1
 		for _ in $(seq 1 60); do adb devices | grep -q 'recovery$' && break; sleep 3; done
 		adb devices | grep -q 'recovery$' || { say "no recovery after 3 min"; exit 1; }
 	fi
@@ -148,12 +154,12 @@ if adb devices | grep -q 'recovery$'; then
 fi
 # ABL counts each RAM boot as a failed slot-B boot and eventually falls back to
 # slot A (tap-free adb there too since 2026-11-19); re-marking B active resets its retry count.
-for _ in $(seq 1 60); do fastboot devices | grep -q fastboot && break; sleep 1; done
-if ! fastboot devices | grep -q fastboot; then	# fastboot would otherwise wait forever, silently
+for _ in $(seq 1 60); do limit 10 fastboot devices | grep -q fastboot && break; sleep 1; done
+if ! limit 10 fastboot devices | grep -q fastboot; then	# fastboot would otherwise wait forever, silently
 	say "phone not visible to fastboot after 60 s; if its screen shows fastboot, replug the USB cable (or hold Power + Volume Down)"
 	exit 1
 fi
-fastboot --set-active=b > "$out/$name-slot.txt" 2>&1 || say "warning: set-active=b failed (see $out/$name-slot.txt)"
+limit 15 fastboot --set-active=b > "$out/$name-slot.txt" 2>&1 || say "warning: set-active=b failed (see $out/$name-slot.txt)"
 say "RAM boot"
 tools/fbboot.sh "$out/$name-shim.img" 3 > "$out/$name-fastboot.txt" 2>&1 || { cat "$out/$name-fastboot.txt"; exit 1; }
 
