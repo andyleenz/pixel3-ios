@@ -1312,8 +1312,43 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   (per-process memory limit). Core Image's specialized kernels from `ci_stdlib` (`_gaussianBlur7` and others)
   are refused (`EntryNotFound`, 194 entries).
 
-Next: the device and stream `Clock`, the stream's output configuration and handler properties and Start
-(synthetic frames first, as redfin did), then the kernel frame ring.
+- cam30 (plug-in stage 3): device and stream answer `Clock` (host time clock), the stream keeps
+  `VideoOutputConfigurations` / `VideoOutputsEnabled` / `VideoOutputHandlers` and Start runs a 30 fps frame thread
+  (one pool buffer per enabled output, held 3 deep, metadata dictionary attached). The graph got to setting
+  handlers and `FormatIndex`, then mediaserverd threw twice:
+  - VideoToolbox `FigGetAlignmentForIOSurfaceOutputToDisplayService` reads AppleCLCD
+    `DisplayPipePlaneBaseAlignment` and `DisplayPipeStrideRequirements` as dictionaries
+    (`PlaneBaseAlignmentLinear`, `StrideLinearHorizontal`); SweetFramebuffer had a number. Kernel 0234.
+  - Core Image's `VisibleFunctionStitchingDescriptor::post_process` inserts the result of
+    `newFunctionWithName:constantValues:` for `_ci_init_destcoord` and others into an array; the frontend
+    returned nil for a visible function with no specialization. am-0008 returns the plain function.
+
+**Camera device (kernel 0233, `/dev/blueline-camera`).** redfin's ABI (`BLFRAME1` header, then RAW10
+2016x1512, stride 2528, RGGB, black 64); the first open powers the rear group up and streams into a ring of four
+4 MiB buffers, the last close powers it down. `tools/camera/camtest` reads N frames. `bluecamdev=0` no node,
+`=2` refuse opens (logs the opener), `=3` write the log to UFS after each line of a session.
+- camdev1-4: the phone froze ~6 s after SpringBoard with no panic. `=2` booted normally (only camtest opens it),
+  so the freeze is in the session. `=3` (camdev6): the ring buffers were at 0x1017b0000 and up. The write master
+  takes 32-bit addresses, so it wrote at 0x017b0000 (kernel memory). `kmem_alloc_contig`'s `max_pnum` counts
+  16 KiB pages: 0xfffff allowed 16 GiB. (0194's single buffer had the same limit and landed at 0xfc7b8000.)
+- With the right limit (camdev7-8) there is no 4 MiB contiguous below 4 GiB, even at boot: XNU's RAM starts at
+  0xf4000000. The ring is now a 16 MiB carve-out XNU does not manage, at 0xd0000000 (`bluecam_pool`), next to the
+  GPU pool, mapped through ml_io_map; 0994 raises that region from 64 to 128 MB.
+- camdev10: 60 of 60 frames whole and in order, sensor at 30.0 fps (226 frames, none without a buffer), stable
+  boot. Centre row mean 64.1 (the black level: lens probably face down). Write-combined, read() took ~100 ms a
+  frame (38 MB/s), so the reader got every third frame; the ring is now mapped cacheable and cleaned and
+  invalidated before each copy.
+
+- camdev11 (cacheable): 60 of 60 frames, ~32 ms a read, 73 sensor frames over 2.4 s.
+- 0994 (io_map region 128 MB) dropped: `ml_io_map_unmappable` allocates from `kernel_map`, not the io submap.
+- cam32, plug-in with synthetic frames (`/private/var/tmp/bluecam_synthetic`), 0234 and am-0008: CamHello gets
+  **227 frames, 29.4 fps, 1920x1080 BGRA, 0 dropped** through `AVCaptureVideoDataOutput` (format 6, one output:
+  PrimaryScaler). The plug-in now calls handlers without its lock, caps the pool (threshold HELD + 4) and
+  converts RAW through per-channel tables.
+- cam31 (device frames): apptest stopped after miinstall (LaunchServices step never returned); not a camera result.
+
+Next: the plug-in reads the device (2x2 cell debayer, grey-world white balance, gain to a
+green target, gamma) into the pool buffers; `/private/var/tmp/bluecam_synthetic` keeps the synthetic frames.
 
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;

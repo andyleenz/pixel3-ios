@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 16:00:00 +1100
+Subject: [PATCH] 0234: display pipe alignment and stride as dictionaries
+
+VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService reads
+DisplayPipePlaneBaseAlignment and DisplayPipeStrideRequirements from
+AppleCLCD and takes PlaneBaseAlignmentLinear / StrideLinearHorizontal
+out of them. The number published since 0107 raised
+-[__NSCFNumber objectForKey:] in mediaserverd building a camera preview
+(cam30). Both now dictionaries, 64 bytes.
+---
+diff -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -512,7 +512,24 @@
+ 			IOLog("SWEET FB: flips on a thread of their own, after the GPU (HakiosWaitsForGPU)\n");
+ 		}
+ 	}
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * (0234) As dictionaries, the form VideoToolbox and QuartzCore read: FigGetAlignmentForIOSurfaceOutputToDisplayService
++	 * takes PlaneBaseAlignmentLinear and StrideLinearHorizontal out of them with CFDictionaryGetValue; the number this was
++	 * raised an exception in mediaserverd building a camera preview (-[__NSCFNumber objectForKey:]).
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1), *stride = OSDictionary::withCapacity(1);
++		OSNumber *n64 = OSNumber::withNumber(64ULL, 32);
++		if (align != NULL && stride != NULL && n64 != NULL) {
++			align->setObject("PlaneBaseAlignmentLinear", n64);
++			stride->setObject("StrideLinearHorizontal", n64);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++			setProperty("DisplayPipeStrideRequirements", stride);
++		}
++		OSSafeReleaseNULL(align);
++		OSSafeReleaseNULL(stride);
++		OSSafeReleaseNULL(n64);
++	}
+ 	registerService();
+ 	int accel = 1;
+ 	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));

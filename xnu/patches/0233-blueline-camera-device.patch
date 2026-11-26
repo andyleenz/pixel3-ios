@@ -1,0 +1,939 @@
+0233: /dev/blueline-camera, the rear IMX363's frames for user space
+
+ios-redfin's /dev/redwood-camera ABI (0923/0926/0931/0934, MIT,
+DenialOfGravity/ios-redfin) as bsd/sys/blueline_camera.h: prefix
+BLUELINE_CAMERA_, magic "BLFRAME1", same layouts and command numbers.
+
+The first open wakes a kernel thread that runs 0196's rear path (power-up,
+IMX363 2016x1512 binned RAW10, CSIPHY0, CSID-lite RDI0, IFE-lite WM0) with
+the boot-arg probe's code, minus the CSID test pattern. WM0 gets a ring of
+four 4 MiB buffers below 4 GiB, kept for the boot: its image address is a
+two-deep queue (camss-vfe-170.c), two queued at start, one more at each
+buf-done. The thread polls the latched status (bus status 1 bit 0) about
+once a frame period, then every 1 ms. Queued buffers are never read; the
+newest done buffer is never queued.
+
+read() waits up to 1 s (EAGAIN) for the newest unread frame: header, then
+up to stride * height bytes (2528 * 1512); a header-sized buffer gets the
+header only and leaves the frame unread. EIO after a failed start or no
+frame for 1 s, until the last close. write(): EXPOSURE (lines, linear gain
+256 = 1x up to 8x, frame lines) in a group hold, taken after a frame and
+reported from two frames later; SENSOR 1, FORMAT RAW10, FOCUS accepted;
+KEEP, FLASH, COLOUR ENOTSUP. The last close ends the loop at a frame
+boundary: sensor stream off, WM0 off, everything powered down as in 0196.
+Line time is measured from frames 2-18. A lock keeps the boot-arg probe and
+a session apart; bluecam=/bluecam_stream= behave as before. bluecamdev=0:
+no device.
+
+diff -ruN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c	2026-11-26 15:44:08
++++ b/bsd/dev/blueline_camera_probe.c	2026-11-26 15:50:01
+@@ -50,6 +50,7 @@
+  *   bluecam=3        rear, then front
+  *   bluecam_gdsc=N   TITAN_TOP GDSC: 0 never, 1 always (stock order),
+  *                    2 only if the MCLK branch stays off (default)
++ *   bluecamdev=0     no /dev/blueline-camera (0233; made by default)
+  * Log prefix "BLUE CAM:". Patch 0188.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -65,6 +66,11 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
++#include <kern/locks.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <sys/blueline_camera.h>
+ 
+ extern uint32_t blueline_cmddb_addr(const char *id);			/* blueline_touch.c */
+ extern int blueline_rpmh_write(const uint32_t *addr, const uint32_t *data, int n);
+@@ -979,7 +985,143 @@
+ static uint64_t cap_pa;
+ static bool cap_axi_set, cap_noc_set;
+ 
++/*
++ * ---- 0233: /dev/blueline-camera state (the device itself is after cam_thread) ----
++ * A session (first open to last close) runs the same power-up, sensor, CSIPHY/CSID and write master
++ * code as the one-shot path, with dev_mode set: the write master gets a ring of DEV_RING buffers
++ * instead of cap_buf. Its image address register is a two-deep queue (Linux camss-vfe-170.c
++ * vfe_enable_output/vfe_isr_wm_done): two addresses are queued at the start, one more at each WM0
++ * buf-done. A buffer in the queue is never handed to a reader; the newest done one is never queued.
++ */
++#define DEV_RING		4
++#define DEV_GAIN_UNITY		256u
++#define DEV_GAIN_MAX		(8u * DEV_GAIN_UNITY)	/* IMX363 analog: code = 512 - 512 / gain, 8x at most */
++#define DEV_MARGIN		16u			/* 0196's table: exposure 3154 of 3170 lines */
++#define DEV_FLL_MIN		3170u			/* 0x0340 in imx363_2016x1512 */
++#define DEV_FLL_MAX		0xfff0u
++#define DEV_BLACK		64u
++enum { BUF_FREE, BUF_QUEUED, BUF_READY };
++struct dev_buf {
++	vm_offset_t va;
++	uint64_t pa;
++	uint8_t state;
++	uint32_t readers;
++	uint64_t seq, time;
++	uint32_t lines, gain, fll;
++};
++static LCK_GRP_DECLARE(dev_grp, "blueline_camera");
++static LCK_MTX_DECLARE(dev_lock, &dev_grp);	/* the ring, the queue, requests and flags below */
++static LCK_MTX_DECLARE(cam_hw_lock, &dev_grp);	/* the hardware: the boot-arg probe or one device session */
++extern int sweet_log_flush_now(void);
++static int dev_sync_log;	/* bluecamdev=3: the log to UFS after each line of a session, so a hang keeps them */
++#define printf(...) ({ int _n = printf(__VA_ARGS__); if (dev_sync_log && dev_mode) (void)sweet_log_flush_now(); _n; })
++static struct dev_buf dev_buf[DEV_RING];
++static uint32_t dev_buf_bytes;
++static int dev_hwq[2], dev_hwn;		/* the write master's queue, oldest (being written) first */
++static vm_offset_t dev_vfe;		/* set while a session streams: dev_refill() writes the queue */
++static bool dev_mode;			/* under cam_hw_lock: a device session, not the boot-arg probe */
++static bool dev_streamed, dev_fault;	/* this session reached its frame loop / ended on a fault */
++static bool dev_open, dev_broken;		/* (dev_loop reads dev_open between IOSleep calls) */
++static uint64_t dev_frames, dev_given, dev_late, dev_bad;
++static uint32_t dev_stride = 2528, dev_w = 2016, dev_h = 1512;	/* 0196: 2520 packed bytes padded to 16 */
++static uint32_t dev_line_ns = 8763;	/* 1e9 / (36 fps * 3170 lines) as measured in 0196; remeasured per session */
++static struct { uint32_t lines, gain, fll; bool pending; } dev_ask = { DEV_FLL_MIN - DEV_MARGIN, 4 * DEV_GAIN_UNITY, 0, false };
++static struct { uint32_t lines, gain, fll; uint64_t from; } dev_now, dev_next;
++
++static void
++dev_limits(uint32_t *lines, uint32_t *gain, uint32_t *fll)
++{
++	*gain = *gain < DEV_GAIN_UNITY ? DEV_GAIN_UNITY : *gain > DEV_GAIN_MAX ? DEV_GAIN_MAX : *gain;
++	*lines = *lines < 4 ? 4 : *lines > DEV_FLL_MAX - DEV_MARGIN ? DEV_FLL_MAX - DEV_MARGIN : *lines;
++	if (*fll == 0) {
++		*fll = *lines + DEV_MARGIN;
++	}
++	*fll = *fll < DEV_FLL_MIN ? DEV_FLL_MIN : *fll > DEV_FLL_MAX ? DEV_FLL_MAX : *fll;
++	if (*lines > *fll - DEV_MARGIN) {
++		*lines = *fll - DEV_MARGIN;
++	}
++}
++
++#define DEV_BUF_BYTES	(4u << 20)
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++extern boolean_t pmap_valid_address(uint64_t);
++static vm_offset_t dev_pool_va;
++static unsigned dev_mismatch;
++/* The ring: allocated once, kept for the rest of the boot (readers may still be copying after a close). */
+ static bool
++dev_ring_alloc(void)
++{
++	/*
++	 * A carve-out below 4 GiB that XNU does not manage (as blueline_gpu_mem.c): the write master has 32-bit
++	 * addresses and XNU's RAM below 4 GiB (0xf4000000+) has no 4 MiB contiguous left even at boot. 16 MiB at
++	 * bluecam_pool (0xd0000000): inside the GPU pool's window, clear of the pool (0xc0000000 + 32 MiB) and
++	 * of Wi-Fi's 0xe0000000. Cacheable (write-combined reads ran at 38 MB/s: 100 ms a frame, camdev10), the one
++	 * mapping: each buffer is cleaned and invalidated before it is copied out.
++	 */
++	if (dev_pool_va) {
++		return true;
++	}
++	uint64_t base = 0xd0000000ull, size = (uint64_t)DEV_RING * DEV_BUF_BYTES;
++	(void)PE_parse_boot_argn("bluecam_pool", &base, sizeof(base));
++	if (base < 0xa4000000ull || base + size > 0xe0000000ull || (base & PAGE_MASK)) {
++		printf("BLUE CAM: dev: bluecam_pool 0x%llx outside 0xa4000000..0xe0000000\n", base);
++		return false;
++	}
++	for (uint64_t pa = base; pa < base + size; pa += PAGE_SIZE) {
++		if (pmap_valid_address(pa)) {
++			printf("BLUE CAM: dev: pool page 0x%llx is XNU memory\n", pa);
++			return false;
++		}
++	}
++	dev_pool_va = ml_io_map_unmappable((vm_offset_t)base, (vm_size_t)size, VM_WIMG_DEFAULT);
++	if (!dev_pool_va) {
++		printf("BLUE CAM: dev: pool 0x%llx not mapped\n", base);
++		return false;
++	}
++	for (int i = 0; i < DEV_RING; i++) {
++		dev_buf[i].va = dev_pool_va + (vm_offset_t)i * DEV_BUF_BYTES;
++		dev_buf[i].pa = base + (uint64_t)i * DEV_BUF_BYTES;
++		memset((void *)dev_buf[i].va, 0, DEV_BUF_BYTES);
++	}
++	FlushPoC_DcacheRegion(dev_pool_va, (size_t)size);
++	dev_buf_bytes = DEV_BUF_BYTES;
++	printf("BLUE CAM: dev: ring %d x %u MiB at 0x%llx (carve-out, cacheable)\n", DEV_RING, DEV_BUF_BYTES >> 20, base);
++	return true;
++}
++
++/* dev_lock held: top the write master's queue up to two from the free or oldest done buffers. */
++static void
++dev_refill(void)
++{
++	while (dev_vfe && dev_hwn < 2) {
++		uint64_t newest = 0;
++		int c = -1;
++		for (int i = 0; i < DEV_RING; i++) {
++			if (dev_buf[i].state == BUF_READY && dev_buf[i].seq > newest) {
++				newest = dev_buf[i].seq;
++			}
++		}
++		for (int i = 0; i < DEV_RING; i++) {
++			struct dev_buf *b = &dev_buf[i];
++			if (b->state == BUF_QUEUED || b->readers || (b->state == BUF_READY && b->seq == newest)) {
++				continue;
++			}
++			if (c < 0 || (b->state == BUF_FREE && dev_buf[c].state != BUF_FREE) ||
++			    (b->state == dev_buf[c].state && b->seq < dev_buf[c].seq)) {
++				c = i;
++			}
++		}
++		if (c < 0) {
++			break;
++		}
++		dev_buf[c].state = BUF_QUEUED;
++		dev_hwq[dev_hwn++] = c;
++		wr32(dev_vfe + 0x2214, (uint32_t)dev_buf[c].pa);
++	}
++}
++
++static bool
+ cap_prepare(vm_offset_t vfe)
+ {
+ 	bool r1 = false, r2 = false;
+@@ -993,20 +1135,26 @@
+ 			return false;
+ 		}
+ 	}
+-	if (cap_buf && cap_alloc < cap_bytes) {
+-		kmem_free(kernel_map, cap_buf, cap_alloc);
+-		cap_buf = 0;
++	if (dev_mode) {
++		if (!dev_ring_alloc()) {
++			return false;
++		}
++	} else {
++		if (cap_buf && cap_alloc < cap_bytes) {
++			kmem_free(kernel_map, cap_buf, cap_alloc);
++			cap_buf = 0;
++		}
++		cap_alloc = cap_bytes;
++		if (!cap_buf && kmem_alloc_contig(kernel_map, &cap_buf, cap_bytes, PAGE_MASK, 0xfffff, 0, KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			cap_buf = 0;
++			printf("BLUE CAM: cap: no %u MiB below 4 GiB\n", cap_bytes >> 20);
++			return false;
++		}
++		cap_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)cap_buf));
++		memset((void *)cap_buf, 0xa5, cap_bytes);
++		flush_dcache64((addr64_t)cap_pa, cap_bytes, TRUE);
+ 	}
+-	cap_alloc = cap_bytes;
+-	if (!cap_buf && kmem_alloc_contig(kernel_map, &cap_buf, cap_bytes, PAGE_MASK, 0xfffff, 0, KMA_DATA,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		cap_buf = 0;
+-		printf("BLUE CAM: cap: no %u MiB below 4 GiB\n", cap_bytes >> 20);
+-		return false;
+-	}
+-	cap_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)cap_buf));
+-	memset((void *)cap_buf, 0xa5, cap_bytes);
+-	flush_dcache64((addr64_t)cap_pa, cap_bytes, TRUE);
+ 
+ 	printf("BLUE CAM: cap: IFE-lite version 0x%x; buffer at 0x%llx\n", rd32(vfe), cap_pa);
+ 	wr32(vfe + 0x05c, 1u << 31);
+@@ -1035,6 +1183,22 @@
+ 	wr32(vfe + 0x2220, 0);
+ 	wr32(vfe + 0x2224, 0);
+ 	wr32(vfe + 0x2228, 0xff01);
++	if (dev_mode) {
++		/* 0233: as vfe_enable_output: enable, then two addresses into the queue, then reg update */
++		wr32(vfe + 0x2258, 0);
++		wr32(vfe + 0x2208, 1u << 0 | 1u << 1);
++		lck_mtx_lock(&dev_lock);
++		for (int i = 0; i < DEV_RING; i++) {
++			dev_buf[i].state = BUF_FREE;
++			dev_buf[i].seq = 0;
++		}
++		dev_hwn = 0;
++		dev_vfe = vfe;
++		dev_refill();
++		lck_mtx_unlock(&dev_lock);
++		wr32(vfe + 0x04ac, 1u << 1);
++		return dev_hwn == 2;
++	}
+ 	wr32(vfe + 0x2214, (uint32_t)cap_pa);		/* image address */
+ 	wr32(vfe + 0x2258, 0);				/* frame increment: every frame to the same place */
+ 	wr32(vfe + 0x2208, 1u << 0 | 1u << 1);		/* enable, MIPI raw */
+@@ -1178,7 +1342,180 @@
+ 	kmem_free(kernel_map, img, round_page(cap_w * cap_h * 4));
+ }
+ 
++/*
++ * ---- 0233: a device session's frame loop ----
++ * No interrupt handler: the thread polls the IFE-lite's latched status, about once a frame period
++ * and then every millisecond until WM0's buf-done (bus status 1 bit 0; 0196's log: 0x00000001,
++ * with RDI0 SOF in top status 0 bit 27). The status is cleared as camss-vfe-170.c's vfe_isr does.
++ */
++static uint64_t
++dev_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
+ 
++/* IMX363 frame length, coarse integration time and analog gain code, in a group hold (0x0104) */
++static bool
++dev_exposure_write(const struct cam_bus *b, uint8_t addr, uint32_t lines, uint32_t gain, uint32_t fll)
++{
++	uint32_t code = 512u - (uint32_t)(512ull * DEV_GAIN_UNITY / gain);
++	const uint16_t w[][2] = {
++		{ 0x0104, 1 }, { 0x0340, (uint16_t)(fll >> 8) }, { 0x0341, (uint16_t)(fll & 0xff) },
++		{ 0x0202, (uint16_t)(lines >> 8) }, { 0x0203, (uint16_t)(lines & 0xff) },
++		{ 0x0204, (uint16_t)(code >> 8) }, { 0x0205, (uint16_t)(code & 0xff) }, { 0x0104, 0 },
++	};
++	for (size_t i = 0; i < sizeof(w) / sizeof(w[0]); i++) {
++		if (bus_write(b, addr, w[i][0], (uint8_t)w[i][1])) {
++			printf("BLUE CAM: dev: exposure write 0x%04x NACK\n", w[i][0]);
++			(void)bus_write(b, addr, 0x0104, 0);
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++dev_loop(const struct cam_bus *b, uint8_t addr, vm_offset_t vfe)
++{
++	uint64_t last = dev_ms(), period = 28, changed_at = 0, t2 = 0;
++	unsigned errs = 0;
++	const char *why = "closed";
++
++	dev_streamed = true;
++	printf("BLUE CAM: dev: streaming %ux%u RAW10 (stride %u); exposure %u lines, gain %u/256, frame %u lines\n",
++	    dev_w, dev_h, dev_stride, dev_now.lines, dev_now.gain, dev_now.fll);
++	for (;;) {
++		if (!dev_open) {
++			break;
++		}
++		uint64_t since = dev_ms() - last;
++		IOSleep(since + 4 < period ? (unsigned)(period - since - 3) : 1);
++		uint32_t top0 = rd32(vfe + 0x06c), top1 = rd32(vfe + 0x070);
++		uint32_t bus0 = rd32(vfe + 0x205c), bus1 = rd32(vfe + 0x2060), bus2 = rd32(vfe + 0x2064);
++		uint64_t now = dev_ms();
++		if (!(bus1 & 1u)) {
++			if (now - last > 1000) {
++				cap_status(vfe, "no frame");
++				why = "no frame for 1 s";
++				dev_fault = true;
++				break;
++			}
++			continue;
++		}
++		wr32(vfe + 0x064, top0);
++		wr32(vfe + 0x068, top1);
++		wr32(vfe + 0x058, 1);
++		wr32(vfe + 0x2050, bus0);
++		wr32(vfe + 0x2054, bus1);
++		wr32(vfe + 0x2058, bus2);
++		wr32(vfe + 0x2068, 1);
++		if (!(rd32(vfe + 0x2060) & 1u)) {
++			dev_bad = 0;	/* (three in a row, not three a session) */
++		} else {
++			/* a real next done is a frame away: the bit did not clear */
++			if (++dev_bad >= 3) {
++				cap_status(vfe, "done stays set");
++				why = "WM0 done does not clear";
++				dev_fault = true;
++				break;
++			}
++		}
++		if ((top1 & (1u << 7)) || (bus0 & (7u << 12))) {	/* violation; bus overwrite, overflow, violation */
++			if (errs++ < 5) {
++				printf("BLUE CAM: dev: frame %llu: IRQ 0x%08x 0x%08x bus 0x%08x, violation 0x%x\n", dev_frames + 1,
++				    top0, top1, bus0, rd32(vfe + 0x07c));
++			}
++		}
++		uint64_t at = mach_absolute_time();
++		if (dev_frames > 0 && now - last >= 5 && now - last <= 500) {
++			period = now - last;
++		}
++		last = now;
++
++		bool ask = false;
++		uint32_t al = 0, ag = 0, af = 0;
++		lck_mtx_lock(&dev_lock);
++		if (dev_hwn > 0) {
++			struct dev_buf *d = &dev_buf[dev_hwq[0]];
++			/* (a check: a missed done would leave the model one buffer behind the write master's address) */
++			uint32_t wa = rd32(vfe + 0x2200);
++			if (dev_hwn > 1 && wa != (uint32_t)dev_buf[dev_hwq[1]].pa && dev_mismatch++ < 5) {
++				printf("BLUE CAM: dev: frame %llu: WM0 at 0x%x, the model has 0x%llx next (done 0x%llx), period %llu ms\n",
++				    dev_frames + 1, wa, dev_buf[dev_hwq[1]].pa, d->pa, period);
++			}
++			dev_hwq[0] = dev_hwq[1];
++			dev_hwn--;
++			dev_frames++;
++			if (dev_next.from != 0 && dev_frames >= dev_next.from) {
++				dev_now = dev_next;
++				dev_next.from = 0;
++				changed_at = dev_frames;
++			}
++			d->state = BUF_READY;
++			d->seq = dev_frames;
++			d->time = at;
++			d->lines = dev_now.lines;
++			d->gain = dev_now.gain;
++			d->fll = dev_now.fll;
++		} else {
++			dev_late++;	/* a done with no address queued */
++		}
++		dev_refill();
++		if (dev_ask.pending) {
++			ask = true;
++			al = dev_ask.lines;
++			ag = dev_ask.gain;
++			af = dev_ask.fll;
++			dev_ask.pending = false;
++		}
++		uint64_t n = dev_frames;
++		lck_mtx_unlock(&dev_lock);
++		wakeup(&dev_frames);
++
++		/* line time from frames 2-18 at one frame length */
++		if (n == 2) {
++			t2 = at;
++		} else if (n == 18 && changed_at < 2 && t2) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(at - t2, &ns);
++			dev_line_ns = (uint32_t)(ns / 16 / dev_now.fll);
++			printf("BLUE CAM: dev: %llu.%03llu ms a frame, %u ns a line\n", ns / 16 / 1000000, ns / 16 / 1000 % 1000,
++			    dev_line_ns);
++		}
++		if (n == 1 || n % 900 == 0) {
++			printf("BLUE CAM: dev: frame %llu: %llu read, %llu without a buffer, period %llu ms\n", n, dev_given, dev_late,
++			    period);
++		}
++		if (ask) {
++			dev_limits(&al, &ag, &af);
++			if (al != dev_now.lines || ag != dev_now.gain || af != dev_now.fll) {
++				if (!dev_exposure_write(b, addr, al, ag, af)) {
++					why = "exposure not taken";
++					dev_fault = true;
++					break;
++				}
++				dev_next.lines = al;
++				dev_next.gain = ag;
++				dev_next.fll = af;
++				dev_next.from = n + 2;
++			}
++		}
++	}
++	lck_mtx_lock(&dev_lock);
++	dev_vfe = 0;
++	for (int i = 0; i < DEV_RING; i++) {
++		dev_buf[i].state = BUF_FREE;
++	}
++	dev_hwn = 0;
++	lck_mtx_unlock(&dev_lock);
++	wakeup(&dev_frames);
++	printf("BLUE CAM: dev: frames stopped (%s): %llu done, %llu read, %llu without a buffer\n", why, dev_frames, dev_given,
++	    dev_late);
++}
++
++
+ /*
+  * ---- 0196: the rear IMX363 ----
+  * Register values from the sdm670-mainline imx363.c (GPL-2.0, from Android's downstream logs, 24 MHz
+@@ -1227,8 +1564,29 @@
+ 		    "IMX363 2016x1512")) {
+ 			return;
+ 		}
+-		(void)bus_write(b, addr, 0x0204, (uint8_t)(cam_rear_gain >> 8));
+-		(void)bus_write(b, addr, 0x0205, (uint8_t)cam_rear_gain);
++		if (dev_mode) {
++			/* 0233: the exposure asked for, else the table's with 4x gain */
++			lck_mtx_lock(&dev_lock);
++			uint32_t l = dev_ask.lines, g = dev_ask.gain, f = dev_ask.fll;
++			dev_ask.pending = false;
++			dev_frames = dev_given = dev_late = dev_bad = dev_mismatch = 0;
++			for (int i = 0; i < DEV_RING; i++) {
++				dev_buf[i].state = BUF_FREE;	/* (no frame of an earlier session is handed out) */
++				dev_buf[i].seq = 0;
++			}
++			lck_mtx_unlock(&dev_lock);
++			dev_limits(&l, &g, &f);
++			if (!dev_exposure_write(b, addr, l, g, f)) {
++				return;
++			}
++			dev_now.lines = l;
++			dev_now.gain = g;
++			dev_now.fll = f;
++			dev_next.from = 0;
++		} else {
++			(void)bus_write(b, addr, 0x0204, (uint8_t)(cam_rear_gain >> 8));
++			(void)bus_write(b, addr, 0x0205, (uint8_t)cam_rear_gain);
++		}
+ 		goto sensor_set;
+ 	}
+ 	cap_w = 820;
+@@ -1251,35 +1609,55 @@
+ sensor_set:;
+ 	vm_offset_t phy = 0, csid = 0, vfe = 0;
+ 	bool rx = false, cap = false;
+-	if (cam_stream >= 2) {
+-		phy = ml_io_map(CSIPHY0_PA + rx_phy * 0x1000u, 0x1000);
+-		csid = ml_io_map(CSID_LITE_PA, 0x1000);
++	static vm_offset_t phy_va[3], csid_va, vfe_va;	/* (mapped once: sessions repeat) */
++	if (cam_stream >= 2 || dev_mode) {
++		if (!phy_va[rx_phy]) {
++			phy_va[rx_phy] = ml_io_map(CSIPHY0_PA + rx_phy * 0x1000u, 0x1000);
++		}
++		if (!csid_va) {
++			csid_va = ml_io_map(CSID_LITE_PA, 0x1000);
++		}
++		phy = phy_va[rx_phy];
++		csid = csid_va;
+ 		/* timer 192 MHz: settle = (85 ns + 6 UI) / 5.21 ns - 6 = 11 (camss-csiphy-3ph-1-0.c) */
+ 		rx = phy && csid && rx_clocks_on();
+ 		if (rx) {
+ 			csiphy_on(phy, (uint8_t)cam_settle);
+ 			rx = csid_on(csid);
+ 		}
+-		if (rx) {
++		if (rx && !dev_mode) {
+ 			csid_watch(csid, 200);			/* nothing expected before the sensor runs */
+ 			csid_tpg(csid, 300);
+ 			rx = csid_on(csid);
+ 			phy_status(phy, "before stream on");
+ 		}
+-		if (rx && cam_stream >= 3) {
+-			vfe = ml_io_map(VFE_LITE_PA, 0x4000);
++		if (rx && (cam_stream >= 3 || dev_mode)) {
++			if (!vfe_va) {
++				vfe_va = ml_io_map(VFE_LITE_PA, 0x4000);
++			}
++			vfe = vfe_va;
+ 			cap = vfe && cap_prepare(vfe);
+ 			printf("BLUE CAM: cap: write master %s\n", cap ? "ready" : "NOT ready");
+ 		}
+ 		printf("BLUE CAM: rx: receiver %s\n", rx ? "ready" : "NOT ready, sensor only");
+ 	}
++	if (dev_mode && !cap) {
++		goto rx_down;
++	}
+ 	uint8_t f0 = rd8(b, addr, 0x0005);
+ 	printf("BLUE CAM: stream: frame count %u, mode 0x%02x; streaming on\n", f0, rd8(b, addr, 0x0100));
+ 	if (bus_write(b, addr, 0x0100, 1)) {
+ 		printf("BLUE CAM: stream: stream-on NACK\n");
+-		return;
++		if (cap) {
++			cap = false;
++			wr32(vfe + 0x2208, 0);
++			wr32(vfe + 0x04ac, 1u << 1);
++		}
++		goto rx_down;
+ 	}
+-	if (rx) {
++	if (dev_mode) {
++		dev_loop(b, addr, vfe);
++	} else if (rx) {
+ 		IOSleep(50);
+ 		phy_status(phy, "streaming");
+ 		csid_watch(csid, 1000);
+@@ -1289,7 +1667,7 @@
+ 		}
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+-	for (int i = 0; i < (rx ? 2 : 10); i++) {
++	for (int i = 0; i < (dev_mode ? 0 : rx ? 2 : 10); i++) {
+ 		IOSleep(100);
+ 		uint64_t ns;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+@@ -1299,10 +1677,26 @@
+ 	(void)bus_write(b, addr, 0x0100, 0);
+ 	IOSleep(50);
+ 	printf("BLUE CAM: stream: off, mode 0x%02x\n", rd8(b, addr, 0x0100));
+-	if (cap) {
++	if (cap && dev_mode) {
++		/* 0233: the sensor has finished its frame: the write master off */
++		wr32(vfe + 0x2208, 0);
++		wr32(vfe + 0x04ac, 1u << 1);
++		IOSleep(20);
++		cap_status(vfe, "after stop");
++	} else if (cap) {
+ 		cap_finish(vfe);
+ 	}
+-	if (cam_stream >= 2) {
++rx_down:
++	if (dev_mode && dev_vfe) {
++		/* (a session that did not reach its frame loop: no more queue writes from read()) */
++		wr32(dev_vfe + 0x2208, 0);
++		wr32(dev_vfe + 0x04ac, 1u << 1);
++		lck_mtx_lock(&dev_lock);
++		dev_vfe = 0;
++		dev_hwn = 0;
++		lck_mtx_unlock(&dev_lock);
++	}
++	if (cam_stream >= 2 || dev_mode) {
+ 		if (cap_axi_set) {
+ 			branch_off(gcc_cam + 0x020, "gcc_camera_axi");
+ 			cap_axi_set = false;
+@@ -1413,15 +1807,16 @@
+ 	}
+ 	IOSleep(c->settle_ms);
+ 
+-	if (!read_ids(c, &bus, "19.2 MHz MCLK")) {
++	int found = read_ids(c, &bus, "19.2 MHz MCLK");
++	if (!found) {
+ 		/* Mainline names 17/19 SDA; the vendor pinctrl comment says "CLK, DATA". Try the other way once. */
+ 		bus.sda = c->scl.va;
+ 		bus.scl = c->sda.va;
+ 		if (bus_open(&bus)) {
+-			(void)read_ids(c, &bus, "SDA/SCL swapped");
++			found = read_ids(c, &bus, "SDA/SCL swapped");
+ 		}
+ 	}
+-	if (cam_stream) {
++	if (dev_mode ? found > 0 : cam_stream != 0) {
+ 		stream_test(&bus, c->sensor[0].addr, c == &groups[0]);
+ 	}
+ 
+@@ -1444,8 +1839,9 @@
+ 	printf("BLUE CAM: %s: powered down, pins as found\n", c->name);
+ }
+ 
++/* The groups in mask (1 rear, 2 front) up, probed (and streamed), down. cam_hw_lock held. */
+ static void
+-cam_thread(void *arg __unused, wait_result_t w __unused)
++cam_groups(int mask)
+ {
+ 	bool ahb_set = false, xo_set = false, ahb_ok = false, xo_ok = false;
+ 
+@@ -1456,8 +1852,12 @@
+ 		printf("BLUE CAM: no LVS1 in cmd-db; not probing\n");
+ 		return;
+ 	}
+-	gcc_cam = ml_io_map(GCC_CAM_PA, 0x1000);
+-	camcc = ml_io_map(CAMCC_PA, CAMCC_SIZE);
++	if (!gcc_cam) {
++		gcc_cam = ml_io_map(GCC_CAM_PA, 0x1000);
++	}
++	if (!camcc) {
++		camcc = ml_io_map(CAMCC_PA, CAMCC_SIZE);
++	}
+ 	if (!gcc_cam || !camcc) {
+ 		printf("BLUE CAM: mapping GCC/camcc failed\n");
+ 		return;
+@@ -1469,7 +1869,7 @@
+ 		printf("BLUE CAM: camera clock controller feeds not running; not touching camcc\n");
+ 	} else {
+ 		for (int i = 0; i < 2; i++) {
+-			if (cam_mode & (1 << i)) {
++			if (mask & (1 << i)) {
+ 				group_probe(&groups[i]);
+ 			}
+ 		}
+@@ -1483,17 +1883,227 @@
+ 	printf("BLUE CAM: probe done\n");
+ }
+ 
++static void
++cam_thread(void *arg __unused, wait_result_t w __unused)
++{
++	lck_mtx_lock(&cam_hw_lock);
++	cam_groups(cam_mode);
++	lck_mtx_unlock(&cam_hw_lock);
++}
++
++/*
++ * ---- 0233: /dev/blueline-camera ----
++ * ABI and behaviour after ios-redfin's /dev/redwood-camera (patches 0923, 0926, 0931, 0934, MIT,
++ * github.com/DenialOfGravity/ios-redfin): sys/blueline_camera.h. One kernel thread runs the sessions:
++ * the first open wakes it, it powers the rear group up and streams (cam_groups(1) with dev_mode), the
++ * last close ends the frame loop and the same code powers everything down. A session that does not
++ * reach its frame loop, or ends on a fault, makes reads return EIO until the last close.
++ */
++__attribute__((noreturn)) static void
++dev_thread(void *arg __unused, wait_result_t w __unused)
++{
++	for (;;) {
++		lck_mtx_lock(&dev_lock);
++		while (!dev_open || dev_broken) {
++			(void)msleep(&dev_open, &dev_lock, PZERO, "blueline-camera-idle", NULL);
++		}
++		lck_mtx_unlock(&dev_lock);
++		lck_mtx_lock(&cam_hw_lock);
++		dev_mode = true;
++		dev_streamed = dev_fault = false;
++		printf("BLUE CAM: dev: session start\n");
++		cam_groups(1);
++		dev_mode = false;
++		lck_mtx_unlock(&cam_hw_lock);
++		bool failed = !dev_streamed || dev_fault;
++		printf("BLUE CAM: dev: session end%s\n", failed ? " (failed: EIO until the last close)" : "");
++		lck_mtx_lock(&dev_lock);
++		if (failed && dev_open) {
++			dev_broken = true;
++		}
++		lck_mtx_unlock(&dev_lock);
++		wakeup(&dev_frames);
++	}
++}
++
++static int
++camdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{ extern void proc_name(int, char *, int); extern int proc_pid(struct proc *); int refuse = 0; char who[32] = "?"; proc_name(proc_pid(p), who, sizeof(who)); PE_parse_boot_argn("bluecamdev", &refuse, sizeof(refuse)); dev_sync_log = refuse == 3; printf("BLUE CAM: dev: opened by %s[%d]%s\n", who, proc_pid(p), refuse == 2 ? " (refused: bluecamdev=2)" : ""); if (refuse == 2) { return EBUSY; }
++	lck_mtx_lock(&dev_lock);
++	if (!dev_open) {
++		dev_broken = false;
++	}
++	dev_open = true;
++	lck_mtx_unlock(&dev_lock);
++	wakeup(&dev_open);
++	return 0;
++}
++
++/* (the last close only: no D_TRACKCLOSE) */
++static int
++camdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	lck_mtx_lock(&dev_lock);
++	dev_open = false;
++	dev_broken = false;
++	lck_mtx_unlock(&dev_lock);
++	wakeup(&dev_frames);
++	return 0;
++}
++
++static int
++camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct blueline_camera_frame f;
++	uint64_t since = dev_ms();
++	int bi, error;
++
++	lck_mtx_lock(&dev_lock);
++	for (;;) {
++		if (dev_broken) {
++			lck_mtx_unlock(&dev_lock);
++			return EIO;
++		}
++		bi = -1;
++		for (int i = 0; i < DEV_RING; i++) {
++			if (dev_buf[i].state == BUF_READY && dev_buf[i].seq > dev_given &&
++			    (bi < 0 || dev_buf[i].seq > dev_buf[bi].seq)) {
++				bi = i;
++			}
++		}
++		if (bi >= 0) {
++			break;
++		}
++		if (dev_ms() - since >= 1000) {
++			lck_mtx_unlock(&dev_lock);
++			return EAGAIN;
++		}
++		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
++		error = msleep(&dev_frames, &dev_lock, PZERO | PCATCH, "blueline-camera", &ts);
++		if (error != 0 && error != EWOULDBLOCK) {
++			lck_mtx_unlock(&dev_lock);
++			return error;
++		}
++	}
++	struct dev_buf *d = &dev_buf[bi];
++	bool body = uio_resid(uio) > (user_ssize_t)sizeof(f);
++	bzero(&f, sizeof(f));
++	memcpy(f.magic, BLUELINE_CAMERA_MAGIC, 8);
++	f.header_bytes = sizeof(f);
++	f.width = dev_w;
++	f.height = dev_h;
++	f.stride = dev_stride;
++	f.format = BLUELINE_CAMERA_FORMAT_RAW10;
++	f.bayer = 0;			/* RGGB, as the 0196 colour snap */
++	f.black = DEV_BLACK;
++	f.sequence = d->seq;
++	f.time = d->time;
++	f.exposure_lines = d->lines;
++	f.line_ns = dev_line_ns;
++	f.gain = d->gain;
++	f.gain_unity = DEV_GAIN_UNITY;
++	f.gain_max = DEV_GAIN_MAX;
++	f.frame_lines = d->fll;
++	f.frame_lines_min = DEV_FLL_MIN;
++	f.frame_lines_max = DEV_FLL_MAX;
++	f.margin = DEV_MARGIN;
++	f.sensor = 1;
++	f.focus = BLUELINE_CAMERA_NO_FOCUS;
++	f.reserved[BLUELINE_CAMERA_R_FLAGS] = dev_given == 0 ? BLUELINE_CAMERA_FLAG_MODE_CHANGED : 0;
++	f.reserved[BLUELINE_CAMERA_R_FPS_MILLI] = (uint32_t)(1000000000000ull / ((uint64_t)dev_line_ns * DEV_FLL_MIN));
++	uint32_t n = MIN(dev_stride * dev_h, dev_buf_bytes);
++	if (body) {
++		d->readers++;
++		dev_given = d->seq;
++	}
++	lck_mtx_unlock(&dev_lock);
++
++	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
++	if (body) {
++		if (error == 0 && uio_resid(uio) > 0) {
++			n = (uint32_t)MIN((uint64_t)n, (uint64_t)uio_resid(uio));
++			/* the IFE wrote past the caches: drop any lines of the frame first */
++			FlushPoC_DcacheRegion(d->va, n);	/* the write master wrote it behind the cache */
++			error = uiomove((caddr_t)d->va, (int)n, uio);
++		}
++		lck_mtx_lock(&dev_lock);
++		d->readers--;
++		dev_refill();
++		lck_mtx_unlock(&dev_lock);
++	}
++	return error;
++}
++
++static int
++camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct blueline_camera_command c;
++
++	if (uio_resid(uio) < (user_ssize_t)sizeof(c) || uiomove((caddr_t)&c, sizeof(c), uio) != 0) {
++		return EINVAL;
++	}
++	switch (c.command) {
++	case BLUELINE_CAMERA_EXPOSURE:
++		lck_mtx_lock(&dev_lock);
++		dev_ask.lines = c.a;
++		dev_ask.gain = c.b;
++		dev_ask.fll = c.c;
++		dev_ask.pending = true;
++		lck_mtx_unlock(&dev_lock);
++		return 0;
++	case BLUELINE_CAMERA_SENSOR:
++		return c.a == 1 ? 0 : ENODEV;
++	case BLUELINE_CAMERA_FORMAT:
++		return c.a == BLUELINE_CAMERA_FORMAT_RAW10 ? 0 : ENOTSUP;
++	case BLUELINE_CAMERA_FOCUS:
++		return 0;
++	case BLUELINE_CAMERA_KEEP:
++	case BLUELINE_CAMERA_FLASH:
++	case BLUELINE_CAMERA_COLOUR:
++		return ENOTSUP;
++	}
++	return EINVAL;
++}
++
++static const struct cdevsw camdev_cdevsw = {
++	.d_open = camdev_open, .d_close = camdev_close, .d_read = camdev_read, .d_write = camdev_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++static void
++camdev_make(void)
++{
++	int major = cdevsw_add(-24, &camdev_cdevsw);	/* (bsd_stubs.c: -24 is the safe start) */
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "blueline-camera") == NULL) {
++		printf("BLUE CAM: /dev/blueline-camera NOT made (%d)\n", major);
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(dev_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("BLUE CAM: /dev/blueline-camera: no thread\n");
++		return;
++	}
++	thread_deallocate(th);
++	bool ring = dev_ring_alloc(); printf("BLUE CAM: /dev/blueline-camera made (rear IMX363, 2016x1512 RAW10)%s\n", ring ? "" : "; no ring yet");
++}
++
+ /* Hook: bsd/dev/sweet_ufs.c, after blueline_audio_start(). */
+ void
+ blueline_camera_start(void)
+ {
++	int camdev = 1;
++	PE_parse_boot_argn("bluecamdev", &camdev, sizeof(camdev));
++	if (camdev) {
++		camdev_make();
++	}
+ 	PE_parse_boot_argn("bluecam", &cam_mode, sizeof(cam_mode));
++	PE_parse_boot_argn("bluecam_settle", &cam_settle, sizeof(cam_settle));	/* (the device's sessions use it too) */
+ 	if (cam_mode <= 0) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("bluecam_gdsc", &gdsc_mode, sizeof(gdsc_mode));
+ 	PE_parse_boot_argn("bluecam_stream", &cam_stream, sizeof(cam_stream));
+-	PE_parse_boot_argn("bluecam_settle", &cam_settle, sizeof(cam_settle));
+ 	PE_parse_boot_argn("bluecam_gain", &cam_gain, sizeof(cam_gain));
+ 	PE_parse_boot_argn("bluecam_rear_gain", &cam_rear_gain, sizeof(cam_rear_gain));
+ 	PE_parse_boot_argn("bluecam_fll", &cam_fll, sizeof(cam_fll));
+diff -ruN a/bsd/sys/blueline_camera.h b/bsd/sys/blueline_camera.h
+--- a/bsd/sys/blueline_camera.h	1970-01-01 10:00:00
++++ b/bsd/sys/blueline_camera.h	2026-11-26 15:48:07
+@@ -0,0 +1,79 @@
++/*
++ * /dev/blueline-camera: the rear IMX363's frames for user space (patch 0233, bsd/dev/blueline_camera_probe.c).
++ * A copy for programs is tools/camera/blueline_camera.h.
++ *
++ * The ABI is ios-redfin's /dev/redwood-camera (sys/redwood_camera.h, MIT, github.com/DenialOfGravity/ios-redfin)
++ * with the prefix BLUELINE_CAMERA_ and the magic "BLFRAME1": the same structure layouts and command numbers.
++ *
++ *   open()   the first one powers the rear camera up and starts its frames (2016x1512 RAW10, 2x2 binned);
++ *            the last close stops them and powers it down.
++ *   read()   waits (at most 1 s, else EAGAIN) for the newest frame not read yet: a struct
++ *            blueline_camera_frame, then as many of the frame's bytes as the buffer has room for.
++ *            A buffer of at most the header's size gets the header only (the frame stays unread).
++ *            EIO when the camera failed to start or stopped delivering: until the last close.
++ *   write()  commands: a struct blueline_camera_command, then what it says follows.
++ *            EXPOSURE is taken; SENSOR 1 (the rear) and FORMAT RAW10 are accepted and change nothing;
++ *            FOCUS is accepted and ignored (focus reads NO_FOCUS); the others return ENOTSUP.
++ */
++#ifndef _SYS_BLUELINE_CAMERA_H_
++#define _SYS_BLUELINE_CAMERA_H_
++
++#include <stdint.h>
++
++#define BLUELINE_CAMERA_DEVICE          "/dev/blueline-camera"
++#define BLUELINE_CAMERA_MAGIC           "BLFRAME1"
++
++struct blueline_camera_frame {
++	char            magic[8];       /* BLUELINE_CAMERA_MAGIC */
++	uint32_t        header_bytes;   /* this structure's size: the frame's bytes follow */
++	uint32_t        width, height;  /* pixels */
++	uint32_t        stride;         /* bytes from one line to the next */
++	uint32_t        format;         /* 1: MIPI RAW10, four pixels in five bytes */
++	uint32_t        bayer;          /* the order of a 2x2 cell: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR */
++	uint32_t        black;          /* the black level, in 10-bit steps */
++	uint64_t        sequence;       /* the frame's number since the sensor started, from 1 */
++	uint64_t        time;           /* when the frame was done, in mach_absolute_time() units */
++	uint32_t        exposure_lines; /* the exposure it was taken with, in lines ... */
++	uint32_t        line_ns;        /* ... of this many nanoseconds */
++	uint32_t        gain;           /* analog gain, linear: gain_unity is 1x */
++	uint32_t        gain_unity;
++	uint32_t        gain_max;
++	uint32_t        frame_lines;    /* the frame's length in lines (frames a second: 1e9 / (frame_lines * line_ns)) */
++	uint32_t        frame_lines_min; /* the mode's own length: the shortest frame */
++	uint32_t        frame_lines_max;
++	uint32_t        margin;         /* exposure_lines is at most frame_lines - margin */
++	uint32_t        sensor;         /* 0 macro, 1 wide (rear), 2 front, 3 ultra-wide: always 1 here */
++	uint32_t        focus;          /* BLUELINE_CAMERA_NO_FOCUS: no lens motor driver */
++	uint32_t        reserved[5];    /* by BLUELINE_CAMERA_R_* */
++};
++
++#define BLUELINE_CAMERA_NO_FOCUS        0xffffffffu
++#define BLUELINE_CAMERA_FOCUS_MAX       1023u
++
++#define BLUELINE_CAMERA_R_FLAGS         0       /* BLUELINE_CAMERA_FLAG_* */
++#define BLUELINE_CAMERA_R_SOF_LO        1       /* (0 here) */
++#define BLUELINE_CAMERA_R_SOF_HI        2       /* (0 here) */
++#define BLUELINE_CAMERA_R_DGAIN         3       /* digital gain unity | max << 16; 0: none */
++#define BLUELINE_CAMERA_R_FPS_MILLI     4       /* the mode's frames a second x 1000 */
++#define BLUELINE_CAMERA_FLAG_FLASH_LIT  (1u << 0)
++#define BLUELINE_CAMERA_FLAG_LENS_MOVING (1u << 1)
++#define BLUELINE_CAMERA_FLAG_MODE_CHANGED (1u << 2)     /* the first frame read after the sensor started */
++
++enum {
++	BLUELINE_CAMERA_EXPOSURE = 1,   /* a: lines, b: gain (linear), c: frame lines (0: the shortest that holds the exposure) */
++	BLUELINE_CAMERA_KEEP = 2,       /* (ENOTSUP) */
++	BLUELINE_CAMERA_SENSOR = 3,     /* a: which (as the header's sensor): 1 only */
++	BLUELINE_CAMERA_FOCUS = 4,      /* (ignored) */
++	BLUELINE_CAMERA_FLASH = 5,      /* (ENOTSUP) */
++	BLUELINE_CAMERA_FORMAT = 6,     /* a: BLUELINE_CAMERA_FORMAT_RAW10 only */
++	BLUELINE_CAMERA_COLOUR = 7,     /* (ENOTSUP) */
++};
++enum { BLUELINE_CAMERA_FORMAT_RAW10 = 1, BLUELINE_CAMERA_FORMAT_NV12 = 2 };
++
++struct blueline_camera_command {
++	uint32_t        command;
++	uint32_t        bytes;          /* of what follows this structure */
++	uint32_t        a, b, c, d;
++};
++
++#endif /* _SYS_BLUELINE_CAMERA_H_ */

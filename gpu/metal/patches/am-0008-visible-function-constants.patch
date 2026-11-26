@@ -1,0 +1,23 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1915,6 +1915,20 @@
+   char head[96];snprintf(head,sizeof head,"S t=%llu us=%llu ok=%d name=",(unsigned long long)((functionBegan-gJournalBegan)/1000),
+       (unsigned long long)(nowUs()-functionBegan),handle?1:0);
+   journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
++ }
++ // pixel3-ios: a [[visible]] / [[stitchable]] function is no entry point the translator specializes; Core Image asks for its
++ // stitchable stdlib functions this way (CI::VisibleFunctionStitchingDescriptor, constants empty or unused) and inserts the
++ // answer into an array (nil: NSInvalidArgumentException in mediaserverd). Such a function is the plain one with the values kept:
++ // stitching compiles it from its own bitcode (functionBitcode).
++ if(!handle && !zeroRest) {
++  if(NmbFunction *plain=nmb_function_new(_handle,name.UTF8String)) {
++   if(nmb_function_type(plain)==MTLFunctionTypeVisible) {
++    NBFunction *function=[NBFunction new];function.handle=plain;function.name=name;function.sourceName=name;
++    function.functionType=MTLFunctionTypeVisible;function.constantsText=text;function.library=self;function.constantValues=snapshot;
++    if(error)*error=nil;return (id<MTLFunction>)function;
++   }
++   nmb_function_release(plain);
++  }
+  }
+  if(!handle){
+   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
