@@ -19,8 +19,10 @@
 #
 # The bridge (metal2vulkan's runtime behind a C ABI, libadreno_metal_bridge.a) is built by UniXNU's own script with
 # our patches in patches/ added to its list: m2v-0001 gives read_pages an iOS fallback (the pinned runtime defines it
-# on Linux, macOS and Windows only). The frontend is compiled from a copy with am-*.patch: am-0001 takes iOS 16's
-# _MTLDevice (the check held to iPadOS 17's 536 bytes; the subclass uses none of its ivars).
+# on Linux, macOS and Windows only); m2v-0002 lists a module's [[stitchable]] signatures, which amb-0001 (the bridge's
+# own sources) answers as nmb_air_stitchable_signatures and am-0007 makes MTLFunction's returnType and arguments of.
+# The frontend is compiled from a copy with am-*.patch: am-0001 takes iOS 16's _MTLDevice (the check held to iPadOS
+# 17's 536 bytes; the subclass uses none of its ivars).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 REPO=$PWD
@@ -33,22 +35,26 @@ export PATH="$(brew --prefix rustup)/bin:$PATH"
 
 BRIDGE=$U/build/adreno-metal-bridge/ios/libadreno_metal_bridge.a
 if [ "${1:-}" != --reuse-bridge ] || [ ! -f "$BRIDGE" ]; then
-	S=$(grep -o "m2v-0001[^']*" "$U/scripts/build-adreno-metal-bridge.py" || true)
-	if [ -z "$S" ]; then
-		# add our patches after UniXNU's recorded ones
-		"$PY" - "$U/scripts/build-adreno-metal-bridge.py" "$REPO/gpu/metal/patches" <<'E'
+	# our m2v-*.patch after UniXNU's recorded ones, each listed by its path (the script checks the source is the pin plus a
+	# prefix of the list, and applies the rest)
+	"$PY" - "$U/scripts/build-adreno-metal-bridge.py" "$REPO/gpu/metal/patches" <<'E'
 import sys, re
+from pathlib import Path
 p, d = sys.argv[1], sys.argv[2]
 s = open(p).read()
-s = re.sub(r"(PATCHES = \[.*?\]\])", lambda m: m.group(1) + " + sorted(Path('%s').glob('m2v-*.patch'))" % d, s, count=1, flags=re.S)
+ours = " + [%s]" % ", ".join("Path(%r)" % str(x) for x in sorted(Path(d).glob('m2v-*.patch')))
+s = re.sub(r"(PATCHES = \[.*?\]\])(?: \+ (?:sorted\(.*?\)|\[Path\(.*?\)\]))?\n", lambda m: m.group(1) + ours + "\n", s, count=1, flags=re.S)
 open(p, 'w').write(s)
 E
-	fi
+	# amb-*.patch: the bridge's own sources (AdrenoMetal/bridge), applied in place once
+	for p in "$REPO"/gpu/metal/patches/amb-*.patch; do
+		git -C "$A" apply --check -R "$p" 2>/dev/null || git -C "$A" apply "$p"
+	done
 	(cd "$U" && "$PY" scripts/build-adreno-metal-bridge.py --target ios)
 fi
 
 mkdir -p "$OUT"
-# the frontend from a copy with our patches (am-*.patch), the AdrenoMetal checkout stays clean
+# the frontend from a copy with our patches (am-*.patch), the AdrenoMetal frontend sources stay clean
 SRC=$OUT/am-src
 rm -rf "$SRC"; mkdir -p "$SRC"
 cp "$A"/*.h "$A"/*.mm "$SRC"/; mkdir -p "$SRC/bridge"; cp "$A"/bridge/*.h "$SRC/bridge/"

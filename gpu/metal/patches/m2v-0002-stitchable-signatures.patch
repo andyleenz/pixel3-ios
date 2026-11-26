@@ -1,0 +1,218 @@
+diff --git a/crates/metal2vulkan-air/src/abi/mod.rs b/crates/metal2vulkan-air/src/abi/mod.rs
+index 39a6d46..0bcc2ab 100644
+--- a/crates/metal2vulkan-air/src/abi/mod.rs
++++ b/crates/metal2vulkan-air/src/abi/mod.rs
+@@ -1252,6 +1252,9 @@ pub struct VisibleOutput {
+ pub struct Stitching {
+     /// The return value's stitching type (`None`: a `void` function).
+     pub result: Option<StitchingType>,
++    /// (pixel3-ios) The return value's MSL type name, from its type descriptor (`None`: a `void`
++    /// function, or a descriptor not named; see `visible::descriptor_name`).
++    pub result_type_name: Option<DiagName>,
+     /// One per stitched argument, in order.
+     pub arguments: Vec<StitchingArgument>,
+ }
+@@ -1263,6 +1266,8 @@ pub struct StitchingArgument {
+     pub ty: StitchingType,
+     /// The argument's name, for diagnostics.
+     pub name: Option<DiagName>,
++    /// (pixel3-ios) The argument's MSL type name, from its type descriptor (`None`: not named).
++    pub type_name: Option<DiagName>,
+ }
+ 
+ /// One `air.stitching_type`: the four helper-function operands in metadata order (`None`: a
+diff --git a/crates/metal2vulkan-air/src/abi/tests.rs b/crates/metal2vulkan-air/src/abi/tests.rs
+index e946018..5609405 100644
+--- a/crates/metal2vulkan-air/src/abi/tests.rs
++++ b/crates/metal2vulkan-air/src/abi/tests.rs
+@@ -3587,6 +3587,7 @@ fn visible_functions_decode() {
+         abi.visible_functions[0].stitching,
+         Some(Stitching {
+             result: None,
++            result_type_name: None,
+             arguments: vec![]
+         })
+     );
+diff --git a/crates/metal2vulkan-air/src/abi/visible.rs b/crates/metal2vulkan-air/src/abi/visible.rs
+index c809c48..f452722 100644
+--- a/crates/metal2vulkan-air/src/abi/visible.rs
++++ b/crates/metal2vulkan-air/src/abi/visible.rs
+@@ -18,7 +18,7 @@
+ //! operand, or a repeated attribute is an [`AbiError`].
+ 
+ use super::keys::Key;
+-use super::md::{kept_diag, node_ops, saw_str, Ops, Site, Tok};
++use super::md::{kept_diag, node_ops, saw_str, tok, Ops, Site, Tok};
+ use super::{
+     Stitching, StitchingArgument, StitchingType, VisibleFunction, VisibleOutput, VisibleParam,
+     VisibleParamKind,
+@@ -144,9 +144,12 @@ fn stitching(m: &Module, id: MdId, site: &Site, meter: &mut Meter) -> Result<Sti
+     let key = Some(STITCHING_INFO);
+     let mut n = Ops::node(m, id, site.clone())?;
+     tag(&mut n, STITCHING_INFO)?;
+-    let result = match n.next(key)? {
+-        Tok::Null => None,
+-        Tok::Node(ty) => Some(stitching_type(m, ty, site)?),
++    let (result, result_type_name) = match n.next(key)? {
++        Tok::Null => (None, None),
++        Tok::Node(ty) => {
++            let (ty, name) = stitching_type(m, ty, site)?;
++            (Some(ty), name)
++        }
+         _ => return Err(site.err(AbiError::BadValue, key)),
+     };
+     let mut arguments = Vec::new();
+@@ -156,25 +159,39 @@ fn stitching(m: &Module, id: MdId, site: &Site, meter: &mut Meter) -> Result<Sti
+         let arg_key = Some(STITCHING_ARGUMENT);
+         let mut a = Ops::node(m, n.child(key)?, site.clone())?;
+         tag(&mut a, STITCHING_ARGUMENT)?;
+-        let ty = stitching_type(m, a.child(arg_key)?, site)?;
++        let (ty, type_name) = stitching_type(m, a.child(arg_key)?, site)?;
+         let name = if a.is_done() {
+             None
+         } else {
+             Some(a.diag(arg_key, meter)?)
+         };
+         a.finish()?;
+-        arguments.push(StitchingArgument { ty, name });
++        arguments.push(StitchingArgument {
++            ty,
++            name,
++            type_name,
++        });
+     }
+-    Ok(Stitching { result, arguments })
++    Ok(Stitching {
++        result,
++        result_type_name,
++        arguments,
++    })
+ }
+ 
+-/// `!{!"air.stitching_type", !<descriptor>, <helper> x 4}`, each helper a function or `null`.
+-fn stitching_type(m: &Module, id: MdId, site: &Site) -> Result<StitchingType, Error> {
++/// `!{!"air.stitching_type", !<descriptor>, <helper> x 4}`, each helper a function or `null`; and
++/// (pixel3-ios) the descriptor's MSL type name.
++fn stitching_type(
++    m: &Module,
++    id: MdId,
++    site: &Site,
++) -> Result<(StitchingType, Option<DiagName>), Error> {
+     let key = Some(STITCHING_TYPE);
+     let mut n = Ops::node(m, id, site.clone())?;
+     tag(&mut n, STITCHING_TYPE)?;
+-    // The MSL type descriptor: a node, not decoded (module documentation).
+-    n.child(key)?;
++    // The MSL type descriptor: a node, only named (descriptor_name), not otherwise decoded.
++    let descriptor = n.child(key)?;
++    let name = descriptor_name(m, descriptor, 0).map(DiagName::new);
+     let mut helpers = [None; 4];
+     for helper in &mut helpers {
+         *helper = match n.next(key)? {
+@@ -184,7 +201,45 @@ fn stitching_type(m: &Module, id: MdId, site: &Site) -> Result<StitchingType, Er
+         };
+     }
+     n.finish()?;
+-    Ok(StitchingType { helpers })
++    Ok((StitchingType { helpers }, name))
++}
++
++/// (pixel3-ios) An MSL type descriptor's type name, as `MTLFunction`'s reflection names it: a struct
++/// `!{!"air.struct_type", size, align, _, !"name", fields}` by its name; a scalar
++/// `!{!"air.<scalar>_type", size, align, _}` as `<scalar>` (`float`, `half`, `bool`, `uint`, ...); a
++/// vector `!{!"air.vector_type", size, align, _, !elem, count}` as `<elem><count>`; a matrix
++/// `!{!"air.matrix_type", size, align, _, !elem, columns, rows}` as `<elem><columns>x<rows>`. Any
++/// other descriptor, or one not of that shape, is not named (lenient: the descriptor is no part of
++/// the module's strict grammar).
++fn descriptor_name(m: &Module, id: MdId, depth: u32) -> Option<String> {
++    let ops = node_ops(m, id)?;
++    let op = |i: usize| ops.get(i).copied().and_then(|o| tok(m, o));
++    let int = |i: usize| match op(i)? {
++        Tok::Int { value, .. } => Some(value),
++        _ => None,
++    };
++    let Tok::Str(kind) = op(0)? else { return None };
++    let kind = std::str::from_utf8(kind).ok()?;
++    match kind {
++        "air.struct_type" => match op(4)? {
++            Tok::Str(name) => std::str::from_utf8(name).ok().map(str::to_owned),
++            _ => None,
++        },
++        "air.vector_type" | "air.matrix_type" if depth == 0 => {
++            let Tok::Node(elem) = op(4)? else { return None };
++            let elem = descriptor_name(m, elem, depth + 1)?;
++            if kind == "air.vector_type" {
++                Some(format!("{elem}{}", int(5)?))
++            } else {
++                Some(format!("{elem}{}x{}", int(5)?, int(6)?))
++            }
++        }
++        _ => kind
++            .strip_prefix("air.")?
++            .strip_suffix("_type")
++            .filter(|s| !s.contains('.'))
++            .map(str::to_owned),
++    }
+ }
+ 
+ /// The node's leading tag string must be `want`; another is `UnknownKey`, naming it.
+diff --git a/crates/metal2vulkan/src/library/function.rs b/crates/metal2vulkan/src/library/function.rs
+index a0c3321..c71f1de 100644
+--- a/crates/metal2vulkan/src/library/function.rs
++++ b/crates/metal2vulkan/src/library/function.rs
+@@ -832,3 +832,45 @@ impl FunctionConstantValue {
+         }
+     }
+ }
++
++/// (pixel3-ios) One `[[stitchable]]` function of a module, as `MTLFunction`'s `returnType` and
++/// `arguments` describe it: from its `air.stitching_info`, the return value's and each stitched
++/// argument's MSL type name (from the type descriptors) and each argument's name. (The
++/// `air.visible_input` parameters are the arguments flattened: a `coreimage::Sampler` is its four
++/// fields, a destination its coordinate.)
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct StitchableSignature {
++    /// The function's name.
++    pub name: String,
++    /// The return value's type name (`None`: a `void` function, or not named).
++    pub return_type: Option<String>,
++    /// Each argument's name and type name (empty where the module names none).
++    pub arguments: Vec<(String, String)>,
++}
++
++/// (pixel3-ios) The `[[stitchable]]` functions of the AIR module `bitcode` (a metallib function's
++/// own module, or a module several share), decoded once. Refused with the decode's own errors.
++pub fn stitchable_signatures(bitcode: &[u8]) -> Result<Vec<StitchableSignature>, Error> {
++    let mut m = Meter::new(&Budget::standard());
++    crate::pipeline::compile::guarded(|| {
++        let decoded = crate::air::decode(bitcode, &mut m)?;
++        let text = |n: &Option<DiagName>| n.as_ref().map(|n| n.to_string());
++        Ok(decoded
++            .abi
++            .visible_functions
++            .iter()
++            .filter_map(|v| {
++                let st = v.stitching.as_ref()?;
++                Some(StitchableSignature {
++                    name: v.name.to_string(),
++                    return_type: text(&st.result_type_name),
++                    arguments: st
++                        .arguments
++                        .iter()
++                        .map(|a| (text(&a.name).unwrap_or_default(), text(&a.type_name).unwrap_or_default()))
++                        .collect(),
++                })
++            })
++            .collect())
++    })
++}
+diff --git a/crates/metal2vulkan/src/library/mod.rs b/crates/metal2vulkan/src/library/mod.rs
+index 82d92a4..c47cbd5 100644
+--- a/crates/metal2vulkan/src/library/mod.rs
++++ b/crates/metal2vulkan/src/library/mod.rs
+@@ -43,3 +43,5 @@ pub use function::{
+     Function, FunctionConstant, FunctionConstantValue, FunctionConstantValues, FunctionInfo,
+     FunctionStage, Library, LibraryType,
+ };
++// (pixel3-ios) `[[stitchable]]` signatures, for the frontend's MTLFunction returnType and arguments.
++pub use function::{stitchable_signatures, StitchableSignature};

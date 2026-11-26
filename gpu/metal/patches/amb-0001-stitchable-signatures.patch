@@ -1,0 +1,46 @@
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 902846e..3062542 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -232,6 +232,8 @@ void nmb_function_release(NmbFunction *);
+ bool nmb_function_set_specialized_name(NmbFunction *, const char *);
+ /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
+ uint64_t nmb_function_type(const NmbFunction *);
++/* (pixel3-ios) the [[stitchable]] functions of an AIR module: "name\treturn\n" then "\targ\ttype\n" per argument */
++size_t nmb_air_stitchable_signatures(const void *bytes, size_t length, char *text, size_t capacity);
+ uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
+ int64_t nmb_function_patch_control_point_count(const NmbFunction *); /* -1: no patch, or no count stated */
+ 
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 4bd287b..8fb5811 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -2018,6 +2018,28 @@ pub unsafe extern "C" fn nmb_function_attribute_at(function: *const NmbFunction,
+     })
+ }
+ 
++/// (pixel3-ios) The `[[stitchable]]` functions of the AIR module `bytes`, as text for MTLFunction's `returnType` and
++/// `arguments`: per function a line `name\treturn type`, then a line `\targument name\ttype name` per argument. The
++/// text's length; 0 when the module cannot be decoded.
++///
++/// # Safety
++/// `bytes` holds `length` bytes, `text` has `capacity` writable bytes (or is null).
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_air_stitchable_signatures(bytes: *const c_void, length: usize, text: *mut c_char,
++                                                    capacity: usize) -> usize {
++    guard(0, || {
++        if bytes.is_null() || length == 0 { return Err("no module bytes".into()); }
++        // SAFETY: the caller's contract.
++        let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length) };
++        let mut s = String::new();
++        for f in metal2vulkan::library::stitchable_signatures(bytes).map_err(e("stitchable signatures"))? {
++            s += &format!("{}\t{}\n", f.name, f.return_type.unwrap_or_default());
++            for (name, ty) in f.arguments { s += &format!("\t{}\t{}\n", name, ty); }
++        }
++        Ok(copy_out(&s, text, capacity))
++    })
++}
++
+ /// `patchType`: 0 (none) for a function other than a post-tessellation vertex function.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_function_patch_type(function: *const NmbFunction) -> u64 {

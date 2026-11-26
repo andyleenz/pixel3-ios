@@ -117,8 +117,10 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Done: capture servers on, the plug-in loads in mediaserverd, Core Image's Metal kernels compile (am-0006),
   AVFoundation lists the back camera with CMCapture's named formats.
 - Done: TCC grants camera access (sandbox extensions, 0993).
-- Next: device formats, the PortraitFilters abort in mediaserverd, then stream Start with frames from the
-  kernel's CSI-2 path (continuous frames, rear focus LC898219XI later).
+- Done: the device lists 46 formats and the session takes the input; Core Image's stitchable kernels get
+  Metal's function reflection (m2v-0002, amb-0001, am-0007), so mediaserverd no longer aborts in PortraitFilters.
+- Next: the device and stream `Clock`, stream Start with synthetic frames, then frames from the kernel's
+  CSI-2 path (continuous frames, rear focus LC898219XI later).
 
 **Next, in order**
 1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery

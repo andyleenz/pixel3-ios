@@ -1296,9 +1296,24 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   patches because the sailfish stack edits the same function.
 - `tools/phone.sh sync` read the size of a symlinked base image (62 bytes) and copied all 16 GiB; `stat -L` now.
 
-Next: why the device has 0 formats; the frontend's function reflection for Core Image's stitchable kernels
-(`returnType`, `arguments`: Metal's own MTLTypeInternal / MTLStructTypeInternal / MTLBindingInternal, built from
-`air.stitching_info`); then the kernel frame ring and Start.
+- **cam28-29: Core Image stitchable reflection.** MTLFunction `returnType` and `arguments` for `[[stitchable]]`
+  functions, as macOS Metal answers them over the same iOS 16.7 metallibs (dumped with a Mac test program):
+  `returnType` an MTLTypeInternal; one MTLBindingInternal per `air.stitching_argument`, binding type 18 for a
+  scalar or vector, 29 for a struct (`coreimage::Sampler`, `coreimage::destination` and four more, members as
+  Metal lists them). Apple's own reflection for these comes from the compiler service, so it is rebuilt:
+  m2v-0002 names each stitching argument's MSL type descriptor, amb-0001 returns a module's signatures
+  (`nmb_air_stitchable_signatures`), am-0007 builds Metal's objects from them, cached per library.
+  The `air.visible_input` list is the arguments flattened (a Sampler is t, s, m, dc; the destination is `c`):
+  using it (cam28) moved the abort to `CIPortraitLightingSide`; the stitching list (cam29) fixed it.
+- cam28: the plug-in's formats now also carry redfin's crop, GDC, scaler-output and exposure keys; the device
+  lists 46 formats and `canAddInput` succeeds.
+- cam29: no PortraitFilters abort. The session start asks the device for `Clock` (not answered), then sets
+  `ClientIsActive` false; CamHello: `running 0`, -11800. mediaserverd was killed once after the test by jetsam
+  (per-process memory limit). Core Image's specialized kernels from `ci_stdlib` (`_gaussianBlur7` and others)
+  are refused (`EntryNotFound`, 194 entries).
+
+Next: the device and stream `Clock`, the stream's output configuration and handler properties and Start
+(synthetic frames first, as redfin did), then the kernel frame ring.
 
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;

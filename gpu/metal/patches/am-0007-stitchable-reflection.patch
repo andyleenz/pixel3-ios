@@ -1,0 +1,116 @@
+--- a/NativeBridgeMetalFrontend.mm	2026-11-26 14:59:12
++++ b/NativeBridgeMetalFrontend.mm	2026-11-26 14:59:12
+@@ -1650,9 +1650,113 @@
+   const size_t offset=word(at+8),size=word(at+12);
+   if(offset>length || size>length-offset)return;
+   library.bytes=file+offset;library.length=size;return;
++ }
++}
++// (am-0007) MTLFunction's returnType and arguments for a [[stitchable]] function, which Core Image reads for each kernel it loads
++// (CIKernelReflection::reflect: a nil returnType aborted PortraitFilters' kernels in mediaserverd). As Metal answers them (macOS 26
++// Metal over iOS 16.7's Core Image metallibs): returnType an MTLTypeInternal of the return value's MSL type; arguments one
++// MTLBindingInternal per argument, binding type 18 for a scalar or vector and 29 for a struct, access, index, use and array length 0.
++// The names and types come from the function's air.stitching_info (nmb_air_stitchable_signatures); a struct by its MSL name from the table,
++// the only ones Core Image's stitchable kernels pass (their layouts as Metal states them).
++static NSData *functionBitcode(NBFunction *function);
++static id nbType(uint64_t dataType) {
++ return ((id(*)(id,SEL,uint64_t))objc_msgSend)([NSClassFromString(@"MTLTypeInternal") alloc],@selector(initWithDataType:),dataType);
++}
++static id nbTexture(uint64_t element,uint64_t access) {
++ return ((id(*)(id,SEL,uint64_t,uint64_t,uint64_t,BOOL))objc_msgSend)([NSClassFromString(@"MTLTextureReferenceTypeInternal") alloc],
++  @selector(initWithDataType:textureType:access:isDepthTexture:),element,MTLTextureType2D,access,NO);
++}
++static id nbMember(NSString *name,uint64_t offset,uint64_t dataType,id details) {
++ return ((id(*)(id,SEL,id,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,id))objc_msgSend)(
++  [NSClassFromString(@"MTLStructMemberInternal") alloc],
++  @selector(initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:raster_order_group:details:),
++  name,offset,dataType,0,0,0,0xffffffffull,0,details);
++}
++static uint64_t nbScalarType(NSString *name) {
++ static NSDictionary<NSString *,NSNumber *> *types=@{
++  @"float":@3,@"float2":@4,@"float3":@5,@"float4":@6,@"float2x2":@7,@"float3x3":@11,@"float4x4":@15,
++  @"half":@16,@"half2":@17,@"half3":@18,@"half4":@19,@"half2x2":@20,@"half3x3":@24,@"half4x4":@28,
++  @"int":@29,@"int2":@30,@"int3":@31,@"int4":@32,@"uint":@33,@"uint2":@34,@"uint3":@35,@"uint4":@36,
++  @"short":@37,@"short2":@38,@"short3":@39,@"short4":@40,@"ushort":@41,@"ushort2":@42,@"ushort3":@43,@"ushort4":@44,
++  @"char":@45,@"char2":@46,@"char3":@47,@"char4":@48,@"uchar":@49,@"uchar2":@50,@"uchar3":@51,@"uchar4":@52,
++  @"bool":@53,@"bool2":@54,@"bool3":@55,@"bool4":@56};
++ return types[name].unsignedLongLongValue;
++}
++// A Core Image struct by its MSL name (nil: not one of them).
++static id nbCoreImageStruct(NSString *name) {
++ const bool half=[name hasSuffix:@"_h"];const uint64_t element=half?MTLDataTypeHalf:MTLDataTypeFloat;
++ NSArray *members=nil;
++ if([name isEqualToString:@"coreimage::destination"] || [name isEqualToString:@"coreimage::destination_h"]) {
++  members=@[nbMember(@"c",0,MTLDataTypeFloat2,nil)];
++ } else if([name isEqualToString:@"coreimage::Sampler"] || [name isEqualToString:@"coreimage::Sampler_h"]) {
++  id matrix=((id(*)(id,SEL,uint64_t,id,uint64_t,uint64_t,uint64_t,BOOL,BOOL))objc_msgSend)([NSClassFromString(@"MTLPointerTypeInternal") alloc],
++   @selector(initWithElementType:elementTypeDescription:access:alignment:dataSize:elementIsIndirectArgumentBuffer:isConstantBuffer:),
++   MTLDataTypeFloat4x4,nil,0,16,64,NO,NO);
++  members=@[nbMember(@"t",0,MTLDataTypeTexture,nbTexture(element,MTLBindingAccessReadOnly)),nbMember(@"s",8,MTLDataTypeSampler,nil),
++            nbMember(@"m",16,MTLDataTypePointer,matrix),nbMember(@"dc",24,MTLDataTypeFloat2,nil)];
++ } else if([name isEqualToString:@"coreimage::priv::Destination"] || [name isEqualToString:@"coreimage::priv::Destination_h"]) {
++  members=@[nbMember(@"c",0,MTLDataTypeFloat2,nil),nbMember(@"_gid",8,MTLDataTypeUInt2,nil),nbMember(@"_extent",16,MTLDataTypeFloat4,nil),
++            nbMember(@"_transform",32,MTLDataTypeFloat4x4,nil),nbMember(@"_texture",96,MTLDataTypeTexture,nbTexture(element,MTLBindingAccessWriteOnly)),
++            nbMember(@"_texturePlane",104,MTLDataTypeTexture,nbTexture(element,MTLBindingAccessWriteOnly))];
++ } else if([name isEqualToString:@"coreimage::group::destination_h"]) {
++  members=@[nbMember(@"c",0,MTLDataTypeFloat2,nil),nbMember(@"gid",8,MTLDataTypeUInt2,nil),nbMember(@"r",16,MTLDataTypeFloat4,nil),
++            nbMember(@"m",32,MTLDataTypeFloat4x4,nil),nbMember(@"t",96,MTLDataTypeTexture,nbTexture(MTLDataTypeHalf,MTLBindingAccessWriteOnly))];
++ }
++ if(!members)return nil;
++ __unsafe_unretained id list[8];NSUInteger n=0;
++ for(id m in members)list[n++]=m;
++ return ((id(*)(id,SEL,__unsafe_unretained id *,uint64_t,id))objc_msgSend)([NSClassFromString(@"MTLStructTypeInternal") alloc],
++  @selector(initWithMembers:count:typeName:),list,n,name);
++}
++static id nbReflectedType(NSString *name,bool *isStruct) {
++ id s=nbCoreImageStruct(name);
++ if(isStruct)*isStruct=s!=nil;
++ if(s)return s;
++ const uint64_t t=nbScalarType(name);
++ if(!t)noteProblem([NSString stringWithFormat:@"stitchable type %@ not reflected (MTLDataTypeNone)",name]);
++ return nbType(t);
++}
++// The function's [return type, [[name, type] ...]] (nil: not a stitchable function, or its module did not decode). Each module is
++// decoded once: every stitchable function in it is kept, by name, on its library.
++static NSArray *stitchableSignature(NBFunction *function) {
++ NBLibrary *library=function.library;NSString *name=function.sourceName?:function.name;
++ if(!library || !name)return nil;
++ static char key;
++ @synchronized(library) {
++  NSMutableDictionary *known=objc_getAssociatedObject(library,&key);
++  if(!known){known=[NSMutableDictionary dictionary];objc_setAssociatedObject(library,&key,known,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
++  if(!known[name]) {
++   NSData *bitcode=functionBitcode(function);
++   std::vector<char> text(1<<16);
++   size_t n=bitcode?nmb_air_stitchable_signatures(bitcode.bytes,bitcode.length,text.data(),text.size()):0;
++   if(n>=text.size()){text.resize(n+1);n=nmb_air_stitchable_signatures(bitcode.bytes,bitcode.length,text.data(),text.size());}
++   NSMutableArray *arguments=nil;
++   for(NSString *line in [[NSString stringWithUTF8String:text.data()]?:@"" componentsSeparatedByString:@"\n"]) {
++    NSArray<NSString *> *f=[line componentsSeparatedByString:@"\t"];
++    if(f.count==3 && !f[0].length){[arguments addObject:@[f[1],f[2]]];continue;}
++    if(f.count==2 && f[0].length){arguments=[NSMutableArray array];known[f[0]]=@[f[1],arguments];}
++   }
++   if(!known[name])known[name]=[NSNull null];
++  }
++  id found=known[name];
++  return found==[NSNull null]?nil:found;
+  }
+ }
+ @implementation NBFunction
++- (id)returnType {
++ NSArray *s=stitchableSignature(self);NSString *type=s[0];
++ return type.length && ![type isEqualToString:@"void"]?nbReflectedType(type,nullptr):nil;
++}
++- (NSArray *)arguments {
++ NSArray *s=stitchableSignature(self);if(!s)return nil;
++ NSMutableArray *bindings=[NSMutableArray array];
++ for(NSArray<NSString *> *a in s[1]) {
++  bool isStruct=false;id type=nbReflectedType(a[1],&isStruct);
++  [bindings addObject:((id(*)(id,SEL,id,uint64_t,uint64_t,uint64_t,BOOL,uint64_t,id))objc_msgSend)([NSClassFromString(@"MTLBindingInternal") alloc],
++   @selector(initWithName:type:access:index:active:arrayLength:typeDescription:),a[0],isStruct?29:18,MTLBindingAccessReadOnly,0,NO,0,type)];
++ }
++ return bindings;
++}
+ - (NSArray *)stageInputAttributes {
+  if(!_handle)return nil;
+  int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;

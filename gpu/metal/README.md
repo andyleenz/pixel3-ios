@@ -26,6 +26,9 @@ Translated QuartzCore pipelines are also drawn straight through Vulkan by `gpu/m
 | `patches/am-0004-*` | Linear texture alignment of 64 bytes (A6xx pitch): CoreAnimation's images in buffers import without shadow copies (`NATIVE_METAL_LINEAR16=1`: 16) |
 | `patches/am-0005-*` | `presentDrawable:` presents once the command buffer is scheduled, as Metal does, not after completion (`NATIVE_METAL_PRESENT_COMPLETED=1`: after). Needed with the DPU's second layer: presenting at completion added about a frame to each drawable's round trip, SpriteKit 40.5 -> 60.6 fps steady (sk22, sk23) |
 | `patches/am-0006-*` | `newFunctionWithName:constantValues:pipelineLibrary:error:` (Core Image's kernel path on iOS 16) answered as the plain specialization; it answered nil, and Core Image crashed on the nil function (mediaserverd, `PortraitFilters.cifilter`) |
+| `patches/am-0007-*` | MTLFunction `returnType` and `arguments` for `[[stitchable]]` functions (Core Image): Metal's own MTLTypeInternal / MTLStructTypeInternal / MTLBindingInternal, built from the function's `air.stitching_info` names, with the `coreimage::` struct layouts macOS Metal reports. Without them PortraitFilters aborted mediaserverd (nil insert) |
+| `patches/m2v-0002-*` | metal2vulkan: the MSL type name of each stitching argument's descriptor (struct name, scalar, vector, matrix); `stitchable_signatures()` |
+| `patches/amb-0001-*` | AdrenoMetal bridge: `nmb_air_stitchable_signatures()`, a module's stitchable signatures as text |
 | `m2vbatch.py` | translates every function of a metallib: `M2V_PROFILE=turnip-a630 python3 m2vbatch.py SCRATCH LIB TAG` |
 
 The captures come from the Mac: the host build of the same Turnip (`VK=1 HOST=1`) over the fake BlueGPU,

@@ -149,6 +149,16 @@ put(NSMutableDictionary *d, const char *name, id value)
 		d[(__bridge NSString *)k] = value;
 }
 
+/* A scaler output of a format (SupportedOutputs; redfin's camera_device.c output_info(), whose preview runs in Camera.app). */
+static NSDictionary *
+scalerInfo(int w, int h)
+{
+	return @{ @"SupportedPixelFormats": @[ @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange), @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+			@(kCVPixelFormatType_32BGRA) ],
+		  @"NativeWidth": @(w), @"NativeHeight": @(h), @"MaxDownscaleFactor": @32.0, @"MaxScaleFactor": @1.0,
+		  @"MinScaleFactor": @(1.0 / 32), @"OutputWidthAlignmentRequirement": @16 };
+}
+
 static NSArray *
 backFormats(void)
 {
@@ -187,6 +197,24 @@ backFormats(void)
 		put(d, "kFigCaptureStreamVideoFormatKey_SensorWidth", @(sw));
 		put(d, "kFigCaptureStreamVideoFormatKey_SensorHeight", @(sh));
 		put(d, "kFigCaptureStreamVideoFormatKey_SensorHDRMode", @0);
+		/*
+		 * What the graph builder reads next (redfin, by hooks): the crop and distortion-corrected sizes (all the
+		 * sensor: no crop, no GDC), the scalers' outputs, exposure and gain limits.
+		 */
+		BOOL binned = [f[@"Binned"] boolValue];
+		d[@"VideoBinningFactorHorizontal"] = @(binned ? 2 : 1);
+		d[@"VideoBinningFactorVertical"] = @(binned ? 2 : 1);
+		d[@"VideoMinIntegrationTime"] = @100;
+		d[@"VideoMaxIntegrationTime"] = @(1000000 / 15);
+		d[@"VideoRawBitDepth"] = @10;
+		d[@"ISOBase"] = @32.0;
+		d[@"DefaultAEMaxGain"] = @64.0;
+		d[@"PixelSize"] = @1.4;		/* IMX363, um */
+		for (NSString *k in @[ @"SensorCrop", @"PreGDCSensorCrop", @"PostGDCCrop", @"GeometricDistortionCorrectedNative" ]) {
+			d[[k stringByAppendingString:@"Width"]] = @(sw);
+			d[[k stringByAppendingString:@"Height"]] = @(sh);
+		}
+		d[@"SupportedOutputs"] = @{ @"PrimaryScaler": scalerInfo(w, h), @"SecondaryScaler": scalerInfo(w, h), @"StillImage": scalerInfo(sw, sh) };
 		if (fes) {
 			put(d, "kFigCaptureStreamVideoFormatKey_FrontEndScalerOutputWidth", @(w));
 			put(d, "kFigCaptureStreamVideoFormatKey_FrontEndScalerOutputHeight", @(h));
