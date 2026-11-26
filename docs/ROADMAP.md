@@ -6,7 +6,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 | Area | Feasibility | Route | Effort |
 |---|---|---|---|
 | Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; plug-in frames reach apps (cam32). Next: sensor frames in apps, then assetsd/Photos so captures save; force JPEG/H.264 (no HEIC/HEVC encoder) | hours |
-| Thermals to thermalmonitord | runs, uncalibrated | 0235 (`bluethermal=1`) + the launchd job: loop runs, reads all sensors, but goes to pressure 20 / backlight 90% at boot (SDM845 die hotter than the A11 tables). Next: scale or offset the die readings to the skin model, then on by default | 0.5 day |
+| Thermals to thermalmonitord | runs, uncalibrated | 0235 (`bluethermal=1`) + the launchd job: loop runs, reads all sensors, but goes to pressure 20 / backlight 90% at boot (SDM845 die hotter than the A11 tables). 0237 (built, untested) reads the board thermistors (PM8998 ADC) for the PMU sensors. Next: boot it, then on by default | 0.5 day |
 | Wi-Fi 5 GHz | needs a reference | ruled out: second rail (stock DT has ch0 only), board data, regulatory (firmware allows ch 36), ath10k pdev params (0236). Next: WMI trace from Android/Linux on this phone to diff; radio in the default boot | 1-2 days |
 | Cellular control, SMS | realistic | UniXNU/QcomBaseband (BSD-2, SC7180, iOS 17): `/baseband` ADT node, AppleBaseband classes, QMUX-QRTR bridge; board layer exists (0149, 0165, 0166); ends the CommCenter crash loop | 3-5 days |
 | Mobile data | more work | IPA v3.5.1 + GSI (Linux `drivers/net/ipa` has SDM845) | +4-6 days |

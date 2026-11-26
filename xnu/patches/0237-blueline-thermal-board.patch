@@ -1,0 +1,226 @@
+blueline: thermal PMU tdev sensors from the PM8998 board thermistors
+
+Apple's PMU tdev/tcal sensors are board thermistors; 0235 fed them SDM845 die
+sensors (55-69 C at boot) and thermalmonitord went to serious. Read the PM8998
+ADC5 (rev2, SPMI sid 0 0x3100) as qcom-spmi-adc5.c does: xo_therm, 100k NTC
+table; battery temperature when the ADC has no reading. Logs channels 0x4c-0x4f
+at start. ReportInterval 0 now stops mic1's events.
+
+--- a/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-26 19:47:20
++++ b/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-26 19:48:11
+@@ -37,9 +37,10 @@
+ #define BLUE_TEMP_PAGE		0xFF00u		/* kHIDPage_AppleVendor */
+ #define BLUE_TEMP_USAGE		0x05u		/* kHIDUsage_AppleVendor_TemperatureSensor */
+ 
+-enum { kFirst, kAvg, kMax, kBattery, kBatteryPush };
++enum { kFirst, kAvg, kMax, kBattery, kBatteryPush, kBoard };
+ #define S0(n)	(n)			/* tsens0 sensor n */
+ #define S1(n)	(0x10 | (n))		/* tsens1 sensor n */
++#define BLUE_XO_THERM	0x4cu		/* kBoard: a PM8998 ADC channel (dt-bindings qcom,spmi-vadc.h ADC5_XO_THERM_100K_PU) */
+ 
+ static const struct blue_tz {
+ 	const char *name;
+@@ -67,12 +68,12 @@
+ 	{ "Avg: ACC Temp Sensor2", kAvg, 1, { S0(6) } },
+ 	{ "Max: ACC Temp Sensor2", kMax, 1, { S0(6) } },
+ 	{ "NAND CH0 temp", kFirst, 1, { S1(2) } },
+-	{ "PMU tdev1", kFirst, 1, { S1(0) } },
+-	{ "PMU tdev2", kFirst, 1, { S1(3) } },
+-	{ "PMU tdev3", kFirst, 1, { S1(5) } },
+-	{ "PMU tdev4", kFirst, 1, { S1(6) } },
+-	{ "PMU tdev5", kFirst, 1, { S1(7) } },
+-	{ "PMU tcal", kFirst, 1, { S0(0) } },
++	{ "PMU tdev1", kBoard, 1, { BLUE_XO_THERM } },
++	{ "PMU tdev2", kBoard, 1, { BLUE_XO_THERM } },
++	{ "PMU tdev3", kBoard, 1, { BLUE_XO_THERM } },
++	{ "PMU tdev4", kBoard, 1, { BLUE_XO_THERM } },
++	{ "PMU tdev5", kBoard, 1, { BLUE_XO_THERM } },
++	{ "PMU tcal", kBoard, 1, { BLUE_XO_THERM } },
+ 	{ "PMU tjunc", kMax, 4, { S0(7), S0(8), S0(9), S0(10) } },
+ 	{ "TG0B", kBattery, 0, { 0 } },
+ 	{ "TG0V", kBattery, 0, { 0 } },
+@@ -81,7 +82,122 @@
+ #define BLUE_TZ_N	(sizeof(blue_tz) / sizeof(blue_tz[0]))
+ 
+ static vm_offset_t blue_tm[2];
++
++/*
++ * 0237: board temperatures from the PM8998 ADC (ADC5 rev2 at SPMI sid 0, 0x3100), as Linux qcom-spmi-adc5.c
++ * reads a thermistor channel: ratiometric calibration, decimation 1024, 200 us settle, one sample; the code
++ * to mV (1875 mV full scale = 0x4000), then the NTCG104EF104 100k pull-up table (qcom-vadc-common.c
++ * adcmap_100k_104ef_104fb_1875_vref). Apple's PMU tdev sensors are board thermistors (30-45 C in use);
++ * fed from SDM845 die sensors (0235) they read 55-69 C at boot and thermalmonitord went to "serious".
++ * One conversion a channel a second at most (cached); each a few ms of SPMI.
++ */
++extern "C" int blueline_spmi_read_sid(uint8_t sid, uint16_t addr, uint8_t *buf, unsigned len);
++extern "C" int blueline_spmi_write_sid(uint8_t sid, uint16_t addr, uint8_t val);
++extern "C" int blueline_spmi_apid(uint8_t sid, uint8_t periph, uint16_t *apid, uint8_t *owner);
++#define BLUE_ADC		0x3100u
++#define BLUE_ADC_STATUS1	0x08u
++#define BLUE_ADC_DIG_PARAM	0x42u	/* .. 0x46 written in order, then CONV_REQ 0x47 */
++#define BLUE_ADC_DATA0		0x50u
++
++static const int16_t blue_ntc_mv[] = {	/* -40 C to 125 C in 5 C steps */
++	1831, 1814, 1791, 1761, 1723, 1675, 1616, 1545, 1463, 1370, 1268, 1160, 1049, 937, 828, 726, 630,
++	544, 467, 399, 340, 290, 247, 209, 179, 153, 130, 112, 96, 82, 71, 62, 53, 46,
++};
++#define BLUE_NTC_N	(sizeof(blue_ntc_mv) / sizeof(blue_ntc_mv[0]))
++
++static IOLock *blue_adc_lock;
++static struct { uint8_t ch; bool ok; int dc; uint64_t at; } blue_adc_cache[4];
++
++/* mV to 0.1 C by linear steps through the table; false outside it */
++static bool
++blue_ntc(int mv, int *dc)
++{
++	if (mv > blue_ntc_mv[0] || mv < blue_ntc_mv[BLUE_NTC_N - 1]) {
++		return false;
++	}
++	for (unsigned i = 1; i < BLUE_NTC_N; i++) {
++		if (mv >= blue_ntc_mv[i]) {
++			int hi = blue_ntc_mv[i - 1], lo = blue_ntc_mv[i];
++			*dc = -400 + 50 * (int)(i - 1) + (hi - mv) * 50 / (hi - lo);
++			return true;
++		}
++	}
++	return false;
++}
++
++/* One conversion: the raw code, or false (SPMI error, no end of conversion, invalid data). */
++static bool
++blue_adc_convert(uint8_t ch, uint16_t *code)
++{
++	uint8_t b[6];
++	if (blueline_spmi_read_sid(0, BLUE_ADC + BLUE_ADC_DIG_PARAM, b, 5)) {
++		return false;
++	}
++	b[0] = (uint8_t)((b[0] & ~0x7cu) | (1u << 4) | (2u << 2));	/* CAL_VAL 0, CAL_SEL ratiometric, DEC_RATIO 1024 */
++	b[1] = (uint8_t)(b[1] & ~0x07u);			/* FAST_AVG: one sample */
++	b[2] = ch;						/* CH_SEL */
++	b[3] = (uint8_t)((b[3] & ~0x0fu) | 2u);			/* HW settle 200 us */
++	b[4] |= 0x80u;						/* EN_CTL1: ADC on */
++	for (unsigned i = 0; i < 5; i++) {
++		if (blueline_spmi_write_sid(0, (uint16_t)(BLUE_ADC + BLUE_ADC_DIG_PARAM + i), b[i])) {
++			return false;
++		}
++	}
++	if (blueline_spmi_write_sid(0, BLUE_ADC + BLUE_ADC_DIG_PARAM + 5, 0x80u)) {	/* CONV_REQ */
++		return false;
++	}
++	for (unsigned t = 0; t < 40; t++) {	/* Linux: 400 x 263 us; a conversion at 1024 is ~1-2 ms */
++		IODelay(300);
++		uint8_t st;
++		if (blueline_spmi_read_sid(0, BLUE_ADC + BLUE_ADC_STATUS1, &st, 1)) {
++			return false;
++		}
++		if ((st & 0x3u) == 0x1u) {	/* EOC, no request pending */
++			uint8_t d[2];
++			if (blueline_spmi_read_sid(0, BLUE_ADC + BLUE_ADC_DATA0, d, 2)) {
++				return false;
++			}
++			*code = (uint16_t)(d[0] | (d[1] << 8));
++			return *code != 0x8000u;
++		}
++	}
++	return false;
++}
+ 
++/* A thermistor channel in 0.1 C, cached for a second */
++static bool
++blue_board(uint8_t ch, int *dc)
++{
++	if (!blue_adc_lock) {
++		return false;
++	}
++	uint64_t now = mach_absolute_time(), sec;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
++	IOLockLock(blue_adc_lock);
++	unsigned i = 0;
++	while (i < 4 && blue_adc_cache[i].ch && blue_adc_cache[i].ch != ch) {
++		i++;
++	}
++	bool ok = false;
++	if (i < 4) {
++		if (blue_adc_cache[i].ch == ch && now - blue_adc_cache[i].at < sec) {
++			ok = blue_adc_cache[i].ok;
++			*dc = blue_adc_cache[i].dc;
++		} else {
++			uint16_t code;
++			int v = 0;
++			ok = blue_adc_convert(ch, &code) && code <= 0x7fffu && blue_ntc((int)((uint32_t)code * 1875u / 0x4000u), &v);
++			blue_adc_cache[i].ch = ch;
++			blue_adc_cache[i].ok = ok;
++			blue_adc_cache[i].dc = v;
++			blue_adc_cache[i].at = now;
++			*dc = v;
++		}
++	}
++	IOLockUnlock(blue_adc_lock);
++	return ok;
++}
++
+ /* BlueBattery: the gauge's last temperature in 0.1 C, BLUE_NO_BATTERY_TEMP until it has one. */
+ #define BLUE_NO_BATTERY_TEMP	(-10000)
+ extern "C" volatile int blue_battery_deci_c;
+@@ -107,6 +223,12 @@
+ blue_tz_read(const struct blue_tz *z, int *dc)
+ {
+ 	int sum = 0, max = -10000, got = 0, v;
++	if (z->how == kBoard) {
++		if (blue_board(z->ids[0], dc)) {
++			return true;
++		}
++		/* no ADC reading: the battery's, the nearest board temperature there is */
++	}
+ 	if (z->how >= kBattery) {
+ 		v = blue_battery_deci_c;
+ 		if (v == BLUE_NO_BATTERY_TEMP) {
+@@ -204,7 +326,9 @@
+ 		me->dispatchEvent(e);
+ 		e->release();
+ 	}
+-	sender->setTimeoutMS(me->fPeriodMS);
++	if (me->fPeriodMS != 0) {	/* 0: stopped (ReportInterval 0) */
++		sender->setTimeoutMS(me->fPeriodMS);
++	}
+ }
+ 
+ IOHIDEvent *
+@@ -233,7 +357,13 @@
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject(kIOHIDReportIntervalKey)) : NULL;
+ 	if (n && fTimer) {	/* microseconds; the copyEvent sensors are read when asked */
+ 		uint32_t ms = n->unsigned32BitValue() / 1000u;
+-		fPeriodMS = ms < 100u ? 100u : ms > 60000u ? 60000u : ms;
++		if (n->unsigned32BitValue() == 0) {	/* 0237: 0 stops the events (HID's meaning) */
++			fPeriodMS = 0;
++			fTimer->cancelTimeout();
++		} else {
++			fPeriodMS = ms < 100u ? 100u : ms > 60000u ? 60000u : ms;
++			fTimer->setTimeoutMS(fPeriodMS);
++		}
+ 		setProperty(kIOHIDReportIntervalKey, n);
+ 		IOLog("BLUELINE THERMAL: \"%s\" ReportInterval %u us: sending every %u ms\n", blue_tz[fIndex].name,
+ 		    (unsigned)n->unsigned32BitValue(), fPeriodMS);
+@@ -262,6 +392,22 @@
+ 		IOLog("BLUELINE THERMAL: TSENS map failed\n");
+ 		return false;
+ 	}
++	blue_adc_lock = IOLockAlloc();
++	{
++		uint16_t apid = 0;
++		uint8_t owner = 0xff;
++		int e = blueline_spmi_apid(0, BLUE_ADC >> 8, &apid, &owner);
++		IOLog("BLUELINE THERMAL: PM8998 ADC: %s APID %u owner EE %u\n", e ? "no" : "", apid, owner);
++		static const uint8_t probe[] = { 0x4c, 0x4d, 0x4e, 0x4f };	/* xo_therm, AMUX_THM1-3 (100k pull-up) */
++		for (unsigned i = 0; !e && i < sizeof(probe); i++) {
++			uint16_t code = 0;
++			bool ok = blue_adc_convert(probe[i], &code);
++			int mv = ok && code <= 0x7fffu ? (int)((uint32_t)code * 1875u / 0x4000u) : -1, dc = 0;
++			bool t = mv >= 0 && blue_ntc(mv, &dc);
++			IOLog("BLUELINE THERMAL: ADC ch %#x: %s code %#x %d mV %s%d.%d C\n", probe[i], ok ? "" : "FAILED", code, mv,
++			    t ? "" : "(out of table) ", dc / 10, (dc < 0 ? -dc : dc) % 10);
++		}
++	}
+ 	unsigned made = 0;
+ 	for (unsigned i = 0; i < BLUE_TZ_N; i++) {
+ 		BlueThermalSensor *s = new BlueThermalSensor;

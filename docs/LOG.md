@@ -1372,6 +1372,12 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   so it stays opt-in: default boots keep the job out and bluethermal off.
 - `tools/oslog-pull.sh`: the phone's os_log over bluesh, parsed with mandiant/macos-UnifiedLogs (Apple's
   `log show` refuses the partial archive). `tools/bluerun/envrun.c`: env(1) for the phone.
+- 0237 (built, not yet booted): Apple's PMU tdev/tcal sensors are board thermistors, and 0235 fed them die
+  sensors. They now read the PM8998 ADC (ADC5 rev2, SPMI sid 0 0x3100, as Linux qcom-spmi-adc5.c: ratiometric,
+  decimation 1024, 200 us settle; 100k NTC table at 1.875 V) on xo_therm (0x4c), with the battery temperature
+  as fallback; channels 0x4c-0x4f logged at start. ReportInterval 0 stops mic1's events.
+  therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
+  it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
 **5 GHz (2026-11-26).** Ruled out:
 - A second 3.3 V rail: Google's own device tree (read in LineageOS recovery, `/proc/device-tree/soc/qcom,icnss@18800000`)
