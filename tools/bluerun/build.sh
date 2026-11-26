@@ -33,3 +33,7 @@ for src in bluerun.c hello.c ${extra[@]+"${extra[@]}"}; do
 	sign "out/$name"
 	echo "out/$name: $(file -b "out/$name")"
 done
+# apptest (Objective-C): install, launch and check apps (tools/bluerun/apptest.m)
+xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc \
+	-framework Foundation -framework MobileCoreServices -o out/apptest apptest.m
+ENTITLEMENTS=apptest.ent sign out/apptest

@@ -50,6 +50,9 @@ extern char **environ;
 
 static int con = -1;
 
+static double now(void);
+
+/* each line ends with the time since boot ("@12.3"), so a log shows when each step ran */
 static void
 say(const char *fmt, ...)
 {
@@ -59,9 +62,13 @@ say(const char *fmt, ...)
 	va_start(ap, fmt);
 	n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 1, fmt, ap);
 	va_end(ap);
-	if (n > (int)sizeof(buf) - 2) {
-		n = (int)sizeof(buf) - 2;
+	if (n > (int)sizeof(buf) - 16) {
+		n = (int)sizeof(buf) - 16;
 	}
+	while (n > 0 && buf[n - 1] == '\n') {
+		n--;
+	}
+	n += snprintf(buf + n, sizeof(buf) - (size_t)n, " @%.1f", now());
 	buf[n++] = '\n';
 	if (con >= 0) {
 		(void)write(con, buf, (size_t)n);

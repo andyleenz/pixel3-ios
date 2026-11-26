@@ -1,6 +1,7 @@
 /*
  * WebGLHello.app - a WKWebView page drawing a spinning triangle with WebGL (WebKit's GPU process, ANGLE on
- * Metal). After 120 animation frames the page reads back pixels, reports the renderer and frame rate to the app,
+ * Metal). After 120 animation frames the page reads back pixels; at frame 301 it reports the renderer, the frame
+ * rate of frames 1-120 and 121-300 (steady) and the vsyncs between frames 121-300 to the app,
  * and the app writes Documents/hello.txt, which tools/bluerun apptest waits for.
  *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
@@ -12,7 +13,7 @@ static NSString *const kPage = @"<!doctype html><meta name=viewport content='wid
 "<body style='margin:0;background:#123'><canvas id=c style='width:100vw;height:100vh'></canvas><script>"
 "const post=m=>webkit.messageHandlers.hello.postMessage(m);"
 "window.onerror=(e,u,l)=>post('webglhello: error '+e+' line '+l);"
-"let n=0,t0=0;function run(){"
+"let n=0,t0=0,t1=0,tp=0,r='';const gap=[0,0,0,0,0];function run(){"
 "const c=document.getElementById('c');c.width=innerWidth*devicePixelRatio;c.height=innerHeight*devicePixelRatio;"
 "const gl=c.getContext('webgl',{preserveDrawingBuffer:true});"
 "if(!gl){post('webglhello: no WebGL context');return;}"
@@ -28,11 +29,12 @@ static NSString *const kPage = @"<!doctype html><meta name=viewport content='wid
 "gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([0,.8,-.7,-.5,.7,-.5]),gl.STATIC_DRAW);"
 "gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);"
 "const ut=gl.getUniformLocation(p,'t');"
-"function f(ts){if(!n)t0=ts;n++;gl.viewport(0,0,c.width,c.height);gl.clearColor(.07,.13,.2,1);gl.clear(gl.COLOR_BUFFER_BIT);"
+"function f(ts){if(!n)t0=ts;if(n>121)gap[Math.min(4,Math.max(1,Math.round((ts-tp)/16.667))-1)]++;tp=ts;n++;gl.viewport(0,0,c.width,c.height);gl.clearColor(.07,.13,.2,1);gl.clear(gl.COLOR_BUFFER_BIT);"
 "gl.uniform1f(ut,ts/600);gl.drawArrays(gl.TRIANGLES,0,3);"
 "if(n==121){const px=new Uint8Array(4);gl.readPixels(c.width>>1,c.height>>1,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);"
 "const bg=new Uint8Array(4);gl.readPixels(2,2,1,1,gl.RGBA,gl.UNSIGNED_BYTE,bg);"
-"post('webglhello: renderer '+who+', 120 frames in '+((ts-t0)/1000).toFixed(2)+' s ('+(120000/(ts-t0)).toFixed(1)+' fps), centre '+px.join(',')+', corner '+bg.join(',')+', gl error '+gl.getError());}"
+"r='webglhello: renderer '+who+', 120 frames in '+((ts-t0)/1000).toFixed(2)+' s ('+(120000/(ts-t0)).toFixed(1)+' fps), centre '+px.join(',')+', corner '+bg.join(',')+', gl error '+gl.getError();t1=ts;}"
+"if(n==301)post(r+'; frames 121-300 '+(180000/(ts-t1)).toFixed(1)+' fps, vsyncs between frames 1:'+gap[0]+' 2:'+gap[1]+' 3:'+gap[2]+' 4:'+gap[3]+' 5+:'+gap[4]);"
 "requestAnimationFrame(f);}requestAnimationFrame(f);}"
 "try{run();}catch(e){post('webglhello: exception '+e+' '+(e.stack||''));}"
 "</script>";

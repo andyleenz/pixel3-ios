@@ -132,8 +132,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
       to (0219-0223; MetalHello 36 -> 44 -> ~57.5 fps). Since 0226-0228 an app's full-screen Metal layer is
       a second DPU plane under the status bar (no compositing, no copy), and a kernel check (0227) finds no
       frame drawn into while on screen. With a GPU clock floor while frames flow (0230) and drawables
-      presented when scheduled (am-0005): SpriteKit 60.5 fps steady (was 51), MetalHello 220-234 of 240
-      frames one vsync apart. Left: 2-3 copied frames at an app's launch (8 contiguous buffers).
+      presented when scheduled (am-0005), steady state after launch (2026-11-26, `b3`): SpriteKit 60.6 fps
+      (was 51), WebGL 59.1 fps (the 57 before counted start-up), MetalHello 234 of 240 frames one vsync
+      apart. Left: 2-3 copied frames at an app's launch (8 contiguous buffers).
    3. Later: backboardd on Metal. It unlocks and pages the home screen correctly with as many frames as
       GL on the same swipes (334 vs 327-345; median 36 ms commit to complete, 14 ms recording, 18 ms GPU
       in sysmem); GL stays the compositor until it is clearly faster.

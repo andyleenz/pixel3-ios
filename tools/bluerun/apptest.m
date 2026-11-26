@@ -2,10 +2,14 @@
  * apptest - install an app bundle through installd (miinstall), launch it by bundle ID and
  * check that it ran (Hello.app writes Documents/hello.txt in its data container).
  *
- *   apptest /private/var/tmp/Hello.app [BUNDLE_ID] [DOMAIN] [SETTLE_S]
+ *   apptest /private/var/tmp/Hello.app[:B.app...] [BUNDLE_ID[:ID...]] [DOMAIN] [SETTLE_S] [HOLD_S]
  *
- * SETTLE_S: seconds between install and launch (default 15; more lets the boot-time CPU load pass
- * before an app measures frame times). Defaults: dev.blueline.hello, domain 2 (user; 1 = system needs a system-app entitlement). Prints "APPTEST: PASS" or the step that failed.
+ * SETTLE_S: seconds between install and the first launch (default 15; more lets the boot-time CPU load
+ * pass before an app measures frame times). HOLD_S: seconds an app keeps running after its hello.txt
+ * (default 0), so the kernel's periodic summaries cover it; with several apps (':'-separated, one boot)
+ * each is then killed before the next starts, so its surfaces go back first.
+ * Defaults: dev.blueline.hello, domain 2 (user; 1 = system needs a system-app entitlement).
+ * Prints "APPTEST: start ID" / "APPTEST: end ID" around each app and "APPTEST: PASS" or the step that failed.
  * Built by tools/bluerun/build.sh-style flags, signed with apptest.ent.
  *
  * The launch is ios-flame's phone/tools/openapp.m (FBSOpenApplicationService, MIT),
@@ -97,20 +101,43 @@ run(const char *path, char *const argv[])
 	return WIFEXITED(st) ? WEXITSTATUS(st) : 128;
 }
 
+static int test_one(char *path, NSString *bid, char *domain, int settle, int hold, BOOL kill_after);
+
 int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
 		if (argc < 2) {
-			fprintf(stderr, "usage: apptest BUNDLE.app [BUNDLE_ID] [DOMAIN]\n");
+			fprintf(stderr, "usage: apptest BUNDLE.app[:B.app...] [BUNDLE_ID[:ID...]] [DOMAIN] [SETTLE_S] [HOLD_S]\n");
 			return 2;
 		}
-		NSString *bid = argc > 2 ? @(argv[2]) : @"dev.blueline.hello";
+		NSArray *paths = [@(argv[1]) componentsSeparatedByString:@":"];
+		NSArray *bids = [(argc > 2 ? @(argv[2]) : @"dev.blueline.hello") componentsSeparatedByString:@":"];
 		char *domain = argc > 3 ? argv[3] : "2";
 		int settle = argc > 4 ? atoi(argv[4]) : 15;
+		int hold = argc > 5 ? atoi(argv[5]) : 0;
 		setvbuf(stdout, NULL, _IOLBF, 0);
+		if (paths.count != bids.count) {
+			printf("APPTEST: FAIL (%lu bundles, %lu ids)\n", (unsigned long)paths.count, (unsigned long)bids.count);
+			return 2;
+		}
+		int fails = 0;
+		for (NSUInteger i = 0; i < paths.count; i++) {
+			printf("APPTEST: start %s\n", [bids[i] UTF8String]);
+			fails += test_one((char *)[paths[i] UTF8String], bids[i], domain, i == 0 ? settle : 3, hold,
+			    paths.count > 1) != 0;
+			printf("APPTEST: end %s\n", [bids[i] UTF8String]);
+		}
+		printf("APPTEST: %s\n", fails ? "FAIL" : "PASS");
+		return fails ? 1 : 0;
+	}
+}
 
-		char *mi[] = { "/usr/local/bin/miinstall", domain, argv[1], NULL };
+static int
+test_one(char *path, NSString *bid, char *domain, int settle, int hold, BOOL kill_after)
+{
+	@autoreleasepool {
+		char *mi[] = { "/usr/local/bin/miinstall", domain, path, NULL };
 		int rc = run(mi[0], mi);
 		printf("APPTEST: miinstall exit %d\n", rc);
 
@@ -124,7 +151,7 @@ main(int argc, char **argv)
 		NSString *txt = [p.dataContainerURL.path stringByAppendingPathComponent:@"Documents/hello.txt"];
 		[[NSFileManager defaultManager] removeItemAtPath:txt error:nil];
 		/* right after boot SpringBoard answered the open with an XPC error (app11):
-		 * let it settle, then try up to three times, 10 s apart */
+		 * let it settle, then try up to three times, 20 s apart */
 		NSString *exe = [NSDictionary dictionaryWithContentsOfURL:
 		    [p.bundleURL URLByAppendingPathComponent:@"Info.plist"]][@"CFBundleExecutable"] ?: @"Hello";
 		sleep(settle > 0 ? settle : 15);
@@ -133,18 +160,24 @@ main(int argc, char **argv)
 				BOOL opened = [[LSApplicationWorkspace defaultWorkspace] openApplicationWithBundleID:bid];
 				printf("APPTEST: LaunchServices openApplicationWithBundleID %d\n", opened);
 			}
-			for (int i = 0; i < 10; i++) {
+			for (int i = 0; i < 20; i++) {
 				NSString *s = [NSString stringWithContentsOfFile:txt encoding:NSUTF8StringEncoding error:nil];
 				if (s) {
 					printf("APPTEST: hello.txt (attempt %d, %d s): %s", attempt, i, s.UTF8String);
-					printf("APPTEST: PASS\n");
+					if (hold > 0)
+						sleep(hold);
+					pid_t app = kill_after ? pid_of(exe.UTF8String) : 0;
+					if (app > 0) {
+						kill(app, SIGKILL);
+						printf("APPTEST: killed %s (pid %d)\n", exe.UTF8String, app);
+					}
 					return 0;
 				}
 				sleep(1);
 			}
 			printf("APPTEST: attempt %d: no hello.txt; %s pid %d\n", attempt, exe.UTF8String, pid_of(exe.UTF8String));
 		}
-		printf("APPTEST: FAIL (no %s)\n", txt.UTF8String);
+		printf("APPTEST: no %s\n", txt.UTF8String);
 		return 1;
 	}
 }

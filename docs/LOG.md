@@ -1206,3 +1206,15 @@ What it took (`work/test/app1..14`):
 | | 628 bytes, over the 607 limit | 0214: `blueapps=1` stands for the 186-byte `sweetenv` |
 
 Open: reinstall over an installed copy fails ("Failed to make staged container live"); IPA files; launching from the home-screen icon.
+
+### Test loop: reboot when the test ends, several apps a boot (2026-11-26)
+
+A run was ~260 s, ~145 s of it idle: phonetest rebooted at a fixed SpringBoard + timeout + 20 s while apptest was done after ~55 s (`pd7`, `sk24`, `wgl16`). phonetest now passes `bluerun_end=reboot` (kern.bluedone, 0175; the fixed delay stays as the fallback), apptest launches at 25 s (was 45) and keeps the app HOLD_S seconds after its result so the kernel's 5 s and 10 s summaries cover it. One app: 109 s start to result (`wgl17`). apptest also takes several apps (`A.app:B.app`, ids likewise), killing each after its hold and printing `APPTEST: start/end ID` around it; bluerun lines end in `@S`, seconds since boot.
+
+`WebGLHello` reports frames 121-300 and the vsyncs between frames, as SpriteHello: **59.6 fps, all 179 one vsync apart** (`wgl17`). The 53-55 fps before was frames 1-120, start-up included.
+
+WebGL takes a new 1125x1941 surface each frame (~8800 a run, `wgl14`-`wgl16`). A diagnostic (not kept) showed each lives 75-120 ms, use count 0 at free, clearing it costs ~1.7 ms in the GPU process. It is WebKit's design (7615.3.9): `RemoteGraphicsContextGLCocoa::prepareForDisplay` marks the display buffer in use when it sends it to the web process, and `GraphicsContextGLIOSurfaceSwapChain::present` then drops it rather than keep it as the spare. Not a frame-rate cost; the clear could be skipped when the pool slot's last owner is the same process.
+
+All three in one boot on the clean kernel (`b3`, 160 s start to result): MetalHello 234 of 240 one vsync apart; SpriteKit frames 121-300 60.6 fps, all one vsync apart; WebGL 59.1 fps, 178 of 179.
+
+Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s window while backboardd still composites the launch animation; after it no creates and 0 panel copies (`pd7`). 2-3 copied frames a launch; not worth SMMU scanout now.

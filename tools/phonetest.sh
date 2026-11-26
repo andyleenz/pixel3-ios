@@ -19,8 +19,10 @@
 #   --run     run that program once SpringBoard is up (tools/bluerun, launchd
 #             job from tools/bluerun/setup.sh, once) with a timeout (default
 #             60 s); its stdout/stderr come out as "BLUERUN: ..." lines in the
-#             log. Pushes tools/bluerun/out/bluerun too, and unless BOOT-ARGS
-#             have bluereboot=, reboots to recovery after SpringBoard + timeout.
+#             log, each ending in "@S" (seconds since boot). Pushes
+#             tools/bluerun/out/bluerun too, and unless BOOT-ARGS have
+#             bluereboot=, reboots to recovery as soon as the program ends
+#             (bluerun_end=reboot), or at SpringBoard + timeout + 20 s if it hangs.
 #   --end     where the phone is left (default fastboot; recovery with --push,
 #             so the next --push test starts there)
 #   BOOT-ARGS are added to the usual ones, e.g. bluegpu=3 bluereboot=recovery
@@ -69,7 +71,8 @@ extra="$*"
 if [ -n "$run" ]; then
 	[ -x tools/bluerun/out/bluerun ] || tools/bluerun/build.sh > /dev/null
 	pushes+=(tools/bluerun/out/bluerun:/usr/local/bin/bluerun)
-	extra="$extra bluerun=$run bluerun_timeout=$run_timeout"
+	# reboot once the program ends (kern.bluedone, 0175); the fixed delay below stays as the fallback
+	extra="$extra bluerun=$run bluerun_timeout=$run_timeout bluerun_end=reboot"
 	case " $extra " in *" bluereboot="*) ;; *)
 		extra="$extra bluereboot=recovery bluereboot_after=springboard bluereboot_delay=$(( run_timeout + 20 ))" ;;
 	esac
