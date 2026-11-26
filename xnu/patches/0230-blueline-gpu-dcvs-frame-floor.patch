@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 15:00:00 +1100
+Subject: [PATCH] 0230: GPU DCVS frame floor while frames flow
+
+With two DPU layers (0226) backboardd no longer composites a full-screen
+app layer, the GPU is less busy and DCVS (20% target) held SpriteKit at
+257-342 MHz: 36 fps against 50 composited at 710 MHz (sk16, sk15). An
+app's GPU work is on a 16.7 ms chain the average busy cannot see. While
+the display takes >= 24 swaps a second the level stays at or above
+bluegpu_dcvs_frame_mhz (596; 0 off). SweetFramebuffer counts swaps.
+---
+diff -ru a/bsd/dev/blueline_gpu.c b/bsd/dev/blueline_gpu.c
+--- a/bsd/dev/blueline_gpu.c	2026-11-26 10:52:53
++++ b/bsd/dev/blueline_gpu.c	2026-11-26 10:52:54
+@@ -352,7 +352,9 @@
+  *    start. bluegpu_dcvs=1: every >= 100 ms of presents, busy % (GMU power
+  *    counter 0 XOCLK, else blit time) -> lowest level that runs it at
+  *    bluegpu_dcvs_target % (20) within bluegpu_dcvs_min..max; up at once,
+- *    down after 3 windows; legacy GMU DCVS OOB (a6xx_gmu_set_freq), the DDR
++ *    down after 3 windows; 0230: not below bluegpu_dcvs_frame_mhz (596)
++ *    while the display takes >= 24 swaps a second (frames have a deadline
++ *    the average busy cannot see; 0 turns it off); legacy GMU DCVS OOB (a6xx_gmu_set_freq), the DDR
+  *    vote follows the level (bluegpu_bw_kbps=N fixes it). Logged per change.
+  *  - bluegpu_present_clean: 1 (default) DC CVAC to PoC per present; 0 no
+  *    clean (UNSAFE, measures what it costs); 2 a coherence probe at up
+@@ -4184,6 +4186,9 @@
+ 	int dcvs_boost, dcvs_boost_ms;	/* 0198: after input, at least this many MHz for this long */
+ 	uint64_t input_t;		/* 0198: last touch or key (blue_gpu_core_input) */
+ 	uint32_t dcvs_boosts;
++	uint32_t frames, dcvs_frames;	/* 0230: swaps (blue_gpu_core_frame), at the last tick */
++	int dcvs_frame_mhz;		/* 0230: floor while frames flow */
++	uint32_t dcvs_floored;		/* 0230: windows raised to the floor since the last summary */
+ 	/* 0151 cache */
+ 	bool coherent;
+ 	uint32_t n_irq_wake, n_slice, n_clean_skip;
+@@ -4228,6 +4233,7 @@
+ 	rs.dcvs_target = 20;	/* 0221: was 50 (0198: 65); a frame is a serial chain, average busy hides it */
+ 	rs.dcvs_boost = 520;
+ 	rs.dcvs_boost_ms = 1000;
++	rs.dcvs_frame_mhz = 596;
+ 	rs.clean = 1;
+ 	(void)PE_parse_boot_argn("bluegpu_irq", &rs.irq, sizeof(rs.irq));
+ 	(void)PE_parse_boot_argn("bluegpu_gmu_irq", &rs.gmu_irq, sizeof(rs.gmu_irq));
+@@ -4242,6 +4248,7 @@
+ 	(void)PE_parse_boot_argn("bluegpu_dcvs_target", &rs.dcvs_target, sizeof(rs.dcvs_target));
+ 	(void)PE_parse_boot_argn("bluegpu_dcvs_boost", &rs.dcvs_boost, sizeof(rs.dcvs_boost));
+ 	(void)PE_parse_boot_argn("bluegpu_dcvs_boost_ms", &rs.dcvs_boost_ms, sizeof(rs.dcvs_boost_ms));
++	(void)PE_parse_boot_argn("bluegpu_dcvs_frame_mhz", &rs.dcvs_frame_mhz, sizeof(rs.dcvs_frame_mhz));
+ 	(void)PE_parse_boot_argn("bluegpu_present_clean", &rs.clean, sizeof(rs.clean));
+ 	if (rs.recover_max < 1 || rs.recover_max > RS_REC_MAX) {
+ 		rs.recover_max = 3;
+@@ -4792,6 +4799,10 @@
+ 	if (ns < 100ull * NSEC_PER_MSEC) {
+ 		return;
+ 	}
++	uint32_t frames = __atomic_load_n(&rs.frames, __ATOMIC_RELAXED), dframes = frames - rs.dcvs_frames;
++	rs.dcvs_frames = frames;
++	/* 0230: frames flowing (>= 24 swaps a second): an app's GPU work sits on a 16.7 ms chain */
++	int lframe = rs.dcvs_frame_mhz > 0 && (uint64_t)dframes * NSEC_PER_SEC >= 24ull * ns ? gx_level_at(rs.dcvs_frame_mhz) : 0;
+ 	uint64_t xo = rs_xoclk(), dxo = xo - rs.dcvs_xo, dbl = rs.blit_total - rs.dcvs_ticks;
+ 	rs.busy_gmu = dxo != 0 || dbl == 0;	/* a counter that never moves while blits run: blit time instead */
+ 	uint64_t busy = rs.busy_gmu ? dxo : dbl, pct = busy * 10000 / 192 * 100 / ns;
+@@ -4812,6 +4823,10 @@
+ 	if (l < lboost) {
+ 		l = lboost;	/* 0198: not below the boost while it lasts */
+ 	}
++	if (l < lframe) {
++		l = lframe;	/* 0230 */
++		rs.dcvs_floored++;
++	}
+ 	char why[48];
+ 	snprintf(why, sizeof(why), "busy %u%% (%s)", rs.busy_pct, rs.busy_gmu ? "GMU counter" : "blit time");
+ 	if (l > gx.perf) {
+@@ -4873,9 +4888,10 @@
+ 				rs.dcvs_lvl_ns[l] = 0;
+ 			}
+ 			rs.dcvs_lvl_ns[0] = 0;
+-			printf("BLUELINE GPU: DCVS 10s: busy %u%%, now %u MHz, %u changes, %u boosts; MHz:time%s\n", rs.busy_pct,
+-			    gpu_khz[gx.perf] / 1000, rs.dcvs_changes - changes0, rs.dcvs_boosts, line);
++			printf("BLUELINE GPU: DCVS 10s: busy %u%%, now %u MHz, %u changes, %u boosts, %u frame floors; MHz:time%s\n",
++			    rs.busy_pct, gpu_khz[gx.perf] / 1000, rs.dcvs_changes - changes0, rs.dcvs_boosts, rs.dcvs_floored, line);
+ 			rs.dcvs_boosts = 0;
++			rs.dcvs_floored = 0;
+ 			changes0 = rs.dcvs_changes;
+ 			rs.dcvs_sum_t = now;
+ 		}
+@@ -4909,6 +4925,13 @@
+ 	if (rs.dcvs_thread && rs.dcvs_boost > 0 && gx.perf < gx_level_at(rs.dcvs_boost)) {
+ 		thread_wakeup((event_t)&rs.input_t);
+ 	}
++}
++
++/* 0230: SweetFramebuffer on every swap the display takes: frames are flowing (DCVS frame floor). */
++void
++blue_gpu_core_frame(void)
++{
++	__atomic_add_fetch(&rs.frames, 1, __ATOMIC_RELAXED);
+ }
+ 
+ /* 0151 interrupts on (after the ring check): GPU SPI 300 with a fenced check, GMU SPIs 304/305. */
+diff -ru a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 10:52:53
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 10:52:54
+@@ -62,6 +62,7 @@
+ extern "C" void blue_dpu_start(uint64_t panel_pa, uint32_t w, uint32_t h, uint32_t stride,
+     uintptr_t panel_va, uint32_t lw, uint32_t lh);
+ extern "C" void blue_dpu_stat(int kind, uint64_t dt);
++extern "C" void blue_gpu_core_frame(void);      /* 0230: DCVS frame floor (blueline_gpu.c) */
+ 
+ /*
+  * Screenshots (bluesnap=, sweet_ufs.c, patch 0146): the kernel mapping of
+@@ -1072,6 +1073,7 @@
+ 	}
+ 	bool flipped = fFlip && swapFlip(rec);
+ 	blue_trace(flipped ? 'F' : 'K', get32(rec, 0x50), 0);
++	blue_gpu_core_frame();
+ 	if (sweet_fb_swaplog > 16 && sweet_fb_shown_logged < sweet_fb_swaplog) {
+ 		uint32_t mask = get32(rec, 0x104);
+ 		uint64_t ns = 0;

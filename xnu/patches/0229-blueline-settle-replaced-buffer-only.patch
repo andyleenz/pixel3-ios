@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 14:00:00 +1100
+Subject: [PATCH] 0229: hold GPU work only for a buffer a pending flip replaces
+
+0157 held every GPU submit writing a surface the display still uses
+until the pending flip latched. With two layers that included the app's
+Metal frames, which a latch does not free (pd5: ~6 holds a second, avg
+10.4 ms). Now only the top or under buffer the pending flip replaces
+waits; every written surface is checked, not the first.
+---
+diff -ru a/iokit/Kernel/arm/BlueDPU.cpp b/iokit/Kernel/arm/BlueDPU.cpp
+--- a/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 10:15:59
++++ b/iokit/Kernel/arm/BlueDPU.cpp	2026-11-26 10:15:59
+@@ -121,7 +121,7 @@
+     uint32_t w, uint32_t h, uint32_t fmt);
+ extern "C" int blue_dpu_unflip(const char *why);
+ extern "C" int blue_dpu_scanout(void);
+-extern "C" uint32_t blue_dpu_flip_settle(void);
++extern "C" uint32_t blue_dpu_flip_settle(IOMemoryDescriptor *md);
+ extern "C" int blue_dpu_latch_pending(void);
+ extern "C" int blue_dpu_snapinfo(uintptr_t *kva, uint32_t *w, uint32_t *h, uint32_t *bpr, int32_t *fit_x, int32_t *fit_w);
+ extern "C" int blue_dpu_snapinfo_under(uintptr_t *kva, uint32_t *bpr, uint32_t *sy, uint32_t *sh, uint32_t *dy);
+@@ -1479,6 +1479,8 @@
+  */
+ static uint64_t bd_flip_pa_prev;        /* buffer fetched before bd_flip_pa */
+ static bool bd_latch_pending;           /* bd_flip_pa flushed, latch not seen yet */
++static uint64_t bd_uflip_pa;            /* 0229: the layer under, being fetched */
++static uint64_t bd_repl_pa[2];          /* 0229: top and under buffers the pending flip replaces (0: none) */
+ static bool bd_flip_sync;               /* wait for every latch (bluedpu_flip_sync=1) */
+ static uint32_t bd_n_cycle2, bd_n_cycle3;       /* flips of the buffer replaced 1 / 2+ flips ago */
+ static char bd_slots[48];               /* pool slot of the first flips, for the log */
+@@ -1655,6 +1657,8 @@
+ 	bd_flipped = false;
+ 	bd_geom = false;
+ 	bd_flip_pa = 0;
++	bd_uflip_pa = 0;
++	bd_repl_pa[0] = bd_repl_pa[1] = 0;
+ 	bd_ugeom = false;
+ 	bd_layered = false;
+ 	bd_ushown = -1;
+@@ -1866,7 +1870,10 @@
+ 	if (pa != bd_flip_pa) {
+ 		bd_flip_pa_prev = bd_flip_pa;
+ 	}
++	bd_repl_pa[0] = pa != bd_flip_pa ? bd_flip_pa : 0;
++	bd_repl_pa[1] = upa != bd_uflip_pa ? bd_uflip_pa : 0;
+ 	bd_flip_pa = pa;
++	bd_uflip_pa = upa;
+ 	if (wait) {
+ 		lat = bd_flush(&bd_st, bits, first ? "first flip" : NULL, true, BD_FLIP_WAIT_MS);
+ 	} else {
+@@ -1914,11 +1921,19 @@
+  * buffer it replaces may still be fetched, and backboardd draws its next
+  * frame into exactly that buffer (it alternates two). The wait overlaps
+  * CoreAnimation's CPU work for the frame instead of following the flip.
++ * 0229: only for md, a buffer the pending flip replaces (top or under).
++ * Any other surface the display holds stays fetched after the latch, so
++ * waiting for it bought nothing: an app's Metal frames in the layer under
++ * were held avg 10 ms, ~165 times a second (pd5).
+  */
+ uint32_t
+-blue_dpu_flip_settle(void)
++blue_dpu_flip_settle(IOMemoryDescriptor *md)
+ {
+ 	if (bd_flip_lock == NULL || !bd_latch_pending) {
++		return 0;
++	}
++	int slot = bd_pool_index(md);
++	if (slot < 0 || (bd_pool_pa[slot] != bd_repl_pa[0] && bd_pool_pa[slot] != bd_repl_pa[1])) {
+ 		return 0;
+ 	}
+ 	IOLockLock(bd_flip_lock);
+diff -ru a/iokit/Kernel/arm/BlueGPUUserClient.cpp b/iokit/Kernel/arm/BlueGPUUserClient.cpp
+--- a/iokit/Kernel/arm/BlueGPUUserClient.cpp	2026-11-26 10:15:59
++++ b/iokit/Kernel/arm/BlueGPUUserClient.cpp	2026-11-26 10:15:59
+@@ -80,7 +80,7 @@
+ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
+-extern uint32_t blue_dpu_flip_settle(void);     /* 0157, BlueDPU.cpp */
++extern uint32_t blue_dpu_flip_settle(IOMemoryDescriptor *md);     /* 0157, BlueDPU.cpp */
+ extern void proc_name(int pid, char *buf, int size);
+ }
+ 
+@@ -871,11 +871,10 @@
+ 		BGBo *wb = bg_lookup(c, bos[i].handle);
+ 		/* 0158: only a surface the display still holds (2 buffers); 3+ buffers never wait */
+ 		if (bos[i].flags & BLUE_GPU_SUBMIT_BO_WRITE && wb->surf != NULL && !wb->ro && sweet_surface_in_use(wb->surf)) {
+-			uint32_t held = blue_dpu_flip_settle();   /* 0157: maybe the buffer a pending flip replaces */
++			uint32_t held = blue_dpu_flip_settle(wb->surf->memory);   /* 0157: maybe the buffer a pending flip replaces */
+ 			if (held != 0) {
+ 				blue_trace('H', held, 0);
+ 			}
+-			break;
+ 		}
+ 	}
+ 	for (uint32_t i = 0; i < a->nr_bos; i++) {

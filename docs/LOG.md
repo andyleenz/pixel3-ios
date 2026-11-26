@@ -915,6 +915,19 @@ So completion on a swap's own latch lets apps draw into the shown buffer in both
 | `pd4` | MetalHello only | layer on from the first frame | 0 of 7874 | 198 (misses #61-71) |
 | `pd5` | MetalHello only | layer on from the first frame | 0 of 7835 | 228 |
 
+Other apps on the layered path (`bluemetal.dylib` without am-0005): MetalHello `am0` 199 of 240 (one run; am-0005 runs 198-234, so not settled). SpriteKit `sk16` 36.2 fps against `sk15` 50.4 composited, physics 2.9 against 1.9 ms a frame. The cause is the GPU clock: with layers backboardd no longer composites the full-screen app layer, the GPU is 20% busy and DCVS (0221, 20% target) sat at 257-342 MHz, against 710 MHz composited.
+
+**0229**: the 0157 hold (GPU work waits for a pending latch) applies only to the top or under buffer that flip replaces, not to any surface the display uses. Small: ~6 holds a second before.
+
+**0230**: DCVS frame floor. While the display takes >= 24 swaps a second the GPU stays at or above `bluegpu_dcvs_frame_mhz` (596; 0 off); idle still drops to 257.
+
+| Run | App | Path | GPU | Result |
+| --- | --- | --- | --- | --- |
+| `sk16` | SpriteKit | layers, 0229 | 257-342 MHz | 36.2 fps |
+| `sk17` | SpriteKit | layers, 0230 | 596 MHz | 43.5 fps, physics 2.0 ms |
+| `pd6` | MetalHello | layers, 0230 | 596 MHz | 230 of 240 one vsync apart; render median 9.3 ms (11.5 before) |
+| `wgl15` | WebGL | composited (GPU process) | 710 MHz | 55.3 fps |
+
 Disk: `work/test` held 13.8 GB of per-run boot images (payload, shim, ADT); only the last 10 runs' are kept now.
 
 ## 2026-11-25: WebGL on Metal (WebGLHello)
