@@ -70,7 +70,7 @@ cmd_sync() {
 	local base=$1
 	need_recovery
 	local bytes n
-	bytes=$(stat -f %z "$base")
+	bytes=$(stat -L -f %z "$base")	# -L: work/ios-root.img may be a link
 	n=$(( (bytes + CHUNK - 1) / CHUNK ))
 	[ "$(part_size)" -ge "$bytes" ] || { echo "userdata is smaller than $base" >&2; exit 1; }
 	echo "hashing $n x 4 MiB on the phone and here..."

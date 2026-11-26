@@ -1288,7 +1288,17 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   and `arguments` (it answers nil). 6 restarts in a 110 s boot.
 - `tools/camera/bluecam`: the plug-in (`H13ISP.mediacapture`), stage 2: device, one stream, formats; logs every call.
 
-Next: why tccd denies (its os_log); the frontend's function reflection; then the kernel frame ring and Start.
+- **cam27: TCC fixed (patch 0993).** tccd gives each process it allows a sandbox extension for the service and
+  takes a failure to issue one for a refusal; the kernel's Sandbox stand-in answered extension issue (op 5) and
+  consume (op 6) with ENOENT. 0993 writes a token into the caller's buffer and gives handle 1 (port of ios-redfin's
+  0924, MIT). CamHello: `tcc 0 access 3, granted 1`, the device input is made, `canAddInput` says no (0 formats),
+  the session runs and reports -11819 (mediaserverd aborted, PortraitFilters). 0993 is numbered with the 099x
+  patches because the sailfish stack edits the same function.
+- `tools/phone.sh sync` read the size of a symlinked base image (62 bytes) and copied all 16 GiB; `stat -L` now.
+
+Next: why the device has 0 formats; the frontend's function reflection for Core Image's stitchable kernels
+(`returnType`, `arguments`: Metal's own MTLTypeInternal / MTLStructTypeInternal / MTLBindingInternal, built from
+`air.stitching_info`); then the kernel frame ring and Start.
 
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;
