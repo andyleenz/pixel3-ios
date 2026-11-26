@@ -533,8 +533,14 @@ frameThread(void *arg)
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	uint64_t t0 = mach_absolute_time();
-	/* the kernel's frames, or synthetic ones where there is no device (bluecam_synthetic: always) */
-	int fd = access("/private/var/tmp/bluecam_synthetic", F_OK) == 0 ? -1 : open(BLUELINE_CAMERA_DEVICE, O_RDONLY);
+	/* the kernel's frames, or synthetic ones where there is no device or /private/var/tmp/bluecam_synthetic says 1 */
+	char flag = 0;	/* "1" in the file: synthetic (the file stays on the phone across test boots: "0" undoes it) */
+	int ff = open("/private/var/tmp/bluecam_synthetic", O_RDONLY);
+	if (ff >= 0) {
+		(void)read(ff, &flag, 1);
+		close(ff);
+	}
+	int fd = flag == '1' ? -1 : open(BLUELINE_CAMERA_DEVICE, O_RDONLY);
 	int openErr = fd < 0 ? errno : 0;
 	size_t cap = 0;
 	uint8_t *buf = NULL;

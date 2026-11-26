@@ -187,6 +187,7 @@ ABL (Google's bootloader, unlocked)
 | `tools/` | Device tree (`mkadt.py`) and payload, boot images, the iOS root (`mkiosroot.sh`, `iosroot-tweaks.py`), sparse diffs (`simgdiff.py`), phone access (`phone.sh`, `fbboot.sh`), preference fixes, USB tools |
 | `dtb/` | The mainline blueline DTB used by the first probes |
 | [docs/LOG.md](docs/LOG.md) | The full engineering log: every step, measurement and dead end |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | What is left per area, the cheapest route, rough effort, and the order |
 
 ## Our kernel patches
 
