@@ -22,8 +22,9 @@ NOTES.md; the code here is our own):
                   an older run moved it aside; BTAudioHALPlugin.driver moved
                   to HAL.disabled (bluetoothd is not run: the plugin retried
                   its connection in a tight loop, ~1.2 cores of mediaserverd
-                  and launchd at idle, LOG.md 2026-11-23); MediaToolbox does
-                  not start the recorder server (no microphone yet)
+                  and launchd at idle, LOG.md 2026-11-23); MediaToolbox's
+                  StartRecorderServer key removed again (it gates the camera
+                  capture servers too)
   SpringBoard     no watchdogs (CPU rendering is slow), launch watchdogs x20,
                   no cloud-config UI, battery percentage shown
   Setup           marked done, mini-buddies off
@@ -210,8 +211,11 @@ def audio_media(root):
         print('RedwoodAudio.driver not built (audio/redwood-hal/build.sh): no sound from iOS')
     for conf in glob.glob(os.path.join(
             root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')):
-        rewrite(conf, lambda d: d.__setitem__('StartRecorderServer', False), plistlib.FMT_XML)
-        print('MediaToolbox recorder server off')
+        # An older run set StartRecorderServer False; that also stopped the capture servers
+        # (FigStartCaptureServers: com.apple.coremedia.capturesession), so AVFoundation's
+        # camera calls got no answer (LOG.md 2026-11-26). Apple's value (absent: start) is restored.
+        rewrite(conf, lambda d: d.pop('StartRecorderServer', None), plistlib.FMT_XML)
+        print('MediaToolbox recorder and capture servers on (Apple default)')
 
 
 def main():

@@ -11,7 +11,7 @@
 //   - then /usr/local/etc/bluemetal.procs, a name (getprogname) a line: NAME opts in, -NAME refuses;
 //   - else apps: the executable of an .app bundle under /Applications or an installed app's container (not its
 //     extensions), and WebKit's GPU process. System daemons (backboardd composites on GL) stay off unless named.
-// BLUE_METAL_LOG=1 logs (stderr and os_log) each new problem the frontend records, and every 5 s its status and texture
+// BLUE_METAL_LOG=1 logs (stderr, os_log and kern.bluesay) each new problem the frontend records, and every 5 s its status and texture
 // counters when they changed.
 // An opted-in process gets the native Metal frontend (UniXNU's AdrenoMetal over the metal2vulkan runtime on Turnip),
 // loaded from /usr/lib/bluemetal.dylib only then.
@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define FRONTEND "/usr/lib/bluemetal.dylib"
@@ -82,6 +83,13 @@ say(const char *what, const char *text)
 {
 	os_log(OS_LOG_DEFAULT, "BlueMetal: %{public}s: %{public}s %{public}s", getprogname(), what, text);
 	fprintf(stderr, "BlueMetal: %s: %s %s\n", getprogname(), what, text);
+	// and the console (kern.bluesay, kernel patch 0231): a daemon's stderr and os_log reach no log here
+	static int lines;
+	if (++lines <= 200) {
+		char line[480];
+		snprintf(line, sizeof line, "BlueMetal: %s %s", what, text);
+		sysctlbyname("kern.bluesay", NULL, NULL, line, strlen(line));
+	}
 }
 
 static void

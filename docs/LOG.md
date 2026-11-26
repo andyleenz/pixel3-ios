@@ -1248,12 +1248,30 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   properties; the camera list and formats come from `CMCapture.framework/D22/AVCaptureSession.plist`
   (`T8110SIM/` has a minimal two-camera set for an ISP simulator).
 
-- **Why the client never gets an answer.** `FigCaptureSourceServerStart` starts the listener unconditionally
-  after `FigCaptureSourceInitialize`, and `FigMediaServerStart` calls `FigStartCaptureServers` by default
-  (`StartRecorderServer` absent = true). That function first needs `CFBundleGetBundleWithIdentifier
-  ("com.apple.CMCapture")`; nothing mediaserverd links pulls CMCapture in (MediaToolbox -> CMCaptureCore only),
-  and if the lookup fails it only logs. mediaserverd's threads are all idle while CamHello waits, which fits the
-  listener never having been started. Unconfirmed.
+- **Why the client never got an answer.** `FigMediaServerStart` calls `FigStartCaptureServers` only when
+  `SubServerConfiguration.plist` (MediaToolbox, D22/D221/Default) does not set `StartRecorderServer` false, and
+  `tools/iosroot-tweaks.py` had set it false since 2026-10-21 (c0d677e, to keep the recorder off with no
+  microphone). That one key also stops CaptureSession, CaptureSource and the other capture servers, so
+  `com.apple.coremedia.capturesession` was never registered. An earlier guess (CMCapture not loaded, a bundle-ID
+  lookup failing) was wrong: cam15 showed CMCapture loaded. iosroot-tweaks now removes the key (Apple's default).
+- cam17 (Apple's plists pushed): mediaserverd loads `H13ISP.mediacapture` through the 0232 `AppleH13CamIn` stub,
+  `H13ISPCaptureDeviceCreate` returns a device, and CMCapture's first question is `SupportedPropertiesDictionary`.
+  Then mediaserverd crash-loops: `BWCoreImageFilterRenderer` makes a CIContext, CoreImage falls back to EAGL
+  (mediaserverd had no Metal device), and `-[EAGLContext getMacroContextPrivate]` is NULL there (the GL shim is
+  for backboardd only), so `CI::GLContext::init` calls a NULL entry.
+- cam18-19 (`mediaserverd` in `bluemetal.procs`): Metal is used, and the crash moves to
+  `CI::MetalKernel::MetalKernel` (`[function bitCodeHash]` on a nil function), called from a `dispatch_once` in
+  `PortraitFilters.cifilter`: our Metal frontend refuses one of its precompiled kernels. Patch 0231 gained
+  `bluestackimg=*` (every image outside the shared cache) to find that caller.
+- cam20-22: the frontend's problem lines now also go to the console (`BlueMetal.m`, kern.bluesay;
+  `sweetenv=...;mediaserverd:BLUE_METAL_LOG=1`). Core Image calls
+  `newFunctionWithName:constantValues:pipelineLibrary:error:`, which the frontend did not have, and passes an empty
+  `NSDictionary` as the constant values of a kernel without constants, which the frontend refused without a word.
+  Frontend patch am-0006 answers both; the Core Image crash is gone (cam22). mediaserverd then aborts on an
+  uncaught exception in a dispatch block; bluecam now logs uncaught exceptions.
+- `BWFigCaptureDevice` (`_copyProperty:requireSupported:error:`) asks the device only for keys present in its
+  `SupportedPropertiesDictionary`; an error for that dictionary drops the device. For discovery bluecam answers a
+  dictionary that claims every key, so each key CMCapture wants is logged.
 - `tools/camera/bluecam`: stage 1 of the plug-in (`H13ISP.mediacapture`, device object only, logs every call).
 
 Next: confirm whether mediaserverd loads the plug-in at all; then fill in the properties CMCapture asks for

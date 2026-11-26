@@ -1,0 +1,29 @@
+Answer _MTLLibrary newFunctionWithName:constantValues:pipelineLibrary:error: (Core Image's kernel path on iOS 16) as the plain specialization, take Core Image's empty NSDictionary as no constant values, and log a refused constant-values object. pixel3-ios: mediaserverd crashed in CI::MetalKernel on the nil function.
+
+--- a/NativeBridgeMetalFrontend.mm	2026-11-26 14:10:52
++++ b/NativeBridgeMetalFrontend.mm	2026-11-26 14:14:46
+@@ -1763,13 +1763,24 @@
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
+  return [self nb_newFunctionWithName:name constantValues:values zeroRest:NO error:error];
+ }
++// pixel3-ios: _MTLLibrary's form with a pipeline library (Core Image's CIKernelLibrary on iOS 16 uses it, with nil); this runtime keeps no
++// pipeline libraries, so it is the plain specialization. Without it the call answered nil, and CI::MetalKernel read the nil function's
++// bitCodeHash (mediaserverd crashed in PortraitFilters.cifilter's first kernel).
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary
++                                 error:(NSError **)error {
++ (void)pipelineLibrary;
++ return [self nb_newFunctionWithName:name constantValues:values zeroRest:NO error:error];
++}
+ // zeroRest: every constant the function declares that values leaves out is zero (nmb_function_new_specialized_zero_rest); only for the
+ // retry of a pipeline the runtime refused because such a constant had no value.
+ - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
+                                     error:(NSError **)error {
+  if(NBFunction *kernel=ciKernelFunction(self,name)){if(error)*error=nil;return (id<MTLFunction>)kernel;}
++ // pixel3-ios: Core Image (CI::MetalKernel) passes an empty NSDictionary for a kernel without constants: no constants.
++ if([(id)values isKindOfClass:[NSDictionary class]] && [(NSDictionary *)(id)values count]==0)values=nil;
+  if(!values)values=[MTLFunctionConstantValues new];
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
++  NBLOG(@"native-metal: function %@: unqualified constant values (%@)",name,values?NSStringFromClass([(id)values class]):@"nil");
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+  }
+  MTLFunctionConstantValues *snapshot=[values copy];

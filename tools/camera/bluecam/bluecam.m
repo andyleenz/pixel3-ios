@@ -6,9 +6,11 @@
  * H13ISPCaptureDeviceCreate}, then H10, H9, H6. Kernel patch 0232 publishes an AppleH13CamIn stub, and this
  * library is installed at that path, so every capture client (AVFoundation apps, Camera.app) goes through it.
  *
- * Stage 1 (this file): the device and stream objects exist and answer nothing; every CopyProperty / SetProperty
- * key and every class call is printed on the console (kern.bluesay, kernel patch 0231), so the property set
- * CMCapture needs can be filled in from what it asks for.
+ * Stage 1 (this file): the device object exists and answers little; every CopyProperty / SetProperty key and every
+ * class call is printed on the console (kern.bluesay, kernel patch 0231), so the property set CMCapture needs can be
+ * filled in from what it asks for. BWFigCaptureDevice reads SupportedPropertiesDictionary first and then asks the
+ * device only for keys in it (an error for it, or a key missing, drops the device), so for now that dictionary
+ * claims every key (AnyKey below).
  *
  * Interface (read from H10ISP.mediacapture, iOS 16.7): CMDerivedObjectCreate objects, WebKit's CMBaseClass layout.
  *   OSStatus H13ISPCaptureDeviceCreate(CFAllocatorRef, void *unknown, FigCaptureDeviceRef *out)
@@ -17,8 +19,9 @@
  *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
  */
-#include <CoreFoundation/CoreFoundation.h>
+#import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -98,6 +101,17 @@ desc(CFTypeRef v, char *buf, size_t len)
 	return buf;
 }
 
+/* SupportedPropertiesDictionary for discovery: every key is "supported" (an empty dictionary as its value), so
+ * each key CMCapture wants reaches devCopyProperty and the log. */
+@interface BCAnyKey : NSDictionary
+@end
+@implementation BCAnyKey
+- (NSUInteger)count { return 0; }
+- (id)objectForKey:(id)key { return key ? @{} : nil; }
+- (NSEnumerator *)keyEnumerator { return [@[] objectEnumerator]; }
+- (id)copyWithZone:(NSZone *)zone { return self; }
+@end
+
 /* --- device --- */
 
 static OSStatus
@@ -121,6 +135,11 @@ devCopyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef a, void *out)
 	if (strstr(k, "StreamArray")) {	/* no streams yet: an empty array rather than an error */
 		*(CFArrayRef *)out = CFArrayCreate(a, NULL, 0, &kCFTypeArrayCallBacks);
 		say("dev copy %s -> empty array", k);
+		return 0;
+	}
+	if (strcmp(k, "SupportedPropertiesDictionary") == 0) {
+		*(CFDictionaryRef *)out = (__bridge_retained CFDictionaryRef)[BCAnyKey new];
+		say("dev copy %s -> any key", k);
 		return 0;
 	}
 	say("dev copy %s -> not available", k);
@@ -201,12 +220,30 @@ H13ISPCaptureDeviceCreate(CFAllocatorRef a, void *arg1, CMBaseObjectRef *out)
 	return st;
 }
 
+/* mediaserverd's crash-loop causes so far were exceptions in dispatch blocks: log them (the kernel sees only SIGABRT) */
+static NSUncaughtExceptionHandler *previousHandler;
+
+static void
+uncaught(NSException *e)
+{
+	say("uncaught %s: %s", e.name.UTF8String, e.reason.UTF8String ?: "(no reason)");
+	NSArray<NSNumber *> *pcs = e.callStackReturnAddresses;
+	char line[400] = "";
+	size_t n = 0;
+	for (NSUInteger i = 0; i < pcs.count && i < 24 && n < sizeof line - 20; i++)
+		n += snprintf(line + n, sizeof line - n, " 0x%llx", pcs[i].unsignedLongLongValue);
+	say("uncaught bt%s", line);
+	if (previousHandler)
+		previousHandler(e);
+}
+
 __attribute__((constructor)) static void
 loaded(void)
 {
 	char exe[256] = "?";
 	uint32_t n = sizeof exe;
-	extern int _NSGetExecutablePath(char *, uint32_t *);
 	_NSGetExecutablePath(exe, &n);
 	say("loaded into %s", exe);
+	previousHandler = NSGetUncaughtExceptionHandler();
+	NSSetUncaughtExceptionHandler(uncaught);
 }

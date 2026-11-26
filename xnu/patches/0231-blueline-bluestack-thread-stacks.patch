@@ -6,7 +6,10 @@ Subject: [PATCH] 0231: bluestack= thread stacks, kern.bluesay console lines
 For daemons that hang rather than crash (CamHello's discovery session
 waits on mediaserverd, cam2): every thread's pc, lr and frame-pointer
 backtrace of each process named NAME, SECS seconds into boot and 3 s
-later, with the shared cache slide, as STACK lines.
+later, with the shared cache slide, as STACK lines; the loaded image
+count, and with bluestackimg=WORD[,WORD] the image paths containing a
+WORD (bluestackimg=* every image outside the shared cache), as
+IMAGES / IMG lines.
 
 kern.bluesay: any process writes a line to the console as
 "SAY name[pid]: text" (mediaserverd plugins and apps have no
@@ -115,8 +118,8 @@ diff -ru a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	/* Adreno 630 stage 1 probe, off unless bluegpu=1 (blueline_gpu.c). */
 diff -ru a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 --- a/osfmk/kern/exception.c	2026-11-26 13:01:40
-+++ b/osfmk/kern/exception.c	2026-11-26 13:01:40
-@@ -879,6 +879,55 @@
++++ b/osfmk/kern/exception.c	2026-11-26 14:03:10
+@@ -879,6 +879,113 @@
  }
  
  /*
@@ -130,10 +133,12 @@ diff -ru a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 +void
 +sweet_stack_task(task_t task, const char *name, int pid)
 +{
-+	uint64_t slide = 0;
++	uint64_t slide = 0, cache_lo = 0, cache_hi = 0;
 +	vm_shared_region_t sr = vm_shared_region_get(task);
 +	if (sr != NULL) {
 +		slide = sr->sr_slide;
++		cache_lo = sr->sr_base_address;
++		cache_hi = sr->sr_base_address + sr->sr_size;
 +		vm_shared_region_deallocate(sr);
 +	}
 +	printf("STACK %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
@@ -166,6 +171,62 @@ diff -ru a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 +		printf("%s\n", line);
 +	}
 +	task_unlock(task);
++
++	/*
++	 * The loaded images (dyld_all_image_infos: count at +4, array at +8; entries {load address, path,
++	 * date}): "IMAGES name count N", then "IMG name 0xaddr path" for the paths that contain one of the
++	 * comma-separated words in boot-arg bluestackimg (not set: the count only; "*": every image outside the
++	 * shared cache).
++	 */
++	static char img_words[128];
++	static int img_init;
++	if (!img_init) {
++		img_init = 1;
++		if (!PE_parse_boot_argn("bluestackimg", img_words, sizeof(img_words))) {
++			img_words[0] = 0;
++		}
++	}
++	uint64_t aii = task->all_image_info_addr;
++	uint32_t hdr[4];
++	if (aii == 0 || vm_map_read_user(task->map, (vm_map_offset_t)aii, hdr, sizeof(hdr)) != KERN_SUCCESS) {
++		printf("IMAGES %s none (0x%llx)\n", name, aii);
++		return;
++	}
++	uint32_t count = hdr[1];
++	uint64_t arr = (uint64_t)hdr[2] | ((uint64_t)hdr[3] << 32);
++	printf("IMAGES %s count %u\n", name, count);
++	for (uint32_t i = 0; i < count && i < 2000 && arr != 0 && img_words[0] != 0; i++) {
++		uint64_t e[3];
++		char path[200];
++		if (vm_map_read_user(task->map, (vm_map_offset_t)(arr + 24ULL * i), e, sizeof(e)) != KERN_SUCCESS ||
++		    vm_map_read_user(task->map, (vm_map_offset_t)e[1], path, sizeof(path)) != KERN_SUCCESS) {
++			continue;
++		}
++		path[sizeof(path) - 1] = 0;
++		if (strcmp(img_words, "*") == 0) {	/* "*": every image outside the shared cache */
++			if (e[0] < cache_lo || e[0] >= cache_hi) {
++				printf("IMG %s 0x%llx %s\n", name, e[0], path);
++			}
++			continue;
++		}
++		for (const char *w = img_words; *w != 0;) {
++			const char *c = strchr(w, ',');
++			size_t len = c ? (size_t)(c - w) : strlen(w);
++			char word[48];
++			if (len > 0 && len < sizeof(word)) {
++				memcpy(word, w, len);
++				word[len] = 0;
++				if (strnstr(path, word, sizeof(path)) != NULL) {
++					printf("IMG %s 0x%llx %s\n", name, e[0], path);
++					break;
++				}
++			}
++			if (c == NULL) {
++				break;
++			}
++			w = c + 1;
++		}
++	}
 +}
 +
 +/*
