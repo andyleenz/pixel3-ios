@@ -1,10 +1,32 @@
-blueline: SoC temperatures for thermalmonitord (bluethermal=1)
+blueline: SoC and battery temperatures for thermalmonitord (bluethermal=1)
 
 BlueThermal on IOResources makes one HID temperature service (0xFF00, 0x05) per
-sensor name in D22AP-Info.plist that SDM845 TSENS can stand for (Gold, Silver,
-L3, GPU, always-on, memory, Wi-Fi, camera, video, modem); copyEvent answers
-kIOHIDEventTypeTemperature with the reading (first, mean or highest).
+sensor name in D22AP-Info.plist that the phone can stand for: SDM845 TSENS for the
+die sensors (Gold, Silver, L3, GPU, always-on, memory, Wi-Fi, camera, video, modem;
+first, mean or highest), the battery gauge (BlueBattery) for TG0B, TG0V and mic1.
+thermalmonitord runs its loop only when all non-synthetic sensors are found
+("partial sensors: ... mask"). mic1 also sends events every ReportInterval.
 
+--- a/iokit/Kernel/arm/BlueBattery.cpp	2026-11-26 17:08:50
++++ b/iokit/Kernel/arm/BlueBattery.cpp	2026-11-26 17:08:50
+@@ -51,6 +51,9 @@
+ #include <pexpert/pexpert.h>
+ 
+ #define BLUE_BATTERY_MAH	2915u
++
++/* 0235: the gauge's last temperature (0.1 C) for BlueThermal's TG0B, TG0V and mic1; -10000 = none yet */
++extern "C" { volatile int blue_battery_deci_c = -10000; }
+ 
+ /* bsd/dev/blueline_keys.c (0129 observer-channel reads; SID argument from 0130) */
+ extern "C" int blueline_spmi_read_sid(uint8_t sid, uint16_t addr, uint8_t *buf, unsigned len);
+@@ -419,6 +422,7 @@
+ 	putNumber("AppleRawCurrentCapacity", m ? m->repMah : mah);
+ 	putNumber("InstantAmperage", (UInt32)amperage);
+ 	putNumber("Temperature", (UInt32)(r->deciC * 10));	/* centidegrees */
++	blue_battery_deci_c = r->deciC;
+ 	if (m) {
+ 		int minutes = r->charging ? m->ttfMin : r->plugged ? -1 : m->tteMin;
+ 		setCycleCount(m->cycleCount);
 --- a/iokit/KernelConfigTables.cpp	2026-11-26 16:44:11
 +++ b/iokit/KernelConfigTables.cpp	2026-11-26 16:44:12
 @@ -88,6 +88,11 @@
@@ -30,8 +52,8 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
  iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
  iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
 --- a/iokit/Kernel/arm/hid/BlueThermal.cpp	1970-01-01 10:00:00
-+++ b/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-26 16:44:11
-@@ -0,0 +1,211 @@
++++ b/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-26 17:08:50
+@@ -0,0 +1,284 @@
 +/*
 + * Pixel 3 (blueline): SoC temperatures for thermalmonitord (patch 0235). Boot-arg bluethermal=1 turns it on.
 + *
@@ -45,10 +67,17 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 + * or the highest ("Max:"). The mapping is by role, not by position on the die: Apple's P-core and GPU die
 + * sensors take the Gold cluster and the GPU, the E-core ACC sensor the Silver cluster, the PMU's the
 + * always-on, Wi-Fi, camera, video and modem sensors. Sensors without a reading answer nothing (no event).
-+ * Battery (TG0B, TG0V), microphones and synthetic skin sensors are not provided.
++ *
++ * thermalmonitord runs its control loop only once every non-synthetic sensor is there ("partial sensors:
++ * ... mask"): besides the die sensors, TG0B and TG0V (battery) and mic1. These three read the battery
++ * gauge's temperature (BlueBattery, MAX1720x; nothing until BlueBattery has a reading). mic1 is a
++ * callback sensor (callbackInterval, watchdog): it also sends an event every ReportInterval (default 1 s).
++ * mic2 and Tarc come from elsewhere; the synthetic skin sensors are thermalmonitord's own sums.
 + */
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOService.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSNumber.h>
 +#include <libkern/c++/OSString.h>
 +#include <pexpert/pexpert.h>
 +#include "IOHIDEventService.h"
@@ -64,7 +93,7 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +#define BLUE_TEMP_PAGE		0xFF00u		/* kHIDPage_AppleVendor */
 +#define BLUE_TEMP_USAGE		0x05u		/* kHIDUsage_AppleVendor_TemperatureSensor */
 +
-+enum { kFirst, kAvg, kMax };
++enum { kFirst, kAvg, kMax, kBattery, kBatteryPush };
 +#define S0(n)	(n)			/* tsens0 sensor n */
 +#define S1(n)	(0x10 | (n))		/* tsens1 sensor n */
 +
@@ -101,10 +130,17 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +	{ "PMU tdev5", kFirst, 1, { S1(7) } },
 +	{ "PMU tcal", kFirst, 1, { S0(0) } },
 +	{ "PMU tjunc", kMax, 4, { S0(7), S0(8), S0(9), S0(10) } },
++	{ "TG0B", kBattery, 0, { 0 } },
++	{ "TG0V", kBattery, 0, { 0 } },
++	{ "mic1", kBatteryPush, 0, { 0 } },
 +};
 +#define BLUE_TZ_N	(sizeof(blue_tz) / sizeof(blue_tz[0]))
 +
 +static vm_offset_t blue_tm[2];
++
++/* BlueBattery: the gauge's last temperature in 0.1 C, BLUE_NO_BATTERY_TEMP until it has one. */
++#define BLUE_NO_BATTERY_TEMP	(-10000)
++extern "C" volatile int blue_battery_deci_c;
 +
 +/* One TSENS sensor in 0.1 C; false when it has no valid reading. */
 +static bool
@@ -127,6 +163,14 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +blue_tz_read(const struct blue_tz *z, int *dc)
 +{
 +	int sum = 0, max = -10000, got = 0, v;
++	if (z->how >= kBattery) {
++		v = blue_battery_deci_c;
++		if (v == BLUE_NO_BATTERY_TEMP) {
++			return false;
++		}
++		*dc = v;
++		return true;
++	}
 +	for (uint8_t i = 0; i < z->n; i++) {
 +		if (blue_tsens(z->ids[i], &v)) {
 +			if (got == 0 && z->how == kFirst) {
@@ -153,6 +197,7 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = NULL,
 +	    IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
 +protected:
 +	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return BLUE_TEMP_PAGE; }
 +	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return BLUE_TEMP_USAGE; }
@@ -160,7 +205,10 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 1000000; }
 +	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString(blue_tz[fIndex].name); }
 +private:
-+	unsigned fIndex, fReads;
++	IOHIDEvent *reading();
++	static void tick(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fTimer;
++	unsigned fIndex, fReads, fPeriodMS = 1000;
 +};
 +OSDefineMetaClassAndStructors(BlueThermalSensor, IOHIDEventService);
 +
@@ -178,15 +226,54 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +		return false;
 +	}
 +	setProperty("Transport", "SPU");
++	if (blue_tz[fIndex].how == kBatteryPush) {
++		fTimer = IOTimerEventSource::timerEventSource(this, &BlueThermalSensor::tick);
++		if (!fTimer || _hidWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(fTimer);
++			return false;
++		}
++		fTimer->setTimeoutMS(fPeriodMS);
++	}
 +	registerService();
 +	return true;
++}
++
++void
++BlueThermalSensor::free(void)
++{
++	if (fTimer) {
++		fTimer->cancelTimeout();
++		if (_hidWorkLoop) {
++			_hidWorkLoop->removeEventSource(fTimer);
++		}
++		OSSafeReleaseNULL(fTimer);
++	}
++	IOHIDEventService::free();
++}
++
++void
++BlueThermalSensor::tick(OSObject *owner, IOTimerEventSource *sender)
++{
++	BlueThermalSensor *me = (BlueThermalSensor *)owner;
++	IOHIDEvent *e = me->reading();
++	if (e) {
++		me->dispatchEvent(e);
++		e->release();
++	}
++	sender->setTimeoutMS(me->fPeriodMS);
 +}
 +
 +IOHIDEvent *
 +BlueThermalSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
 +{
++	return type == kIOHIDEventTypeTemperature ? reading() : NULL;
++}
++
++IOHIDEvent *
++BlueThermalSensor::reading()
++{
 +	int dc;
-+	if (type != kIOHIDEventTypeTemperature || !blue_tz_read(&blue_tz[fIndex], &dc)) {
++	if (!blue_tz_read(&blue_tz[fIndex], &dc)) {
 +		return NULL;
 +	}
 +	if (fReads++ == 0) {
@@ -198,7 +285,15 @@ kIOHIDEventTypeTemperature with the reading (first, mean or highest).
 +IOReturn
 +BlueThermalSensor::setProperties(OSObject *properties)
 +{
-+	(void)properties;	/* ReportInterval and the like: readings are taken when asked for */
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject(kIOHIDReportIntervalKey)) : NULL;
++	if (n && fTimer) {	/* microseconds; the copyEvent sensors are read when asked */
++		uint32_t ms = n->unsigned32BitValue() / 1000u;
++		fPeriodMS = ms < 100u ? 100u : ms > 60000u ? 60000u : ms;
++		setProperty(kIOHIDReportIntervalKey, n);
++		IOLog("BLUELINE THERMAL: \"%s\" ReportInterval %u us: sending every %u ms\n", blue_tz[fIndex].name,
++		    (unsigned)n->unsigned32BitValue(), fPeriodMS);
++	}
 +	return kIOReturnSuccess;
 +}
 +

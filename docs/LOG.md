@@ -1356,6 +1356,23 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
 
 Next: a lit scene (one frame saved as PGM), the preview layer on screen, then photos (assetsd).
 
+**Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
+HID services (usage pairs (0xFF00, 5), (0xFF08, 1), (0x20, 0x31)) by Product = matchName and reads them
+with copyEvent. 0235 publishes 32: SDM845 TSENS for the die sensors (Gold, Silver, L3, GPU; first, mean or
+highest) and the PMU ones (always-on, memory, Wi-Fi, camera, video, modem), the battery gauge (BlueBattery)
+for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInterval).
+- therm1-2: 29 of 29 die services, thermtest reads 43-69 C. thermalmonitord was not running: the image
+  tweaks remove its launchd job (DENY list).
+- therm4 (job kept, `launchd-build.py OUT com.apple.thermalmonitord`): runs, no restarts, reads nothing.
+  Its os_log: "partial sensors: current 23FFFFFFFFE, expected 67FFFFFFFFF": TG0B, mic1, TG0V missing,
+  and the loop waits for all of them.
+- therm6 (with those three): the loop runs and reads every sensor except the infoOnly ones. Within a second
+  of start: "Thermal pressure level 20 thermal level 4", "set Backlight: 90"; NSProcessInfo thermalState 2
+  (serious). The die reads 55-69 C under boot load, hotter than the A11 tables expect. Calibration not done,
+  so it stays opt-in: default boots keep the job out and bluethermal off.
+- `tools/oslog-pull.sh`: the phone's os_log over bluesh, parsed with mandiant/macos-UnifiedLogs (Apple's
+  `log show` refuses the partial archive). `tools/bluerun/envrun.c`: env(1) for the phone.
+
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;
 HEVC has no encoder (`VTCompressionSessionCreate` -12908, `kVTCouldNotFindVideoEncoderErr`). iOS has no

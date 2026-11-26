@@ -6,7 +6,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 | Area | Feasibility | Route | Effort |
 |---|---|---|---|
 | Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; plug-in frames reach apps (cam32). Next: sensor frames in apps, then assetsd/Photos so captures save; force JPEG/H.264 (no HEIC/HEVC encoder) | hours |
-| Thermals to thermalmonitord | easy | TSENS is read already: publish HID temperature services (usage page 0xff00, usage 5), one per sensor ID the D22 thermal table expects; report-only first | 0.5-1 day |
+| Thermals to thermalmonitord | runs, uncalibrated | 0235 (`bluethermal=1`) + the launchd job: loop runs, reads all sensors, but goes to pressure 20 / backlight 90% at boot (SDM845 die hotter than the A11 tables). Next: scale or offset the die readings to the skin model, then on by default | 0.5 day |
 | Wi-Fi 5 GHz | small | untried: second 3.3 V rail (L23A on other SDM845 boards; only L25A tried), then board data, then WMI diff against Linux on this phone; radio in the default boot | hours-1 day |
 | Cellular control, SMS | realistic | UniXNU/QcomBaseband (BSD-2, SC7180, iOS 17): `/baseband` ADT node, AppleBaseband classes, QMUX-QRTR bridge; board layer exists (0149, 0165, 0166); ends the CommCenter crash loop | 3-5 days |
 | Mobile data | more work | IPA v3.5.1 + GSI (Linux `drivers/net/ipa` has SDM845) | +4-6 days |
