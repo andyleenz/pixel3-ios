@@ -118,6 +118,7 @@ case " $base $extra " in
 	[ "$adsp" = 1 ] && [ -f work/fw/audio/adsp.mdt ] && fw+=(--adsp-fw work/fw/audio) ;;
 esac
 case " $base $extra " in *" sweetfb_native=1 "*) fw+=(--canvas 1080x2160) ;; esac	# iOS draws the panel's own size
+case " $base $extra " in *" bluecell=1 "*) fw+=(--baseband) ;; esac	# /baseband: the cellular CommCenter job (0238)
 python3 tools/mkadt.py --ufs --cpus 8 --iphone work/DeviceTree.d22ap.im4p "${fw[@]}" "$out/$name.adt" > /dev/null
 python3 tools/mkpayload.py "$kernel" "$out/$name.adt" "$out/$name-payload.bin" --cmdline "$base $extra" > /dev/null
 PATH=/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH p2-shim/build.sh "$out/$name-payload.bin" stock/boot.img > "$out/$name-shim.txt" 2>&1

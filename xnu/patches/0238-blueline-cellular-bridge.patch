@@ -1,0 +1,3953 @@
+blueline: cellular control bridge (UniXNU/QcomBaseband dd0199cf3300, BSD-2), boot-arg bluecell=1
+
+QcomBaseband publishes AppleBaseband, AppleBasebandPCIControl, the PCIe channel
+interfaces (pbl, sahara, qmux1/2...), the PDP manager and AppleIPAppender, and
+bridges ABM's QMUX to the modem's QMI over QRTR. iOS 16.7's libIOABP and
+libTelephonyBasebandDynamic use the same channel and control selectors as the
+reference's iOS 17. The board side is ours: QRTR servers and client-port data
+from blueline_wifi.c (0165), sends and polling on the modem watcher. Needs
+bluewifi>=4 (modem + GLINK) and bluewifi_watch=0. No data path (IPA v3.5.1):
+PDP sends fail. MiniIPAppender (0199) now publishes the bridge's AppleIPAppender
+(one class of that name), which refuses every method without bluecell.
+
+diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c	2026-11-26 20:09:30
++++ b/bsd/dev/blueline_wifi.c	2026-11-26 20:09:52
+@@ -1272,6 +1272,33 @@
+ /* Data for one of our ports (stage 3b on: rmtfs, pd-mapper, WLFW, TFTP). */
+ static void qrtr_data(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);
+ 
++/*
++ * 0238: the cellular bridge (UniXNU/QcomBaseband, iokit/Kernel/arm/baseband, BSD-2; boot-arg bluecell=1). It is
++ * given every QRTR server and the data for its client ports (0x4100 + slot), and sends through bb_qrtr_send
++ * on this thread (coachz_baseband_poll from the watcher).
++ */
++extern int coachz_baseband_enabled(void);
++extern void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
++extern void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port);
++extern void coachz_baseband_del_server(uint32_t service, uint32_t node, uint32_t port);
++extern int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
++extern void coachz_baseband_poll(void);
++extern void coachz_baseband_report(unsigned second);
++
++static void
++bb_qrtr_send(uint32_t local_port, uint32_t node, uint32_t port, const void *msg, uint32_t len)
++{
++	(void)qrtr_send(Q_DATA, local_port, node, port, msg, len);
++}
++
++static void
++bb_qrtr_del_client(uint32_t local_port)
++{
++	/* struct qrtr_ctrl_pkt: cmd, client { node, port }, broadcast to the control port */
++	uint32_t pkt[5] = { Q_DEL_CLIENT, QRTR_NODE_APPS, local_port, 0, 0 };
++	(void)qrtr_send(Q_DEL_CLIENT, local_port, 0xffffffffu, QRTR_PORT_CTRL, pkt, sizeof(pkt));
++}
++
+ static uint32_t wlfw_srv_node, wlfw_srv_port;
+ static bool wlfw_srv_seen;
+ 
+@@ -1323,8 +1350,10 @@
+ 		}
+ 		printf("BLUELINE WIFI: qrtr: server: service %u (%#x) version %u instance %u at %u:%#x\n", w[1], w[1], w[2] & 0xffu,
+ 		    w[2] >> 8, w[3], w[4]);
++		coachz_baseband_new_server(w[1], w[2], w[3], w[4]);	/* 0238 (does nothing without bluecell) */
+ 		break;
+ 	case Q_DEL_SERVER:
++		coachz_baseband_del_server(w[1], w[3], w[4]);
+ 		printf("BLUELINE WIFI: qrtr: server gone: service %u instance %u at %u:%#x\n", w[1], w[2] >> 8, w[3], w[4]);
+ 		break;
+ 	default:
+@@ -2445,6 +2474,9 @@
+ 		}
+ 		return;
+ 	}
++	if (coachz_baseband_qrtr(h->dst_port, h->src_node, h->src_port, d, n)) {	/* 0238: a cellular bridge client */
++		return;
++	}
+ 	if (!qmi_parse(d, n, &m) || m.type != QMI_REQUEST) {
+ 		printf("BLUELINE WIFI: qrtr: < DATA %u:%#x -> port %#x, %u bytes (not a request)\n", h->src_node, h->src_port,
+ 		    h->dst_port, n);
+@@ -5371,6 +5403,7 @@
+ 	uint64_t t0 = mach_absolute_time();
+ 	uint32_t last = 0xffffffffu, v, fl, ver;
+ 	bool wd = false, crashed = false, link_tried = false;
++	unsigned bb_report_s = 0;
+ 
+ 	if (w2.watch_s == 0) {
+ 		printf("BLUELINE WIFI: watcher: following the modem for good (bluewifi_watch=0)\n");
+@@ -5399,7 +5432,9 @@
+ 			if (w2.level >= 5 && !wf.powered) {
+ 				wf.powered = wlan_power();
+ 			}
+-			(void)link_up();
++			if (link_up() && coachz_baseband_enabled()) {
++				coachz_baseband_configure(bb_qrtr_send, bb_qrtr_del_client);	/* 0238 */
++			}
+ 		}
+ 		if (w2.level >= 5 && gl.up && wlfw_srv_seen && !wf.started && !crashed) {
+ 			wf.started = true;
+@@ -5419,6 +5454,11 @@
+ 		}
+ 		if (gl.up) {
+ 			link_poll();
++			coachz_baseband_poll();
++			if (coachz_baseband_enabled() && ms_since(t0) / 1000u != bb_report_s && ms_since(t0) / 1000u % 30u == 0) {
++				bb_report_s = ms_since(t0) / 1000u;
++				coachz_baseband_report(bb_report_s);
++			}
+ 		}
+ 		if (ce_up) {
+ 			radio_poll();
+diff -urN a/iokit/Kernel/arm/MiniIPAppender.cpp b/iokit/Kernel/arm/MiniIPAppender.cpp
+--- a/iokit/Kernel/arm/MiniIPAppender.cpp	2026-11-26 20:13:03
++++ b/iokit/Kernel/arm/MiniIPAppender.cpp	2026-11-26 20:15:00
+@@ -24,81 +24,13 @@
+ 
+ extern "C" void MiniIPAppenderStart(void);
+ 
+-class AppleIPAppender : public IOService
+-{
+-	OSDeclareDefaultStructors(AppleIPAppender);
++/*
++ * 0238: one AppleIPAppender (iOS matches the class name): the cellular bridge's (iokit/Kernel/arm/baseband).
++ * Without bluecell it refuses every method, as this stand-in's own class did.
++ */
++extern "C" bool coachz_ipappender_publish(void);
++extern "C" int coachz_baseband_enabled(void);
+ 
+-public:
+-	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+-};
+-
+-OSDefineMetaClassAndStructors(AppleIPAppender, IOService);
+-
+-bool
+-AppleIPAppender::start(IOService * provider)
+-{
+-	if (!IOService::start(provider)) {
+-		return false;
+-	}
+-	setProperty(kIOUserClientClassKey, "AppleIPAppenderUserClient");
+-	registerService();
+-	return true;
+-}
+-
+-class AppleIPAppenderUserClient : public IOUserClient
+-{
+-	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
+-
+-public:
+-	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+-	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+-	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * arguments,
+-	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
+-};
+-
+-OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, IOUserClient);
+-
+-static unsigned gIPAOpens, gIPACalls;
+-
+-bool
+-AppleIPAppenderUserClient::start(IOService * provider)
+-{
+-	char who[32] = "?";
+-
+-	if (!IOUserClient::start(provider)) {
+-		return false;
+-	}
+-	if (gIPAOpens++ < 4) {
+-		proc_selfname(who, sizeof(who));
+-		IOLog("BLUE PDP: AppleIPAppender opened by %s\n", who);
+-	}
+-	return true;
+-}
+-
+-IOReturn
+-AppleIPAppenderUserClient::clientClose(void)
+-{
+-	if (!isInactive()) {
+-		terminate();
+-	}
+-	return kIOReturnSuccess;
+-}
+-
+-IOReturn
+-AppleIPAppenderUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * arguments,
+-    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+-{
+-	IOReturn ret = kIOReturnUnsupported;
+-
+-	if (gIPACalls++ < 16) {
+-		IOLog("BLUE PDP: method %u (scalars in %u, struct in %u, out %u): %s\n", selector,
+-		    arguments ? arguments->scalarInputCount : 0,
+-		    arguments ? arguments->structureInputSize : 0, arguments ? arguments->structureOutputSize : 0,
+-		    "unsupported");
+-	}
+-	return ret;
+-}
+-
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ void
+@@ -109,18 +41,12 @@
+ 	if (!on) {
+ 		return;
+ 	}
+-	IOService * resources = IOService::getResourceService();
+-	AppleIPAppender * ipa = OSTypeAlloc(AppleIPAppender);
+-
+-	if (resources == NULL || ipa == NULL || !ipa->init() || !ipa->attach(resources)) {
+-		OSSafeReleaseNULL(ipa);
+-		IOLog("BLUE PDP: cannot create AppleIPAppender\n");
+-		return;
++	if (coachz_baseband_enabled()) {
++		return;	/* the bridge publishes it with the rest */
+ 	}
+-	if (!ipa->start(resources)) {
+-		ipa->detach(resources);
+-	} else {
++	if (coachz_ipappender_publish()) {
+ 		IOLog("BLUE PDP: AppleIPAppender published (every method unsupported; bluepdp=0 leaves it out)\n");
++	} else {
++		IOLog("BLUE PDP: cannot create AppleIPAppender\n");
+ 	}
+-	ipa->release();
+ }
+diff -urN a/iokit/Kernel/arm/baseband/LICENSE b/iokit/Kernel/arm/baseband/LICENSE
+--- a/iokit/Kernel/arm/baseband/LICENSE	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/LICENSE	2026-11-26 20:09:31
+@@ -0,0 +1,25 @@
++BSD 2-Clause License
++
++Copyright (c) 2026, Trogdor-ipadOS contributors
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice,
++   this list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+diff -urN a/iokit/Kernel/arm/baseband/QcomBaseband.h b/iokit/Kernel/arm/baseband/QcomBaseband.h
+--- a/iokit/Kernel/arm/baseband/QcomBaseband.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/QcomBaseband.h	2026-11-26 20:09:30
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++#ifndef QCOM_BASEBAND_H
++#define QCOM_BASEBAND_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++int coachz_baseband_enabled(void);
++void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
++void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port);
++void coachz_baseband_del_server(uint32_t service, uint32_t node, uint32_t port);
++int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
++void coachz_baseband_poll(void);
++void coachz_baseband_report(unsigned second);
++/* Implemented by the board data adapter; called on the QRTR/IPA owner thread. */
++int coachz_modem_data_send(uint32_t mux, const uint8_t *ip, uint32_t length);
++void coachz_modem_data_receiver(void (*receiver)(uint32_t mux, const uint8_t *ip, uint32_t length, uint32_t ip_version));
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff -urN a/iokit/Kernel/arm/baseband/coachz_baseband.cpp b/iokit/Kernel/arm/baseband/coachz_baseband.cpp
+--- a/iokit/Kernel/arm/baseband/coachz_baseband.cpp	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_baseband.cpp	2026-11-26 20:13:04
+@@ -0,0 +1,1279 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// The cellular bridge: the IOKit side of Apple's PCIe baseband (AppleBaseband, AppleBasebandPCIControl and one
++// AppleBasebandPCIInterface per channel, with the user-client classes the sandbox knows them by) over this SoC's modem. ABM and
++// BBUpdater talk to these as to an MHI modem; the QMUX channels go to the modem's QMI services over QRTR (coachz_bb_qmux.h), the
++// sahara channel is answered by a device end that reads and drops the firmware it is offered (coachz_bb_sahara.h), and the board
++// methods are answered by coachz_bb_control.h. Started only with /chosen/coachz-baseband (tools/xnu_screen.py --baseband).
++//
++// Threads: the Wi-Fi thread owns QRTR (bsd/dev/coachz_wifi.c): it hands modem messages to coachz_baseband_qrtr and sends what
++// coachz_baseband_poll gives it. User threads only queue. One lock covers the bridge state and the queues; user memory is copied
++// outside it, and asynchronous reads complete on a thread call.
++#include <sys/errno.h>	/* blueline 0238 */
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSData.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++
++#include "coachz_bb_qmux.h"
++#include "coachz_bb_sahara.h"
++#include "coachz_bb_control.h"
++#include "coachz_bb_channels.h"
++#include "coachz_bb_data.h"
++#include "coachz_bb_pdp.h"
++#include "coachz_bb_esim.h"
++
++#define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
++// Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
++// queue overflowed every boot (5 to 22 frames), a lost VOICE answer made CommCenter reset the baseband (ATCS_TIMEOUT) and lost UIM and
++// NAS frames left the SIM and registration state stale until the SIM was reinserted. A dropped frame is a lost answer: keep room.
++#define BB_QUEUE 1024u
++#define BB_READS 8u                      // asynchronous reads waiting for a frame, per channel
++#define BB_TX 64u                        // QMI messages waiting for the Wi-Fi thread
++#define BB_SYNC_READ_SECONDS 30u
++
++// Which SAHARA images the device end asks for. SBL1 (Qualcomm image id 0x15) is the first image a boot loader requests; the rest of
++// a Mav16 boot (rpm, tz, apps, acdb, mba, qdsp6sw in the bbfw) follow once BBUpdater's log shows how it takes this one.
++static const uint32_t bb_sahara_images[] = { 0x15 };
++
++namespace {
++struct bb_frame { uint32_t len; uint8_t *data; };
++struct bb_read { OSAsyncReference64 reference; IOMemoryDescriptor *memory; uint32_t len; void *owner; };
++struct bb_channel {
++  bb_frame frames[BB_QUEUE];
++  uint32_t head, count;
++  bb_read reads[BB_READS];
++  uint32_t reads_waiting;
++  void *owner;
++  uint32_t opens, frames_in, frames_out, frames_dropped, bytes_in, bytes_out;
++};
++struct bb_tx { uint32_t local_port, node, port, len; uint8_t *data; };
++}
++
++static IOLock *bb_lock;
++static thread_call_t bb_complete_call;
++static struct cbq_bridge bb_qmux;
++static struct cbs_device bb_sahara;
++static struct cbc_state bb_control;
++static bb_channel bb_ch[CBH_PUBLISHED];
++static bb_tx bb_txq[BB_TX];
++static uint32_t bb_tx_head, bb_tx_count, bb_tx_dropped;
++static void (*bb_send)(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length);
++static void (*bb_del_client)(uint32_t local_port);
++static int bb_published;
++static uint32_t bb_private_seen[64], bb_private_count, bb_ctl_logged;
++static uint8_t bb_out[BB_FRAME_MAX];     // answers built under the lock
++static struct cbp_client bb_pdp_clients[CBQ_MAX_CLIENTS];
++static uint32_t bb_pdp_owners[CBQ_MAX_CLIENTS];
++static struct cbd_setup bb_data;         // the data port setup ModemManager runs for IPA (coachz_bb_data.h)
++static int bb_data_slot[2] = { -1, -1 }; // the bridge's own DPM and WDA clients
++static uint32_t bb_endpoint_fixes, bb_activations;
++static uint8_t bb_fix[2048];
++static struct cbe bb_esim;
++static int bb_esim_slot = -1;
++static bb_tx bb_uim_held[BB_TX];
++static uint32_t bb_uim_head, bb_uim_count;
++static uint8_t bb_uim_cid[BB_TX];
++static uint8_t *bb_esim_in, *bb_esim_resp;
++#define BB_ESIM_BYTES (1024u * 1024u)
++
++static uint32_t bb_now_ms(void)
++{
++  uint64_t ticks, ns;
++  clock_get_uptime(&ticks);
++  absolutetime_to_nanoseconds(ticks, &ns);
++  return (uint32_t)(ns / 1000000u);
++}
++
++extern "C" {
++int coachz_baseband_enabled(void);
++void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
++void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port);
++void coachz_baseband_del_server(uint32_t service, uint32_t node, uint32_t port);
++int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
++void coachz_baseband_poll(void);
++void coachz_baseband_report(unsigned second);
++}
++
++// ------------------------------------------------------------------ device tree
++static OSData *bb_chosen(const char *path, const char *key)
++{
++  IORegistryEntry *entry = IORegistryEntry::fromPath(path, gIODTPlane);
++  if (!entry) return nullptr;
++  OSData *value = OSDynamicCast(OSData, entry->getProperty(key));
++  if (value) value->retain();
++  entry->release();
++  return value;
++}
++
++// blueline (0238): boot-arg bluecell=1 instead of /chosen/coachz-baseband (the modem comes from bluewifi>=4).
++extern "C" int coachz_baseband_enabled(void)
++{
++  static int cached = -1;
++  if (cached < 0) {
++    uint32_t on = 0;
++    (void)PE_parse_boot_argn("bluecell", &on, sizeof(on));
++    cached = on != 0;
++  }
++  return cached;
++}
++
++// blueline (0238): no cellular data path yet (SDM845 has IPA v3.5.1, not the reference's v4.2): PDP sends fail.
++extern "C" int coachz_modem_data_send(uint32_t, const uint8_t *, uint32_t) { return ENETDOWN; }
++extern "C" void coachz_modem_data_receiver(void (*)(uint32_t, const uint8_t *, uint32_t, uint32_t)) {}
++
++// ------------------------------------------------------------------ queues (bb_lock held)
++static void bb_complete(thread_call_param_t, thread_call_param_t);
++
++static void bb_init(void)
++{
++  if (bb_lock) return;
++  bb_lock = IOLockAlloc();
++  bb_complete_call = thread_call_allocate(bb_complete, nullptr);
++  cbq_init(&bb_qmux);
++  bb_esim_in = static_cast<uint8_t *>(IOMallocData(BB_ESIM_BYTES));
++  bb_esim_resp = static_cast<uint8_t *>(IOMallocData(BB_ESIM_BYTES));
++  cbe_init(&bb_esim, bb_esim_in, bb_esim_in ? BB_ESIM_BYTES : 0,
++           bb_esim_resp, bb_esim_resp ? BB_ESIM_BYTES : 0);
++  // Read-only eUICC answers (coachz_bb_esim.h): preserve 16 KiB per entry.
++  const uint32_t cache_bytes = CBE_CACHE_ENTRIES * 16384u;
++  uint8_t *cache = static_cast<uint8_t *>(IOMallocData(cache_bytes));
++  cbe_set_cache(&bb_esim, cache, cache ? cache_bytes : 0);
++  cbc_init(&bb_control);
++  cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
++}
++
++// Probe: QMI header fields of each message (service, type, message, transaction, length, QMI error), never TLV contents, so no APN,
++// ICCID, APDU or address reaches the log. UIM, VINYL and WDS print every message; other services the first 6 of a kind, then each
++// power of two. A budget keeps the log ring from filling; the periodic report says how many lines it held back.
++#define BB_TRACE_KINDS 512u
++#define BB_TRACE_BUDGET 6000u
++static uint64_t bb_trace_key[BB_TRACE_KINDS];
++static uint32_t bb_trace_count[BB_TRACE_KINDS], bb_trace_lines, bb_trace_held;
++static void bb_trace(const char *dir, uint32_t channel, uint32_t service, uint32_t cid, const uint8_t *sdu, uint32_t n)
++{
++  if (!service || n < 7u) return;   // CTL has its own SDU layout and its own lines
++  const uint32_t type = sdu[0], txn = cbd_rd16(sdu + 1), message = cbd_rd16(sdu + 3);
++  const uint32_t error = type == 2u ? (cbd_sdu_ok(sdu, n) ? cbd_error(sdu, n) : 0xfffeu) : 0u;
++  const uint64_t key = 1u + ((uint64_t)((uint32_t)dir[0] << 8 | (uint32_t)dir[4]) << 48 |(uint64_t)service << 40 | (uint64_t)type << 32 |
++    (uint64_t)message << 16 | error);
++  uint32_t count = 0;
++  for (uint32_t i = 0, at = (uint32_t)(key * 0x9e3779b97f4a7c15ull >> 55) % BB_TRACE_KINDS; i < BB_TRACE_KINDS; i++, at = (at + 1) % BB_TRACE_KINDS) {
++    if (bb_trace_key[at] != key && bb_trace_key[at]) continue;
++    bb_trace_key[at] = key;
++    count = ++bb_trace_count[at];
++    break;
++  }
++  const bool always = service == CBE_SVC_UIM || service == CBE_SVC_VINYL || service == CBD_SVC_WDS;
++  if (!always && count > 6u && (count & (count - 1u))) return;
++  if (bb_trace_lines >= BB_TRACE_BUDGET) { bb_trace_held++; return; }
++  bb_trace_lines++;
++  printf("COACHZ qmi: %s ch %u svc 0x%x cid %u type %u msg 0x%x txn %u len %u err 0x%x n %u t %u\n",
++         dir, channel, service, cid, type, message, txn, n, error, count, bb_now_ms());
++}
++// A QMUX frame (I/F type 1, length, flags, service, client id, then the SDU).
++static void bb_trace_frame(const char *dir, uint32_t channel, const uint8_t *frame, uint32_t len)
++{
++  if (len >= CBQ_HDR + 7u && frame[0] == 1u) bb_trace(dir, channel, frame[4], frame[5], frame + CBQ_HDR, len - CBQ_HDR);
++}
++
++static void bb_push(uint32_t channel, const uint8_t *data, uint32_t len)
++{
++  if (channel == CBH_QMUX1 || channel == CBH_QMUX2) bb_trace_frame("to-host", channel == CBH_QMUX1 ? 1u : 2u, data, len);
++  bb_channel *c = &bb_ch[channel];
++  uint8_t *copy = len && len <= BB_FRAME_MAX ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
++  if (!copy || c->count == BB_QUEUE) {
++    if (copy) IOFreeData(copy, len);
++    // Probe: which answer was lost (header fields only).
++    if (c->frames_dropped < 32u)
++      printf("COACHZ baseband: dropped frame for ABM on channel %u (%s, %u queued, %u bytes) svc 0x%x type %u msg 0x%x\n", channel,
++             copy ? "queue full" : "no memory", c->count, len, len > 4 ? data[4] : 0u, len > CBQ_HDR ? data[CBQ_HDR] : 0u,
++             len > CBQ_HDR + 4 ? (uint32_t)(data[CBQ_HDR + 3] | data[CBQ_HDR + 4] << 8) : 0u);
++    c->frames_dropped++;
++    return;
++  }
++  memcpy(copy, data, len);
++  c->frames[(c->head + c->count++) % BB_QUEUE] = { len, copy };
++  c->frames_out++;
++  c->bytes_out += len;
++  IOLockWakeup(bb_lock, c, false);
++  if (c->reads_waiting && bb_complete_call) thread_call_enter(bb_complete_call);
++}
++
++static bb_frame bb_pop(uint32_t channel)
++{
++  bb_channel *c = &bb_ch[channel];
++  bb_frame f = { 0, nullptr };
++  if (!c->count) return f;
++  f = c->frames[c->head];
++  c->head = (c->head + 1) % BB_QUEUE;
++  c->count--;
++  return f;
++}
++
++static void bb_flush(uint32_t channel)
++{
++  for (bb_frame f = bb_pop(channel); f.data; f = bb_pop(channel)) IOFreeData(f.data, f.len);
++}
++
++// A QMI message for the modem, sent by the Wi-Fi thread from coachz_baseband_poll.
++static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len)
++{
++  uint8_t *copy = len ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
++  if (!copy || bb_tx_count == BB_TX) {
++    if (copy) IOFreeData(copy, len);
++    bb_tx_dropped++;
++    return;
++  }
++  memcpy(copy, data, len);
++  bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = { local_port, node, port, len, copy };
++  const uint32_t slot = local_port - CBQ_PORT_BASE;
++  if (slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used && bb_qmux.client[slot].channel == CBQ_INTERNAL)
++    bb_trace("int-tx", 0, bb_qmux.client[slot].service, bb_qmux.client[slot].cid, data, len);
++}
++
++// BBUEUR13Loader pushes the SBL with SendImage on pbl, frees that transport, opens sahara and waits 40 s for the loaded SBL's HELLO there. So the
++// HELLO goes out when sahara opens after a SendImage.
++static bool bb_boot_image_sent;
++
++static void bb_sahara_restart(void)
++{
++  struct cbs_out o;
++  bb_flush(CBH_SAHARA);
++  cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
++  cbs_start(&bb_sahara, &o);
++  for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
++  printf("COACHZ baseband: sahara hello\n");
++}
++
++static void bb_private_note(uint32_t service, uint32_t message)
++{
++  const uint32_t key = service << 16 | (message & 0xffff);
++  for (uint32_t i = 0; i < bb_private_count; i++)
++    if (bb_private_seen[i] == key) return;
++  if (bb_private_count < 64) bb_private_seen[bb_private_count++] = key;
++  printf("COACHZ baseband: private QMI service 0x%x message 0x%x answered not supported\n", service, message);
++}
++
++// ------------------------------------------------------------------ data port setup (bb_lock held)
++static void bb_data_step(void)
++{
++  uint8_t sdu[128];
++  uint32_t service = 0;
++  const uint32_t n = cbd_next(&bb_data, sdu, sizeof sdu, &service);
++  if (!n) {
++    printf("COACHZ baseband: data port: DPM open %s 0x%x; WDA set data format error 0x%x, link %d, uplink %d, downlink %d (asked %u), %d datagrams, %d bytes\n",
++           bb_data.has_dpm ? "error" : "skipped, no service,", bb_data.dpm_error, bb_data.wda_error, (int)bb_data.llp, (int)bb_data.ul_dap,
++           (int)bb_data.dl_dap, cbd_daps[bb_data.dap_index], (int)bb_data.dl_datagrams, (int)bb_data.dl_size);
++    return;
++  }
++  int *slot = &bb_data_slot[service == CBD_SVC_DPM ? 0 : 1];
++  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, service);
++  const struct cbq_server *server = cbq_server_find(&bb_qmux, service);
++  if (*slot < 0 || !server) {
++    printf("COACHZ baseband: data port: no client for service %u\n", service);
++    bb_data.step = CBD_DONE;
++    return;
++  }
++  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)*slot, server->node, server->port, sdu, n);
++}
++
++static void bb_data_start(void)
++{
++  if (bb_data.step != CBD_IDLE) return;
++  bb_data.has_dpm = cbq_server_find(&bb_qmux, CBD_SVC_DPM) != nullptr;
++  bb_data.has_wda = cbq_server_find(&bb_qmux, CBD_SVC_WDA) != nullptr;
++  bb_data_step();
++}
++
++// WDS is still entirely owned by CommCenter. Observe only wire lifecycle facts, never credentials or addresses.
++static void bb_pdp_note(uint32_t local_port, uint32_t cid, uint32_t channel, const uint8_t *sdu, uint32_t n)
++{
++  const uint32_t slot = local_port - CBQ_PORT_BASE;
++  if (slot >= CBQ_MAX_CLIENTS || !cbd_sdu_ok(sdu, n)) return;
++  const uint32_t owner = 1u + cid + (channel << 8);
++  if (bb_pdp_owners[slot] != owner) {
++    bzero(&bb_pdp_clients[slot], sizeof bb_pdp_clients[slot]);
++    bb_pdp_clients[slot].family = 4; // WDS default family, overridden by Set IP Family or Start Network
++    bb_pdp_owners[slot] = owner;
++  }
++  cbp_client &c = bb_pdp_clients[slot];
++  if (cbp_observe(&c, sdu, n))
++    printf("COACHZ pdp: WDS type %u message 0x%x txn %u mux %u family %u active %u error %u address-fields %u\n",
++      sdu[0], cbd_rd16(sdu + 3), cbd_rd16(sdu + 1), c.mux, c.family, c.active,
++      sdu[0] == 2 ? cbd_error(sdu, n) : 0, c.settings);
++  const bool start_failed = sdu[0] == 2 && cbd_rd16(sdu + 3) == CBP_START && cbd_error(sdu, n);
++  if (start_failed || (sdu[0] == 4 && cbd_rd16(sdu + 3) == CBP_STATUS && !c.active)) {
++    // libqmi WDS 0x20 responses and 0x22 indications use the same call-end TLVs.
++    uint32_t reason_size = 0, verbose_size = 0;
++    const uint8_t *reason = cbd_find(sdu, n, 0x10, &reason_size);
++    const uint8_t *verbose = cbd_find(sdu, n, 0x11, &verbose_size);
++    printf("COACHZ pdp: %s cid %u channel %u mux %u family %u reason-present %u reason %u verbose-present %u type %u code %d\n",
++      start_failed ? "start failed" : "disconnected", cid, channel, c.mux, c.family, reason && reason_size == 2u,
++      reason && reason_size == 2u ? cbd_rd16(reason) : 0u, verbose && verbose_size == 4u,
++      verbose && verbose_size == 4u ? cbd_rd16(verbose) : 0u,
++      verbose && verbose_size == 4u ? static_cast<int16_t>(cbd_rd16(verbose + 2)) : 0);
++  }
++}
++
++static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
++
++// A request for the modem, with the data port named as this modem has it.
++static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
++{
++  if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
++  bb_sim_request(r, sdu);
++  if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
++    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_INTERNAL, nullptr, 0, bb_out, sizeof bb_out);
++    if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
++    return;
++  }
++  if (r.service == CBE_SVC_UIM && bb_esim_in && bb_esim_resp &&
++      (bb_esim.freeze || (!bb_esim.slots.known && r.len >= 7 && cbd_rd16(sdu + 3) == CBE_UIM_GET_CARD_STATUS))) {
++    uint8_t *copy = bb_uim_count < BB_TX ? static_cast<uint8_t *>(IOMallocData(r.len)) : nullptr;
++    if (copy) {
++      memcpy(copy, sdu, r.len);
++      const uint32_t slot = (bb_uim_head + bb_uim_count++) % BB_TX;
++      bb_uim_held[slot] = { r.local_port, r.node, r.port, r.len, copy };
++      bb_uim_cid[slot] = r.cid;
++    } else {
++      const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_DEVICE_IN_USE, nullptr, 0, bb_out, sizeof bb_out);
++      if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
++    }
++    return;
++  }
++  const struct cbd_fix f = cbd_endpoint_fix(r.service, sdu, r.len, bb_fix, sizeof bb_fix);
++  if (!f.len) {
++    bb_queue_tx(r.local_port, r.node, r.port, sdu, r.len);
++    return;
++  }
++  if (bb_endpoint_fixes++ < 8)
++    printf("COACHZ baseband: data port: service %u message 0x%x endpoint %u/%u %s %u/%u\n", r.service, (uint32_t)(sdu[3] | sdu[4] << 8),
++           f.before_type, f.before_interface, f.inserted ? "added as" : "now", CBD_EP_EMBEDDED, CBD_EP_INTERFACE);
++  bb_queue_tx(r.local_port, r.node, r.port, bb_fix, f.len);
++}
++
++// eSIM control runs on the same QRTR owner as the other QMI traffic (bb_lock held).
++// Only explicit VINYL commands may switch slots or send an APDU. Idle discovery reads slot status.
++static void bb_esim_step(void)
++{
++  if (!bb_esim_in || !bb_esim_resp) return;
++  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBE_SVC_UIM);
++  if (!server) return;
++  if (bb_esim_slot < 0) bb_esim_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBE_SVC_UIM);
++  if (bb_esim_slot < 0) return;
++  const uint32_t now = bb_now_ms();
++  while (!bb_esim.freeze && !bb_esim.route_failed && (bb_esim.slots.known || (bb_esim.step == CBE_S_IDLE && bb_esim.txn)) &&
++         bb_uim_count && bb_tx_count < BB_TX) {
++    bb_tx &held = bb_uim_held[bb_uim_head];
++    const uint32_t index = held.local_port - CBQ_PORT_BASE;
++    if (index < CBQ_MAX_CLIENTS && bb_qmux.client[index].used && bb_qmux.client[index].service == CBE_SVC_UIM &&
++        bb_qmux.client[index].cid == bb_uim_cid[bb_uim_head]) {
++      bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = held;
++    } else IOFreeData(held.data, held.len);
++    bb_uim_head = (bb_uim_head + 1) % BB_TX; bb_uim_count--;
++  }
++  for (uint32_t i = 0; i < CBE_JOBS; i++) {
++    struct cbe_job *j = &bb_esim.job[i];
++    if (j->state && cbq_client_find(&bb_qmux, j->channel, CBE_SVC_VINYL, j->cid) < 0) {
++      if ((int)i == bb_esim.active) cbe_finish(&bb_esim, 1, CBE_R_INACTIVE, 0, now);
++      else j->state = CBE_J_FREE;
++    }
++  }
++  if (bb_esim.session && bb_esim.active < 0 &&
++      cbq_client_find(&bb_qmux, bb_esim.session_channel, CBE_SVC_VINYL, bb_esim.session_cid) < 0)
++    cbe_session_release(&bb_esim, now, 2);
++  cbe_tick(&bb_esim, now);
++  if (bb_esim.req_len) {
++    const uint32_t queued = bb_tx_count;
++    bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_esim_slot, server->node, server->port, bb_esim.req, bb_esim.req_len);
++    if (bb_tx_count != queued) bb_esim.req_len = 0;
++  }
++  for (uint32_t i = 0; i < 4 && bb_esim.done_pending; i++) {
++    const struct cbe_job *done = &bb_esim.done;
++    if (cbq_client_find(&bb_qmux, done->channel, CBE_SVC_VINYL, done->cid) < 0) {
++      if (bb_esim.step == CBE_S_IDLE) bb_esim.done_pending = 0;
++      break;
++    }
++    const uint32_t channel = done->channel ? CBH_QMUX2 : CBH_QMUX1;
++    if (bb_ch[channel].count == BB_QUEUE) break;
++    const uint32_t chunk = bb_esim.done_chunk, pending = bb_esim.done_pending, queued = bb_ch[channel].count;
++    uint8_t qmux = 0;
++    const uint32_t n = cbe_output(&bb_esim, &qmux, bb_out, sizeof bb_out);
++    if (!n) break;
++    bb_push(channel, bb_out, n);
++    if (bb_ch[channel].count == queued) { bb_esim.done_chunk = chunk; bb_esim.done_pending = (uint8_t)pending; break; }
++  }
++  struct cbe_event event;
++  while (cbe_take_event(&bb_esim, &event))
++    printf("COACHZ baseband: esim event %u a%u b%u c%u d%u e%u\n", event.kind, event.a, event.b, event.c, event.d, event.e);
++}
++
++// The activation indication (coachz_bb_data.h) to the BSP client that registered, with slot one's ICCID and IMSI once the card gave them.
++static uint8_t bb_iccid[CBD_ICCID_BYTES], bb_imsi[CBD_IMSI_BYTES], bb_iccid_known, bb_imsi_known, bb_act_known, bb_act_channel, bb_act_cid;
++static void bb_activation_indicate(void)
++{
++  if (!bb_act_known) return;
++  uint8_t tlvs[CBD_ACTIVATION_SIM_TLVS];
++  const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs, bb_iccid_known ? bb_iccid : nullptr, bb_imsi_known ? bb_imsi : nullptr);
++  const uint32_t n = cbq_private_indication(CBD_BSP_ACTIVATION_REGISTER, CBD_SVC_BSP, bb_act_cid, tlvs, t, bb_out, sizeof bb_out);
++  if (n) bb_push(bb_act_channel, bb_out, n);
++}
++
++// CommCenter's own EF_ICCID and EF_IMSI reads: the request's client, transaction and file, so the answer can be recognized. Never logged.
++struct bb_sim_read { uint8_t used, channel, cid; uint16_t txn, file; };
++static bb_sim_read bb_sim_reads[8];
++static uint32_t bb_sim_next;
++static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu)
++{
++  if (r.service != CBD_SVC_UIM) return;
++  const uint32_t file = cbd_uim_read_file(sdu, r.len);
++  if (file != CBD_EF_ICCID && file != CBD_EF_IMSI) return;
++  bb_sim_reads[bb_sim_next++ % 8] = { 1, r.channel, r.cid, cbd_rd16(sdu + 1), (uint16_t)file };
++}
++static void bb_sim_answer(const struct cbq_result &r, const uint8_t *sdu, uint32_t n)
++{
++  if (r.service != CBD_SVC_UIM || n < 7u || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT) return;
++  for (auto &q : bb_sim_reads) {
++    if (!q.used || q.channel != r.channel || q.cid != r.cid || q.txn != cbd_rd16(sdu + 1)) continue;
++    q.used = 0;
++    uint8_t ef[16], value[CBD_ICCID_BYTES];
++    const uint32_t len = cbd_uim_read_content(sdu, n, ef, sizeof ef);
++    const bool iccid = q.file == CBD_EF_ICCID;
++    if (iccid ? !cbd_iccid_from_ef(ef, len, value) : !cbd_imsi_from_ef(ef, len, value)) return;
++    uint8_t *have = iccid ? bb_iccid : bb_imsi, *known = iccid ? &bb_iccid_known : &bb_imsi_known;
++    const uint32_t size = iccid ? CBD_ICCID_BYTES : CBD_IMSI_BYTES;
++    if (*known && !memcmp(value, have, size)) return;
++    memcpy(have, value, size); *known = 1;
++    printf("COACHZ baseband: slot one %s read from the card, activation indication %s\n", iccid ? "ICCID" : "IMSI",
++           bb_act_known ? "sent again with it" : "waits for registration");
++    bb_activation_indicate();
++    return;
++  }
++}
++
++// A private request the bridge answers itself: 1 when it did.
++static int bb_private_answer(uint32_t channel, const struct cbq_result &r, const uint8_t *sdu)
++{
++  const uint32_t message = (uint32_t)(sdu[3] | sdu[4] << 8);
++  if (r.service == CBE_SVC_VINYL) {
++    const uint32_t n = bb_esim_in && bb_esim_resp ?
++      cbe_host(&bb_esim, r.channel, r.cid, sdu, r.len, bb_out, sizeof bb_out, bb_now_ms()) :
++      cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_NO_MEMORY, nullptr, 0, bb_out, sizeof bb_out);
++    if (!n) return 0;
++    if (n != CBE_DEFERRED) bb_push(channel, bb_out, n);
++    return 1;
++  }
++  // Carrier bundle files (coachz_bb_data.h): accepted and dropped, each segment acknowledged with the next segment number.
++  if (r.service == CBD_SVC_BSP && message == CBD_BSP_SEND_FILE) {
++    struct cbd_file_segment f;
++    if (!cbd_bsp_file_segment(sdu, r.len, &f)) return 0;
++    uint8_t tlvs[8];
++    const uint32_t t = cbd_bsp_file_answer(&f, tlvs, sizeof tlvs);
++    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, tlvs, t, bb_out, sizeof bb_out);
++    if (n) bb_push(channel, bb_out, n);
++    if (f.segment + 1u == f.count) {
++      // The file is complete: report it received as an Apple modem does (FileTransferStatus), or CommCenter times out after 22 s.
++      uint8_t done[12];
++      const uint32_t d = cbd_bsp_file_done(&f, done, sizeof done);
++      const uint32_t m = cbq_private_indication(CBD_BSP_FILE_TRANSFER_STATUS, r.service, r.cid, done, d, bb_out, sizeof bb_out);
++      if (m) bb_push(channel, bb_out, m);
++      printf("COACHZ baseband: carrier file type %u taken (%u segments, last %u bytes), dropped, transfer status sent\n", f.type, f.count, f.bytes);
++    }
++    return 1;
++  }
++  if (r.service == CBD_SVC_BSP && message == CBD_BSP_CHIP_INFO) {
++    uint8_t tlvs[12];
++    const uint32_t t = cbd_bsp_chip_info(CBS_CHIP_ID, CBS_SERIAL, tlvs, sizeof tlvs);
++    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, tlvs, t, bb_out, sizeof bb_out);
++    if (n) bb_push(channel, bb_out, n);
++    return 1;
++  }
++  if (r.service == CBD_SVC_BSP && message == CBD_BSP_SET_CONFIG) {
++    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, nullptr, 0, bb_out, sizeof bb_out);
++    if (n) bb_push(channel, bb_out, n);
++    printf("COACHZ baseband: baseband config (SetConfig) taken\n");
++    return 1;
++  }
++  if (r.service == CBD_SVC_BSP && message == CBD_BSP_ACTIVATION_REGISTER) {
++    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, 0, 0, bb_out, sizeof bb_out);
++    if (n) bb_push(channel, bb_out, n);
++    bb_act_known = 1; bb_act_channel = (uint8_t)channel; bb_act_cid = r.cid;
++    bb_activation_indicate();
++    if (bb_activations++ < 4)
++      printf("COACHZ baseband: activation register answered, state activated, slot one ICCID %s, IMSI %s\n", bb_iccid_known ? "included" : "not read yet",
++             bb_imsi_known ? "included" : "not read yet");
++    return 1;
++  }
++  return 0;
++}
++
++// One write from ABM on a channel, after its bytes were copied in.
++static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
++{
++  bb_channel *c = &bb_ch[channel];
++  c->frames_in++;
++  c->bytes_in += len;
++  if (channel == CBH_SAHARA) {
++    const enum cbs_state before = bb_sahara.state;
++    for (uint32_t at = 0; at < len && bb_sahara.state != CBS_FAILED;) {
++      struct cbs_out o;
++      const uint32_t used = cbs_receive(&bb_sahara, data + at, len - at, &o);
++      for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
++      if (!used) break;
++      at += used;
++    }
++    if (bb_sahara.state != before && bb_sahara.state == CBS_COMMAND)
++      printf("COACHZ baseband: sahara command mode\n");
++    if (bb_sahara.state != before && (bb_sahara.state == CBS_FINISHED || bb_sahara.state == CBS_FAILED || bb_sahara.state == CBS_WAIT_DONE))
++      printf("COACHZ baseband: sahara %s, image %u of %u (id 0x%x), host mode %u status %u, last command %u, %u requests, %llu bytes\n",
++             bb_sahara.state == CBS_FINISHED ? "finished" : bb_sahara.state == CBS_FAILED ? "failed" : "image read",
++             bb_sahara.image_index + 1, bb_sahara.image_count, bb_sahara.images[bb_sahara.image_index], bb_sahara.host_mode,
++             bb_sahara.host_status, bb_sahara.last_command, bb_sahara.requests, bb_sahara.bytes);
++    return;
++  }
++  if (channel != CBH_QMUX1 && channel != CBH_QMUX2) return;   // counted above, nothing behind it yet
++  const uint32_t qmux = channel == CBH_QMUX1 ? 0 : 1;
++  bb_trace_frame("host", qmux + 1u, data, len);
++  const struct cbq_result r = cbq_from_host(&bb_qmux, qmux, data, len, bb_out, sizeof bb_out);
++  switch (r.kind) {
++  case CBQ_TO_HOST:
++    bb_push(channel, bb_out, r.len);
++    // The first WDS client ABM takes: set the data port up as ModemManager does before its first bind.
++    if (r.service == CBD_SVC_WDS && r.local_port && cbq_rd16(data + CBQ_HDR + 2) == CBQ_CTL_GET_CLIENT_ID) bb_data_start();
++    if (bb_qmux.ctl_other != bb_ctl_logged) {
++      bb_ctl_logged = bb_qmux.ctl_other;
++      printf("COACHZ baseband: CTL message 0x%x accepted without action\n", (uint32_t)(data[CBQ_HDR + 2] | data[CBQ_HDR + 3] << 8));
++    }
++    break;
++  case CBQ_TO_MODEM:
++    // Apple's report configuration this modem's firmware does not know (coachz_bb_data.h): accepted here, not forwarded.
++    if (cbd_vendor_reporting(r.service, data + CBQ_HDR, r.len)) {
++      const uint32_t n = cbq_private_answer(data + CBQ_HDR, r.service, r.cid, 0, nullptr, 0, bb_out, sizeof bb_out);
++      if (n) bb_push(channel, bb_out, n);
++      break;
++    }
++    bb_to_modem(r, data + CBQ_HDR);
++    break;
++  case CBQ_PRIVATE: {
++    const uint8_t *sdu = data + CBQ_HDR;
++    if (bb_private_answer(channel, r, sdu)) break;
++    bb_private_note(r.service, (uint32_t)(sdu[3] | sdu[4] << 8));
++    const uint32_t n = cbq_private_unsupported(sdu, r.service, r.cid, bb_out, sizeof bb_out);
++    if (n) bb_push(channel, bb_out, n);
++    break;
++  }
++  case CBQ_DROP:
++    break;
++  }
++}
++
++// ------------------------------------------------------------------ asynchronous completions
++// IOUserClient::sendAsyncResult64 is a protected static; this never-instantiated subclass only forwards to it.
++class CoachzBasebandAsync : public IOUserClient {
++public:
++  static IOReturn send(OSAsyncReference64 reference, IOReturn result, io_user_reference_t *args, UInt32 count)
++  {
++    return sendAsyncResult64(reference, result, args, count);
++  }
++};
++
++static void bb_finish_read(bb_read *read, IOReturn result, const uint8_t *data, uint32_t len)
++{
++  io_user_reference_t args[1] = { 0 };
++  if (data && read->memory) {
++    const uint32_t n = len < read->len ? len : read->len;
++    args[0] = read->memory->writeBytes(0, data, n);
++    if (len > read->len) result = kIOReturnOverrun;
++  }
++  if (read->memory) {
++    read->memory->complete();
++    read->memory->release();
++    read->memory = nullptr;
++  }
++  CoachzBasebandAsync::send(read->reference, result, args, 1);
++}
++
++static void bb_complete(thread_call_param_t, thread_call_param_t)
++{
++  for (;;) {
++    bb_read read;
++    bb_frame frame = { 0, nullptr };
++    bool found = false;
++    IOLockLock(bb_lock);
++    for (uint32_t c = 0; c < CBH_PUBLISHED && !found; c++) {
++      bb_channel *ch = &bb_ch[c];
++      if (!ch->reads_waiting || !ch->count) continue;
++      read = ch->reads[0];
++      memmove(&ch->reads[0], &ch->reads[1], (--ch->reads_waiting) * sizeof ch->reads[0]);
++      frame = bb_pop(c);
++      found = true;
++    }
++    IOLockUnlock(bb_lock);
++    if (!found) return;
++    bb_finish_read(&read, kIOReturnSuccess, frame.data, frame.len);
++    IOFreeData(frame.data, frame.len);
++  }
++}
++
++// Every read a client has waiting ends with `result` (close, abort).
++static void bb_abort_reads(uint32_t channel, void *owner, IOReturn result)
++{
++  bb_read ended[BB_READS];
++  uint32_t n = 0;
++  IOLockLock(bb_lock);
++  bb_channel *ch = &bb_ch[channel];
++  for (uint32_t i = 0; i < ch->reads_waiting;) {
++    if (!owner || ch->reads[i].owner == owner) {
++      ended[n++] = ch->reads[i];
++      memmove(&ch->reads[i], &ch->reads[i + 1], (--ch->reads_waiting - i) * sizeof ch->reads[0]);
++    } else {
++      i++;
++    }
++  }
++  IOLockWakeup(bb_lock, ch, false);
++  IOLockUnlock(bb_lock);
++  for (uint32_t i = 0; i < n; i++) bb_finish_read(&ended[i], result, nullptr, 0);
++}
++
++// ------------------------------------------------------------------ user memory
++static uint8_t *bb_copy_in(task_t task, mach_vm_address_t address, uint32_t len)
++{
++  if (!len || len > BB_FRAME_MAX) return nullptr;
++  IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(address, len, kIODirectionOut, task);
++  uint8_t *copy = static_cast<uint8_t *>(IOMallocData(len));
++  bool ok = memory && copy && memory->prepare() == kIOReturnSuccess;
++  if (ok) {
++    ok = memory->readBytes(0, copy, len) == len;
++    memory->complete();
++  }
++  OSSafeReleaseNULL(memory);
++  if (!ok && copy) {
++    IOFreeData(copy, len);
++    copy = nullptr;
++  }
++  return copy;
++}
++
++static bool bb_async(IOExternalMethodArguments *args) { return args->asyncWakePort != MACH_PORT_NULL && args->asyncReference; }
++
++static void bb_reply(IOExternalMethodArguments *args, IOReturn result, uint32_t count, uint64_t a = 0, uint64_t b = 0)
++{
++  io_user_reference_t values[2] = { a, b };
++  OSAsyncReference64 reference;
++  memset(reference, 0, sizeof reference);
++  memcpy(reference, args->asyncReference, sizeof(io_user_reference_t) *
++         (args->asyncReferenceCount < kOSAsyncRef64Count ? args->asyncReferenceCount : kOSAsyncRef64Count));
++  CoachzBasebandAsync::send(reference, result, values, count);
++}
++
++// ------------------------------------------------------------------ AppleBasebandPCIInterface
++class AppleBasebandPCIUserClient : public IOUserClient {
++  OSDeclareDefaultStructors(AppleBasebandPCIUserClient)
++  task_t fTask;
++  uint32_t fChannel;
++public:
++  bool initWithTask(task_t task, void *security, UInt32 type, OSDictionary *properties) override
++  {
++    fTask = task;
++    return IOUserClient::initWithTask(task, security, type, properties);
++  }
++  void setChannel(uint32_t channel) { fChannel = channel; }
++  IOReturn clientClose() override
++  {
++    closeChannel();
++    terminate();
++    return kIOReturnSuccess;
++  }
++  void closeChannel()
++  {
++    bb_abort_reads(fChannel, this, kIOReturnAborted);
++    IOLockLock(bb_lock);
++    if (bb_ch[fChannel].owner == this) bb_ch[fChannel].owner = nullptr;
++    IOLockUnlock(bb_lock);
++  }
++  IOReturn write(IOExternalMethodArguments *args);
++  IOReturn read(IOExternalMethodArguments *args);
++  IOReturn readRegister(IOExternalMethodArguments *args);
++  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override;
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIUserClient, IOUserClient)
++
++IOReturn AppleBasebandPCIUserClient::write(IOExternalMethodArguments *args)
++{
++  uint8_t *copy = nullptr;
++  uint32_t len = 0;
++  if (bb_async(args)) {
++    if (args->scalarInputCount < 2) return kIOReturnBadArgument;
++    len = (uint32_t)args->scalarInput[1];
++    copy = bb_copy_in(fTask, args->scalarInput[0], len);
++  } else if (args->structureInputDescriptor) {
++    IOMemoryDescriptor *memory = args->structureInputDescriptor;
++    len = (uint32_t)memory->getLength();
++    copy = len && len <= BB_FRAME_MAX ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
++    bool ok = copy && memory->prepare() == kIOReturnSuccess;
++    if (ok) {
++      ok = memory->readBytes(0, copy, len) == len;
++      memory->complete();
++    }
++    if (!ok && copy) {
++      IOFreeData(copy, len);
++      copy = nullptr;
++    }
++  } else if (args->structureInput && args->structureInputSize) {
++    len = args->structureInputSize;
++    copy = len <= BB_FRAME_MAX ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
++    if (copy) memcpy(copy, args->structureInput, len);
++  }
++  if (!copy) return kIOReturnBadArgument;
++  IOLockLock(bb_lock);
++  bb_host_write(fChannel, copy, len);
++  IOLockUnlock(bb_lock);
++  IOFreeData(copy, len);
++  if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 1, len);
++  return kIOReturnSuccess;
++}
++
++IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
++{
++  if (bb_async(args)) {
++    if (args->scalarInputCount < 2 || !args->scalarInput[1]) return kIOReturnBadArgument;
++    bb_read r;
++    memset(&r, 0, sizeof r);
++    memcpy(r.reference, args->asyncReference, sizeof(io_user_reference_t) *
++           (args->asyncReferenceCount < kOSAsyncRef64Count ? args->asyncReferenceCount : kOSAsyncRef64Count));
++    r.len = (uint32_t)args->scalarInput[1];
++    r.owner = this;
++    r.memory = IOMemoryDescriptor::withAddressRange(args->scalarInput[0], r.len, kIODirectionIn, fTask);
++    if (!r.memory || r.memory->prepare() != kIOReturnSuccess) {
++      OSSafeReleaseNULL(r.memory);
++      return kIOReturnVMError;
++    }
++    IOLockLock(bb_lock);
++    bb_channel *ch = &bb_ch[fChannel];
++    const bool queued = ch->reads_waiting < BB_READS;
++    if (queued) ch->reads[ch->reads_waiting++] = r;
++    if (queued && ch->count && bb_complete_call) thread_call_enter(bb_complete_call);
++    IOLockUnlock(bb_lock);
++    if (!queued) {
++      r.memory->complete();
++      r.memory->release();
++      return kIOReturnNoResources;
++    }
++    return kIOReturnSuccess;
++  }
++  // synchronous: the next frame, waiting up to BB_SYNC_READ_SECONDS
++  uint64_t deadline = 0;
++  clock_interval_to_deadline(BB_SYNC_READ_SECONDS, kSecondScale, &deadline);
++  IOLockLock(bb_lock);
++  bb_channel *ch = &bb_ch[fChannel];
++  int waited = THREAD_AWAKENED;
++  while (!ch->count && ch->owner == this && waited == THREAD_AWAKENED)
++    waited = IOLockSleepDeadline(bb_lock, ch, deadline, THREAD_INTERRUPTIBLE);
++  bb_frame frame = bb_pop(fChannel);
++  IOLockUnlock(bb_lock);
++  if (!frame.data) return waited == THREAD_TIMED_OUT ? kIOReturnTimeout : kIOReturnAborted;
++  IOReturn result = kIOReturnSuccess;
++  if (args->structureOutputDescriptor) {
++    IOMemoryDescriptor *memory = args->structureOutputDescriptor;
++    const uint32_t room = (uint32_t)memory->getLength(), n = frame.len < room ? frame.len : room;
++    if (memory->prepare() == kIOReturnSuccess) {
++      memory->writeBytes(0, frame.data, n);
++      memory->complete();
++      args->structureOutputDescriptorSize = n;
++    } else {
++      result = kIOReturnVMError;
++    }
++    if (frame.len > room) result = kIOReturnOverrun;
++  } else if (args->structureOutput) {
++    const uint32_t n = frame.len < args->structureOutputSize ? frame.len : args->structureOutputSize;
++    memcpy(args->structureOutput, frame.data, n);
++    if (frame.len > args->structureOutputSize) result = kIOReturnOverrun;
++    args->structureOutputSize = n;
++  } else {
++    result = kIOReturnBadArgument;
++  }
++  IOFreeData(frame.data, frame.len);
++  return result;
++}
++
++// IOABPClass::readRegister: one scalar, the register, and a structure output of the size asked for.
++IOReturn AppleBasebandPCIUserClient::readRegister(IOExternalMethodArguments *args)
++{
++  if (args->scalarInputCount < 1) return kIOReturnBadArgument;
++  const uint32_t reg = (uint32_t)args->scalarInput[0];   // pbl
++  static uint32_t seen;
++  if (reg < 32 && !(__atomic_fetch_or(&seen, 1u << reg, __ATOMIC_RELAXED) & (1u << reg)))
++    printf("COACHZ baseband: %s register %u read, %u bytes\n", cbh_published[fChannel], reg,
++           args->structureOutputDescriptor ? (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize);
++  if (args->structureOutput && args->structureOutputSize) {
++    cbs_read_register(reg, static_cast<uint8_t *>(args->structureOutput), args->structureOutputSize);
++    return kIOReturnSuccess;
++  }
++  if (IOMemoryDescriptor *memory = args->structureOutputDescriptor) {
++    const uint32_t size = (uint32_t)memory->getLength();
++    if (!size || size > BB_FRAME_MAX) return kIOReturnBadArgument;
++    uint8_t *data = static_cast<uint8_t *>(IOMallocData(size));
++    if (!data) return kIOReturnNoMemory;
++    cbs_read_register(reg, data, size);
++    IOReturn result = memory->prepare();
++    if (result == kIOReturnSuccess) {
++      memory->writeBytes(0, data, size);
++      memory->complete();
++      args->structureOutputDescriptorSize = size;
++    }
++    IOFreeData(data, size);
++    return result;
++  }
++  return kIOReturnBadArgument;
++}
++
++// Selectors and shapes: coachz_bb_channels.h (libIOABP's IOConnectCall* sites).
++IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *,
++                                                    OSObject *, void *)
++{
++  if (!args) return kIOReturnBadArgument;
++  switch (selector) {
++  case 0: {   // open
++    IOLockLock(bb_lock);
++    bb_channel *ch = &bb_ch[fChannel];
++    const bool free_channel = !ch->owner || ch->owner == this;
++    if (free_channel) {
++      ch->owner = this;
++      if (!ch->opens++) printf("COACHZ baseband: %s opened\n", cbh_published[fChannel]);
++      if (fChannel == CBH_SAHARA && bb_boot_image_sent) {
++        bb_boot_image_sent = false;
++        bb_sahara_restart();
++      }
++    }
++    IOLockUnlock(bb_lock);
++    return free_channel ? kIOReturnSuccess : kIOReturnExclusiveAccess;
++  }
++  case 1:     // close
++    closeChannel();
++    return kIOReturnSuccess;
++  case 2:
++    return write(args);
++  case 3:
++    return read(args);
++  case 4:     // sendImage (BHI): the modem is already running; the image is accepted and dropped
++    printf("COACHZ baseband: %s sendImage %llu bytes dropped\n", cbh_published[fChannel], args->scalarInputCount > 1 ? args->scalarInput[1] : 0ull);
++    IOLockLock(bb_lock);
++    if (fChannel == CBH_PBL) bb_boot_image_sent = true;
++    IOLockUnlock(bb_lock);
++    if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 2, args->scalarInputCount > 1 ? args->scalarInput[1] : 0, 0);
++    return kIOReturnSuccess;
++  case 5:
++    return readRegister(args);
++  case 6:     // abort channel: pending reads end
++    bb_abort_reads(fChannel, this, kIOReturnAborted);
++    if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 0);
++    return kIOReturnSuccess;
++  case 7:     // start channel
++  case 9:     // map shared memory: nothing here reads it
++  case 10:    // unmap
++  case 12:    // deregister time event
++    if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 0);
++    return kIOReturnSuccess;
++  case 11:    // register time event: none is ever sent
++    return kIOReturnSuccess;
++  default:    // 8 time sync: no time base behind this channel
++    printf("COACHZ baseband: channel %s selector %u unsupported\n", cbh_published[fChannel], selector);
++    return kIOReturnUnsupported;
++  }
++}
++
++class AppleBasebandPCIInterface : public IOService {
++  OSDeclareDefaultStructors(AppleBasebandPCIInterface)
++  uint32_t fChannel;
++public:
++  bool setup(uint32_t channel)
++  {
++    fChannel = channel;
++    return setProperty(CBH_PROTOCOL_KEY, cbh_published[channel]);
++  }
++  // IOABPClass::start_nl puts ABPInterfaceProtocol straight in the IOServiceMatching dictionary. IOKit does not compare a key it does not know: the
++  // family's matchPropertyTable does, and without it every client gets whichever channel comes first.
++  bool matchPropertyTable(OSDictionary *table, SInt32 *score) override
++  {
++    return IOService::matchPropertyTable(table, score) && matchProtocol(table);
++  }
++  bool matchPropertyTable(OSDictionary *table) override
++  {
++    return IOService::matchPropertyTable(table) && matchProtocol(table);
++  }
++  bool matchProtocol(OSDictionary *table) const
++  {
++    OSString *wanted = OSDynamicCast(OSString, table->getObject(CBH_PROTOCOL_KEY));
++    return !wanted || wanted->isEqualTo(cbh_published[fChannel]);
++  }
++  IOReturn newUserClient(task_t task, void *security, UInt32 type, OSDictionary *properties, IOUserClient **out) override
++  {
++    if (!out) return kIOReturnBadArgument;
++    *out = nullptr;
++    static uint32_t seen;
++    if (!(__atomic_fetch_or(&seen, 1u << fChannel, __ATOMIC_RELAXED) & (1u << fChannel)))
++      printf("COACHZ baseband: first user client on %s\n", cbh_published[fChannel]);
++    AppleBasebandPCIUserClient *client = OSTypeAlloc(AppleBasebandPCIUserClient);
++    if (!client) return kIOReturnNoMemory;
++    client->setChannel(fChannel);
++    if (!client->initWithTask(task, security, type, properties) || !client->attach(this)) {
++      client->release();
++      return kIOReturnError;
++    }
++    if (!client->start(this)) {
++      client->detach(this);
++      client->release();
++      return kIOReturnError;
++    }
++    *out = client;
++    return kIOReturnSuccess;
++  }
++  IOReturn newUserClient(task_t task, void *security, UInt32 type, IOUserClient **out) override
++  {
++    return newUserClient(task, security, type, nullptr, out);
++  }
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIInterface, IOService)
++
++// ------------------------------------------------------------------ AppleBasebandPCIControl
++class AppleBasebandPCIControlUserClient : public IOUserClient {
++  OSDeclareDefaultStructors(AppleBasebandPCIControlUserClient)
++  OSAsyncReference64 fLogs;
++  bool fLogsPending;
++public:
++  void endLogs()
++  {
++    if (!fLogsPending) return;
++    fLogsPending = false;
++    io_user_reference_t none[1] = { 0 };
++    CoachzBasebandAsync::send(fLogs, kIOReturnAborted, none, 1);
++  }
++  IOReturn clientClose() override
++  {
++    endLogs();
++    terminate();
++    return kIOReturnSuccess;
++  }
++  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
++  {
++    if (!args) return kIOReturnBadArgument;
++    switch (selector) {
++    case 0:   // open
++    case 3:   // logger tune
++      return kIOReturnSuccess;
++    case 1:   // close
++      endLogs();
++      return kIOReturnSuccess;
++    case 2:   // read logs: there are none; the request waits until close
++      if (!bb_async(args) || fLogsPending) return kIOReturnBadArgument;
++      memset(fLogs, 0, sizeof fLogs);
++      memcpy(fLogs, args->asyncReference, sizeof(io_user_reference_t) *
++             (args->asyncReferenceCount < kOSAsyncRef64Count ? args->asyncReferenceCount : kOSAsyncRef64Count));
++      fLogsPending = true;
++      return kIOReturnSuccess;
++    default:
++      return kIOReturnUnsupported;
++    }
++  }
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIControlUserClient, IOUserClient)
++
++template <class Client>
++static IOReturn bb_open(IOService *service, task_t task, void *security, UInt32 type, OSDictionary *properties, IOUserClient **out)
++{
++  if (!out) return kIOReturnBadArgument;
++  *out = nullptr;
++  Client *client = OSTypeAlloc(Client);
++  if (!client) return kIOReturnNoMemory;
++  if (!client->initWithTask(task, security, type, properties) || !client->attach(service)) {
++    client->release();
++    return kIOReturnError;
++  }
++  if (!client->start(service)) {
++    client->detach(service);
++    client->release();
++    return kIOReturnError;
++  }
++  *out = client;
++  return kIOReturnSuccess;
++}
++
++class AppleBasebandPCIControl : public IOService {
++  OSDeclareDefaultStructors(AppleBasebandPCIControl)
++public:
++  IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
++  {
++    static uint32_t seen;
++    if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED)) printf("COACHZ baseband: first user client on AppleBasebandPCIControl\n");
++    return bb_open<AppleBasebandPCIControlUserClient>(this, t, s, type, p, out);
++  }
++  IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIControl, IOService)
++
++// ------------------------------------------------------------------ AppleBaseband
++class AppleBasebandUserClient : public IOUserClient {
++  OSDeclareDefaultStructors(AppleBasebandUserClient)
++public:
++  IOReturn clientClose() override
++  {
++    terminate();
++    return kIOReturnSuccess;
++  }
++  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
++  {
++    if (!args) return kIOReturnBadArgument;
++    uint64_t out[4] = { 0 };
++    uint32_t nout = args->scalarOutputCount < 4 ? args->scalarOutputCount : 4;
++    IOLockLock(bb_lock);
++    const int result = cbc_call(&bb_control, selector, args->scalarInput, args->scalarInputCount, out, &nout);
++    // A reset or power-on goes back to before SendImage: nothing greets until the next one.
++    if (!result && (selector == CBC_RESET_MODEM || selector == CBC_POWERCYCLE || (selector == CBC_POWER && args->scalarInputCount && args->scalarInput[0]))) {
++      bb_boot_image_sent = false;
++      bb_flush(CBH_SAHARA);
++    }
++    IOLockUnlock(bb_lock);
++    if (result == CBC_UNSUPPORTED) printf("COACHZ baseband: AppleBaseband selector %u unsupported\n", selector);
++    for (uint32_t i = 0; i < nout; i++) args->scalarOutput[i] = out[i];
++    args->scalarOutputCount = nout;
++    return result;
++  }
++};
++OSDefineMetaClassAndStructors(AppleBasebandUserClient, IOUserClient)
++
++class AppleBaseband : public IOService {
++  OSDeclareDefaultStructors(AppleBaseband)
++public:
++  IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
++  {
++    return bb_open<AppleBasebandUserClient>(this, t, s, type, p, out);
++  }
++  IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
++};
++OSDefineMetaClassAndStructors(AppleBaseband, IOService)
++
++#include "coachz_bb_pdp.cpp"
++
++// ------------------------------------------------------------------ the data plane's kernel services
++// ABM's data::TransportService calls ApplePDPHelperInterface::getInstance()->enableMetadataTrailer() without a null check, and getInstance
++// is null without an AppleIPAppender service to open. ApplePDPHelper picks its variant by which PDP manager is registered; this is the Mav
++// one. Nothing is behind them until pdp_ip exists: every AppleIPAppender method (0 addFlow ... 20 registerFilterRuleCallBack, libApplePDPHelper)
++// succeeds with zeroed outputs, and the first use of each selector is logged.
++class AppleIPAppenderUserClient : public IOUserClient {
++  OSDeclareDefaultStructors(AppleIPAppenderUserClient)
++public:
++  IOReturn clientClose() override
++  {
++    terminate();
++    return kIOReturnSuccess;
++  }
++  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
++  {
++    if (!args) return kIOReturnBadArgument;
++    if (!coachz_baseband_enabled()) {   // blueline 0238: MiniIPAppender's stand-in (no baseband): every method refused
++      static uint32_t refused;
++      if (refused++ < 16) printf("BLUE PDP: method %u: unsupported\n", selector);
++      return kIOReturnUnsupported;
++    }
++    // Capture the first call shape for each helper operation, including the traffic gate.
++    // Payloads can contain network identities. Record only sizes and counts.
++    static uint32_t shapes_seen;
++    if (selector < 32 && !(__atomic_fetch_or(&shapes_seen, 1u << selector, __ATOMIC_RELAXED) & (1u << selector)))
++      printf("COACHZ pdp: appender selector %u scalar-in %u scalar-out %u struct-in %llu struct-out %llu descriptor-in %llu descriptor-out %llu\n",
++        selector, args->scalarInputCount, args->scalarOutputCount,
++        static_cast<unsigned long long>(args->structureInputSize), static_cast<unsigned long long>(args->structureOutputSize),
++        static_cast<unsigned long long>(args->structureInputDescriptor ? args->structureInputDescriptor->getLength() : 0),
++        static_cast<unsigned long long>(args->structureOutputDescriptor ? args->structureOutputDescriptor->getLength() : 0));
++    if (selector == 16) {
++      if (args->scalarInputCount != 2) return kIOReturnBadArgument;
++      return bb_pdp_block(static_cast<uint32_t>(args->scalarInput[0]), static_cast<uint32_t>(args->scalarInput[1]));
++    }
++    static uint32_t seen;
++    if (selector < 32 && !(__atomic_fetch_or(&seen, 1u << selector, __ATOMIC_RELAXED) & (1u << selector)))
++      printf("COACHZ baseband: AppleIPAppender selector %u answered with zeros\n", selector);
++    for (uint32_t i = 0; i < args->scalarOutputCount; i++) args->scalarOutput[i] = 0;
++    if (args->structureOutput && args->structureOutputSize) bzero(args->structureOutput, args->structureOutputSize);
++    if (args->structureOutputDescriptor) args->structureOutputDescriptorSize = 0;
++    return kIOReturnSuccess;
++  }
++};
++OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, IOUserClient)
++
++class AppleIPAppender : public IOService {
++  OSDeclareDefaultStructors(AppleIPAppender)
++public:
++  IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
++  {
++    return bb_open<AppleIPAppenderUserClient>(this, t, s, type, p, out);
++  }
++  IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
++};
++OSDefineMetaClassAndStructors(AppleIPAppender, IOService)
++
++// libPCITransport's pci::event::PDPListener matches the base class, ApplePDPHelper the leaf and AppleBasebandPCIPDPManager.
++class AppleBasebandPCIPDPManagerBase : public IOService {
++  OSDeclareDefaultStructors(AppleBasebandPCIPDPManagerBase)
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIPDPManagerBase, IOService)
++
++class AppleBasebandPCIPDPManager : public AppleBasebandPCIPDPManagerBase {
++  OSDeclareDefaultStructors(AppleBasebandPCIPDPManager)
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIPDPManager, AppleBasebandPCIPDPManagerBase)
++
++class AppleBasebandPCIMAVPDPManager : public AppleBasebandPCIPDPManager {
++  OSDeclareDefaultStructors(AppleBasebandPCIMAVPDPManager)
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIMAVPDPManager, AppleBasebandPCIPDPManager)
++
++// ------------------------------------------------------------------ publication and the Wi-Fi thread's entry points
++template <class Service>
++static Service *bb_publish(IOService *provider, uint32_t channel = ~0u)
++{
++  Service *service = OSTypeAlloc(Service);
++  bool ok = service && service->init();
++  if (ok && channel != ~0u) {
++    AppleBasebandPCIInterface *interface = OSDynamicCast(AppleBasebandPCIInterface, service);
++    ok = interface && interface->setup(channel);
++  }
++  ok = ok && service->attach(provider);
++  if (ok && !service->start(provider)) {
++    service->detach(provider);
++    ok = false;
++  }
++  if (!ok) {
++    OSSafeReleaseNULL(service);
++    return nullptr;
++  }
++  service->registerService();
++  return service;
++}
++
++// blueline 0238: MiniIPAppenderStart's AppleIPAppender when the bridge is off (bluecell=0).
++extern "C" bool coachz_ipappender_publish(void)
++{
++  IOService *provider = IOService::getResourceService();
++  return provider && bb_publish<AppleIPAppender>(provider);
++}
++
++// The modem's QRTR is up (GLINK started): publish the services ABM looks for. `send` and `del_client` run on the Wi-Fi thread only.
++extern "C" void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t))
++{
++  if (!coachz_baseband_enabled() || bb_published) return;
++  bb_init();
++  bb_pdp_init();
++  bb_send = send;
++  bb_del_client = del_client;
++  IOService *provider = IOService::getResourceService();
++  int made = 0;
++  made += provider && bb_publish<AppleBaseband>(provider);
++  made += provider && bb_publish<AppleBasebandPCIControl>(provider);
++  for (uint32_t c = 0; c < CBH_PUBLISHED; c++) made += provider && bb_publish<AppleBasebandPCIInterface>(provider, c);
++  made += provider && bb_publish<AppleBasebandPCIMAVPDPManager>(provider);
++  made += provider && bb_publish<AppleIPAppender>(provider);
++  bb_published = 1;
++  printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl, %u channels, the PDP manager, AppleIPAppender)\n", made, 4u + CBH_PUBLISHED, CBH_PUBLISHED);
++}
++
++extern "C" void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port)
++{
++  if (!coachz_baseband_enabled()) return;
++  bb_init();
++  IOLockLock(bb_lock);
++  cbq_server_new(&bb_qmux, service, version_instance, node, port);
++  IOLockUnlock(bb_lock);
++}
++
++extern "C" void coachz_baseband_del_server(uint32_t service, uint32_t node, uint32_t port)
++{
++  if (!bb_lock) return;
++  IOLockLock(bb_lock);
++  cbq_server_del(&bb_qmux, service, node, port);
++  if (service == CBD_SVC_WDS) bzero(bb_pdp_clients, sizeof bb_pdp_clients);
++  IOLockUnlock(bb_lock);
++}
++
++// QRTR data for one of the bridge's client ports: 1 when the port is the bridge's.
++extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t, const void *body, uint32_t size)
++{
++  if (dst_port < CBQ_PORT_BASE || dst_port >= CBQ_PORT_BASE + CBQ_MAX_CLIENTS) return 0;
++  if (!bb_lock) return 1;
++  IOLockLock(bb_lock);
++  const struct cbq_result r = cbq_from_modem(&bb_qmux, dst_port, src_node, static_cast<const uint8_t *>(body), size, bb_out, sizeof bb_out);
++  if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
++    bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
++    if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
++      cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
++    } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
++  } else if (r.kind == CBQ_TO_HOST) {
++    if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
++    // A temporary eUICC card-status indication is not the restored logical SIM.
++    const uint8_t *sdu = static_cast<const uint8_t *>(body);
++    if (bb_esim.freeze && r.service == CBE_SVC_UIM && size >= 7 &&
++        sdu[0] == CBQ_QMI_INDICATION && cbd_rd16(sdu + 3) == 0x32u) {
++      IOLockUnlock(bb_lock);
++      return 1;
++    }
++    const uint32_t fixed = cbe_card_status_fix(&bb_esim, r.service,
++      static_cast<const uint8_t *>(body), size, bb_fix, sizeof bb_fix);
++    if (fixed) {
++      cbq_frame_header(bb_out, fixed, r.service, r.cid);
++      memcpy(bb_out + CBQ_HDR, bb_fix, fixed);
++      bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, CBQ_HDR + fixed);
++    } else bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, r.len);
++    bb_sim_answer(r, sdu, size);   // after the answer itself: bb_activation_indicate reuses bb_out
++  }
++  IOLockUnlock(bb_lock);
++  return 1;
++}
++
++// On the Wi-Fi thread: QMI requests for the modem, then DEL_CLIENT for released clients.
++extern "C" void coachz_baseband_poll(void)
++{
++  if (!bb_lock || !bb_send) return;
++  bb_tx batch[16];
++  uint32_t n = 0, released[16], r = 0, port;
++  IOLockLock(bb_lock);
++  bb_esim_step();
++  while (bb_tx_count && n < 16) {
++    batch[n++] = bb_txq[bb_tx_head];
++    bb_tx_head = (bb_tx_head + 1) % BB_TX;
++    bb_tx_count--;
++  }
++  while (r < 16 && (port = cbq_next_release(&bb_qmux))) released[r++] = port;
++  IOLockUnlock(bb_lock);
++  for (uint32_t i = 0; i < n; i++) {
++    bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len);
++    IOFreeData(batch[i].data, batch[i].len);
++  }
++  for (uint32_t i = 0; i < r; i++)
++    if (bb_del_client) bb_del_client(released[i]);
++  bb_pdp_poll();
++}
++
++extern "C" void coachz_baseband_report(unsigned second)
++{
++  if (!bb_lock || !bb_published) return;
++  bb_pdp_report(second);
++  IOLockLock(bb_lock);
++  uint32_t clients = 0, servers = 0;
++  for (uint32_t i = 0; i < CBQ_MAX_CLIENTS; i++) clients += bb_qmux.client[i].used;
++  for (uint32_t i = 0; i < CBQ_MAX_SERVERS; i++) servers += bb_qmux.server[i].present;
++  printf("COACHZ baseband: %u s: %u QMI services, %u clients, dropped %u/%u; sahara state %u, %u executes, %u requests; board calls %u (%u unsupported); data port step %u, %u endpoints named, %u activations\n",
++         second, servers, clients, bb_qmux.dropped, bb_tx_dropped, bb_sahara.state, bb_sahara.executes, bb_sahara.requests, bb_control.calls, bb_control.unsupported,
++         bb_data.step, bb_endpoint_fixes, bb_activations);
++  printf("COACHZ qmi: %u s: %u trace lines, %u held back by the budget\n", second, bb_trace_lines, bb_trace_held);
++  for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
++    const bb_channel *ch = &bb_ch[c];
++    if (ch->opens)
++      printf("COACHZ baseband: %s: opens %u, in %u frames %u bytes, out %u frames %u bytes, dropped %u, queued %u, reads waiting %u\n",
++             cbh_published[c], ch->opens, ch->frames_in, ch->bytes_in, ch->frames_out, ch->bytes_out, ch->frames_dropped, ch->count,
++             ch->reads_waiting);
++  }
++  IOLockUnlock(bb_lock);
++}
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_channels.h b/iokit/Kernel/arm/baseband/coachz_bb_channels.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_channels.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_channels.h	2026-11-26 20:09:30
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * The channels and user-client methods of Apple's PCIe baseband interface as iPadOS 21H461 uses them (libIOABP, libPCITransport).
++ * ABM finds a channel with IOServiceMatching("AppleBasebandPCIInterface") plus ABPInterfaceProtocol = <name> (an ASCII CFString),
++ * opens it with IOServiceOpen type 0 and calls method 0 with one scalar 0. Portable; no kernel code.
++ */
++#ifndef COACHZ_BB_CHANNELS_H
++#define COACHZ_BB_CHANNELS_H
++
++#include <stdint.h>
++
++#define CBH_INTERFACE_CLASS "AppleBasebandPCIInterface"
++#define CBH_CONTROL_CLASS "AppleBasebandPCIControl"
++#define CBH_BASEBAND_CLASS "AppleBaseband"
++#define CBH_PROTOCOL_KEY "ABPInterfaceProtocol"
++
++/* libPCITransport's {id, name} table */
++struct cbh_channel { uint32_t id; const char *name; };
++static const struct cbh_channel cbh_channels[] = {
++    { 0, "pbl" }, { 1, "sahara" }, { 2, "diag" }, { 3, "refs" }, { 4, "qmux1" }, { 5, "qmux2" }, { 6, "rom" }, { 7, "boot" },
++    { 8, "ari" }, { 9, "trace" }, { 10, "at" }, { 11, "dpl" }, { 12, "mediactl" }, { 13, "vcom" }, { 14, "gnss" }, { 15, "qdss" },
++    { 17, "virtual_timesync" }, { 20, "boot_logger" },
++};
++/* Every channel of that table is published. pbl takes BBUEUR13Loader's register reads and SendImage, sahara the second stage, qmux1 and qmux2 go to the
++ * modem. The rest have nothing behind them yet: they open, count what is written and never have anything to read, so the log shows which of them ABM uses. */
++enum {
++    CBH_PBL, CBH_SAHARA, CBH_DIAG, CBH_REFS, CBH_QMUX1, CBH_QMUX2, CBH_ROM, CBH_BOOT, CBH_ARI, CBH_TRACE, CBH_AT, CBH_DPL, CBH_MEDIACTL, CBH_VCOM, CBH_GNSS,
++    CBH_QDSS, CBH_VIRTUAL_TIMESYNC, CBH_BOOT_LOGGER, CBH_PUBLISHED
++};
++static const char *const cbh_published[CBH_PUBLISHED] = {
++    "pbl", "sahara", "diag", "refs", "qmux1", "qmux2", "rom", "boot", "ari", "trace", "at", "dpl", "mediactl", "vcom", "gnss", "qdss", "virtual_timesync", "boot_logger"
++};
++
++/* AppleBasebandPCIInterface user client: selector, scalar inputs, async completion arguments (-1: synchronous only) */
++struct cbh_method { uint32_t selector, scalars; int async_args; const char *name; };
++static const struct cbh_method cbh_interface_methods[] = {
++    { 0, 1, -1, "open" },
++    { 1, 0, -1, "close" },
++    { 2, 2, 1, "write" },             /* user address and length; the synchronous form passes the data as a structure */
++    { 3, 2, 1, "read" },
++    { 4, 2, 2, "sendImage" },
++    { 5, 1, -1, "readRegister" },
++    { 6, 1, 0, "abortChannel" },      /* direction */
++    { 7, 1, 0, "startChannel" },
++    { 8, 3, 1, "timeSync" },
++    { 9, 3, 0, "mapMemory" },         /* region, user address, length */
++    { 10, 1, 0, "unmapMemory" },
++    { 11, 1, -2, "registerTimeEvent" },   /* completes with a variable argument list */
++    { 12, 1, 0, "deregisterTimeEvent" },
++};
++/* AppleBasebandPCIControl user client */
++static const struct cbh_method cbh_control_methods[] = {
++    { 0, 1, -1, "open" },
++    { 1, 0, -1, "close" },
++    { 2, 3, 1, "readLogs" },
++    { 3, 4, -1, "loggerTune" },
++};
++
++/* IOKit's async reference as libIOABP fills it: three words, [1] the callback, [2] its refcon */
++#define CBH_ASYNC_REFERENCE_WORDS 3u
++
++static inline int cbh_channel_id(const char *name)
++{
++    for (unsigned i = 0; i < sizeof cbh_channels / sizeof cbh_channels[0]; i++) {
++        const char *a = cbh_channels[i].name, *b = name;
++        while (*a && *a == *b) { a++; b++; }
++        if (!*a && !*b) return (int)cbh_channels[i].id;
++    }
++    return -1;
++}
++
++#endif /* COACHZ_BB_CHANNELS_H */
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_control.h b/iokit/Kernel/arm/baseband/coachz_bb_control.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_control.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_control.h	2026-11-26 20:09:30
+@@ -0,0 +1,92 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * The methods of the AppleBaseband user client (AppleBasebandN71's, which libTelephonyBaseband finds by the service name AppleBaseband)
++ * as the bridge answers them. Selectors and scalar counts are read from __TelephonyBasebandControllerCallMethod's call sites in
++ * libTelephonyBasebandDynamic (21H461). Portable and host-tested; no kernel code.
++ *
++ * On Apple's boards these drive GPIOs and PMU lines of a separate modem chip. Here the modem lives in the SoC and is started by our
++ * MBA/PIL code before iPadOS runs, so power, reset, mux and VBUS requests are accepted and recorded but do not touch the modem; the
++ * read-back lines report a modem out of reset and powered. The manager and baseband states (22/23, 26/27) are values ABM writes and
++ * reads back itself (BootController), so they are stored and returned unchanged. Selectors nothing here implements answer unsupported.
++ */
++#ifndef COACHZ_BB_CONTROL_H
++#define COACHZ_BB_CONTROL_H
++
++#include <stdint.h>
++
++#define CBC_OK 0
++#define CBC_BAD_ARGUMENT ((int)0xe00002c2)     /* kIOReturnBadArgument */
++#define CBC_UNSUPPORTED ((int)0xe00002c7)      /* kIOReturnUnsupported */
++#define CBC_PROPERTIES 16u
++
++enum {
++    CBC_RESET_MODEM = 0, CBC_POWER = 1, CBC_MUX = 2, CBC_GET_RESET = 3, CBC_POWERCYCLE = 6, CBC_VBUS = 8, CBC_GET_PMU_EXTON = 11, CBC_SELF_IDENTIFY = 15, CBC_GET_DIAG_READY = 16,
++    CBC_GET_EFS_ERASE_DONE = 17, CBC_GET_RESET_REQUEST = 18, CBC_COREDUMP_GPIO = 19, CBC_TIMESYNC = 20, CBC_SET_MANAGER_STATE = 22,
++    CBC_GET_MANAGER_STATE = 23, CBC_CHARGER_DESENSE = 25, CBC_GET_BASEBAND_STATE = 26, CBC_SET_BASEBAND_STATE = 27,
++    CBC_GET_PROPERTY = 28, CBC_SET_PROPERTY = 29, CBC_CLEAR_FREQ_LIST = 32, CBC_REMOVE_FREQ_LIST = 34, CBC_RESET_SPMI = 35,
++    CBC_SPMI_RAW_WRITE = 36, CBC_SPMI_RAW_READ = 37, CBC_SPMI_GET_EVENTS = 41, CBC_GET_COREDUMP_READY = 42, CBC_SPMI_REG0_WRITE = 45,
++};
++
++struct cbc_state {
++    uint64_t manager_state, baseband_state;
++    uint64_t property_key[CBC_PROPERTIES], property_value[CBC_PROPERTIES];
++    uint32_t properties;
++    uint8_t powered, mux, vbus, coredump_gpio, desense;
++    uint32_t resets, calls, unsupported, last_unsupported;
++};
++
++static inline void cbc_init(struct cbc_state *s) { __builtin_memset(s, 0, sizeof *s); s->powered = 1; }
++
++/* One call: `in`/`nin` scalars in, up to `*nout` scalars out (set to the count written). */
++static inline int cbc_call(struct cbc_state *s, uint32_t selector, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t *nout)
++{
++    const uint32_t room = *nout;
++    *nout = 0;
++    s->calls++;
++#define CBC_NEED(i, o) do { if (nin < (i) || room < (o)) return CBC_BAD_ARGUMENT; } while (0)
++#define CBC_OUT(v) (out[(*nout)++] = (uint64_t)(v))
++    switch (selector) {
++    case CBC_RESET_MODEM: CBC_NEED(1, 0); s->resets++; return CBC_OK;
++    case CBC_POWER: CBC_NEED(1, 0); s->powered = in[0] != 0; return CBC_OK;
++    case CBC_POWERCYCLE: s->resets++; s->powered = 1; return CBC_OK;
++    case CBC_SELF_IDENTIFY: return CBC_OK;                                      /* each client names itself in a structure; nothing here keys on it */
++    case CBC_MUX: CBC_NEED(1, 0); s->mux = in[0] != 0; return CBC_OK;
++    case CBC_VBUS: CBC_NEED(1, 0); s->vbus = in[0] != 0; return CBC_OK;
++    case CBC_COREDUMP_GPIO: CBC_NEED(1, 0); s->coredump_gpio = in[0] != 0; return CBC_OK;
++    case CBC_CHARGER_DESENSE: CBC_NEED(1, 0); s->desense = in[0] != 0; return CBC_OK;
++    case CBC_CLEAR_FREQ_LIST: CBC_NEED(1, 0); return CBC_OK;
++    case CBC_GET_RESET: CBC_NEED(0, 1); CBC_OUT(0); return CBC_OK;             /* not held in reset */
++    case CBC_GET_PMU_EXTON: CBC_NEED(0, 1); CBC_OUT(s->powered); return CBC_OK;
++    case CBC_GET_DIAG_READY: CBC_NEED(0, 1); CBC_OUT(0); return CBC_OK;
++    case CBC_GET_EFS_ERASE_DONE: CBC_NEED(0, 1); CBC_OUT(0); return CBC_OK;
++    case CBC_GET_RESET_REQUEST: CBC_NEED(0, 1); CBC_OUT(0); return CBC_OK;
++    case CBC_GET_COREDUMP_READY: CBC_NEED(0, 1); CBC_OUT(0); return CBC_OK;
++    case CBC_SET_MANAGER_STATE: CBC_NEED(1, 0); s->manager_state = in[0]; return CBC_OK;
++    case CBC_GET_MANAGER_STATE: CBC_NEED(0, 1); CBC_OUT(s->manager_state); return CBC_OK;
++    case CBC_SET_BASEBAND_STATE: CBC_NEED(1, 0); s->baseband_state = in[0]; return CBC_OK;
++    case CBC_GET_BASEBAND_STATE: CBC_NEED(0, 1); CBC_OUT(s->baseband_state); return CBC_OK;
++    case CBC_SET_PROPERTY: {
++        CBC_NEED(2, 0);
++        for (uint32_t i = 0; i < s->properties; i++)
++            if (s->property_key[i] == in[0]) { s->property_value[i] = in[1]; return CBC_OK; }
++        if (s->properties == CBC_PROPERTIES) return CBC_BAD_ARGUMENT;
++        s->property_key[s->properties] = in[0];
++        s->property_value[s->properties++] = in[1];
++        return CBC_OK;
++    }
++    case CBC_GET_PROPERTY:
++        CBC_NEED(1, 1);
++        for (uint32_t i = 0; i < s->properties; i++)
++            if (s->property_key[i] == in[0]) { CBC_OUT(s->property_value[i]); return CBC_OK; }
++        CBC_OUT(0);
++        return CBC_OK;
++    default:   /* time sync, SPMI, GNSS, frequency lists with data: there is no such line to this modem */
++        s->unsupported++;
++        s->last_unsupported = selector;
++        return CBC_UNSUPPORTED;
++    }
++#undef CBC_NEED
++#undef CBC_OUT
++}
++
++#endif /* COACHZ_BB_CONTROL_H */
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_data.h b/iokit/Kernel/arm/baseband/coachz_bb_data.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_data.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_data.h	2026-11-26 20:09:30
+@@ -0,0 +1,402 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * The data port as this modem has it. Portable and host-tested; no kernel code.
++ *
++ * Apple's PCIe modem carries data over MHI, and CommCenter names that port in its requests: WDS Bind Mux Data Port (0x00a2) and QOS
++ * Bind Data Port (0x002b) carry the peripheral endpoint {type 3 (PCIe), interface 4} or only a mux id. Here data goes through the IPA,
++ * whose port the modem knows as {type 4 (embedded), interface 1}, and the modem refuses a mux id without it (QMI_ERR_INVALID_ARG).
++ * ModemManager does the same for its "ipa" driver (mm_port_net_driver_to_qmi_endpoint_type, initialize_endpoint_info): it names the
++ * embedded endpoint in every bind, and before the first one it opens the hardware port with DPM Open Port (the IPA endpoint ids
++ * Linux shows as modem/tx_endpoint_id and rx_endpoint_id, swapped as the modem sees them) and sets the data format with WDA Set Data
++ * Format: raw IP, QMAP aggregation both ways, at most 32 datagrams and 32768 bytes per downlink aggregate. Of its QMAP versions
++ * (QMAPv5, QMAPv4, QMAP, each tried until the modem reports it) IPA v4.2 takes MAPv4 (ipa_sysfs.c ipa_offload_string), so the
++ * bridge asks for QMAPv4 and then QMAP.
++ *
++ * Message layouts are libqmi's (qmi-service-wds, -wda, -dpm); the QOS bind is Qualcomm's QOS 0x002b, whose endpoint TLV is 0x10 beside
++ * CommCenter's mux id (0x11) and data port (0x12).
++ */
++#ifndef COACHZ_BB_DATA_H
++#define COACHZ_BB_DATA_H
++
++#include <stdint.h>
++
++#define CBD_SVC_WDS 0x01u
++#define CBD_SVC_QOS 0x04u
++#define CBD_SVC_WDA 0x1au
++#define CBD_SVC_DPM 0x2fu
++#define CBD_WDS_BIND_MUX_DATA_PORT 0x00a2u
++#define CBD_QOS_BIND_DATA_PORT 0x002bu
++#define CBD_WDA_SET_DATA_FORMAT 0x0020u
++#define CBD_WDA_GET_DATA_FORMAT 0x0021u
++#define CBD_DPM_OPEN_PORT 0x0020u
++
++#define CBD_EP_EMBEDDED 4u
++#define CBD_EP_INTERFACE 1u
++#define CBD_IPA_AP_MODEM_TX 1u        /* IPA v4.2 endpoint ids (ipa_data-v4.2.c), as coachz_ipa_qmi.h has them */
++#define CBD_IPA_AP_MODEM_RX 9u
++#define CBD_LLP_RAW_IP 2u
++#define CBD_DAP_QMAP 5u
++#define CBD_DAP_QMAPV4 8u
++#define CBD_DL_MAX_DATAGRAMS 32u
++#define CBD_DL_MAX_SIZE 32768u
++
++static const uint32_t cbd_daps[] = { CBD_DAP_QMAPV4, CBD_DAP_QMAP };
++
++static inline uint16_t cbd_rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static inline uint32_t cbd_rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static inline void cbd_wr16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static inline void cbd_wr32(uint8_t *p, uint32_t v) { cbd_wr16(p, v); cbd_wr16(p + 2, v >> 16); }
++
++/* TLV writer: returns the bytes written, 0 when it does not fit */
++static inline uint32_t cbd_tlv(uint8_t *p, uint32_t room, uint32_t type, const uint8_t *value, uint32_t len)
++{
++    if (room < 3u + len) return 0;
++    p[0] = (uint8_t)type;
++    cbd_wr16(p + 1, len);
++    for (uint32_t i = 0; i < len; i++) p[3 + i] = value[i];
++    return 3u + len;
++}
++static inline uint32_t cbd_tlv_u32(uint8_t *p, uint32_t room, uint32_t type, uint32_t v)
++{
++    uint8_t b[4];
++    cbd_wr32(b, v);
++    return cbd_tlv(p, room, type, b, 4);
++}
++static inline uint32_t cbd_tlv_endpoint(uint8_t *p, uint32_t room, uint32_t type)
++{
++    uint8_t b[8];
++    cbd_wr32(b, CBD_EP_EMBEDDED);
++    cbd_wr32(b + 4, CBD_EP_INTERFACE);
++    return cbd_tlv(p, room, type, b, 8);
++}
++
++/* A whole SDU (flags, transaction, message, length, TLVs) whose TLVs are all well formed. */
++static inline int cbd_sdu_ok(const uint8_t *sdu, uint32_t n)
++{
++    if (n < 7u || 7u + cbd_rd16(sdu + 5) > n) return 0;
++    uint32_t at = 7u, end = 7u + cbd_rd16(sdu + 5);
++    while (at < end) {
++        if (end - at < 3u || 3u + cbd_rd16(sdu + at + 1) > end - at) return 0;
++        at += 3u + cbd_rd16(sdu + at + 1);
++    }
++    return 1;
++}
++static inline const uint8_t *cbd_find(const uint8_t *sdu, uint32_t n, uint32_t type, uint32_t *len)
++{
++    if (!cbd_sdu_ok(sdu, n)) return 0;
++    for (uint32_t at = 7u, end = 7u + cbd_rd16(sdu + 5); at < end; at += 3u + cbd_rd16(sdu + at + 1))
++        if (sdu[at] == type) { *len = cbd_rd16(sdu + at + 1); return sdu + at + 3; }
++    return 0;
++}
++
++/* Where the endpoint goes in a request for this modem: its TLV, and whether to add it beside a mux id (0x11) when it is missing. */
++static inline uint32_t cbd_endpoint_tlv(uint32_t service, uint32_t message, int *insert)
++{
++    *insert = 0;
++    if (service == CBD_SVC_WDS && message == CBD_WDS_BIND_MUX_DATA_PORT) { *insert = 1; return 0x10; }
++    if (service == CBD_SVC_QOS && message == CBD_QOS_BIND_DATA_PORT) { *insert = 1; return 0x10; }
++    if (service == CBD_SVC_WDA && message == CBD_WDA_SET_DATA_FORMAT) return 0x17;
++    if (service == CBD_SVC_WDA && message == CBD_WDA_GET_DATA_FORMAT) return 0x10;
++    return 0;
++}
++
++struct cbd_fix { uint32_t len, before_type, before_interface; uint8_t inserted; };
++
++/* A request SDU with its endpoint for this modem's IPA port. `len` 0: the request goes as it is. before_type and before_interface
++   are the endpoint the host named (0 when it named none). */
++static inline struct cbd_fix cbd_endpoint_fix(uint32_t service, const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
++{
++    struct cbd_fix f = { 0, 0, 0, 0 };
++    int insert;
++    if (n < 7u || sdu[0] != 0) return f;
++    const uint32_t type = cbd_endpoint_tlv(service, cbd_rd16(sdu + 3), &insert);
++    uint32_t len = 0;
++    if (!type || !cbd_sdu_ok(sdu, n)) return f;
++    const uint8_t *ep = cbd_find(sdu, n, type, &len);
++    if (ep && len == 8u) {
++        f.before_type = cbd_rd32(ep);
++        f.before_interface = cbd_rd32(ep + 4);
++        if (f.before_type == CBD_EP_EMBEDDED && f.before_interface == CBD_EP_INTERFACE) return f;
++    } else if (ep || !insert || !cbd_find(sdu, n, 0x11, &len)) {
++        return f;
++    }
++    const uint32_t end = 7u + cbd_rd16(sdu + 5);
++    uint32_t w = 7u;
++    if (room < end + 11u) return f;
++    for (uint32_t i = 0; i < 7u; i++) out[i] = sdu[i];
++    for (uint32_t at = 7u; at < end; at += 3u + cbd_rd16(sdu + at + 1)) {
++        const uint32_t l = cbd_rd16(sdu + at + 1);
++        if (sdu[at] == type) { w += cbd_tlv_endpoint(out + w, room - w, type); continue; }
++        w += cbd_tlv(out + w, room - w, sdu[at], sdu + at + 3, l);
++    }
++    if (!ep) { w += cbd_tlv_endpoint(out + w, room - w, type); f.inserted = 1; }
++    cbd_wr16(out + 5, w - 7u);
++    f.len = w;
++    return f;
++}
++
++static inline uint32_t cbd_request(uint8_t *sdu, uint32_t txn, uint32_t message, uint32_t tlv_len)
++{
++    sdu[0] = 0;
++    cbd_wr16(sdu + 1, txn);
++    cbd_wr16(sdu + 3, message);
++    cbd_wr16(sdu + 5, tlv_len);
++    return 7u + tlv_len;
++}
++/* DPM Open Port with the IPA hardware port: {embedded, 1, rx endpoint = AP_MODEM_TX, tx endpoint = AP_MODEM_RX} */
++static inline uint32_t cbd_dpm_open(uint8_t *sdu, uint32_t room, uint32_t txn)
++{
++    uint8_t port[17];
++    if (room < 7u + 20u) return 0;
++    port[0] = 1;
++    cbd_wr32(port + 1, CBD_EP_EMBEDDED);
++    cbd_wr32(port + 5, CBD_EP_INTERFACE);
++    cbd_wr32(port + 9, CBD_IPA_AP_MODEM_TX);
++    cbd_wr32(port + 13, CBD_IPA_AP_MODEM_RX);
++    return cbd_request(sdu, txn, CBD_DPM_OPEN_PORT, cbd_tlv(sdu + 7, room - 7u, 0x11, port, sizeof port));
++}
++/* WDA Set Data Format: raw IP, `dap` both ways, the downlink limits, the embedded endpoint */
++static inline uint32_t cbd_wda_set(uint8_t *sdu, uint32_t room, uint32_t txn, uint32_t dap)
++{
++    uint32_t w = 0;
++    if (room < 7u + 5u * 7u + 11u) return 0;
++    uint8_t *t = sdu + 7;
++    const uint32_t r = room - 7u;
++    w += cbd_tlv_u32(t + w, r - w, 0x11, CBD_LLP_RAW_IP);
++    w += cbd_tlv_u32(t + w, r - w, 0x12, dap);
++    w += cbd_tlv_u32(t + w, r - w, 0x13, dap);
++    w += cbd_tlv_u32(t + w, r - w, 0x15, CBD_DL_MAX_DATAGRAMS);
++    w += cbd_tlv_u32(t + w, r - w, 0x16, CBD_DL_MAX_SIZE);
++    w += cbd_tlv_endpoint(t + w, r - w, 0x17);
++    return cbd_request(sdu, txn, CBD_WDA_SET_DATA_FORMAT, w);
++}
++
++/* The QMI error of a response, or 0xffff when it carries no result */
++static inline uint32_t cbd_error(const uint8_t *sdu, uint32_t n)
++{
++    uint32_t len = 0;
++    const uint8_t *r = cbd_find(sdu, n, 0x02, &len);
++    if (!r || len < 4u) return 0xffffu;
++    return cbd_rd16(r) ? cbd_rd16(r + 2) : 0;
++}
++static inline uint32_t cbd_u32(const uint8_t *sdu, uint32_t n, uint32_t type)
++{
++    uint32_t len = 0;
++    const uint8_t *v = cbd_find(sdu, n, type, &len);
++    return v && len >= 4u ? cbd_rd32(v) : 0xffffffffu;
++}
++
++/* The setup ModemManager runs before its first bind, as a sequence of requests and answers. */
++enum cbd_step { CBD_IDLE, CBD_DPM, CBD_WDA, CBD_DONE };
++struct cbd_setup {
++    enum cbd_step step;
++    uint32_t txn, dap_index, dpm_error, wda_error;
++    uint32_t llp, ul_dap, dl_dap, dl_datagrams, dl_size;   /* as the modem reports them, 0xffffffff when it did not */
++    uint8_t has_dpm, has_wda;
++};
++/* Next request: its service in *service and its SDU in `sdu`; 0 when there is none. Call at the start and after each answer. */
++static inline uint32_t cbd_next(struct cbd_setup *s, uint8_t *sdu, uint32_t room, uint32_t *service)
++{
++    s->txn = (s->txn + 1u) & 0xffffu;
++    if (!s->txn) s->txn = 1;
++    if (s->step == CBD_IDLE) {
++        s->dpm_error = s->wda_error = 0xffffu;
++        s->llp = s->ul_dap = s->dl_dap = s->dl_datagrams = s->dl_size = 0xffffffffu;
++        s->step = CBD_DPM;
++        if (s->has_dpm) { *service = CBD_SVC_DPM; return cbd_dpm_open(sdu, room, s->txn); }
++    }
++    if (s->step == CBD_DPM) {
++        s->step = CBD_WDA;
++        s->dap_index = 0;
++        if (s->has_wda) { *service = CBD_SVC_WDA; return cbd_wda_set(sdu, room, s->txn, cbd_daps[0]); }
++    } else if (s->step == CBD_WDA && s->has_wda && (s->wda_error || s->dl_dap != cbd_daps[s->dap_index]) &&
++               s->dap_index + 1u < sizeof cbd_daps / sizeof cbd_daps[0]) {
++        s->dap_index++;
++        *service = CBD_SVC_WDA;
++        return cbd_wda_set(sdu, room, s->txn, cbd_daps[s->dap_index]);
++    }
++    s->step = CBD_DONE;
++    return 0;
++}
++/* An answer for the request in flight. 1 when it was that one. */
++static inline int cbd_answer(struct cbd_setup *s, uint32_t service, const uint8_t *sdu, uint32_t n)
++{
++    if (n < 7u || sdu[0] != 0x02 || cbd_rd16(sdu + 1) != s->txn) return 0;
++    if (s->step == CBD_DPM && service == CBD_SVC_DPM && cbd_rd16(sdu + 3) == CBD_DPM_OPEN_PORT) {
++        s->dpm_error = cbd_error(sdu, n);
++        return 1;
++    }
++    if (s->step == CBD_WDA && service == CBD_SVC_WDA && cbd_rd16(sdu + 3) == CBD_WDA_SET_DATA_FORMAT) {
++        s->wda_error = cbd_error(sdu, n);
++        s->llp = cbd_u32(sdu, n, 0x11);
++        s->ul_dap = cbd_u32(sdu, n, 0x12);
++        s->dl_dap = cbd_u32(sdu, n, 0x13);
++        s->dl_datagrams = cbd_u32(sdu, n, 0x15);
++        s->dl_size = cbd_u32(sdu, n, 0x16);
++        return 1;
++    }
++    return 0;
++}
++
++/*
++ * Baseband activation (BSP 0xe2, ActivationRegister 0xb00c, QMIMav13ActivationCommandDriver): CommCenter registers, then takes the
++ * state from the indication of the same id, TLV 0x01, one byte of bsp::ActivationState (0 kActivated, 1 kReady, 2 kNotReady, 3 kError).
++ * An Apple modem reports kActivated once its activation ticket is accepted; until then CommCenter keeps /cc/props/baseband_activated
++ * false, which stops operator names, network attach and data contexts. This modem has no activation lock: it is activated.
++ *
++ * The same indication carries the service provisioned state. Without it CommCenter keeps baseband_service_provisioned_states at
++ * kUnknown and gives up the operator name ("not provisioned"), and the interface shows no service while the modem is registered.
++ * TLV 0x4f (one byte, parseLegacyTlvs): 2 is kProvisioned, 3 kNotProvisioned. TLV 0x50 and 0x51 (one byte each, slot one and two,
++ * parseMutableTlvs): 2 is kCardProvisionedStateProvisioned. Slot two has no card here, so 0x51 is left out.
++ *
++ * TLV 0x56 and 0x57 (Slot1IsAccepted, Slot2IsAccepted, one byte, nonzero true) are the activation's verdict on each slot's SIM, the
++ * SIM lock. While slot one is not accepted CommCenter logs "Baseband activation result is unexpected!" and "BB activated, but there
++ * is no SIM" on every activation query and sets the service provisioned state back to kUnknown. This modem has no SIM lock: both
++ * slots are accepted.
++ *
++ * Whether a slot holds a SIM at all is the slot's own record in ActivationInfo (slot one at +0x60, its present flag at +0x110; slot
++ * two at +0x110, flag at +0x1c0). parseMutableTlvs fills slot one's record, and sets the flag, from TLV 0x42 (ActivationIccidSlot1,
++ * 10 bytes); 0x43 is its IMSI (8 bytes), 0x44 and 0x45 its GIDs, 0x46 to 0x49 the same for slot two. ActivationInfo +0x1c8 is the OR of
++ * the two flags, and pp reads it: without 0x42 every activation query ends in "BB activated, but there is no SIM". pp then hands the
++ * slot's ICCID and IMSI to carrier bundle matching (kCTPostponementInfoICCID, kCTPostponementInfoIMSI) through
++ * createActivationStringFromData, which prints the bytes as hex and drops a trailing F: both are BCD in reading order, padded with F.
++ * With the ICCID alone matching answers "There is no CarrierID or SIM Info present", the bundle technology stays kUnknown and the
++ * carrier bundle is never set up (no APN, no data context). So both, as read from the card, go into the indication once known.
++ */
++#define CBD_SVC_BSP 0xe2u
++#define CBD_BSP_ACTIVATION_REGISTER 0xb00cu
++#define CBD_ACTIVATED 0u
++#define CBD_PROVISIONED 2u
++#define CBD_ACCEPTED 1u
++#define CBD_ICCID_BYTES 10u
++#define CBD_IMSI_BYTES 8u
++#define CBD_ACTIVATION_TLVS 20u
++#define CBD_ACTIVATION_SIM_TLVS (CBD_ACTIVATION_TLVS + 3u + CBD_ICCID_BYTES + 3u + CBD_IMSI_BYTES)
++static inline uint32_t cbd_activation_state(uint8_t *tlvs, uint32_t room, const uint8_t *iccid, const uint8_t *imsi)
++{
++    const uint8_t state = CBD_ACTIVATED, provisioned = CBD_PROVISIONED, accepted = CBD_ACCEPTED;
++    const uint32_t need = CBD_ACTIVATION_TLVS + (iccid ? 3u + CBD_ICCID_BYTES : 0u) + (iccid && imsi ? 3u + CBD_IMSI_BYTES : 0u);
++    if (room < need) return 0;
++    uint32_t w = cbd_tlv(tlvs, room, 0x01, &state, 1);
++    w += cbd_tlv(tlvs + w, room - w, 0x4f, &provisioned, 1);
++    w += cbd_tlv(tlvs + w, room - w, 0x50, &provisioned, 1);
++    w += cbd_tlv(tlvs + w, room - w, 0x56, &accepted, 1);
++    w += cbd_tlv(tlvs + w, room - w, 0x57, &accepted, 1);
++    if (iccid) w += cbd_tlv(tlvs + w, room - w, 0x42, iccid, CBD_ICCID_BYTES);
++    if (iccid && imsi) w += cbd_tlv(tlvs + w, room - w, 0x43, imsi, CBD_IMSI_BYTES);
++    return w;
++}
++
++/* After a carrier bundle change CommCenter (QMIBasebandSettingsDriver) pushes the bundle's files: BSP 0xa000, one 1024-byte segment
++ * per request, TLV 0x01 {u16 file type, u16 segment, u16 segment count, data}; then SetConfig 0xe00d (TLV 0x10, one byte) for the IMSI
++ * switch and multi-PDN settings. Each segment's answer must carry TLV 0x40 ExpectedSegmentInfo, the next segment number (u16): it is
++ * compared with the one sendSegmentWithData_sync expects ("Next segment numbers are not matching"), and the last segment ends the file.
++ * Unsupported answers made CommCenter leave the configuration uncached, so every boot it pushed, reset the baseband to apply it and
++ * pushed again, about every 12 seconds. These files are Apple's Mav16 carrier configuration; this modem has its own, so the bridge
++ * takes them as an Apple modem would and drops them, as it drops the images sahara sends. */
++#define CBD_BSP_SEND_FILE 0xa000u
++#define CBD_BSP_SET_CONFIG 0xe00du
++struct cbd_file_segment { uint16_t type, segment, count; uint32_t bytes; };
++static inline int cbd_bsp_file_segment(const uint8_t *sdu, uint32_t n, struct cbd_file_segment *f)
++{
++    uint32_t len = 0;
++    if (!cbd_sdu_ok(sdu, n) || sdu[0] != 0u || cbd_rd16(sdu + 3) != CBD_BSP_SEND_FILE) return 0;
++    const uint8_t *v = cbd_find(sdu, n, 0x01, &len);
++    if (!v || len < 6u) return 0;
++    f->type = cbd_rd16(v); f->segment = cbd_rd16(v + 2); f->count = cbd_rd16(v + 4); f->bytes = len - 6u;
++    return f->count && f->segment < f->count;
++}
++/* When a file's last segment is answered CommCenter logs "complete, waiting for indication from baseband" and waits 22 seconds for
++ * FileTransferStatus, BSP indication 0xa001 (QMIBasebandSettingsDriver::bootstrap): TLV 0x01 {u8 QMIFileType, the type the segments
++ * carried; u8 QMIFileTransferResult, 0 success}, TLV 0x10 SubscriptionID (one byte, 1 for slot one, as the BSP requests carry it).
++ * Without it the push times out as failed and the configuration is not cached. */
++#define CBD_BSP_FILE_TRANSFER_STATUS 0xa001u
++static inline uint32_t cbd_bsp_file_done(const struct cbd_file_segment *f, uint8_t *tlvs, uint32_t room)
++{
++    const uint8_t status[2] = { (uint8_t)f->type, 0 }, subscription = 1;
++    if (room < 9u) return 0;
++    uint32_t w = cbd_tlv(tlvs, room, 0x01, status, 2);
++    w += cbd_tlv(tlvs + w, room - w, 0x10, &subscription, 1);
++    return w;
++}
++/* The TLVs of a segment's successful answer: the next segment number. */
++static inline uint32_t cbd_bsp_file_answer(const struct cbd_file_segment *f, uint8_t *tlvs, uint32_t room)
++{
++    uint8_t next[2] = { (uint8_t)(f->segment + 1u), (uint8_t)((f->segment + 1u) >> 8) };
++    return room >= 5u ? cbd_tlv(tlvs, room, 0x40, next, 2) : 0;
++}
++
++/* Apple's Mav16 firmware adds vendor messages to the standard services, and this modem's firmware answers them QMI_ERR_INVALID_QMI_CMD.
++ * Message 0x555b on NAS (frequency reporting mode, TLV 0xb0 of one byte) and on WDS (link statistics, TLVs 0x01 and 0x10 of nine bytes)
++ * only configure reports: CommCenter logs "Could not set frequency reporting mode" and ABM "Failed to Setting link stats" when they fail.
++ * The bridge accepts both without action, as it takes the carrier files; no reports follow. */
++#define CBD_SVC_NAS 0x03u
++#define CBD_VENDOR_REPORTING 0x555bu
++static inline int cbd_vendor_reporting(uint32_t service, const uint8_t *sdu, uint32_t n)
++{
++    return (service == CBD_SVC_NAS || service == CBD_SVC_WDS) && cbd_sdu_ok(sdu, n) && sdu[0] == 0u && cbd_rd16(sdu + 3) == CBD_VENDOR_REPORTING;
++}
++
++/* BSP 0xb001 (queryActivationStatus): TLV 0x01 ChipInformation {u32 chip id, u32 serial number}. CommCenter puts both in the activation
++ * postponement info (kCTPostponementInfoBasebandChipID, ...BasebandSerialNumber) and ABM publishes them; unanswered it logs "Unable to
++ * get chip id and serial number" on every query. The bridge answers the same two values BBUpdater already read over BHI and sahara. */
++#define CBD_BSP_CHIP_INFO 0xb001u
++static inline uint32_t cbd_bsp_chip_info(uint32_t chip, uint32_t serial, uint8_t *tlvs, uint32_t room)
++{
++    const uint8_t v[8] = { (uint8_t)chip, (uint8_t)(chip >> 8), (uint8_t)(chip >> 16), (uint8_t)(chip >> 24),
++                           (uint8_t)serial, (uint8_t)(serial >> 8), (uint8_t)(serial >> 16), (uint8_t)(serial >> 24) };
++    return room >= 11u ? cbd_tlv(tlvs, room, 0x01, v, 8) : 0;
++}
++
++/* CommCenter reads EF_ICCID and EF_IMSI itself: UIM Read Transparent (0x20), TLV 0x02 {u16 file id, u8 path length, path}. The answer
++ * carries TLV 0x11 {u16 content length, content} (libqmi qmi-service-uim.json). Files are stored as on the card (TS 31.102). */
++#define CBD_SVC_UIM 0x0bu
++#define CBD_UIM_READ_TRANSPARENT 0x0020u
++#define CBD_EF_ICCID 0x2fe2u
++#define CBD_EF_IMSI 0x6f07u
++static inline uint32_t cbd_uim_read_file(const uint8_t *sdu, uint32_t n)
++{
++    uint32_t len = 0;
++    if (!cbd_sdu_ok(sdu, n) || sdu[0] != 0u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT) return 0;
++    const uint8_t *file = cbd_find(sdu, n, 0x02, &len);
++    return file && len >= 3u ? cbd_rd16(file) : 0u;
++}
++/* The content of a successful read, at most room bytes: its length, or 0. */
++static inline uint32_t cbd_uim_read_content(const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
++{
++    uint32_t len = 0;
++    if (!cbd_sdu_ok(sdu, n) || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT || cbd_error(sdu, n)) return 0;
++    const uint8_t *r = cbd_find(sdu, n, 0x11, &len);
++    if (!r || len < 2u || cbd_rd16(r) != len - 2u || len - 2u > room) return 0;
++    for (uint32_t i = 0; i < len - 2u; i++) out[i] = r[2 + i];
++    return len - 2u;
++}
++/* EF_ICCID keeps each digit pair low nibble first: swap into reading order. */
++static inline int cbd_iccid_from_ef(const uint8_t *ef, uint32_t n, uint8_t out[CBD_ICCID_BYTES])
++{
++    if (n != CBD_ICCID_BYTES) return 0;
++    for (uint32_t i = 0; i < CBD_ICCID_BYTES; i++) out[i] = (uint8_t)(ef[i] << 4 | ef[i] >> 4);
++    return 1;
++}
++/* EF_IMSI: a length byte (digit bytes that follow), then digit 1 in the high nibble of the first byte above the parity nibble, then
++ * pairs low nibble first, F filling. Repacked in reading order, padded with F. */
++static inline int cbd_imsi_from_ef(const uint8_t *ef, uint32_t n, uint8_t out[CBD_IMSI_BYTES])
++{
++    uint8_t digits[16];
++    uint32_t count = 0;
++    if (n < 2u || !ef[0] || ef[0] > 8u || n < 1u + ef[0]) return 0;
++    for (uint32_t i = 1; i <= ef[0]; i++) {
++        const uint8_t lo = ef[i] & 0xfu, hi = ef[i] >> 4;
++        if (i > 1u) { if (lo > 9u) break; digits[count++] = lo; }
++        if (hi > 9u) break;
++        digits[count++] = hi;
++    }
++    if (count < 6u || count > 15u) return 0;
++    for (uint32_t i = 0; i < CBD_IMSI_BYTES; i++) {
++        const uint8_t a = 2u * i < count ? digits[2u * i] : 0xfu, b = 2u * i + 1u < count ? digits[2u * i + 1u] : 0xfu;
++        out[i] = (uint8_t)(a << 4 | b);
++    }
++    return 1;
++}
++
++#endif /* COACHZ_BB_DATA_H */
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_esim.h b/iokit/Kernel/arm/baseband/coachz_bb_esim.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_esim.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_esim.h	2026-11-26 20:09:30
+@@ -0,0 +1,826 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * eSIM for the baseband bridge: Apple's VINYL "Tape" commands carried to this machine's eUICC. Portable state machine; no kernel code. Hardware acceptance pending.
++ *
++ * CommCenter (EURSimCommandDriver) takes each SIM slot's eSIM capability from TLV 0x21 of the UIM Get Card Status (0x2f) response, one
++ * byte per slot (1 Vinyl, 2 Tape, 3 Hydra, 4 virtual Hydra, anything else none), and expects two. A modem that is not Apple's leaves it
++ * out, so the bridge adds it. Tape is GSMA SGP.22: VinylQMICommandDriver sends each ES10 command as whole DER on VINYL (0xe5) message
++ * 0x1002 (TLV 0x01 {command, transaction, slot}, TLV 0x10 {flag, segment count, segment index, at most 1500 bytes}, each segment after
++ * the previous one's response) and takes the eUICC's answer from indication 0x1003 (TLV 0x01 {u8 command, u16 status (1 failure), u16 reserved,
++ * u32 transaction, two error bytes}, then TLV 0x10 {segment count, index from 0, data} per segment). 0x1004 answers the EID in its response
++ * (TLV 0x11, 16 bytes), 0x1005 the radio releases the eUICC is told about (TLV 0x10 transaction, 0x11 six bytes, 0x12 three bytes).
++ *
++ * The eUICC side follows ChromeOS's Hermes on this same modem (modem_qrtr.cc, apdu.cc; BSD): UIM Get Slot Status (0x47) finds the
++ * physical slot whose card is an eUICC and its EID; while it is not the active slot, Switch Slot (0x46) makes it active, the modem
++ * gets six seconds to settle (kSimRefreshDelay) and the slot that was active is restored afterwards; Open Logical Channel (0x42) on
++ * ISD-R; each command as STORE DATA (CLA 0x80, INS 0xE2, P1 0x11 or 0x91 on the last block, P2 the block number, at most 255 bytes) by
++ * Send APDU (0x3b, intermediate procedure bytes on), and 61xx answered with GET RESPONSE. A Bound Profile Package (BF36) is split as
++ * SGP.22 2.5.5 does before ES10b.LoadBoundProfilePackage: BF36 header with BF23, A0, A1 header, each 88, A2, A3 header, each 86.
++ *
++ * Challenge/authenticate/prepare keep the same ISD-R channel and slot for the owning VINYL client until
++ * load/cancel/clear, an error, disconnect or 180 seconds without a command. Ordinary UIM stays queued during that session.
++ * GetSessionData/ClearSessionData are modem-local recovery-record operations, not ES10 APDUs. This bridge has no stored records.
++ *
++ * Which CommCenter slot is the eUICC: the logical slot it is in while active, otherwise slot two. While the bridge has switched for
++ * a command the capability bytes stay as they were before the switch.
++ */
++#ifndef COACHZ_BB_ESIM_H
++#define COACHZ_BB_ESIM_H
++
++#include <stdint.h>
++#include "coachz_bb_qmux.h"
++#include "coachz_bb_data.h"
++
++#define CBE_SVC_UIM 0x0bu
++#define CBE_SVC_VINYL 0xe5u
++#define CBE_UIM_GET_CARD_STATUS 0x002fu
++#define CBE_UIM_CARD_STATUS_CHANGE 0x0032u
++#define CBE_UIM_SEND_APDU 0x003bu
++#define CBE_UIM_OPEN_LOGICAL_CHANNEL 0x0042u
++#define CBE_UIM_CLOSE_LOGICAL_CHANNEL 0x003fu
++#define CBE_UIM_SWITCH_SLOT 0x0046u
++#define CBE_UIM_GET_SLOT_STATUS 0x0047u
++#define CBE_UIM_CAPABILITY_TLV 0x21u
++#define CBE_ERR_NO_MEMORY 2u
++#define CBE_ERR_INTERNAL 3u
++#define CBE_ERR_DEVICE_IN_USE 23u
++#define CBE_ERR_NO_EFFECT 26u
++#define CBE_ERR_INVALID_ARG 48u
++
++#define CBE_VINYL_COMMAND 0x1000u
++#define CBE_VINYL_GET_CSN 1u
++/* Apple legacy Vinyl CSN is not the GSMA EID, and is unavailable on this Tape transport. */
++#define CBE_ERR_VINYL_NOCAPABLE_UICC 0x0204u
++
++#define CBE_VINYL_TAPE 0x1002u
++#define CBE_VINYL_TAPE_INFO 0x1003u
++#define CBE_VINYL_TAPE_EID 0x1004u
++#define CBE_VINYL_TAPE_CAPS 0x1005u
++
++#define CBE_CAP_NONE 0u
++#define CBE_CAP_TAPE 2u
++
++/* vinyl::TapeCommand */
++#define CBE_TAPE_CHALLENGE 0x03u
++#define CBE_TAPE_PREPARE_DOWNLOAD 0x05u
++#define CBE_TAPE_LOAD_BPP 0x06u
++#define CBE_TAPE_AUTHENTICATE 0x0bu
++#define CBE_TAPE_CANCEL 0x0cu
++#define CBE_TAPE_ENABLE 0x0eu
++#define CBE_TAPE_DISABLE 0x0fu
++#define CBE_TAPE_DELETE 0x10u
++#define CBE_TAPE_MEMORY_RESET 0x11u
++#define CBE_TAPE_GET_SESSION 0x15u
++#define CBE_TAPE_CLEAR_SESSION 0x16u
++#define CBE_TAPE_EID 0xffu              /* the bridge's own GET EID, for a 0x1004 it cannot answer from the slot status */
++
++#define CBE_SLOTS 4u
++#define CBE_JOBS 8u
++#define CBE_SEGMENTS 512u
++#define CBE_CHUNK 1500u                 /* the segment size CommCenter uses itself (sendOutgoingTapeData_sync) */
++#define CBE_APDU_DATA 255u
++#define CBE_TIMEOUT_MS 10000u
++#define CBE_SETTLE_MS 6000u
++#define CBE_SESSION_IDLE_MS 180000u
++#define CBE_EVENTS 32u
++#define CBE_DEFERRED UINT32_MAX
++/* Answers to read-only ES10 queries, kept so a repeated query does not switch the physical slot away from the SIM in use:
++ * on hardware each switch dropped LTE about 2 s later, and the SIM state change it caused made CommCenter query again. */
++#define CBE_CACHE_ENTRIES 6u
++#define CBE_CACHE_REQ 64u
++
++static const uint8_t cbe_isdr_aid[16] = { 0xa0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xff, 0xff, 0xff, 0xff, 0x89, 0x00, 0x00, 0x01, 0x00 };
++static const uint8_t cbe_get_eid[] = { 0xbf, 0x3e, 0x03, 0x5c, 0x01, 0x5a };
++/* GSM, UTRAN, three CDMA2000, E-UTRAN (EPC); then NR (EPC), NR (5GC), E-UTRAN (5GC): this modem has no CDMA and no NR */
++static const uint8_t cbe_releases[6] = { 12, 12, 0, 0, 0, 12 };
++static const uint8_t cbe_releases_5g[3] = { 0, 0, 0 };
++
++/* ------------------------------------------------------------------ slots */
++struct cbe_slots {
++    uint8_t known, count, euicc, active, logical, eid_len;   /* euicc, active: physical slot from 1, 0 none; logical: the active one's */
++    uint8_t present[CBE_SLOTS], is_euicc[CBE_SLOTS], is_active[CBE_SLOTS], logical_of[CBE_SLOTS];
++    uint8_t eid[16];
++};
++
++/* UIM Get Slot Status response: 1 when parsed. TLV 0x10 {n, {u32 card, u32 state, u8 logical, u8 iccid[len]}}, 0x11 {n, {u32 protocol,
++   u8 apps, u8 atr[len], u8 is_euicc}}, 0x12 {n, {u8 eid[len]}} (Hermes uim_cmd.qmi get_slots_resp). */
++static inline int cbe_parse_slots(struct cbe_slots *s, const uint8_t *sdu, uint32_t n)
++{
++    uint32_t l1 = 0, l2 = 0, l3 = 0;
++    const uint8_t *st = cbd_find(sdu, n, 0x10, &l1), *info = cbd_find(sdu, n, 0x11, &l2), *eid = cbd_find(sdu, n, 0x12, &l3);
++    struct cbe_slots t;
++    __builtin_memset(&t, 0, sizeof t);
++    if (cbd_error(sdu, n) || !st || !l1) return 0;
++    t.count = st[0] < CBE_SLOTS ? st[0] : CBE_SLOTS;
++    for (uint32_t i = 0, at = 1; i < st[0]; i++) {
++        if (at + 10u > l1 || at + 10u + st[at + 9] > l1) return 0;
++        if (i < CBE_SLOTS) {
++            t.present[i] = cbd_rd32(st + at) == 2u;
++            t.is_active[i] = cbd_rd32(st + at + 4) == 1u;
++            t.logical_of[i] = st[at + 8];
++        }
++        at += 10u + st[at + 9];
++    }
++    if (info && l2) {
++        for (uint32_t i = 0, at = 1; i < info[0]; i++) {
++            if (at + 6u > l2 || at + 7u + info[at + 5] > l2) return 0;
++            if (i < CBE_SLOTS) t.is_euicc[i] = info[at + 6 + info[at + 5]] != 0;
++            at += 7u + info[at + 5];
++        }
++    }
++    for (uint32_t i = 0; i < t.count; i++) {
++        if (t.is_active[i] && !t.active) { t.active = (uint8_t)(i + 1); t.logical = t.logical_of[i] ? t.logical_of[i] : 1; }
++        if (t.is_euicc[i] && t.present[i] && !t.euicc) t.euicc = (uint8_t)(i + 1);
++    }
++    if (eid && l3 && t.euicc) {
++        for (uint32_t i = 0, at = 1; i < eid[0]; i++) {
++            if (at + 1u > l3 || at + 1u + eid[at] > l3) break;
++            if (i + 1u == t.euicc && eid[at] == 16u) { t.eid_len = 16; __builtin_memcpy(t.eid, eid + at + 1, 16); }
++            at += 1u + eid[at];
++        }
++    }
++    t.known = 1;
++    *s = t;
++    return 1;
++}
++
++/* ------------------------------------------------------------------ BPP segments (SGP.22 2.5.5) */
++/* One BER-TLV header at p: tag (one byte, or 0x1f-class two), definite length up to three bytes. 0 when malformed. */
++static inline uint32_t cbe_der(const uint8_t *p, uint32_t n, uint32_t *tag, uint32_t *len)
++{
++    uint32_t at = 0;
++    if (n < 2) return 0;
++    *tag = p[at++];
++    if ((*tag & 0x1fu) == 0x1fu) { if (n < 3) return 0; *tag = *tag << 8 | p[at++]; }
++    const uint32_t l = p[at++];
++    if (l < 0x80u) *len = l;
++    else if (l == 0x81u && at + 1u <= n) *len = p[at++];
++    else if (l == 0x82u && at + 2u <= n) { *len = (uint32_t)p[at] << 8 | p[at + 1]; at += 2; }
++        else if (l == 0x83u && at + 3u <= n) { *len = (uint32_t)p[at] << 16 | (uint32_t)p[at + 1] << 8 | p[at + 2]; at += 3; }
++            else return 0;
++    return at + *len <= n ? at : 0;
++}
++
++struct cbe_seg { uint32_t off, len; };
++/* The STORE DATA segments of a command: a Bound Profile Package split as SGP.22 says, anything else whole. 0 when a BF36 is malformed. */
++static inline uint32_t cbe_segments(const uint8_t *in, uint32_t n, struct cbe_seg *seg, uint32_t max)
++{
++    uint32_t tag, len, count = 0;
++    uint32_t h = cbe_der(in, n, &tag, &len);
++    if (!h || h + len != n) return 0;
++    if (tag != 0xbf36u) { if (!max) return 0; seg[0] = (struct cbe_seg){ 0, n }; return 1; }
++    const uint32_t end = h + len;
++    uint32_t at = h;
++    while (at < end) {
++        uint32_t t, l;
++        const uint32_t hh = cbe_der(in + at, end - at, &t, &l);
++        if (!hh || count + 1u > max) return 0;
++        if (t == 0xbf23u && count == 0) {
++            seg[count++] = (struct cbe_seg){ 0, at + hh + l };            /* BF36 header and the whole BF23 */
++        } else if (t == 0xa1u || t == 0xa3u) {
++            seg[count++] = (struct cbe_seg){ at, hh };                    /* the header alone, then each element */
++            for (uint32_t e = at + hh; e < at + hh + l;) {
++                uint32_t et, el;
++                const uint32_t eh = cbe_der(in + e, at + hh + l - e, &et, &el);
++                if (!eh || count + 1u > max) return 0;
++                seg[count++] = (struct cbe_seg){ e, eh + el };
++                e += eh + el;
++            }
++        } else if (count) {
++            seg[count++] = (struct cbe_seg){ at, hh + l };                /* A0, A2 whole */
++        } else {
++            return 0;
++        }
++        at += hh + l;
++    }
++    return count;
++}
++
++/* ------------------------------------------------------------------ the engine */
++enum cbe_step { CBE_S_IDLE, CBE_S_SLOTS, CBE_S_SWITCH, CBE_S_SETTLE, CBE_S_RESLOT, CBE_S_OPEN, CBE_S_APDU, CBE_S_CLOSE, CBE_S_RESTORE, CBE_S_RESTORE_SETTLE };
++enum cbe_job_state { CBE_J_FREE, CBE_J_RECEIVING, CBE_J_READY };
++enum cbe_event_kind {
++    CBE_EV_SLOTS,        /* a: count, b: eUICC physical slot, c: active physical slot, d: EID length */
++    CBE_EV_SLOTS_FAILED, /* a: QMI error (0xffff none) */
++    CBE_EV_REQUEST,      /* a: command, b: transaction, c: CommCenter slot, d: bytes */
++    CBE_EV_SWITCH,       /* a: physical slot, b: logical slot, c: QMI error */
++    CBE_EV_OPEN,         /* a: QMI error, b: channel */
++    CBE_EV_DONE,         /* a: command, b: status, c: SW1 << 8 | SW2, d: bytes out; e: segments */
++    CBE_EV_FAILED,       /* a: command, b: step, c: QMI error or SW, d: reason (cbe_reason) */
++    CBE_EV_CAPS,         /* a: slot one, b: slot two: the capability bytes changed */
++    CBE_EV_LEGACY_CSN,   /* a: command, b: CommCenter slot, c: QMI result; no card identifier */
++    CBE_EV_SESSION,      /* a: 1 held, 2 released; b: slot, c: trigger command, d: reason (0 explicit, 1 idle, 2 disconnect, 3 error) */
++    CBE_EV_CACHE,        /* a: command, b: 1 answered from the cache, 2 stored, 3 cleared; c: bytes (stored, answered) or entries (cleared) */
++};
++enum cbe_reason { CBE_R_NO_SLOTS = 1, CBE_R_NO_EUICC, CBE_R_SWITCH_LIMIT, CBE_R_QMI, CBE_R_SW, CBE_R_TIMEOUT, CBE_R_ROOM, CBE_R_INACTIVE, CBE_R_SEGMENTS };
++struct cbe_event { uint32_t kind, a, b, c, d, e; };
++
++struct cbe_job {
++    uint8_t state, cmd, slot, channel, cid;
++    uint16_t qmi_txn;                 /* CBE_TAPE_EID: the 0x1004 request to answer */
++    uint32_t txid, total, next, off, len, cap, seq, deadline;
++};
++
++struct cbe {
++struct cbe_slots slots;
++uint8_t caps[2], frozen[2], freeze;
++uint8_t *in, *resp;               /* caller's buffers: the commands' bytes, one answer */
++uint32_t in_cap, in_used, resp_cap, resp_len, seq;
++struct cbe_job job[CBE_JOBS];
++/* the command in progress */
++enum cbe_step step;
++int active;                       /* job index, -1 none */
++uint8_t channel_id, channel_open, switched, restore_phys, get_more, sw1, sw2, route_failed;
++uint32_t deadline, wait_txn, wait_msg, txn, switches;
++uint8_t session, session_channel, session_cid, session_slot;
++uint32_t session_deadline;
++struct cbe_seg seg[CBE_SEGMENTS];
++uint32_t seg_count, seg_index, frag_pos, block;
++/* the request for the modem, when req_len is set */
++uint8_t req[600];
++uint32_t req_len;
++/* what goes to CommCenter: one result (indications, or the 0x1004 answer) */
++struct cbe_job done;
++uint8_t done_pending, done_status, done_sw1, done_sw2;
++uint32_t done_chunk, done_len;
++struct cbe_event ev[CBE_EVENTS];
++uint32_t ev_count, ev_lost, card_status_fixed;
++/* read-only query answers; each entry's bytes at cache + index * (cache_cap / CBE_CACHE_ENTRIES) */
++uint8_t *cache;
++uint32_t cache_cap, cache_next;
++struct { uint8_t used, cmd, sw1, sw2; uint32_t req_len, resp_len; uint8_t req[CBE_CACHE_REQ]; } cached[CBE_CACHE_ENTRIES];
++};
++
++static inline void cbe_init(struct cbe *e, uint8_t *in, uint32_t in_cap, uint8_t *resp, uint32_t resp_cap)
++{
++__builtin_memset(e, 0, sizeof *e);
++e->in = in; e->in_cap = in_cap; e->resp = resp; e->resp_cap = resp_cap;
++e->active = -1;
++}
++
++static inline void cbe_event(struct cbe *e, uint32_t kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t x)
++{
++if (e->ev_count == CBE_EVENTS) { e->ev_lost++; return; }
++e->ev[e->ev_count++] = (struct cbe_event){ kind, a, b, c, d, x };
++}
++/* The next event for the log, oldest first: 1 when there was one. */
++static inline int cbe_take_event(struct cbe *e, struct cbe_event *out)
++{
++if (!e->ev_count) return 0;
++*out = e->ev[0];
++for (uint32_t i = 1; i < e->ev_count; i++) e->ev[i - 1] = e->ev[i];
++e->ev_count--;
++return 1;
++}
++
++/* The capability bytes CommCenter gets now. */
++static inline void cbe_caps(const struct cbe *e, uint8_t caps[2])
++{
++caps[0] = caps[1] = CBE_CAP_NONE;
++if (e->freeze) { caps[0] = e->frozen[0]; caps[1] = e->frozen[1]; return; }
++if (!e->slots.known || !e->slots.euicc) return;
++if (e->slots.active == e->slots.euicc && e->slots.logical >= 1 && e->slots.logical <= 2) caps[e->slots.logical - 1] = CBE_CAP_TAPE;
++else caps[1] = CBE_CAP_TAPE;
++}
++static inline void cbe_caps_note(struct cbe *e)
++{
++uint8_t c[2];
++cbe_caps(e, c);
++if (c[0] != e->caps[0] || c[1] != e->caps[1]) { e->caps[0] = c[0]; e->caps[1] = c[1]; cbe_event(e, CBE_EV_CAPS, c[0], c[1], 0, 0, 0); }
++}
++
++/* Both card-status responses and indications replace the complete Vinyl capability vector in CommCenter.
++ * Keep TLV 0x21 on both, or a hotplug indication silently removes Tape support until the next query.
++ * Returns the new SDU length, 0 to leave it as it is. Card/application status bytes are never changed. */
++static inline uint32_t cbe_card_status_fix(struct cbe *e, uint32_t service, const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
++{
++if (service != CBE_SVC_UIM || n < 7u || !cbd_sdu_ok(sdu, n) || !e->slots.known) return 0;
++const uint32_t message = cbd_rd16(sdu + 3);
++if (!((sdu[0] == CBQ_QMI_RESPONSE && message == CBE_UIM_GET_CARD_STATUS && !cbd_error(sdu, n)) ||
++      (sdu[0] == CBQ_QMI_INDICATION && message == CBE_UIM_CARD_STATUS_CHANGE))) return 0;
++uint8_t caps[2];
++cbe_caps(e, caps);
++const uint32_t end = 7u + cbd_rd16(sdu + 5);
++if (room < end + 5u) return 0;
++uint32_t w = 7u;
++for (uint32_t i = 0; i < 7u; i++) out[i] = sdu[i];
++for (uint32_t at = 7u; at < end; at += 3u + cbd_rd16(sdu + at + 1))
++if (sdu[at] != CBE_UIM_CAPABILITY_TLV) w += cbd_tlv(out + w, room - w, sdu[at], sdu + at + 3, cbd_rd16(sdu + at + 1));
++w += cbd_tlv(out + w, room - w, CBE_UIM_CAPABILITY_TLV, caps, 2);
++cbd_wr16(out + 5, w - 7u);
++e->card_status_fixed++;
++return w;
++}
++
++/* ------------------------------------------------------------------ requests for the modem (into e->req) */
++static inline void cbe_send(struct cbe *e, uint32_t message, uint32_t tlv_len, uint32_t now)
++{
++e->txn = (e->txn + 1u) & 0xffffu;
++if (!e->txn) e->txn = 1;
++e->req_len = cbd_request(e->req, e->txn, message, tlv_len);
++e->wait_txn = e->txn;
++e->wait_msg = message;
++e->deadline = now + CBE_TIMEOUT_MS;
++}
++static inline void cbe_send_slot_status(struct cbe *e, uint32_t now) { cbe_send(e, CBE_UIM_GET_SLOT_STATUS, 0, now); }
++static inline void cbe_send_switch(struct cbe *e, uint32_t physical, uint32_t now)
++{
++uint8_t *t = e->req + 7;
++const uint8_t logical = e->slots.logical ? e->slots.logical : 1;
++uint32_t w = cbd_tlv(t, 32, 0x01, &logical, 1);
++w += cbd_tlv_u32(t + w, 32, 0x02, physical);
++cbe_send(e, CBE_UIM_SWITCH_SLOT, w, now);
++e->switches++;
++}
++static inline void cbe_send_open(struct cbe *e, uint32_t now)
++{
++uint8_t *t = e->req + 7, aid[17];
++const uint8_t logical = e->slots.logical ? e->slots.logical : 1;
++aid[0] = sizeof cbe_isdr_aid;
++__builtin_memcpy(aid + 1, cbe_isdr_aid, sizeof cbe_isdr_aid);
++uint32_t w = cbd_tlv(t, 32, 0x01, &logical, 1);
++w += cbd_tlv(t + w, 32, 0x10, aid, sizeof aid);
++cbe_send(e, CBE_UIM_OPEN_LOGICAL_CHANNEL, w, now);
++}
++/* Send APDU: TLV 0x01 slot, 0x02 {u16 length, APDU}, 0x10 channel, 0x11 procedure bytes (0: intermediate ones reported) */
++static inline void cbe_send_apdu(struct cbe *e, const uint8_t *apdu, uint32_t n, uint32_t now)
++{
++uint8_t *t = e->req + 7;
++const uint8_t logical = e->slots.logical ? e->slots.logical : 1;
++const uint8_t cmd = e->active >= 0 ? e->job[e->active].cmd : 0;
++/* Hermes disables intermediate bytes for refresh-producing operations. */
++const uint8_t procedure = cmd == CBE_TAPE_ENABLE || cmd == CBE_TAPE_DISABLE ||
++    cmd == CBE_TAPE_DELETE || cmd == CBE_TAPE_MEMORY_RESET ? 1 : 0;
++uint32_t w = cbd_tlv(t, 8, 0x01, &logical, 1);
++t[w] = 0x02; cbd_wr16(t + w + 1, n + 2u); cbd_wr16(t + w + 3, n);
++for (uint32_t i = 0; i < n; i++) t[w + 5 + i] = apdu[i];
++w += 5u + n;
++w += cbd_tlv(t + w, 8, 0x10, &e->channel_id, 1);
++w += cbd_tlv(t + w, 8, 0x11, &procedure, 1);
++cbe_send(e, CBE_UIM_SEND_APDU, w, now);
++}
++/* The next STORE DATA block of the current segment, or GET RESPONSE */
++static inline void cbe_send_block(struct cbe *e, uint32_t now)
++{
++    uint8_t apdu[261];
++    if (e->get_more) {
++        /* Same short GET RESPONSE encoding as Hermes CommandApdu. */
++        apdu[0] = 0x80; apdu[1] = 0xc0; apdu[2] = 0x91; apdu[3] = 0; apdu[4] = e->sw2;
++        cbe_send_apdu(e, apdu, e->sw2 ? 5u : 4u, now);
++        return;
++    }
++    const struct cbe_job *j = &e->job[e->active];
++    const struct cbe_seg *s = &e->seg[e->seg_index];
++    const uint32_t left = s->len - e->frag_pos, take = left < CBE_APDU_DATA ? left : CBE_APDU_DATA;
++    const uint8_t *bytes = j->cmd == CBE_TAPE_EID ? cbe_get_eid : e->in + j->off;
++    apdu[0] = 0x80; apdu[1] = 0xe2; apdu[2] = take == left ? 0x91 : 0x11;
++    apdu[3] = (uint8_t)e->block++; apdu[4] = (uint8_t)take;
++    __builtin_memcpy(apdu + 5, bytes + s->off + e->frag_pos, take);
++    e->frag_pos += take;
++    /* Hermes uses Le=256 (encoded 0) on the final STORE DATA fragment. */
++    if (take == left) apdu[5 + take] = 0;
++    cbe_send_apdu(e, apdu, 5u + take + (take == left), now);
++}
++
++static inline void cbe_send_close(struct cbe *e, uint32_t now)
++{
++    const uint8_t logical = e->slots.logical ? e->slots.logical : 1;
++    uint32_t w = cbd_tlv(e->req + 7, 16, 0x01, &logical, 1);
++    w += cbd_tlv(e->req + 7 + w, 16, 0x11, &e->channel_id, 1);
++    e->step = CBE_S_CLOSE;
++    cbe_send(e, CBE_UIM_CLOSE_LOGICAL_CHANNEL, w, now);
++}
++static inline void cbe_restore(struct cbe *e, uint32_t now)
++{
++    e->session = 0;
++    if (e->switched && e->restore_phys) {
++        e->step = CBE_S_RESTORE;
++        cbe_send_switch(e, e->restore_phys, now);
++    } else {
++        e->step = CBE_S_IDLE; e->freeze = 0;
++        cbe_caps_note(e);
++    }
++}
++/* Drop the channel lease only when no APDU is executing. Cleanup still finishes before queued SIM traffic resumes. */
++static inline void cbe_session_release(struct cbe *e, uint32_t now, uint32_t reason)
++{
++    if (!e->session || e->active >= 0 || e->step != CBE_S_IDLE) return;
++    cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, 0, reason, 0);
++    e->session = 0;
++    if (e->channel_open) cbe_send_close(e, now);
++    else cbe_restore(e, now);
++}
++static inline int cbe_session_owner(const struct cbe *e, const struct cbe_job *j)
++{
++    return j->channel == e->session_channel && j->cid == e->session_cid && j->slot == e->session_slot;
++}
++static inline int cbe_session_terminal(uint32_t cmd)
++{
++    return cmd == CBE_TAPE_LOAD_BPP || cmd == CBE_TAPE_CANCEL || cmd == CBE_TAPE_CLEAR_SESSION ||
++        cmd == CBE_TAPE_ENABLE || cmd == CBE_TAPE_DISABLE || cmd == CBE_TAPE_DELETE || cmd == CBE_TAPE_MEMORY_RESET;
++}
++/* ------------------------------------------------------------------ read-only query cache */
++static inline void cbe_set_cache(struct cbe *e, uint8_t *buf, uint32_t cap) { e->cache = buf; e->cache_cap = buf ? cap : 0; }
++/* SGP.22 queries whose answer only another ES10 command can change: GetEUICCInfo1 (BF20), GetEUICCInfo2 (BF22),
++ * ListNotification (BF28), GetProfilesInfo (BF2D), EuiccConfiguredAddresses (BF3C), GetEID (BF3E).
++ * Section 5.7.9 lists notification metadata without consuming it. Removing a notification (BF30), profile
++ * changes and other uncached card commands still invalidate every entry. Never cache the challenge (BF2E).
++ * Keep room for all six query kinds so initialization cannot evict them cyclically. */
++static inline int cbe_cacheable(const uint8_t *req, uint32_t n)
++{
++    if (n < 2u || n > CBE_CACHE_REQ || req[0] != 0xbfu) return 0;
++    return req[1] == 0x20u || req[1] == 0x22u || req[1] == 0x28u || req[1] == 0x2du || req[1] == 0x3cu || req[1] == 0x3eu;
++}
++static inline int cbe_cache_find(const struct cbe *e, uint32_t cmd, const uint8_t *req, uint32_t n)
++{
++    for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++)
++        if (e->cached[i].used && e->cached[i].cmd == cmd && e->cached[i].req_len == n && !__builtin_memcmp(e->cached[i].req, req, n))
++            return (int)i;
++    return -1;
++}
++/* A hit fills the answer as the card gave it, with its status word. */
++static inline int cbe_cache_take(struct cbe *e, const struct cbe_job *j)
++{
++    const uint8_t *req = e->in + j->off;
++    if (!e->cache || e->switched || e->channel_open || !cbe_cacheable(req, j->len)) return 0;
++    const int i = cbe_cache_find(e, j->cmd, req, j->len);
++    if (i < 0 || e->cached[i].resp_len > e->resp_cap) return 0;
++    __builtin_memcpy(e->resp, e->cache + (uint32_t)i * (e->cache_cap / CBE_CACHE_ENTRIES), e->cached[i].resp_len);
++    e->resp_len = e->cached[i].resp_len; e->sw1 = e->cached[i].sw1; e->sw2 = e->cached[i].sw2; e->seg_count = 0;
++    cbe_event(e, CBE_EV_CACHE, j->cmd, 1, e->resp_len, 0, 0);
++    return 1;
++}
++/* After a command reached the card: keep a clean read-only answer; anything else may change the answers, so drop them all. */
++static inline void cbe_cache_note(struct cbe *e, const struct cbe_job *j, uint32_t status)
++{
++    if (!e->cache || j->cmd == CBE_TAPE_EID || j->cmd == CBE_TAPE_GET_SESSION || j->cmd == CBE_TAPE_CLEAR_SESSION) return;
++    const uint8_t *req = e->in + j->off;
++    if (!cbe_cacheable(req, j->len)) {
++        uint32_t had = 0;
++        for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++) { had += e->cached[i].used; e->cached[i].used = 0; }
++        if (had) cbe_event(e, CBE_EV_CACHE, j->cmd, 3, had, 0, 0);
++        return;
++    }
++    const uint32_t room = e->cache_cap / CBE_CACHE_ENTRIES;
++    if (status || e->sw1 != 0x90u || e->sw2 || !e->resp_len || e->resp_len > room || cbe_cache_find(e, j->cmd, req, j->len) >= 0) return;
++    uint32_t i = 0;
++    while (i < CBE_CACHE_ENTRIES && e->cached[i].used) i++;
++    if (i == CBE_CACHE_ENTRIES) i = e->cache_next++ % CBE_CACHE_ENTRIES;
++    __builtin_memcpy(e->cache + i * room, e->resp, e->resp_len);
++    __builtin_memcpy(e->cached[i].req, req, j->len);
++    e->cached[i].used = 1; e->cached[i].cmd = j->cmd; e->cached[i].sw1 = e->sw1; e->cached[i].sw2 = e->sw2;
++    e->cached[i].req_len = j->len; e->cached[i].resp_len = e->resp_len;
++    cbe_event(e, CBE_EV_CACHE, j->cmd, 2, e->resp_len, 0, 0);
++}
++
++static inline void cbe_finish(struct cbe *e, uint32_t status, uint32_t reason, uint32_t detail, uint32_t now)
++{
++    if (e->active >= 0) {
++        e->done = e->job[e->active]; e->job[e->active].state = CBE_J_FREE;
++        e->done_status = (uint8_t)status; e->done_sw1 = e->sw1; e->done_sw2 = e->sw2;
++        e->done_pending = 1; e->done_chunk = 0; e->done_len = status ? 0 : e->resp_len;
++        cbe_cache_note(e, &e->done, status);
++        if (status) cbe_event(e, CBE_EV_FAILED, e->done.cmd, e->step, detail, reason, 0);
++        else cbe_event(e, CBE_EV_DONE, e->done.cmd, 0, (uint32_t)e->sw1 << 8 | e->sw2, e->resp_len, e->seg_count);
++        e->active = -1;
++    }
++    e->req_len = e->wait_msg = 0;
++    const uint32_t cmd = e->done.cmd;
++    if (!status && e->channel_open && !cbe_session_terminal(cmd) &&
++        (e->session || cmd == CBE_TAPE_CHALLENGE || cmd == CBE_TAPE_AUTHENTICATE || cmd == CBE_TAPE_PREPARE_DOWNLOAD)) {
++        if (!e->session) {
++            e->session_channel = e->done.channel; e->session_cid = e->done.cid; e->session_slot = e->done.slot;
++            cbe_event(e, CBE_EV_SESSION, 1, e->done.slot, cmd, 0, 0);
++        }
++        e->session = 1; e->session_deadline = now + CBE_SESSION_IDLE_MS;
++        e->step = CBE_S_IDLE; return;
++    }
++    if (e->session) cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, cmd, status ? 3 : 0, 0);
++    e->session = 0;
++    if (e->channel_open) cbe_send_close(e, now);
++    else cbe_restore(e, now);
++}
++
++static inline void cbe_begin(struct cbe *e, uint32_t now)
++{
++    struct cbe_job *j = &e->job[e->active];
++    if (e->route_failed) { cbe_finish(e, 1, CBE_R_INACTIVE, e->slots.active, now); return; }
++    if (!e->slots.known || !e->slots.euicc || !e->slots.active) {
++        cbe_finish(e, 1, CBE_R_NO_EUICC, 0, now); return;
++    }
++    uint8_t caps[2]; cbe_caps(e, caps);
++    if (j->slot < 1 || j->slot > 2 || caps[j->slot - 1] != CBE_CAP_TAPE) {
++        cbe_finish(e, 1, CBE_R_INACTIVE, j->slot, now); return;
++    }
++    j->deadline = now + 180000u;
++    e->resp_len = e->seg_index = e->frag_pos = e->block = 0;
++    e->get_more = e->sw1 = e->sw2 = 0;
++    /* No BB recovery records are stored here. Match the driver's explicit empty-session result,
++     * without inventing eUICC data or forwarding an opaque recovery token as DER. */
++    if (j->cmd == CBE_TAPE_GET_SESSION || j->cmd == CBE_TAPE_CLEAR_SESSION) {
++        cbe_finish(e, 0, 0, 0, now); return;
++    }
++    if (cbe_cache_take(e, j)) { cbe_finish(e, 0, 0, 0, now); return; }
++    if (j->cmd == CBE_TAPE_EID) {
++        e->seg[0] = (struct cbe_seg){ 0, sizeof cbe_get_eid }; e->seg_count = 1;
++    } else {
++        e->seg_count = cbe_segments(e->in + j->off, j->len, e->seg, CBE_SEGMENTS);
++    }
++    if (!e->seg_count) { cbe_finish(e, 1, CBE_R_SEGMENTS, 0, now); return; }
++    /* A short APDU numbers at most 256 fragments in one STORE DATA sequence. */
++    for (uint32_t i = 0; i < e->seg_count; i++)
++        if (e->seg[i].len > 256u * CBE_APDU_DATA) { cbe_finish(e, 1, CBE_R_SEGMENTS, i, now); return; }
++    if (e->session && e->channel_open && cbe_session_owner(e, j) && e->slots.active == e->slots.euicc) {
++        e->step = CBE_S_APDU; cbe_send_block(e, now); return;
++    }
++    if (e->slots.active != e->slots.euicc) {
++        e->restore_phys = e->slots.active;
++        e->frozen[0] = caps[0]; e->frozen[1] = caps[1]; e->freeze = 1;
++        /* Restore even if the switch response times out: its request may have landed. */
++        e->switched = 1; e->step = CBE_S_SWITCH;
++        cbe_send_switch(e, e->slots.euicc, now);
++    } else {
++        e->switched = 0; e->step = CBE_S_OPEN; cbe_send_open(e, now);
++    }
++}
++
++/* First fit in the caller's pool; in-flight or receiving jobs keep their bytes. */
++static inline int cbe_reserve(struct cbe *e, uint32_t room, uint32_t *off)
++{
++    uint32_t at = 0;
++    for (uint32_t pass = 0; pass <= CBE_JOBS; pass++) {
++        if (at > e->in_cap || room > e->in_cap - at) return 0;
++        int hit = 0;
++        for (uint32_t i = 0; i < CBE_JOBS; i++) {
++            const struct cbe_job *j = &e->job[i];
++            if (j->state && at < j->off + j->cap && j->off < at + room) {
++                at = j->off + j->cap; hit = 1; break;
++            }
++        }
++        if (!hit) { *off = at; return 1; }
++    }
++    return 0;
++}
++
++/* Accept a VINYL request. Return 0 for an unimplemented message, else one QMUX response in out.
++ * Segment acknowledgements mean buffered, not that the eUICC accepted the ES10 operation.
++ * Completion is a later Tape indication; no profile/key material is interpreted here. */
++static inline uint32_t cbe_host(struct cbe *e, uint32_t channel, uint32_t cid,
++    const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room, uint32_t now)
++{
++    if (!cbd_sdu_ok(sdu, n) || sdu[0] != CBQ_QMI_REQUEST) return 0;
++    const uint32_t message = cbd_rd16(sdu + 3);
++    if (message == CBE_VINYL_COMMAND) {
++        uint32_t len = 0;
++        const uint8_t *command = cbd_find(sdu, n, 0x02, &len);
++        uint32_t error = CBQ_ERR_MALFORMED_MESSAGE;
++        if (command && len == 6u) {
++            if (command[5] < 1 || command[5] > 2) error = CBE_ERR_INVALID_ARG;
++            else if (command[0] != CBE_VINYL_GET_CSN) return 0;
++            else {
++                /* VinylQMICommandDriver::queryCsn_sync accepts this exact error as no legacy CSN:
++                 * asVinylDriverError(0x204) -> 6; handleClientStarted_sync's callback then emits
++                 * Ready for this slot. Generic NOT_SUPPORTED (0x5e) leaves the driver unready.
++                 * Do not invent a CSN from the EID or report a successful legacy Vinyl operation. */
++                error = CBE_ERR_VINYL_NOCAPABLE_UICC;
++                cbe_event(e, CBE_EV_LEGACY_CSN, command[0], command[5], error, 0, 0);
++            }
++        }
++        return cbq_private_answer(sdu, CBE_SVC_VINYL, cid, error, 0, 0, out, room);
++    }
++    if (message != CBE_VINYL_TAPE && message != CBE_VINYL_TAPE_EID && message != CBE_VINYL_TAPE_CAPS) return 0;
++    uint32_t l = 0, error = 0, w = 0;
++    const uint8_t *h = cbd_find(sdu, n, 0x01, &l);
++    uint8_t extra[48];
++    if (!h || l != (message == CBE_VINYL_TAPE ? 6u : 5u)) error = CBQ_ERR_MALFORMED_MESSAGE;
++    /* Device capabilities are not slot-specific: the native writer leaves this byte zero. */
++    else if (message != CBE_VINYL_TAPE_CAPS &&
++        (h[message == CBE_VINYL_TAPE ? 5 : 4] < 1 || h[message == CBE_VINYL_TAPE ? 5 : 4] > 2))
++        error = CBE_ERR_INVALID_ARG;
++    else if (message == CBE_VINYL_TAPE_CAPS) {
++        w = cbd_tlv(extra, sizeof extra, 0x10, h, 4);
++        w += cbd_tlv(extra + w, sizeof extra - w, 0x11, cbe_releases, sizeof cbe_releases);
++        w += cbd_tlv(extra + w, sizeof extra - w, 0x12, cbe_releases_5g, sizeof cbe_releases_5g);
++    } else if (message == CBE_VINYL_TAPE_EID && e->slots.known && e->slots.eid_len == 16) {
++        uint8_t caps[2]; cbe_caps(e, caps);
++        if (caps[h[4] - 1] != CBE_CAP_TAPE) error = CBE_ERR_INVALID_ARG;
++        else w = cbd_tlv(extra, sizeof extra, 0x11, e->slots.eid, 16);
++    } else {
++        const uint8_t cmd = message == CBE_VINYL_TAPE_EID ? CBE_TAPE_EID : h[0];
++        const uint32_t txid = cbd_rd32(h + (message == CBE_VINYL_TAPE ? 1 : 0));
++        const uint8_t slot = h[message == CBE_VINYL_TAPE ? 5 : 4];
++        uint32_t plen = 0;
++        const uint8_t *payload = message == CBE_VINYL_TAPE ? cbd_find(sdu, n, 0x10, &plen) : 0;
++        const uint32_t total = payload && plen >= 5 ? cbd_rd16(payload + 1) : 1;
++        const uint32_t index = payload && plen >= 5 ? cbd_rd16(payload + 3) : 0;
++        const uint32_t bytes = payload && plen >= 5 ? plen - 5 : 0;
++        int found = -1, free_job = -1;
++        for (uint32_t i = 0; i < CBE_JOBS; i++) {
++            struct cbe_job *j = &e->job[i];
++            if (!j->state) free_job = (int)i;
++            else if (j->channel == channel && j->cid == cid && j->txid == txid) found = (int)i;
++        }
++        const int empty_session = message == CBE_VINYL_TAPE && cmd == CBE_TAPE_GET_SESSION && !payload;
++        if (slot < 1 || slot > 2 || !total || total > CBE_SEGMENTS || index >= total || bytes > CBE_CHUNK ||
++            (message == CBE_VINYL_TAPE && !empty_session &&
++             (cmd == CBE_TAPE_EID || !payload || plen < 5 || !bytes || (index + 1 < total && bytes != CBE_CHUNK))))
++            error = CBE_ERR_INVALID_ARG;
++        else if (found < 0 && index) error = CBE_ERR_INVALID_ARG;
++        else {
++            if (found < 0) {
++                uint32_t off = 0, cap = message == CBE_VINYL_TAPE ? total * CBE_CHUNK : 0;
++                if (free_job < 0 || !cbe_reserve(e, cap, &off)) error = CBE_ERR_DEVICE_IN_USE;
++                else {
++                    found = free_job;
++                    struct cbe_job *j = &e->job[found]; __builtin_memset(j, 0, sizeof *j);
++                    j->state = CBE_J_RECEIVING; j->cmd = cmd; j->txid = txid; j->slot = slot;
++                    j->channel = (uint8_t)channel; j->cid = (uint8_t)cid; j->qmi_txn = cbd_rd16(sdu + 1);
++                    j->off = off; j->cap = cap; j->total = total; j->seq = ++e->seq;
++                }
++            }
++            if (!error) {
++                struct cbe_job *j = &e->job[found];
++                if (j->state != CBE_J_RECEIVING || j->cmd != cmd || j->slot != slot || j->total != total || j->next != index)
++                    error = CBE_ERR_INVALID_ARG;
++                else {
++                    if (bytes) __builtin_memcpy(e->in + j->off + j->len, payload + 5, bytes);
++                    j->len += bytes; j->next++; j->deadline = now + 30000u;
++                    if (j->next == j->total) {
++                        j->state = CBE_J_READY;
++                        cbe_event(e, CBE_EV_REQUEST, cmd, txid, slot, j->len, total);
++                    }
++                    /* 0x1004 is answered after its real EID read, not acknowledged twice. */
++                    if (message == CBE_VINYL_TAPE_EID) return CBE_DEFERRED;
++                }
++            }
++        }
++    }
++    return cbq_private_answer(sdu, CBE_SVC_VINYL, cid, error, extra, error ? 0 : w, out, room);
++}
++
++static inline void cbe_tick(struct cbe *e, uint32_t now)
++{
++    if (e->active >= 0 && (int32_t)(now - e->job[e->active].deadline) >= 0) {
++        cbe_finish(e, 1, CBE_R_TIMEOUT, 0, now); return;
++    }
++    for (uint32_t i = 0; i < CBE_JOBS; i++)
++        if (e->job[i].state == CBE_J_RECEIVING && (int32_t)(now - e->job[i].deadline) >= 0)
++            e->job[i].state = CBE_J_FREE;
++    if (e->step == CBE_S_SETTLE && (int32_t)(now - e->deadline) >= 0) {
++        e->step = CBE_S_RESLOT; cbe_send_slot_status(e, now);
++    } else if (e->step == CBE_S_RESTORE_SETTLE && (int32_t)(now - e->deadline) >= 0) {
++        e->slots.known = 0; e->step = CBE_S_RESLOT; cbe_send_slot_status(e, now);
++    } else if (e->step != CBE_S_IDLE && e->step != CBE_S_SETTLE && e->step != CBE_S_RESTORE_SETTLE &&
++               (int32_t)(now - e->deadline) >= 0) {
++        e->req_len = e->wait_msg = 0;
++        if (e->step == CBE_S_CLOSE) {
++            e->done_status = 1; cbe_event(e, CBE_EV_FAILED, e->done.cmd, e->step, 0, CBE_R_TIMEOUT, 0);
++            e->channel_open = 0; cbe_restore(e, now);
++        }
++        else if (e->active >= 0) cbe_finish(e, 1, CBE_R_TIMEOUT, 0, now);
++        else { if (e->switched) e->route_failed = 1; e->done_status = 1; e->slots.known = 0; e->freeze = 0; e->switched = 0; e->step = CBE_S_IDLE; e->deadline = now + 5000u; }
++    }
++    if (e->step != CBE_S_IDLE) return;
++    if (e->session && (int32_t)(now - e->session_deadline) >= 0) {
++        cbe_session_release(e, now, 1); return;
++    }
++    if (e->done_pending) return;
++    int next = -1;
++    for (uint32_t i = 0; i < CBE_JOBS; i++)
++        if (e->job[i].state == CBE_J_READY && (!e->session || cbe_session_owner(e, &e->job[i])) && (next < 0 || (int32_t)(e->job[i].seq - e->job[next].seq) < 0)) next = (int)i;
++    if (next >= 0) {
++        e->active = next; e->job[next].deadline = now + 180000u;
++        if (e->slots.known) cbe_begin(e, now);
++        else { e->step = CBE_S_SLOTS; cbe_send_slot_status(e, now); }
++    } else if (!e->session && !e->slots.known && (int32_t)(now - e->deadline) >= 0) {
++        e->step = CBE_S_SLOTS; cbe_send_slot_status(e, now);
++    }
++}
++
++/* Consume only the response to this engine's private UIM client/transaction. */
++static inline int cbe_answer(struct cbe *e, const uint8_t *sdu, uint32_t n, uint32_t now)
++{
++    if (!cbd_sdu_ok(sdu, n) || sdu[0] != CBQ_QMI_RESPONSE || !e->wait_msg ||
++        cbd_rd16(sdu + 1) != e->wait_txn || cbd_rd16(sdu + 3) != e->wait_msg) return 0;
++    const uint32_t error = cbd_error(sdu, n), step = e->step;
++    e->req_len = e->wait_msg = 0;
++    if (step == CBE_S_CLOSE) {
++        if (error) { e->done_status = 1; cbe_event(e, CBE_EV_FAILED, e->done.cmd, step, error, CBE_R_QMI, 0); }
++        e->channel_open = 0; cbe_restore(e, now); return 1;
++    }
++    if (step == CBE_S_RESTORE) {
++        if (error && error != CBE_ERR_NO_EFFECT) {
++            cbe_event(e, CBE_EV_FAILED, e->done.cmd, step, error, CBE_R_QMI, 0);
++            e->route_failed = 1; e->done_status = 1; e->slots.known = 0; e->freeze = 0; e->switched = 0; e->step = CBE_S_IDLE; e->deadline = now + 5000u;
++        } else { e->step = CBE_S_RESTORE_SETTLE; e->deadline = now + CBE_SETTLE_MS; }
++        return 1;
++    }
++    if (error && !(step == CBE_S_SWITCH && error == CBE_ERR_NO_EFFECT)) {
++        if (e->active >= 0) cbe_finish(e, 1, CBE_R_QMI, error, now);
++        else {
++            cbe_event(e, CBE_EV_SLOTS_FAILED, error, 0, 0, 0, 0);
++            if (e->done_pending) e->done_status = 1;
++            if (e->switched) e->route_failed = 1;
++            e->slots.known = 0; e->freeze = e->switched = 0;
++            e->step = CBE_S_IDLE; e->deadline = now + 5000u;
++        }
++        return 1;
++    }
++    if (step == CBE_S_SLOTS || step == CBE_S_RESLOT) {
++        if (!cbe_parse_slots(&e->slots, sdu, n)) {
++            if (e->active >= 0) cbe_finish(e, 1, CBE_R_NO_SLOTS, 0, now);
++            else {
++                if (e->done_pending) e->done_status = 1;
++                if (e->switched) e->route_failed = 1;
++                e->step = CBE_S_IDLE; e->slots.known = 0; e->freeze = 0; e->switched = 0; e->deadline = now + 5000u;
++            }
++            return 1;
++        }
++        cbe_event(e, CBE_EV_SLOTS, e->slots.count, e->slots.euicc, e->slots.active, e->slots.eid_len, 0);
++        if (e->active < 0) {
++            if (e->route_failed && e->slots.active == e->restore_phys) e->route_failed = 0;
++            if (e->switched && e->slots.active != e->restore_phys) {
++                e->route_failed = 1; e->done_status = 1;
++                cbe_event(e, CBE_EV_FAILED, e->done.cmd, step, e->slots.active, CBE_R_INACTIVE, 0);
++            }
++            e->step = CBE_S_IDLE; e->switched = e->freeze = 0;
++            if (e->route_failed) { e->slots.known = 0; e->deadline = now + 5000u; }
++            cbe_caps_note(e);
++        } else if (step == CBE_S_SLOTS) { cbe_caps_note(e); cbe_begin(e, now); }
++        else if (e->slots.active != e->slots.euicc) cbe_finish(e, 1, CBE_R_INACTIVE, e->slots.active, now);
++        else { e->step = CBE_S_OPEN; cbe_send_open(e, now); }
++    } else if (step == CBE_S_SWITCH) {
++        cbe_event(e, CBE_EV_SWITCH, e->slots.euicc, e->slots.logical, error, 0, 0);
++        e->step = CBE_S_SETTLE; e->deadline = now + CBE_SETTLE_MS;
++    } else if (step == CBE_S_OPEN) {
++        uint32_t l = 0; const uint8_t *ch = cbd_find(sdu, n, 0x10, &l);
++        if (!ch || l != 1 || !ch[0]) { cbe_finish(e, 1, CBE_R_QMI, 0, now); return 1; }
++        e->channel_id = ch[0]; e->channel_open = 1;
++        cbe_event(e, CBE_EV_OPEN, 0, ch[0], 0, 0, 0);
++        e->step = CBE_S_APDU; cbe_send_block(e, now);
++    } else if (step == CBE_S_APDU) {
++        uint32_t l = 0; const uint8_t *a = cbd_find(sdu, n, 0x10, &l);
++        if (!a || l < 4 || cbd_rd16(a) + 2u != l) { cbe_finish(e, 1, CBE_R_QMI, 0, now); return 1; }
++        const uint32_t bytes = cbd_rd16(a) - 2u;
++        e->sw1 = a[2 + bytes]; e->sw2 = a[3 + bytes];
++        if (bytes > e->resp_cap - e->resp_len) { cbe_finish(e, 1, CBE_R_ROOM, bytes, now); return 1; }
++        __builtin_memcpy(e->resp + e->resp_len, a + 2, bytes); e->resp_len += bytes;
++        if (e->sw1 == 0x61) { e->get_more = 1; cbe_send_block(e, now); return 1; }
++        if (e->sw1 != 0x90 || e->sw2) { cbe_finish(e, 1, CBE_R_SW, (uint32_t)e->sw1 << 8 | e->sw2, now); return 1; }
++        e->get_more = 0;
++        if (e->frag_pos < e->seg[e->seg_index].len) { cbe_send_block(e, now); return 1; }
++        if (++e->seg_index < e->seg_count) {
++            e->frag_pos = e->block = e->resp_len = 0; cbe_send_block(e, now); return 1;
++        }
++        if (e->job[e->active].cmd == CBE_TAPE_EID) {
++            uint32_t tag = 0, len = 0, h = cbe_der(e->resp, e->resp_len, &tag, &len);
++            uint32_t at = tag == 0xbf3eu ? h : 0;
++            h = cbe_der(e->resp + at, e->resp_len - at, &tag, &len);
++            if (!h || tag != 0x5a || len != 16) { cbe_finish(e, 1, CBE_R_SW, 0, now); return 1; }
++            __builtin_memcpy(e->slots.eid, e->resp + at + h, 16); e->slots.eid_len = 16;
++        }
++        cbe_finish(e, 0, 0, 0, now);
++    }
++    return 1;
++}
++
++/* One completed result, emitted in <=1500-byte Tape segments. The caller must retain the
++ * returned frame before calling again. No response/APDU/profile/EID bytes go to the log. */
++static inline uint32_t cbe_output(struct cbe *e, uint8_t *channel, uint8_t *out, uint32_t room)
++{
++    if (!e->done_pending || e->step != CBE_S_IDLE) return 0;
++    uint8_t tlvs[CBE_CHUNK + 32]; uint32_t w = 0, n;
++    *channel = e->done.channel;
++    if (e->done.cmd == CBE_TAPE_EID) {
++        if (!e->done_status && e->slots.eid_len == 16) w = cbd_tlv(tlvs, sizeof tlvs, 0x11, e->slots.eid, 16);
++        n = cbq_private_message(CBQ_QMI_RESPONSE, e->done.qmi_txn, CBE_VINYL_TAPE_EID, CBE_SVC_VINYL,
++            e->done.cid, e->done_status ? CBE_ERR_INTERNAL : 0, tlvs, w, out, room);
++        if (n) e->done_pending = 0;
++        return n;
++    }
++    /* IndTapeIndResult is 11 wire bytes, not the legacy Info result's 8-byte layout.
++     * The native parser reads u16 at 1, u16 at 3, u32 transaction at 5, SW bytes at 9/10. */
++    uint8_t info[11] = { 0 };
++    info[0] = e->done.cmd; cbd_wr16(info + 1, e->done_status);
++    cbd_wr32(info + 5, e->done.txid);
++    info[9] = e->done_status ? e->done_sw1 : 0; info[10] = e->done_status ? e->done_sw2 : 0;
++    w = cbd_tlv(tlvs, sizeof tlvs, 0x01, info, sizeof info);
++    /* The native handler explicitly accepts a successful GetSessionData with no payload TLV. */
++    if (e->done.cmd == CBE_TAPE_GET_SESSION || e->done.cmd == CBE_TAPE_CLEAR_SESSION) {
++        n = cbq_private_indication(CBE_VINYL_TAPE_INFO, CBE_SVC_VINYL, e->done.cid, tlvs, w, out, room);
++        if (n) e->done_pending = 0;
++        return n;
++    }
++    const uint32_t count = e->done_len ? (e->done_len + CBE_CHUNK - 1u) / CBE_CHUNK : 1;
++    const uint32_t at = e->done_chunk * CBE_CHUNK;
++    const uint32_t bytes = e->done_len - at < CBE_CHUNK ? e->done_len - at : CBE_CHUNK;
++    tlvs[w] = 0x10; cbd_wr16(tlvs + w + 1, 4u + bytes);
++    cbd_wr16(tlvs + w + 3, count); cbd_wr16(tlvs + w + 5, e->done_chunk);
++    if (bytes) __builtin_memcpy(tlvs + w + 7, e->resp + at, bytes);
++    w += 7u + bytes;
++    n = cbq_private_indication(CBE_VINYL_TAPE_INFO, CBE_SVC_VINYL, e->done.cid, tlvs, w, out, room);
++    if (n && ++e->done_chunk >= count) e->done_pending = 0;
++    return n;
++}
++
++#endif /* COACHZ_BB_ESIM_H */
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_pdp.cpp b/iokit/Kernel/arm/baseband/coachz_bb_pdp.cpp
+--- a/iokit/Kernel/arm/baseband/coachz_bb_pdp.cpp	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_pdp.cpp	2026-11-26 20:09:30
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// Included by coachz_baseband.cpp. XNU's raw-IP KPI joins the existing IPA MAPv4 backend.
++// CommCenter owns WDS and address configuration; this layer never dials or invents addresses.
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/kpi_mbuf.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++extern "C" {
++#include <net/bpf.h>
++}
++#include <netinet/in.h>
++extern "C" {
++#include <netinet/ip.h>
++#include <netinet/ip_var.h>
++#include <netinet/udp.h>
++#include <netinet/udp_var.h>
++extern struct ipstat ipstat;
++extern struct udpstat udpstat;
++}
++
++extern "C" int coachz_modem_data_send(uint32_t, const uint8_t *, uint32_t);
++extern "C" void coachz_modem_data_receiver(void (*)(uint32_t, const uint8_t *, uint32_t, uint32_t));
++
++namespace {
++struct bb_pdp_if {
++  ifnet_t ifp;
++  mbuf_t head, tail;
++  uint32_t queued, families, blocked;
++  uint64_t tx, rx, dropped, busy, requested;
++};
++static bb_pdp_if bb_pdp_ifaces[CBP_INTERFACES];
++static IOLock *bb_pdp_lock;
++static uint32_t bb_pdp_initialized;
++
++static errno_t bb_pdp_demux(ifnet_t, mbuf_t m, char *, protocol_family_t *family)
++{
++  uint8_t first;
++  if (mbuf_copydata(m, 0, 1, &first)) return ENOENT;
++  *family = first >> 4 == 4 ? PF_INET : first >> 4 == 6 ? PF_INET6 : 0;
++  return *family ? 0 : EPROTONOSUPPORT;
++}
++static errno_t bb_pdp_add_proto(ifnet_t, protocol_family_t f, const ifnet_demux_desc *, uint32_t)
++{ return f == PF_INET || f == PF_INET6 ? 0 : EPROTONOSUPPORT; }
++static errno_t bb_pdp_del_proto(ifnet_t ifp, protocol_family_t family)
++{
++  printf("COACHZ pdp: unplumb unit %u family %u\n", ifnet_unit(ifp), family);
++  return 0;
++}
++static errno_t bb_pdp_input(ifnet_t ifp, protocol_family_t f, mbuf_t m, char *)
++{
++  if (proto_input(f, m)) { mbuf_freem(m); ifnet_stat_increment_in(ifp, 0, 0, 1); }
++  return 0;
++}
++static errno_t bb_pdp_pre_output(ifnet_t, protocol_family_t, mbuf_t *, const sockaddr *, void *, char *, char *)
++{ return 0; }  // raw IP: no link header, software checksums, no advertised offloads
++// in_domifattach/proto_plumb is used again after CommCenter tears an IP service down.
++// Match XNU's utun_attach_proto contract, including EEXIST for an attached protocol.
++static errno_t bb_pdp_plumb(ifnet_t ifp, protocol_family_t family)
++{
++  ifnet_attach_proto_param proto = {};
++  proto.input = bb_pdp_input; proto.pre_output = bb_pdp_pre_output;
++  const errno_t error = ifnet_attach_protocol(ifp, family, &proto);
++  printf("COACHZ pdp: plumb unit %u family %u result %d\n", ifnet_unit(ifp), family, error);
++  return error;
++}
++static errno_t bb_pdp_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++  switch (cmd) {
++    case SIOCSIFMTU: {
++      const int mtu = static_cast<ifreq *>(data)->ifr_mtu;
++      if (mtu < 1280 || mtu > 1492) return EINVAL;
++      return ifnet_set_mtu(ifp, static_cast<uint32_t>(mtu));
++    }
++    case SIOCSIFFLAGS: case SIOCSIFADDR: case SIOCSIFDSTADDR: return 0;
++    default:
++      printf("COACHZ pdp: ioctl 0x%lx unit %u unsupported\n", cmd, ifnet_unit(ifp));
++      return EOPNOTSUPP;
++  }
++}
++static errno_t bb_pdp_output(ifnet_t ifp, mbuf_t m)
++{
++  auto *p = static_cast<bb_pdp_if *>(ifnet_softc(ifp));
++  __atomic_fetch_add(&p->requested, 1u, __ATOMIC_RELAXED);
++  const size_t len = mbuf_pkthdr_len(m);
++  uint8_t first = 0;
++  if (!len || len > ifnet_mtu(ifp) || mbuf_copydata(m, 0, 1, &first)) { mbuf_freem(m); return EMSGSIZE; }
++  const uint32_t bit = cbp_family_bit(first >> 4);
++  IOLockLock(bb_pdp_lock);
++  if (!bit || !(p->families & bit) || p->blocked || p->queued == 64u) {
++    p->dropped++; IOLockUnlock(bb_pdp_lock); mbuf_freem(m); return ENETDOWN;
++  }
++  mbuf_setnextpkt(m, nullptr);
++  if (p->tail) mbuf_setnextpkt(p->tail, m); else p->head = m;
++  p->tail = m; p->queued++;
++  IOLockUnlock(bb_pdp_lock);
++  return 0;
++}
++static void bb_pdp_receive(uint32_t mux, const uint8_t *ip, uint32_t n, uint32_t version)
++{
++  if (!bb_pdp_lock || !cbp_mux_ok(mux) || !n || (version != 4 && version != 6)) return;
++  auto *p = &bb_pdp_ifaces[mux - 1u];
++  IOLockLock(bb_pdp_lock);
++  const bool usable = p->ifp && (p->families & cbp_family_bit(version)) && !p->blocked;
++  if (!usable) p->dropped++;
++  IOLockUnlock(bb_pdp_lock);
++  if (!usable || !(ifnet_flags(p->ifp) & IFF_UP)) return;
++  mbuf_t m = nullptr;
++  if (mbuf_allocpacket(MBUF_DONTWAIT, n, nullptr, &m) || !m) return;
++  if (mbuf_copyback(m, 0, n, ip, MBUF_DONTWAIT)) { mbuf_freem(m); return; }
++  mbuf_pkthdr_setrcvif(m, p->ifp);
++  mbuf_pkthdr_setheader(m, nullptr);
++  bpf_tap_in(p->ifp, DLT_RAW, m, nullptr, 0);
++  ifnet_stat_increment_param inc = {};
++  inc.packets_in = 1; inc.bytes_in = n;
++  const errno_t error = ifnet_input(p->ifp, m, &inc);
++  if (error) mbuf_freem(m);
++  else p->rx++;
++}
++static void bb_pdp_init()
++{
++  if (bb_pdp_initialized) return;
++  bb_pdp_lock = IOLockAlloc();
++  if (!bb_pdp_lock) return;
++  const errno_t ipv4 = proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, bb_pdp_plumb, nullptr);
++  const errno_t ipv6 = proto_register_plumber(PF_INET6, IFNET_FAMILY_CELLULAR, bb_pdp_plumb, nullptr);
++  printf("COACHZ pdp: protocol plumbers IPv4 %d IPv6 %d\n", ipv4, ipv6);
++  for (uint32_t i = 0; i < CBP_INTERFACES; i++) {
++    auto *p = &bb_pdp_ifaces[i];
++    ifnet_init_eparams init = {};
++    init.ver = IFNET_INIT_CURRENT_VERSION; init.len = sizeof init;
++    init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
++    init.name = "pdp_ip"; init.unit = i;
++    init.family = IFNET_FAMILY_CELLULAR; init.type = IFT_CELLULAR; init.softc = p;
++    init.output = bb_pdp_output; init.demux = bb_pdp_demux;
++    init.add_proto = bb_pdp_add_proto; init.del_proto = bb_pdp_del_proto; init.ioctl = bb_pdp_ioctl;
++    errno_t error = ifnet_allocate_extended(&init, &p->ifp);
++    if (!error) {
++      ifnet_set_hdrlen(p->ifp, 0); ifnet_set_addrlen(p->ifp, 0);
++      ifnet_set_mtu(p->ifp, 1492);  // IPA MTU minus MAPv4 headers, as rmnet_vnd_headroom
++      ifnet_set_flags(p->ifp, IFF_POINTOPOINT | IFF_MULTICAST, 0xffff);
++      ifnet_set_eflags(p->ifp, IFEF_NOAUTOIPV6LL, IFEF_NOAUTOIPV6LL);
++      error = ifnet_attach(p->ifp, nullptr);
++      if (error) { ifnet_release(p->ifp); p->ifp = nullptr; }
++    }
++    if (!error) {
++      error = bb_pdp_plumb(p->ifp, PF_INET);
++      if (!error || error == EEXIST) error = bb_pdp_plumb(p->ifp, PF_INET6);
++      if (!error || error == EEXIST) error = bpf_attach(p->ifp, DLT_RAW, 0, nullptr, nullptr);
++    }
++    printf("COACHZ pdp: pdp_ip%u mux %u registered result %d (initially down)\n", i, i + 1u, error);
++  }
++  coachz_modem_data_receiver(bb_pdp_receive);
++  bb_pdp_initialized = 1;
++}
++// Wi-Fi thread only; never hold bb_lock while calling the network stack or ringing GSI.
++static void bb_pdp_poll()
++{
++  if (!bb_pdp_initialized) return;
++  uint32_t active[CBP_INTERFACES];
++  IOLockLock(bb_lock);
++  for (uint32_t i = 0; i < CBQ_MAX_CLIENTS; i++) {
++    if (!bb_qmux.client[i].used || bb_qmux.client[i].service != CBD_SVC_WDS ||
++        bb_pdp_owners[i] != (1u + bb_qmux.client[i].cid + (uint32_t(bb_qmux.client[i].channel) << 8)))
++      bzero(&bb_pdp_clients[i], sizeof bb_pdp_clients[i]);
++  }
++  const bool ready = bb_data.step == CBD_DONE && !bb_data.dpm_error && !bb_data.wda_error &&
++    bb_data.llp == CBD_LLP_RAW_IP && bb_data.ul_dap == CBD_DAP_QMAPV4 && bb_data.dl_dap == CBD_DAP_QMAPV4;
++  for (uint32_t i = 0; i < CBP_INTERFACES; i++) active[i] = ready ? cbp_active_families(bb_pdp_clients, CBQ_MAX_CLIENTS, i + 1u) : 0;
++  IOLockUnlock(bb_lock);
++  for (uint32_t i = 0; i < CBP_INTERFACES; i++) {
++    auto *p = &bb_pdp_ifaces[i];
++    if (!p->ifp) continue;
++    IOLockLock(bb_pdp_lock);
++    const bool changed = p->families != active[i];
++    p->families = active[i];
++    IOLockUnlock(bb_pdp_lock);
++    if (changed) {
++      ifnet_set_flags(p->ifp, active[i] ? IFF_RUNNING : 0, IFF_RUNNING);
++      printf("COACHZ pdp: pdp_ip%u active families %u\n", i, active[i]);
++    }
++    for (unsigned batch = 0; batch < 16; batch++) {
++      IOLockLock(bb_pdp_lock);
++      mbuf_t m = p->head;
++      if (m) { p->head = mbuf_nextpkt(m); if (!p->head) p->tail = nullptr; p->queued--; mbuf_setnextpkt(m, nullptr); }
++      const bool usable = p->families && !p->blocked;
++      IOLockUnlock(bb_pdp_lock);
++      if (!m) break;
++      uint8_t ip[1492];
++      const uint32_t n = static_cast<uint32_t>(mbuf_pkthdr_len(m));
++      int error = ENETDOWN;
++      if (usable && (ifnet_flags(p->ifp) & IFF_UP) && !mbuf_copydata(m, 0, n, ip) &&
++          (active[i] & cbp_family_bit(ip[0] >> 4))) error = coachz_modem_data_send(i + 1u, ip, n);
++      if (error == EBUSY) {
++        IOLockLock(bb_pdp_lock);
++        if (p->queued >= 64u) { p->dropped++; IOLockUnlock(bb_pdp_lock); mbuf_freem(m); break; }
++        mbuf_setnextpkt(m, p->head); p->head = m; if (!p->tail) p->tail = m; p->queued++; p->busy++;
++        IOLockUnlock(bb_pdp_lock);
++        break;
++      }
++      if (!error) { bpf_tap_out(p->ifp, DLT_RAW, m, nullptr, 0); p->tx++; ifnet_stat_increment_out(p->ifp, 1, n, 0); }
++      else { p->dropped++; ifnet_stat_increment_out(p->ifp, 0, 0, 1); }
++      mbuf_freem(m);
++    }
++  }
++}
++static IOReturn bb_pdp_block(uint32_t unit, uint32_t blocked)
++{
++  if (unit >= CBP_INTERFACES || !bb_pdp_lock) return kIOReturnBadArgument;
++  IOLockLock(bb_pdp_lock); bb_pdp_ifaces[unit].blocked = !!blocked; IOLockUnlock(bb_pdp_lock);
++  return kIOReturnSuccess;
++}
++static void bb_pdp_report(unsigned second)
++{
++  if (!bb_pdp_lock) return;
++  IOLockLock(bb_pdp_lock);
++  for (uint32_t i = 0; i < CBP_INTERFACES; i++) {
++    const auto &p = bb_pdp_ifaces[i];
++    printf("COACHZ pdp: %u s unit %u families %u blocked %u queued %u tx %llu rx %llu drop %llu busy %llu\n",
++      second, i, p.families, p.blocked, p.queued, p.tx, p.rx, p.dropped, p.busy);
++    if (p.ifp && (p.requested || p.rx)) printf("COACHZ pdp stack: %u s unit %u requested %llu flags 0x%x mtu %u\n",
++      second, i, p.requested, ifnet_flags(p.ifp), ifnet_mtu(p.ifp));
++  }
++  IOLockUnlock(bb_pdp_lock);
++  printf("COACHZ pdp IP: %u s in %u delivered %u checksum %u short %u badlen %u noroute %u UDP in %u out %u checksum %u noport %u full %u\n",
++    second, ipstat.ips_total, ipstat.ips_delivered, ipstat.ips_badsum, ipstat.ips_tooshort, ipstat.ips_badlen, ipstat.ips_noroute,
++    udpstat.udps_ipackets, udpstat.udps_opackets, udpstat.udps_badsum, udpstat.udps_noport, udpstat.udps_fullsock);
++}
++}
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_pdp.h b/iokit/Kernel/arm/baseband/coachz_bb_pdp.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_pdp.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_pdp.h	2026-11-26 20:09:30
+@@ -0,0 +1,99 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* WDS lifecycle observation, not a dialler. Wire facts: libqmi data/qmi-service-wds.json.
++ * Four native contexts use mux 1..4; IPv4 and IPv6 have distinct WDS clients on the same mux.
++ * The control bridge owns this state under its lock. No addresses or APNs are retained here. */
++#ifndef COACHZ_BB_PDP_H
++#define COACHZ_BB_PDP_H
++#include "coachz_bb_data.h"
++#define CBP_INTERFACES 4u
++#define CBP_START 0x20u
++#define CBP_STOP 0x21u
++#define CBP_STATUS 0x22u
++#define CBP_SETTINGS 0x2du
++#define CBP_FAMILY 0x4du
++struct cbp_client {
++    uint16_t bind_txn, family_txn, start_txn, stop_txn;
++    uint8_t bind_pending, family_pending, start_pending, stop_pending;
++    uint8_t mux, next_mux, family, next_family, active, settings;
++    uint32_t handle;
++};
++static inline uint32_t cbp_family_bit(uint32_t family) { return family == 4u ? 1u : family == 6u ? 2u : 0u; }
++static inline uint32_t cbp_byte(const uint8_t *sdu, uint32_t n, uint32_t type)
++{
++    uint32_t len = 0;
++    const uint8_t *v = cbd_find(sdu, n, type, &len);
++    return v && len == 1u ? *v : 0u;
++}
++static inline int cbp_mux_ok(uint32_t mux) { return mux >= 1u && mux <= CBP_INTERFACES; }
++static inline int cbp_observe(struct cbp_client *c, const uint8_t *sdu, uint32_t n)
++{
++    if (!cbd_sdu_ok(sdu, n)) return 0;
++    const uint32_t id = cbd_rd16(sdu + 3), txn = cbd_rd16(sdu + 1);
++    if (sdu[0] == 0u) {
++        if (id == CBD_WDS_BIND_MUX_DATA_PORT) {
++            c->bind_txn = (uint16_t)txn;
++            c->next_mux = (uint8_t)cbp_byte(sdu, n, 0x11);
++            c->bind_pending = 1;
++        } else if (id == CBP_FAMILY) {
++            c->family_txn = (uint16_t)txn;
++            c->next_family = (uint8_t)cbp_byte(sdu, n, 1);
++            c->family_pending = 1;
++        } else if (id == CBP_START) {
++            c->start_txn = (uint16_t)txn;
++            c->start_pending = 1;
++            const uint32_t family = cbp_byte(sdu, n, 0x19);
++            if (cbp_family_bit(family)) c->family = (uint8_t)family;
++        } else if (id == CBP_STOP) {
++            c->stop_txn = (uint16_t)txn;
++            c->stop_pending = 1;
++        } else return 0;
++        return 1;
++    }
++    if (sdu[0] == 2u) {
++        const uint32_t error = cbd_error(sdu, n);
++        if (id == CBD_WDS_BIND_MUX_DATA_PORT && c->bind_pending && txn == c->bind_txn) {
++            c->bind_pending = 0;
++            if (!error) { c->mux = c->next_mux; c->active = c->settings = 0; c->handle = 0; }
++        } else if (id == CBP_FAMILY && c->family_pending && txn == c->family_txn) {
++            c->family_pending = 0;
++            if (!error) c->family = c->next_family;
++        } else if (id == CBP_START && c->start_pending && txn == c->start_txn) {
++            c->start_pending = 0;
++            if (!error) {
++                const uint32_t handle = cbd_u32(sdu, n, 1);
++                if (handle != 0xffffffffu) { c->handle = handle; c->active = 1; }
++            }
++        } else if (id == CBP_STOP && c->stop_pending && txn == c->stop_txn) {
++            c->stop_pending = 0;
++            if (!error) { c->active = c->settings = 0; c->handle = 0; }
++        } else if (id == CBP_SETTINGS) {
++            if (!error) {
++                uint32_t len;
++                c->settings = cbd_find(sdu, n, 0x1e, &len) && len == 4u ? 1u : 0u;
++                if (cbd_find(sdu, n, 0x25, &len) && len == 17u) c->settings |= 2u;
++            }
++        } else if (id == CBP_STATUS && !error) {
++            c->active = cbp_byte(sdu, n, 1) == 2u;
++            if (!c->active) c->settings = 0;
++        } else return 0;
++        return 1;
++    }
++    if (sdu[0] == 4u && id == CBP_STATUS) {
++        uint32_t len;
++        const uint8_t *v = cbd_find(sdu, n, 1, &len);
++        if (!v || len != 2u) return 0;
++        c->active = v[0] == 2u;
++        if (!c->active) { c->settings = 0; c->handle = 0; }
++        return 1;
++    }
++    return 0;
++}
++/* A disconnect on one address family must not tear down the other family's interface. */
++static inline uint32_t cbp_active_families(const struct cbp_client *clients, uint32_t n, uint32_t mux)
++{
++    uint32_t mask = 0;
++    for (uint32_t i = 0; i < n; i++)
++        if (clients[i].mux == mux && clients[i].active) mask |= cbp_family_bit(clients[i].family);
++    return mask;
++}
++#endif
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_qmux.h b/iokit/Kernel/arm/baseband/coachz_bb_qmux.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_qmux.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_qmux.h	2026-11-26 20:09:30
+@@ -0,0 +1,358 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * The QMUX side of the baseband bridge: iPadOS's ABM speaks QMUX on the qmux1 and qmux2 channels of what it takes for a PCIe
++ * Qualcomm modem; this modem serves QMI over QRTR. Portable and host-tested; no kernel code.
++ *
++ * Framing (the first six bytes of Apple's QMuxHeader, the standard QMUX header): I/F type 1, length (excluding the I/F byte, little
++ * endian), control flags (0x00 from the host, 0x80 from a service), service type, client id, then the QMI SDU. For every service but
++ * CTL the SDU header (flags, 16-bit transaction, message id, length) is exactly QMI's header on QRTR, so a request goes to the modem as
++ * the frame minus six bytes and an answer comes back with the six bytes added (libqmi's QRTR backend does the same).
++ *
++ * CTL (service 0, 8-bit transaction) is answered here, as libqmi's QRTR backend answers it: GetClientId allocates a client id per
++ * channel and service and ties it to one local QRTR port, ReleaseClientId frees it and asks for a QRTR DEL_CLIENT, Sync releases every
++ * client of that channel; GetVersionInfo lists the modem's services. Apple's QMI parser also knows ConfigPowerSaveMode(Ext) and the
++ * RevokeClientId indication; any other CTL request is accepted with a success result and counted, so the kernel can log what ABM asked.
++ *
++ * Apple's private services (AUDIO 0xe1 to SFT 0xea, numbers from libQMIParser's serviceTypeFromString) do not exist on this modem. A
++ * client of one gets an id like any other; its requests come back to the caller as CBQ_PRIVATE so the bridge can implement a message
++ * (cbq_private_answer, cbq_private_indication), and cbq_private_unsupported answers the rest with QMI_ERR_NOT_SUPPORTED.
++ *
++ * The bridge also takes modem clients of its own (channel CBQ_INTERNAL), for what the modem needs and ABM never asks, as the data port
++ * setup of coachz_bb_data.h. Their answers come back from cbq_from_modem with that channel and are not ABM's.
++ */
++#ifndef COACHZ_BB_QMUX_H
++#define COACHZ_BB_QMUX_H
++
++#include <stdint.h>
++
++#define CBQ_IF_TYPE 0x01u
++#define CBQ_HDR 6u                    /* I/F type, length (2), control flags, service type, client id */
++#define CBQ_FLAG_SERVICE 0x80u
++#define CBQ_CTL_HDR 6u                /* flags, transaction (1), message id (2), TLV length (2) */
++#define CBQ_SDU_HDR 7u                /* flags, transaction (2), message id (2), TLV length (2) */
++#define CBQ_CTL_RESPONSE 0x01u
++#define CBQ_CTL_INDICATION 0x02u
++#define CBQ_QMI_REQUEST 0x00u
++#define CBQ_QMI_RESPONSE 0x02u
++#define CBQ_QMI_INDICATION 0x04u
++
++#define CBQ_CTL_GET_VERSION_INFO 0x0021u
++#define CBQ_CTL_GET_CLIENT_ID 0x0022u
++#define CBQ_CTL_RELEASE_CLIENT_ID 0x0023u
++#define CBQ_CTL_REVOKE_CLIENT_ID 0x0024u
++#define CBQ_CTL_SYNC 0x0027u
++
++/* qmi-errors.h */
++#define CBQ_ERR_MALFORMED_MESSAGE 1u
++#define CBQ_ERR_CLIENT_IDS_EXHAUSTED 5u
++#define CBQ_ERR_INVALID_CLIENT_ID 7u
++#define CBQ_ERR_MISSING_ARGUMENT 17u
++#define CBQ_ERR_INVALID_SERVICE_TYPE 31u
++#define CBQ_ERR_NOT_SUPPORTED 94u
++
++#define CBQ_CHANNELS 2u                /* qmux1, qmux2 */
++#define CBQ_INTERNAL CBQ_CHANNELS      /* clients the bridge itself holds */
++#define CBQ_MAX_SERVERS 64u
++#define CBQ_MAX_CLIENTS 64u
++#define CBQ_PORT_BASE 0x4100u          /* local QRTR ports: base + client slot (Wi-Fi and IPA use 0x4000..0x4003) */
++
++static inline int cbq_private_service(uint32_t service) { return service >= 0xe1u && service <= 0xeau; }
++
++struct cbq_server { uint32_t service, version, instance, node, port; uint8_t present; };
++struct cbq_client { uint8_t used, channel, service, cid, private_service, release_pending; };
++struct cbq_bridge {
++    struct cbq_server server[CBQ_MAX_SERVERS];
++    struct cbq_client client[CBQ_MAX_CLIENTS];
++    uint8_t last_cid[CBQ_CHANNELS + 1][256];
++    uint32_t ctl_other, dropped;
++};
++
++enum cbq_kind {
++    CBQ_DROP,       /* nothing to send (malformed, unknown client, indication from the host); counted in dropped */
++    CBQ_TO_HOST,    /* `out` holds `len` bytes: one QMUX frame for `channel` */
++    CBQ_TO_MODEM,   /* send the input frame from offset CBQ_HDR (`len` bytes) from local port `local_port` to node:port */
++    CBQ_PRIVATE,    /* a request to a private service: answer it, or cbq_private_unsupported */
++};
++struct cbq_result { enum cbq_kind kind; uint32_t len, node, port, local_port; uint8_t channel, service, cid; };
++
++static inline void cbq_init(struct cbq_bridge *b) { __builtin_memset(b, 0, sizeof *b); }
++
++static inline uint16_t cbq_rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static inline void cbq_wr16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++
++/* ------------------------------------------------------------------ servers, from QRTR NEW_SERVER / DEL_SERVER */
++/* QRTR packs the version in the low byte and the instance above it. The lowest instance of a service is the one used, as qmicli's
++   QRTR backend takes the first it finds. */
++static inline int cbq_server_new(struct cbq_bridge *b, uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port)
++{
++    struct cbq_server *free_slot = 0;
++    for (unsigned i = 0; i < CBQ_MAX_SERVERS; i++) {
++        struct cbq_server *s = &b->server[i];
++        if (s->present && s->service == service && s->node == node && s->port == port) return 1;
++        if (!s->present && !free_slot) free_slot = s;
++    }
++    if (!free_slot || service > 0xffu) return 0;   /* QMUX has an 8-bit service type */
++    *free_slot = (struct cbq_server){ service, version_instance & 0xffu, version_instance >> 8, node, port, 1 };
++    return 1;
++}
++static inline void cbq_server_del(struct cbq_bridge *b, uint32_t service, uint32_t node, uint32_t port)
++{
++    for (unsigned i = 0; i < CBQ_MAX_SERVERS; i++) {
++        struct cbq_server *s = &b->server[i];
++        if (s->present && s->service == service && s->node == node && s->port == port) s->present = 0;
++    }
++}
++static inline const struct cbq_server *cbq_server_find(const struct cbq_bridge *b, uint32_t service)
++{
++    const struct cbq_server *best = 0;
++    for (unsigned i = 0; i < CBQ_MAX_SERVERS; i++) {
++        const struct cbq_server *s = &b->server[i];
++        if (s->present && s->service == service && (!best || s->instance < best->instance)) best = s;
++    }
++    return best;
++}
++
++/* ------------------------------------------------------------------ clients */
++static inline int cbq_client_find(const struct cbq_bridge *b, uint32_t channel, uint32_t service, uint32_t cid)
++{
++    for (unsigned i = 0; i < CBQ_MAX_CLIENTS; i++) {
++        const struct cbq_client *c = &b->client[i];
++        if (c->used && c->channel == channel && c->service == service && c->cid == cid) return (int)i;
++    }
++    return -1;
++}
++/* client ids 1..254 per channel and service, round robin after the last one given (0 is CTL's, 255 broadcast) */
++static inline int cbq_client_alloc(struct cbq_bridge *b, uint32_t channel, uint32_t service)
++{
++    int slot = -1;
++    for (unsigned i = 0; i < CBQ_MAX_CLIENTS; i++)
++        if (!b->client[i].used && !b->client[i].release_pending) { slot = (int)i; break; }
++    if (slot < 0) return -1;
++    uint32_t cid = b->last_cid[channel][service];
++    for (unsigned tries = 0; tries < 254u; tries++) {
++        cid = cid % 254u + 1u;
++        if (cbq_client_find(b, channel, service, cid) < 0) {
++            b->last_cid[channel][service] = (uint8_t)cid;
++            b->client[slot] = (struct cbq_client){ 1, (uint8_t)channel, (uint8_t)service, (uint8_t)cid, (uint8_t)cbq_private_service(service), 0 };
++            return slot;
++        }
++    }
++    return -1;
++}
++/* A freed modem client keeps its slot (and so its QRTR port) until the caller has sent DEL_CLIENT for it. */
++static inline void cbq_client_free(struct cbq_bridge *b, unsigned slot)
++{
++    struct cbq_client *c = &b->client[slot];
++    c->release_pending = !c->private_service;
++    c->used = 0;
++}
++/* the next port that needs a QRTR DEL_CLIENT, or 0; call until 0 after any CTL answer */
++static inline uint32_t cbq_next_release(struct cbq_bridge *b)
++{
++    for (unsigned i = 0; i < CBQ_MAX_CLIENTS; i++)
++        if (b->client[i].release_pending) { b->client[i].release_pending = 0; return CBQ_PORT_BASE + i; }
++    return 0;
++}
++
++/* ------------------------------------------------------------------ frames */
++static inline uint32_t cbq_frame_header(uint8_t *out, uint32_t sdu_len, uint32_t service, uint32_t cid)
++{
++    out[0] = CBQ_IF_TYPE;
++    cbq_wr16(out + 1, CBQ_HDR - 1u + sdu_len);
++    out[3] = CBQ_FLAG_SERVICE;
++    out[4] = (uint8_t)service;
++    out[5] = (uint8_t)cid;
++    return CBQ_HDR;
++}
++static inline uint32_t cbq_tlv_result(uint8_t *p, uint32_t error)
++{
++    p[0] = 0x02; cbq_wr16(p + 1, 4);
++    cbq_wr16(p + 3, error ? 1u : 0u);
++    cbq_wr16(p + 5, error);
++    return 7;
++}
++
++/* CTL answer: [QMUX][flags 1, txn, id, len][result][optional TLV 0x01 of `n` bytes] */
++static inline uint32_t cbq_ctl_answer(uint8_t *out, uint32_t room, uint32_t txn, uint32_t id, uint32_t error, const uint8_t *tlv1, uint32_t n)
++{
++    const uint32_t tlvs = 7u + (tlv1 ? 3u + n : 0u), total = CBQ_HDR + CBQ_CTL_HDR + tlvs;
++    if (total > room) return 0;
++    cbq_frame_header(out, CBQ_CTL_HDR + tlvs, 0, 0);
++    uint8_t *s = out + CBQ_HDR;
++    s[0] = CBQ_CTL_RESPONSE;
++    s[1] = (uint8_t)txn;
++    cbq_wr16(s + 2, id);
++    cbq_wr16(s + 4, tlvs);
++    uint8_t *t = s + CBQ_CTL_HDR;
++    t += cbq_tlv_result(t, error);
++    if (tlv1) {
++        t[0] = 0x01; cbq_wr16(t + 1, n);
++        for (uint32_t i = 0; i < n; i++) t[3 + i] = tlv1[i];
++    }
++    return total;
++}
++/* the CTL Sync indication a modem sends when its QMUX restarts */
++static inline uint32_t cbq_ctl_sync_indication(uint8_t *out, uint32_t room)
++{
++    if (room < CBQ_HDR + CBQ_CTL_HDR) return 0;
++    cbq_frame_header(out, CBQ_CTL_HDR, 0, 0);
++    uint8_t *s = out + CBQ_HDR;
++    s[0] = CBQ_CTL_INDICATION; s[1] = 0;
++    cbq_wr16(s + 2, CBQ_CTL_SYNC);
++    cbq_wr16(s + 4, 0);
++    return CBQ_HDR + CBQ_CTL_HDR;
++}
++
++/* find TLV `type` in a TLV area; returns its value and length, or 0 */
++static inline const uint8_t *cbq_tlv(const uint8_t *p, uint32_t n, uint32_t type, uint32_t *len)
++{
++    while (n >= 3) {
++        const uint32_t l = cbq_rd16(p + 1);
++        if (3u + l > n) return 0;
++        if (p[0] == type) { *len = l; return p + 3; }
++        p += 3u + l; n -= 3u + l;
++    }
++    return 0;
++}
++
++static inline struct cbq_result cbq_ctl(struct cbq_bridge *b, uint32_t channel, const uint8_t *s, uint32_t n, uint8_t *out, uint32_t room)
++{
++    struct cbq_result r = { CBQ_TO_HOST, 0, 0, 0, 0, (uint8_t)channel, 0, 0 };
++    const uint32_t txn = s[1], id = cbq_rd16(s + 2), tlen = cbq_rd16(s + 4);
++    const uint8_t *tlvs = s + CBQ_CTL_HDR, *v;
++    uint32_t vlen = 0;
++    if (s[0] != 0 || CBQ_CTL_HDR + tlen > n) { b->dropped++; r.kind = CBQ_DROP; return r; }
++    switch (id) {
++    case CBQ_CTL_GET_CLIENT_ID: {
++        v = cbq_tlv(tlvs, tlen, 0x01, &vlen);
++        if (!v || vlen < 1) { r.len = cbq_ctl_answer(out, room, txn, id, CBQ_ERR_MISSING_ARGUMENT, 0, 0); break; }
++        const uint32_t service = v[0];
++        if (!service || (!cbq_private_service(service) && !cbq_server_find(b, service))) {
++            r.len = cbq_ctl_answer(out, room, txn, id, CBQ_ERR_INVALID_SERVICE_TYPE, 0, 0);
++            break;
++        }
++        const int slot = cbq_client_alloc(b, channel, service);
++        if (slot < 0) { r.len = cbq_ctl_answer(out, room, txn, id, CBQ_ERR_CLIENT_IDS_EXHAUSTED, 0, 0); break; }
++        const uint8_t info[2] = { (uint8_t)service, b->client[slot].cid };
++        r.service = (uint8_t)service; r.cid = info[1]; r.local_port = CBQ_PORT_BASE + (uint32_t)slot;
++        r.len = cbq_ctl_answer(out, room, txn, id, 0, info, 2);
++        break;
++    }
++    case CBQ_CTL_RELEASE_CLIENT_ID: {
++        v = cbq_tlv(tlvs, tlen, 0x01, &vlen);
++        if (!v || vlen < 2) { r.len = cbq_ctl_answer(out, room, txn, id, CBQ_ERR_MISSING_ARGUMENT, 0, 0); break; }
++        const int slot = cbq_client_find(b, channel, v[0], v[1]);
++        if (slot < 0) { r.len = cbq_ctl_answer(out, room, txn, id, CBQ_ERR_INVALID_CLIENT_ID, 0, 0); break; }
++        cbq_client_free(b, (unsigned)slot);
++        r.service = v[0]; r.cid = v[1]; r.local_port = CBQ_PORT_BASE + (uint32_t)slot;
++        r.len = cbq_ctl_answer(out, room, txn, id, 0, v, 2);
++        break;
++    }
++    case CBQ_CTL_SYNC:
++        for (unsigned i = 0; i < CBQ_MAX_CLIENTS; i++)
++            if (b->client[i].used && b->client[i].channel == channel) cbq_client_free(b, i);
++        r.len = cbq_ctl_answer(out, room, txn, id, 0, 0, 0);
++        break;
++    case CBQ_CTL_GET_VERSION_INFO: {
++        uint8_t list[1 + 5 * 32];
++        uint32_t count = 0;
++        for (unsigned i = 0; i < CBQ_MAX_SERVERS && count < 32; i++) {
++            const struct cbq_server *s2 = &b->server[i];
++            if (!s2->present || cbq_server_find(b, s2->service) != s2) continue;
++            uint8_t *e = list + 1 + 5 * count++;
++            e[0] = (uint8_t)s2->service; cbq_wr16(e + 1, s2->version); cbq_wr16(e + 3, 0);
++        }
++        list[0] = (uint8_t)count;
++        r.len = cbq_ctl_answer(out, room, txn, id, 0, list, 1 + 5 * count);
++        break;
++    }
++    default:   /* ConfigPowerSaveMode and anything else: accepted, nothing here sleeps */
++        b->ctl_other++;
++        r.len = cbq_ctl_answer(out, room, txn, id, 0, 0, 0);
++        break;
++    }
++    if (!r.len) { b->dropped++; r.kind = CBQ_DROP; }
++    return r;
++}
++
++/* One write from ABM on a QMUX channel (one frame per write, as MHI delivers one transfer). */
++static inline struct cbq_result cbq_from_host(struct cbq_bridge *b, uint32_t channel, const uint8_t *f, uint32_t n, uint8_t *out, uint32_t room)
++{
++    struct cbq_result r = { CBQ_DROP, 0, 0, 0, 0, (uint8_t)channel, 0, 0 };
++    if (channel >= CBQ_CHANNELS || n < CBQ_HDR + CBQ_CTL_HDR || f[0] != CBQ_IF_TYPE || cbq_rd16(f + 1) + 1u != n || f[3] != 0) {
++        b->dropped++;
++        return r;
++    }
++    const uint32_t service = f[4], cid = f[5];
++    if (!service) return cbq_ctl(b, channel, f + CBQ_HDR, n - CBQ_HDR, out, room);
++    const int slot = cbq_client_find(b, channel, service, cid);
++    const uint8_t *s = f + CBQ_HDR;
++    if (slot < 0 || n < CBQ_HDR + CBQ_SDU_HDR || CBQ_SDU_HDR + cbq_rd16(s + 5) > n - CBQ_HDR || s[0] != CBQ_QMI_REQUEST) {
++        b->dropped++;
++        return r;
++    }
++    r.service = (uint8_t)service; r.cid = (uint8_t)cid; r.local_port = CBQ_PORT_BASE + (uint32_t)slot;
++    r.len = n - CBQ_HDR;
++    if (b->client[slot].private_service) { r.kind = CBQ_PRIVATE; return r; }
++    const struct cbq_server *srv = cbq_server_find(b, service);
++    if (!srv) { b->dropped++; return r; }
++    r.kind = CBQ_TO_MODEM;
++    r.node = srv->node;
++    r.port = srv->port;
++    return r;
++}
++
++/* A QMI message from the modem to one of the bridge's client ports: the QMUX frame for ABM. */
++static inline struct cbq_result cbq_from_modem(struct cbq_bridge *b, uint32_t local_port, uint32_t node, const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
++{
++    struct cbq_result r = { CBQ_DROP, 0, node, 0, local_port, 0, 0, 0 };
++    const uint32_t slot = local_port - CBQ_PORT_BASE;
++    if (local_port < CBQ_PORT_BASE || slot >= CBQ_MAX_CLIENTS || !b->client[slot].used || b->client[slot].private_service ||
++        n < CBQ_SDU_HDR || CBQ_SDU_HDR + cbq_rd16(sdu + 5) > n || CBQ_HDR + n > room) {
++        b->dropped++;
++        return r;
++    }
++    const struct cbq_client *c = &b->client[slot];
++    const struct cbq_server *srv = cbq_server_find(b, c->service);
++    if (!srv || srv->node != node) { b->dropped++; return r; }
++    cbq_frame_header(out, n, c->service, c->cid);
++    for (uint32_t i = 0; i < n; i++) out[CBQ_HDR + i] = sdu[i];
++    r.kind = CBQ_TO_HOST; r.len = CBQ_HDR + n; r.channel = c->channel; r.service = c->service; r.cid = c->cid;
++    return r;
++}
++
++/* A private-service message from the bridge: `type` CBQ_QMI_RESPONSE (result `error`, then `tlvs`) or CBQ_QMI_INDICATION (`tlvs` only,
++   transaction 0). */
++static inline uint32_t cbq_private_message(uint32_t type, uint32_t txn, uint32_t message, uint32_t service, uint32_t cid, uint32_t error,
++                                           const uint8_t *tlvs, uint32_t tlv_len, uint8_t *out, uint32_t room)
++{
++    const uint32_t body = (type == CBQ_QMI_RESPONSE ? 7u : 0u) + tlv_len, total = CBQ_HDR + CBQ_SDU_HDR + body;
++    if (room < total || body > 0xffffu - CBQ_HDR - CBQ_SDU_HDR) return 0;
++    cbq_frame_header(out, CBQ_SDU_HDR + body, service, cid);
++    uint8_t *s = out + CBQ_HDR, *t = s + CBQ_SDU_HDR;
++    s[0] = (uint8_t)type;
++    cbq_wr16(s + 1, txn);
++    cbq_wr16(s + 3, message);
++    cbq_wr16(s + 5, body);
++    if (type == CBQ_QMI_RESPONSE) t += cbq_tlv_result(t, error);
++    for (uint32_t i = 0; i < tlv_len; i++) t[i] = tlvs[i];
++    return total;
++}
++/* The answer to a private-service request: same message id and transaction. */
++static inline uint32_t cbq_private_answer(const uint8_t *request_sdu, uint32_t service, uint32_t cid, uint32_t error, const uint8_t *tlvs,
++                                          uint32_t tlv_len, uint8_t *out, uint32_t room)
++{
++    return cbq_private_message(CBQ_QMI_RESPONSE, cbq_rd16(request_sdu + 1), cbq_rd16(request_sdu + 3), service, cid, error, tlvs, tlv_len, out, room);
++}
++static inline uint32_t cbq_private_indication(uint32_t message, uint32_t service, uint32_t cid, const uint8_t *tlvs, uint32_t tlv_len,
++                                              uint8_t *out, uint32_t room)
++{
++    return cbq_private_message(CBQ_QMI_INDICATION, 0, message, service, cid, 0, tlvs, tlv_len, out, room);
++}
++/* The answer to a private-service request nobody implements: QMI_ERR_NOT_SUPPORTED. */
++static inline uint32_t cbq_private_unsupported(const uint8_t *request_sdu, uint32_t service, uint32_t cid, uint8_t *out, uint32_t room)
++{
++    return cbq_private_answer(request_sdu, service, cid, CBQ_ERR_NOT_SUPPORTED, 0, 0, out, room);
++}
++
++#endif /* COACHZ_BB_QMUX_H */
+diff -urN a/iokit/Kernel/arm/baseband/coachz_bb_sahara.h b/iokit/Kernel/arm/baseband/coachz_bb_sahara.h
+--- a/iokit/Kernel/arm/baseband/coachz_bb_sahara.h	1970-01-01 10:00:00
++++ b/iokit/Kernel/arm/baseband/coachz_bb_sahara.h	2026-11-26 20:09:30
+@@ -0,0 +1,277 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * The device end of SAHARA on the bridge's sahara channel. BBUpdater (BBUEUR10Programmer for Mav16) is the host and is passive: it
++ * waits for the device's HELLO, answers it, then sends whatever the device asks for with READ_DATA, and after END_IMAGE_TX sends DONE.
++ * The real modem here already runs (started by MBA/PIL), so this end asks for each listed image the way a Qualcomm boot loader does
++ * (ELF header, program headers, then every segment with file data), throws the bytes away, and reports the image transferred. The
++ * DONE answer says "complete" after the last listed image. Portable and host-tested; no kernel code.
++ *
++ * Packets (libETLSAH, little-endian 32-bit words): HELLO 1, HELLO_RESP 2, READ_DATA 3, END_IMAGE_TX 4, DONE 5, DONE_RESP 6, RESET 7,
++ * RESET_RESP 8, COMMAND_READY 0xb, SWITCH_MODE 0xc, EXECUTE 0xd, EXECUTE_RESP 0xe, EXECUTE_DATA 0xf. Modes: 0 image pending, 1 complete, 2 memory
++ * debug, 3 command, 0x100 Apple's Maverick (manifest and nonce). BBUEUR10Loader first answers HELLO with mode 3 and queries the chip in command mode
++ * (execute 2 the MSM hardware id, whose word at offset 4 is the chip id, execute 1 the serial number), then switches to mode 0, which brings a new
++ * HELLO and image transfer. Which image ids a normal Mav16 boot must ask for is not known yet: BBUpdater logs every request ("request image ID")
++ * and refuses ids it has no item for ("item not found in item list").
++ */
++#ifndef COACHZ_BB_SAHARA_H
++#define COACHZ_BB_SAHARA_H
++
++#include <stdint.h>
++
++#define CBS_HELLO 1u
++#define CBS_HELLO_RESP 2u
++#define CBS_READ_DATA 3u
++#define CBS_END_IMAGE_TX 4u
++#define CBS_DONE 5u
++#define CBS_DONE_RESP 6u
++#define CBS_RESET 7u
++#define CBS_RESET_RESP 8u
++#define CBS_COMMAND_READY 0xbu
++#define CBS_SWITCH_MODE 0xcu
++#define CBS_EXECUTE 0xdu
++#define CBS_EXECUTE_RESP 0xeu
++#define CBS_EXECUTE_DATA 0xfu
++#define CBS_MODE_IMAGE_PENDING 0u
++#define CBS_MODE_COMPLETE 1u
++#define CBS_MODE_COMMAND 3u
++#define CBS_EXEC_SERIAL 1u
++#define CBS_EXEC_HW_ID 2u
++#define CBS_CHIP_ID 0x009540e1u          /* com.apple.EmbeddedSoftwareRestore.Baseband.ChipId of the Mav16 Info.plist */
++#define CBS_SERIAL 0x0c0ac42bu           /* no real serial number leaves this machine */
++#define CBS_VERSION 2u
++#define CBS_VERSION_COMPATIBLE 1u
++#define CBS_MAX_COMMAND 0x400u
++#define CBS_ELF_PROBE 64u               /* covers the ELF32 (52) and ELF64 (64) headers */
++#define CBS_MAX_PHDRS 64u
++#define CBS_MAX_IMAGES 32u
++#define CBS_PACKET_MAX 48u
++
++enum cbs_state {
++    CBS_IDLE, CBS_WAIT_HELLO_RESP, CBS_WAIT_ELF, CBS_WAIT_PHDRS, CBS_WAIT_SEGMENT, CBS_WAIT_DONE, CBS_FINISHED, CBS_FAILED, CBS_COMMAND,
++};
++
++struct cbs_out { uint32_t count, len[2]; uint8_t data[2][CBS_PACKET_MAX]; };
++
++struct cbs_device {
++    enum cbs_state state;
++    uint32_t images[CBS_MAX_IMAGES], image_count, image_index;
++    uint32_t chunk;                           /* largest READ_DATA length */
++    uint32_t host_mode, host_status, last_command, last_execute, executes;
++    /* the image being read */
++    uint32_t elf64, phoff, phnum, phentsize;
++    uint32_t seg_offset[CBS_MAX_PHDRS], seg_size[CBS_MAX_PHDRS], segments, segment;
++    uint32_t read_offset, read_remaining;     /* the current segment's next request */
++    uint32_t expect, have;                    /* raw bytes the current READ_DATA still owes */
++    uint8_t keep[CBS_MAX_PHDRS * 56u];        /* ELF header, then the program headers; segment data is dropped */
++    uint64_t bytes;                           /* everything received as image data, for the log */
++    uint32_t requests;
++};
++
++static inline void cbs_put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
++static inline uint32_t cbs_get32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static inline uint64_t cbs_get64(const uint8_t *p) { return cbs_get32(p) | (uint64_t)cbs_get32(p + 4) << 32; }
++
++static inline uint8_t *cbs_packet(struct cbs_out *o, uint32_t command, uint32_t length)
++{
++    uint8_t *p = o->data[o->count];
++    __builtin_memset(p, 0, CBS_PACKET_MAX);
++    cbs_put32(p, command);
++    cbs_put32(p + 4, length);
++    o->len[o->count++] = length;
++    return p;
++}
++
++static inline void cbs_hello(struct cbs_out *o, uint32_t mode)
++{
++    uint8_t *p = cbs_packet(o, CBS_HELLO, 0x30);
++    cbs_put32(p + 8, CBS_VERSION);
++    cbs_put32(p + 12, CBS_VERSION_COMPATIBLE);
++    cbs_put32(p + 16, CBS_MAX_COMMAND);
++    cbs_put32(p + 20, mode);
++}
++
++/* AppleBasebandPCIInterface method 5, the BHI registers BBUEUR13Loader reads (PCITransportRegister, libPCITransport): 0 the serial number, 3 the MSM
++ * hardware id with the chip id at offset 4, 4 the PK hash. Any other hash means fused, and BBUpdater then refuses to load images without a personalized
++ * manifest (kBBUReturnUnPersonalizedImageError), so this answers the loader's default (BBULoader::create), which reads as unfused. Nothing here checks
++ * an image: this modem runs its own firmware. Other registers read as zero. `out` holds `size` bytes. */
++static const uint8_t cbs_default_pk_hash[32] = { 0xcc, 0x31, 0x53, 0xa8, 0x02, 0x93, 0x93, 0x9b, 0x90, 0xd0, 0x2d, 0x3b, 0xf8, 0xb2, 0x3e, 0x02, 0x92, 0xe4, 0x52, 0xfe, 0xf6, 0x62, 0xc7, 0x49, 0x98, 0x42, 0x1a, 0xda, 0xd4, 0x2a, 0x38, 0x0f };
++
++static inline void cbs_read_register(uint32_t reg, uint8_t *out, uint32_t size)
++{
++    __builtin_memset(out, 0, size);
++    if (reg == 0u && size >= 4u) cbs_put32(out, CBS_SERIAL);
++    else if (reg == 3u && size >= 8u) cbs_put32(out + 4, CBS_CHIP_ID);
++    else if (reg == 4u) __builtin_memcpy(out, cbs_default_pk_hash, size < sizeof cbs_default_pk_hash ? size : sizeof cbs_default_pk_hash);
++}
++
++/* What an execute answers with; unknown commands answer empty. */
++static inline uint32_t cbs_execute_length(uint32_t command)
++{
++    return command == CBS_EXEC_HW_ID ? 8u : command == CBS_EXEC_SERIAL ? 4u : 0u;
++}
++
++static inline void cbs_read(struct cbs_device *d, struct cbs_out *o, uint32_t offset, uint32_t length)
++{
++    uint8_t *p = cbs_packet(o, CBS_READ_DATA, 0x14);
++    cbs_put32(p + 8, d->images[d->image_index]);
++    cbs_put32(p + 12, offset);
++    cbs_put32(p + 16, length);
++    d->expect = length;
++    d->have = 0;
++    d->requests++;
++}
++
++static inline void cbs_init(struct cbs_device *d, const uint32_t *images, uint32_t count, uint32_t chunk)
++{
++    __builtin_memset(d, 0, sizeof *d);
++    if (count > CBS_MAX_IMAGES) count = CBS_MAX_IMAGES;
++    for (uint32_t i = 0; i < count; i++) d->images[i] = images[i];
++    d->image_count = count;
++    d->chunk = chunk ? chunk : 0x10000u;
++}
++
++/* The channel was opened: the device speaks first. */
++static inline void cbs_start(struct cbs_device *d, struct cbs_out *o)
++{
++    o->count = 0;
++    d->image_index = 0;
++    d->state = d->image_count ? CBS_WAIT_HELLO_RESP : CBS_FAILED;
++    if (d->image_count) cbs_hello(o, CBS_MODE_IMAGE_PENDING);
++}
++
++/* Ask for the next piece of the current segment, or move to the next segment, or end the image. */
++static inline void cbs_next_request(struct cbs_device *d, struct cbs_out *o)
++{
++    while (!d->read_remaining && d->segment < d->segments) {
++        d->read_offset = d->seg_offset[d->segment];
++        d->read_remaining = d->seg_size[d->segment];
++        d->segment++;
++    }
++    if (d->read_remaining) {
++        const uint32_t n = d->read_remaining < d->chunk ? d->read_remaining : d->chunk;
++        cbs_read(d, o, d->read_offset, n);
++        d->read_offset += n;
++        d->read_remaining -= n;
++        d->state = CBS_WAIT_SEGMENT;
++        return;
++    }
++    uint8_t *p = cbs_packet(o, CBS_END_IMAGE_TX, 0x10);
++    cbs_put32(p + 8, d->images[d->image_index]);
++    cbs_put32(p + 12, 0);
++    d->state = CBS_WAIT_DONE;
++}
++
++/* ELF header: where the program headers are. A non-ELF image ends after the probe. */
++static inline void cbs_parse_elf(struct cbs_device *d, struct cbs_out *o)
++{
++    const uint8_t *h = d->keep;
++    d->segments = d->segment = d->read_remaining = 0;
++    if (h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F' || (h[4] != 1 && h[4] != 2)) { cbs_next_request(d, o); return; }
++    d->elf64 = h[4] == 2;
++    d->phoff = d->elf64 ? (uint32_t)cbs_get64(h + 0x20) : cbs_get32(h + 0x1c);
++    d->phentsize = d->elf64 ? (uint32_t)(h[0x36] | h[0x37] << 8) : (uint32_t)(h[0x2a] | h[0x2b] << 8);
++    d->phnum = d->elf64 ? (uint32_t)(h[0x38] | h[0x39] << 8) : (uint32_t)(h[0x2c] | h[0x2d] << 8);
++    if (!d->phnum || d->phnum > CBS_MAX_PHDRS || d->phentsize != (d->elf64 ? 56u : 32u)) { cbs_next_request(d, o); return; }
++    cbs_read(d, o, d->phoff, d->phnum * d->phentsize);
++    d->state = CBS_WAIT_PHDRS;
++}
++
++/* Program headers: every one with file data is read, in order (a boot loader also reads the hash segment, a PT_NULL with data). */
++static inline void cbs_parse_phdrs(struct cbs_device *d, struct cbs_out *o)
++{
++    for (uint32_t i = 0; i < d->phnum; i++) {
++        const uint8_t *e = d->keep + i * d->phentsize;
++        const uint32_t offset = d->elf64 ? (uint32_t)cbs_get64(e + 8) : cbs_get32(e + 4);
++        const uint32_t size = d->elf64 ? (uint32_t)cbs_get64(e + 32) : cbs_get32(e + 16);
++        if (!size) continue;
++        d->seg_offset[d->segments] = offset;
++        d->seg_size[d->segments++] = size;
++    }
++    cbs_next_request(d, o);
++}
++
++/* Bytes from the host. Returns how many were used; packets to send go to `o` (at most two). */
++static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint32_t n, struct cbs_out *o)
++{
++    o->count = 0;
++    if (d->state == CBS_WAIT_ELF || d->state == CBS_WAIT_PHDRS || d->state == CBS_WAIT_SEGMENT) {
++        const uint32_t take = n < d->expect - d->have ? n : d->expect - d->have;
++        if (d->state != CBS_WAIT_SEGMENT && d->have + take <= sizeof d->keep) __builtin_memcpy(d->keep + d->have, in, take);
++        d->have += take;
++        d->bytes += take;
++        if (d->have == d->expect) {
++            if (d->state == CBS_WAIT_ELF) cbs_parse_elf(d, o);
++            else if (d->state == CBS_WAIT_PHDRS) cbs_parse_phdrs(d, o);
++            else cbs_next_request(d, o);
++        }
++        return take;
++    }
++    if (n < 8) { d->state = CBS_FAILED; return n; }
++    const uint32_t command = cbs_get32(in), length = cbs_get32(in + 4);
++    d->last_command = command;
++    if (length < 8 || length > n) { d->state = CBS_FAILED; return n; }
++    if (command == CBS_RESET) {
++        cbs_packet(o, CBS_RESET_RESP, 8);
++        d->state = CBS_IDLE;
++        return length;
++    }
++    if (d->state == CBS_WAIT_HELLO_RESP && command == CBS_HELLO_RESP && length >= 0x18) {
++        d->host_status = cbs_get32(in + 16);
++        d->host_mode = cbs_get32(in + 20);
++        if (d->host_status) { d->state = CBS_FAILED; return length; }
++        if (d->host_mode == CBS_MODE_COMMAND) {
++            cbs_packet(o, CBS_COMMAND_READY, 8);
++            d->state = CBS_COMMAND;
++            return length;
++        }
++        if (d->host_mode != CBS_MODE_IMAGE_PENDING && d->host_mode != CBS_MODE_COMPLETE) { d->state = CBS_FAILED; return length; }
++        cbs_read(d, o, 0, CBS_ELF_PROBE);
++        d->state = CBS_WAIT_ELF;
++        return length;
++    }
++    if (d->state == CBS_COMMAND && length >= 0xc) {
++        const uint32_t argument = cbs_get32(in + 8);
++        if (command == CBS_EXECUTE) {
++            uint8_t *p = cbs_packet(o, CBS_EXECUTE_RESP, 0x10);
++            cbs_put32(p + 8, argument);
++            cbs_put32(p + 12, cbs_execute_length(argument));
++            d->last_execute = argument;
++            d->executes++;
++            return length;
++        }
++        if (command == CBS_EXECUTE_DATA) {
++            /* Raw data, no packet header: the host asked for exactly this many bytes. */
++            const uint32_t data = cbs_execute_length(argument);
++            if (data) {
++                uint8_t *p = o->data[o->count];
++                __builtin_memset(p, 0, CBS_PACKET_MAX);
++                if (argument == CBS_EXEC_HW_ID) cbs_put32(p + 4, CBS_CHIP_ID);
++                else cbs_put32(p, CBS_SERIAL);
++                o->len[o->count++] = data;
++            }
++            return length;
++        }
++        if (command == CBS_SWITCH_MODE) {
++            cbs_hello(o, argument);
++            d->state = CBS_WAIT_HELLO_RESP;
++            return length;
++        }
++    }
++    if (d->state == CBS_WAIT_DONE && command == CBS_DONE) {
++        const int last = d->image_index + 1u >= d->image_count;
++        uint8_t *p = cbs_packet(o, CBS_DONE_RESP, 0x0c);
++        cbs_put32(p + 8, last ? 1u : 0u);
++        if (last) {
++            d->state = CBS_FINISHED;
++        } else {
++            d->image_index++;
++            cbs_hello(o, CBS_MODE_IMAGE_PENDING);
++            d->state = CBS_WAIT_HELLO_RESP;
++        }
++        return length;
++    }
++    d->state = CBS_FAILED;
++    return length;
++}
++
++#endif /* COACHZ_BB_SAHARA_H */
+diff -urN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-26 20:09:30
++++ b/iokit/conf/files.arm64	2026-11-26 20:09:52
+@@ -28,6 +28,7 @@
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/BlueFakeMotion.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/BlueThermal.cpp                             optional iokitcpp
++iokit/Kernel/arm/baseband/coachz_baseband.cpp                    optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp

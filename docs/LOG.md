@@ -1379,6 +1379,27 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**Cellular control plane, prepared (2026-11-26, not yet booted).**
+- Reference: UniXNU/QcomBaseband (BSD-2, dd0199cf3300; SC7180, iPadOS 17): AppleBaseband,
+  AppleBasebandPCIControl, the PCIe channel interfaces, PDP manager and AppleIPAppender, bridging ABM's QMUX
+  to QMI over QRTR.
+- ABI check against iOS 16.7.16 (dyld cache, `ipsw dyld disass`): libIOABP's channel selectors (0 open,
+  1 close, 2 write, 3 read, 4 sendImage, 5 readRegister, 6 abort, 7 start, 8 timeSync, 9/10 map/unmap, 11/12
+  time events; read/write/sendImage pass 2 scalars) and libTelephonyBasebandDynamic's AppleBaseband
+  selectors (0 reset, 1 power, 2 mux, 3 get reset, 8 VBUS, 11 PMU ext-on, 16-20, 22-23, 25-29, 32, 34, 35,
+  42) are the reference's numbers. Not in its table: 10 (VoteDeviceWake), 30, 31, 33 (answered unsupported).
+- 0238 (`bluecell=1`): the bridge in iokit/Kernel/arm/baseband, our QRTR (0165) as its board side: servers
+  and client-port (0x4100+) data from blueline_wifi.c, sends and polling on the modem watcher. No data path
+  (SDM845 IPA v3.5.1, the reference's is v4.2). MiniIPAppender (0199) publishes the bridge's AppleIPAppender,
+  which refuses every method without `bluecell` as before. Builds.
+- `mkadt --baseband` (phonetest adds it with `bluecell=1`): D22AP's `/baseband` plain properties, so
+  launchd loads the cellular CommCenter job (`_LimitLoadToDeviceTree baseband`) instead of the
+  no-baseband one. `launchd-build.py OUT com.apple.CommCenter` keeps it.
+- Apple firmware for ABM/BBUpdater: Mav17-9.00.02 from the iPhone X 16.7.16 IPSW (`ipsw extract --remote`),
+  unpacked to work/bbfw/Mav17 (not in git). D22AP is the Qualcomm iPhone X (`baseband-chipset mav17`).
+- First boot: `bluewifi=4 bluewifi_watch=0 bluecell=1`, the cellular launchd.plist, Mav17 files pushed
+  to /usr/local/standalone/firmware/Baseband/Mav17; read ABM's "FW path" and the bridge's 30 s reports.
+
 **5 GHz (2026-11-26).** Ruled out:
 - A second 3.3 V rail: Google's own device tree (read in LineageOS recovery, `/proc/device-tree/soc/qcom,icnss@18800000`)
   gives the WCN3990 only `vdd-3.3-ch0` (L25, 3.104-3.312 V). L23 has no consumer there, so the L23A test was dropped.

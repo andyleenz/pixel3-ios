@@ -257,6 +257,19 @@ def d22ap_product(im4p):
     sys.exit('%s: no /product node' % im4p)
 
 
+def d22ap_baseband(im4p):
+    """/baseband of the real D22AP tree (--baseband): its plain properties only. The function-*, interrupt and
+    backpowering ones point at Apple GPIO/PMU nodes this tree does not have; nothing here drives them (the
+    cellular bridge, kernel 0238 bluecell=1, answers ABM's power and reset calls itself). The node's presence
+    is what launchd's _LimitLoadToDeviceTree "baseband" looks for (the cellular CommCenter job)."""
+    root, _ = parse(load(im4p))
+    for c in root.children:
+        if c.name == 'baseband':
+            return [(k, v) for k, v, ph in c.props if not ph and k not in ('name', 'AAPL,phandle', 'interrupt-parent',
+                    'interrupts') and not k.startswith(('function-', 'backpowering-'))]
+    sys.exit('%s: no /baseband node' % im4p)
+
+
 def haptic_firmware(d):
     """cs40l20.wmfw + cs40l20.bin from DIR, checked for their magic."""
     wmfw = open(os.path.join(d, 'cs40l20.wmfw'), 'rb').read()
@@ -288,7 +301,7 @@ def wlan_firmware(d):
 
 
 def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sqe_fw=None, zap_fw=None,
-          haptic_fw=None, wlan_fw=None, adsp_fw=None):
+          haptic_fw=None, wlan_fw=None, adsp_fw=None, baseband=False):
     hw = QEMU if qemu else PHONE
     phandles = iter(range(1, 1 << 16))
 
@@ -422,6 +435,11 @@ def build(qemu=False, cpus=1, seed=None, ufs=False, iphone=None, gpu_fw=None, sq
         # blurs (App Library, Control Center) came out black.
         product.set('artwork-display-gamut', b'sRGB\0')
         extra.append(product)
+        if baseband:
+            bb = node('baseband')
+            for k, v in d22ap_baseband(iphone):
+                bb.set(k, v)
+            extra.append(bb)
 
     storage = []
     if ufs:
@@ -478,11 +496,15 @@ if __name__ == '__main__':
                     help="the display iOS draws (disp0 canvas): 1125x2250 = the X's width at 2:1 (default, as "
                          "the kernel since 0184), 1125x2436 = iPhone X (with bluefb_canvas_h=2436), "
                          "1080x2160 = the Pixel's own panel (with sweetfb_native=1)")
+    ap.add_argument('--baseband', action='store_true',
+                    help='with --iphone: add /baseband from that tree (the cellular CommCenter job; kernel bluecell=1)')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     CANVAS = tuple(int(v) for v in a.canvas.lower().split('x'))
     if not 1 <= a.cpus <= 8 or (a.qemu and a.cpus != 1):
         sys.exit('--cpus: 1..8 on the phone, 1 in QEMU')
+    if a.baseband and not a.iphone:
+        sys.exit('--baseband: needs --iphone')
     if a.qemu and a.ufs:
         sys.exit('--ufs: QEMU virt has no UFS host')
     if a.qemu and a.gpu_fw:
@@ -494,7 +516,7 @@ if __name__ == '__main__':
     wlan_fw = wlan_firmware(a.wlan_fw) if a.wlan_fw else None
     adsp_fw = adsp_firmware(a.adsp_fw) if a.adsp_fw else None
     root = build(a.qemu, a.cpus, ufs=a.ufs, iphone=a.iphone, gpu_fw=gpu_fw, sqe_fw=sqe_fw, zap_fw=zap_fw,
-                 haptic_fw=haptic_fw, wlan_fw=wlan_fw, adsp_fw=adsp_fw)
+                 haptic_fw=haptic_fw, wlan_fw=wlan_fw, adsp_fw=adsp_fw, baseband=a.baseband)
     blob = serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
