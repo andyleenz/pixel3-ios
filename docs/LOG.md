@@ -1272,10 +1272,23 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
 - `BWFigCaptureDevice` (`_copyProperty:requireSupported:error:`) asks the device only for keys present in its
   `SupportedPropertiesDictionary`; an error for that dictionary drops the device. For discovery bluecam answers a
   dictionary that claims every key, so each key CMCapture wants is logged.
-- `tools/camera/bluecam`: stage 1 of the plug-in (`H13ISP.mediacapture`, device object only, logs every call).
+- cam23-25: with every key claimed, CMCapture reads the device's `StreamArray` and
+  `SupportedSynchronizedStreamsGroups`, sets `ClientIsActive`, calls RequestStreams with 1 stream, and asks the
+  stream for `PortType`, `SupportedFormatsArray`, FocalLength, LensFNumber, ModuleInfo and others. bluecam now makes
+  one stream (`CMDerivedObjectCreate` with `FigCaptureStreamGetClassID()`, the H10 stream vtable layout: base v1,
+  storage 0xc08; class v2) whose port type is `kFigCapturePortType_BackFacingCamera`.
+- cam26: AVFoundation lists the camera: `1 devices [Back Camera pos 1, 0 formats]`. The stream's
+  `SupportedFormatsArray` is built from the back camera's `MultiStream/FigCaptureStreamFormats` in
+  `AVCaptureSession.plist` (10 named formats), with the keys `csu_resolveFormatIndexForNamedStreamFormat` matches on
+  (`kFigCaptureStreamVideoFormatKey_SensorWidth/Height`, FES output size, `kFigSupportedFormat_VideoIsBinned`,
+  `VideoMaxFrameRate`) plus a 420f `FormatDescription`. `deviceInputWithDevice:` fails with "Cannot use Back Camera"
+  (not authorised: TCC still answers denied), and the device shows 0 formats.
+- mediaserverd still aborts after each device set-up: `-[__NSPlaceholderArray initWithObjects:count:]` nil insert in
+  PortraitFilters (`processSkinIn:withFaceMask:` path), right after the frontend logs `missing NBFunction returnType`
+  and `arguments` (it answers nil). 6 restarts in a 110 s boot.
+- `tools/camera/bluecam`: the plug-in (`H13ISP.mediacapture`), stage 2: device, one stream, formats; logs every call.
 
-Next: confirm whether mediaserverd loads the plug-in at all; then fill in the properties CMCapture asks for
-until AVFoundation lists the two cameras; then the kernel frame ring.
+Next: why tccd denies (its os_log); the frontend's function reflection; then the kernel frame ring and Start.
 
 **Video encode (VTHello, `tools/apps/vthello`).** 60 synthetic 1280x720 NV12 frames: an H.264
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;

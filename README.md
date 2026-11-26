@@ -78,7 +78,7 @@ partition.
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog |
 | Wi-Fi | **Works in iOS on 2.4 GHz.** The WCN3990's firmware runs in the modem's WLAN domain (copy engines, HTC/WMI/HTT). Settings lists the networks nearby; joining a WPA2 network with the password typed on the phone associates, does the 4-way handshake in the kernel, gets a DHCP address, and Safari loads pages. `en0` and Apple80211 (ported from ios-topaz/HackiOS) serve Apple's own wifid and configd. 5 GHz scans don't start yet |
 | Audio | **iOS plays through the speaker** (startup sound, ringtone previews). HackiOS's RedwoodAudio HAL plug-in writes to `/dev/redwood-audio`; the kernel feeds the ADSP (ASM → ADM → AFE quaternary TDM) and the two CS35L36 amps, with iOS's volume as a gain. On by default (`bluesnd=0` turns it off). No microphone or headset yet |
-| Camera | **Both cameras take a picture in the kernel** (test boots only, `bluecam=1` rear / `2` front, `bluecam_stream=3`): the sensor streams RAW10 over 4-lane CSI-2 (front IMX355 820x616 on CSIPHY2, rear IMX363 2x2-binned 2016x1512 on CSIPHY0), the CSID and IFE-lite write a frame to memory, and the kernel saves it as a colour snap. No rear focus yet; not available to iOS |
+| Camera | **Both cameras take a picture in the kernel** (test boots only, `bluecam=1` rear / `2` front, `bluecam_stream=3`): the sensor streams RAW10 over 4-lane CSI-2 (front IMX355 820x616 on CSIPHY2, rear IMX363 2x2-binned 2016x1512 on CSIPHY0), the CSID and IFE-lite write a frame to memory, and the kernel saves it as a colour snap. No rear focus yet. In iOS, mediaserverd loads our capture plug-in (`tools/camera/bluecam`) and AVFoundation lists "Back Camera"; no frames to apps yet (TCC denies access, Start not done) |
 | Other | Haptics, modem boot (no cellular data yet) |
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
 | Logs | The kernel console in a ring on `userdata`, read from LineageOS recovery, or live over USB |
@@ -113,8 +113,11 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   the same rig: 176 mA. Next: a flashed standalone boot (slot A) and a soak test. Later: a suspend
   path (all subsystems voting down, USB off the bus). Still: CommCenter restarting every ~17 s.
 
-**Parked: camera**
-- Rear focus (LC898219XI), continuous frames, then a path into iOS.
+**In progress: camera into iOS**
+- Done: capture servers on, the plug-in loads in mediaserverd, Core Image's Metal kernels compile (am-0006),
+  AVFoundation lists the back camera with CMCapture's named formats.
+- Next: TCC access for apps, the PortraitFilters abort in mediaserverd, then stream Start with frames from the
+  kernel's CSI-2 path (continuous frames, rear focus LC898219XI later).
 
 **Next, in order**
 1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery
