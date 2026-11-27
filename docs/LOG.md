@@ -1379,7 +1379,7 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
-**Passcode (0246, `bluepasscode=1`; builds, not yet booted, 2026-11-27).**
+**Passcode (0246, `bluepasscode=1`; set, lock, unlock work, passcode7, 2026-11-27).**
 - libaks selectors (MobileKeyBag disassembly, iOS 16.7): change secret 15 (prederived 32), unlock device 9,
   unlock bag 12, lock bag 13, lock state 7, get system 14, device state 17/35, verify password 42, bag UUID
   23. Passcodes are passed as user pointer + length scalars (unlock: [handle, pass, len]; change:
@@ -1413,6 +1413,16 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   notification"; VoiceTrigger "Locked with passcode: Locked" after display off. Swipe up on the lock screen:
   `unlockUIFromSource:CoverSheet`, "[UIUnlock] Returning YES", then "Dismiss Addendum gesture: Cancelled"
   and the cover sheet animates back; no keypad, no unlock call (9) reaches the kernel. Home does nothing.
+- Cause: `-[SBLockScreenManager unlockUIFromSource:withOptions:]` calls `_setPasscodeVisible:animated:` only
+  when `SBFUserAuthenticationController hasPasscodeSet`, which is `SBFMobileKeyBag`'s cached
+  (lock state != 3). It is refreshed only by `MKBEventsRegister`'s callback: an IOGeneralInterest
+  notification on AppleKeyStore, where `aksNotificationCB` maps message 0xe3ffd00d to "keybag status changed"
+  and 0xe3ffd00f to "first unlock". The stand-in never sent one, so SpringBoard kept the boot-time "no
+  passcode" and returned silently.
+- 0246 posts `messageClients(0xe3ffd00d)` (thread call) after a passcode change, a lock (display off, sel 8/13)
+  and an unlock attempt. passcode7: Settings sets 1234, display off locks, swipe up shows "Enter Passcode"
+  with the keypad, 1111 is rejected ("wrong, 1 failed"), 1234 unlocks to the app that was open (Settings).
+  The passcode lives in kernel memory: a reboot clears it.
 - `tools/bluerun/openurl.m`: opens a URL (Settings pane: `prefs:root=PASSCODE`) through LSApplicationWorkspace.
 
 **Thermals on by default (0245; therm9-10, 2026-11-27).**

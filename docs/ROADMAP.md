@@ -19,6 +19,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 | GPS | after QMI | modem GNSS over QMI LOC | 2-4 days |
 | Suspend / battery | hard | every subsystem must vote down so the AOP sleeps (floor 200 mA vs 176 mA recovery) | days-week |
 | Calls, hotspot | hard | need mic + ADSP voice; data + AP mode | weeks |
+| Passcode | works (`bluepasscode=1`) | 0246: set, lock at display off, keypad, unlock (passcode7). Left: keep it across reboots (keybag on disk), default on | 0.5 day |
 | Face ID, Apple Pay, NFC, USB host | not worth it | no Secure Enclave / TrueDepth | - |
 
 Also: overnight soak (wired memory, BO pool, daemon restarts); battery shows charging after unplug; app

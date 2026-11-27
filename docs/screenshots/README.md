@@ -23,3 +23,4 @@ showing; 540x1080, half the panel's resolution, RGB565). Newest first.
 | 2026-11-21-control-center.png | Control Center, drawn by the GPU in place into the display buffer (val1) |
 | 2026-11-21-settings.png | Settings scrolled past the Wi-Fi row |
 | 2026-11-21-safari.png | Safari on apple.com over Wi-Fi |
+| 2026-11-27-passcode-keypad.png | Lock screen keypad after swipe up with a passcode set (0246, `bluepasscode=1`) |
