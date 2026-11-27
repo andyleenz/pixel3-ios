@@ -3,7 +3,7 @@
 SSID ranges) and real-time mode, prints the F3 packets in hex for tools/diag-decode.py.
 diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 --- a/bsd/dev/blueline_wifi.c	2026-11-27 11:21:53
-+++ b/bsd/dev/blueline_wifi.c	2026-11-27 12:48:49
++++ b/bsd/dev/blueline_wifi.c	2026-11-27 12:56:11
 @@ -897,10 +897,11 @@
  	vm_offset_t desc, tx, rx;
  	uint32_t tx_len, rx_len, rcid, rxoff, next_iid, servers, unknown;
@@ -98,7 +98,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  		break;
  	case Q_DEL_SERVER:
  		coachz_baseband_del_server(w[1], w[3], w[4]);
-@@ -1497,6 +1523,263 @@
+@@ -1497,6 +1523,269 @@
  	return qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, 0, QRTR_PORT_CTRL, pkt, sizeof(pkt));
  }
  
@@ -306,6 +306,12 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 +			memcpy(rb + 12, &id, 4);
 +			memcpy(rb + 16, name, nl + 1);
 +			diag_cntl_send(rb, 16 + nl + 1);
++			/* downstream (diag_send_updates_peripheral): masks, mode and buffering only after the diag id */
++			if (!(dg.opts & 2u)) {
++				diag_send_masks();
++			}
++			dg.cmds_sent = false;
++			diag_send_cmds();
 +		} else {
 +			printf("BLUELINE DIAG: cntl: cmd %u, %u bytes\n", cmd, len);
 +			diag_hex("cntl", d + off, MIN(8 + len, 64u));
@@ -362,7 +368,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  static const struct { const char *path, *part; } rmtfs_parts[] = {
  	{ "/boot/modem_fs1", "modemst1" },
  	{ "/boot/modem_fs2", "modemst2" },
-@@ -1538,6 +1821,7 @@
+@@ -1538,6 +1827,7 @@
  		printf("BLUELINE WIFI: qrtr: announcing our servers failed\n");
  		return;
  	}
@@ -370,7 +376,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x, tftp at 1:%#x\n",
  	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT, TFTP_PORT);
  }
-@@ -2513,6 +2797,21 @@
+@@ -2513,6 +2803,21 @@
  		if (qmi_parse(d, n, &m)) {
  			wlfw_handle(&m, d, n);
  		}

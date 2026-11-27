@@ -1379,6 +1379,23 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**Modem DIAG over QRTR (0244, `bluediag=1`; cell9-19, 2026-11-27). Deferred.**
+- The modem's DIAG uses QRTR service 4097 with the AP as master, as linux-msm/diag and downstream
+  `diagfwd_socket.c`: the AP serves CNTL (word 0), DATA (2) and DCI (4); the modem serves CMD (1) and DCI_CMD (3).
+  The modem sends nothing until the AP publishes.
+- Handshake works: modem feature mask `0x1eef7` (3 bytes), ours `0xa053`; NUM_PRESETS 2; DIAG_ID requests from
+  `msm/modem/root_pd` and (with DCI published, cell19) `msm/modem/wlan_pd`; 97 command registrations (cell19).
+- No F3 data or command answer has arrived yet (0x7c build id, 0x7d 5 set-all-masks).
+- Message masks sent before the DCI server existed (cell11-15) stalled the modem: its DIAG task stopped reading
+  CNTL after 3 packets, NAS, CTL and DMS stopped answering, and all 64 of the modem's RX intents for us stayed busy
+  (26 on DIAG CNTL, 37 on NAS). Without masks (cell16-18) nothing stalled. cell19 (DCI published, masks sent):
+  no stall.
+- Untested: masks resent after each DIAG_ID reply, as downstream `diag_send_updates_peripheral` does.
+- `tools/diag-decode.py` decodes 0x79/0x92/0x99 F3 packets with `qdsp6m.qdb` (QShrink 4, 286,771 hashes; the
+  radio image's, same MPSS 00194 as on the phone; verinfo's 00182 is stale).
+- Found on the way: `link_send` waits 3 s for each failed send, which stalls the watcher thread when the modem
+  stops returning intents.
+
 **Radio offline: MCFG over TFTP (0241, 0242; cell5-7, 2026-11-27).**
 - cell4: CommCenter's online request (DMS SET_OPERATING_MODE) got QMI_ERR_DEVICE_NOT_READY; modem stays
   kOffline, so no network search with or without a SIM. rmtfs was fine (all four EFS partitions read).
