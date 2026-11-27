@@ -16,6 +16,12 @@
  *                                  starts a daemon again): "#killed N"
  *   done                           the session is over: reboot as bluereboot=
  *                                  says (sysctl kern.bluedone, patch 0175)
+ *   watch SECONDS                  link watchdog: with no request for SECONDS
+ *                                  (one still running counts as contact), end
+ *                                  the session as "done" does. 0 disarms. For a
+ *                                  USB link that stalls while iOS runs on: the
+ *                                  phone gets itself to recovery. "#watch N"
+ *   ping                           "#pong" (contact only)
  *
  * Started by bluerun (bluerun=/usr/local/bin/bluesh, bluerun_after=launchd,
  * bluerun_timeout=36000) or by hand. Build: tools/bluerun/build.sh bluesh.c.
@@ -30,6 +36,7 @@
 int proc_listallpids(void *buffer, int buffersize);
 int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -212,6 +219,39 @@ do_kill(int c, char *rest)
 	sayf(c, "#killed %d\n", killed);
 }
 
+/* the link watchdog ("watch SECONDS") */
+static volatile time_t last_contact;
+static volatile int watch_secs, busy;
+
+static void
+end_session(const char *why)
+{
+	int v = 1;
+	printf("bluesh: %s: ending the session\n", why);
+	fflush(stdout);
+	if (sysctlbyname("kern.bluedone", NULL, NULL, &v, sizeof(v)) != 0) {
+		printf("bluesh: kern.bluedone: %s\n", strerror(errno));
+	}
+}
+
+static void *
+watchdog(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		sleep(5);
+		if (busy) {
+			last_contact = time(NULL);
+		} else if (watch_secs > 0 && time(NULL) - last_contact > watch_secs) {
+			char why[80];
+			snprintf(why, sizeof(why), "no request for %d s (link watchdog)", watch_secs);
+			watch_secs = 0;
+			end_session(why);
+		}
+	}
+	return NULL;
+}
+
 int
 main(void)
 {
@@ -229,6 +269,9 @@ main(void)
 		sleep(1);
 	}
 	listen(s, 4);
+	last_contact = time(NULL);
+	pthread_t wt;
+	pthread_create(&wt, NULL, watchdog, NULL);
 	printf("bluesh: listening on 192.168.7.2:2222\n");
 	fflush(stdout);
 	for (;;) {
@@ -242,7 +285,11 @@ main(void)
 			n++;
 		}
 		line[n] = 0;
-		printf("bluesh: %.200s\n", line);
+		busy = 1;
+		last_contact = time(NULL);
+		if (strcmp(line, "ping") != 0) {
+			printf("bluesh: %.200s\n", line);
+		}
 		fflush(stdout);
 		if (strncmp(line, "run ", 4) == 0) {
 			do_run(c, line + 4);
@@ -252,18 +299,23 @@ main(void)
 			do_get(c, line + 4);
 		} else if (strncmp(line, "kill ", 5) == 0) {
 			do_kill(c, line + 5);
+		} else if (strcmp(line, "ping") == 0) {
+			sayf(c, "#pong\n");
+		} else if (strncmp(line, "watch ", 6) == 0) {
+			watch_secs = atoi(line + 6);
+			sayf(c, "#watch %d\n", watch_secs);
 		} else if (strcmp(line, "done") == 0) {
-			int v = 1;
 			sayf(c, "#rebooting\n");
 			close(c);
+			busy = 0;
 			sleep(1);
-			if (sysctlbyname("kern.bluedone", NULL, NULL, &v, sizeof(v)) != 0) {
-				printf("bluesh: kern.bluedone: %s\n", strerror(errno));
-			}
+			end_session("done");
 			continue;
 		} else {
 			sayf(c, "#error unknown request\n");
 		}
 		close(c);
+		last_contact = time(NULL);
+		busy = 0;
 	}
 }

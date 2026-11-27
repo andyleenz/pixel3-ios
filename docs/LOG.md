@@ -1429,6 +1429,14 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   keeps blocks only. cam49: two Camera close cycles, no crash, same mediaserverd.
 - GPU memory with Camera open: BlueGPU's write-combined XNU pages (pool full, 0216) at 256-725 MiB, ~2000 BOs,
   mostly mediaserverd's; they follow the camera (released when it stops), no leak seen.
+- Camera hidden: Camera.app has `SBAppTags = [still-camera]`, and SpringBoard leaves out apps whose tag
+  MobileGestalt does not answer. cam50: `still-camera` and `video-camera` (obfuscated keys
+  nv4RoLkNoPT0/rsO8Yaiew, nteaxwXwZWYUI9z46VDRnA) added as true to the MobileGestalt cache's CacheExtra: Camera
+  shows in the App Library and opens. Its viewfinder, and CamHello's, show about a second of the scene and then loop
+  the first frames (camtest now hashes frames to tell repeats).
+- The USB link (bluesh and the live log) stalled with iOS running on, twice while Camera ran (23:11, 10:17).
+  bluesh `watch SECONDS` / `ping` and `tools/bluesh.py keepalive`: with no request for SECONDS the phone ends the
+  session itself (bluereboot=recovery).
 
 Next: memory pressure (more RAM for XNU: 0xa2000000..0xd0000000 is free; or find the wired and compressed
 users), then the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's

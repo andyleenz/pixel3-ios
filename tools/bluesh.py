@@ -8,6 +8,10 @@
   tools/bluesh.py kill NAME                         SIGKILL processes named NAME (launchd restarts daemons)
   tools/bluesh.py wait [SECONDS]                    wait until bluesh answers
   tools/bluesh.py done                              end the session: the phone reboots as bluereboot= says
+  tools/bluesh.py keepalive [SECONDS]               arm the phone's link watchdog (default 180 s) and ping it
+                                                    every SECONDS/6 until killed: if the USB link stalls, the
+                                                    phone ends the session itself (reboots to recovery).
+                                                    keepalive 0 disarms it
   tools/bluesh.py snap OUT.png                      a screenshot now (bluectl snap, kern.bluesnap, 0177)
   tools/bluesh.py touch STEP[;STEP...]              touches now (kern.bluetouch): bluetouchscript= steps,
                                                     time optional: "tap,540,1200;wait,800;swipe,540,2150,540,900,300"
@@ -46,6 +50,21 @@ def main(argv):
         print(__doc__)
         return 2
     cmd = argv[0]
+    if cmd == 'keepalive':
+        secs = int(argv[1]) if len(argv) > 1 else 180
+        def ask(line):
+            s = connect()
+            s.sendall(line)
+            return readline(s)
+        print(ask(('watch %d\n' % secs).encode()), flush=True)
+        if secs == 0:
+            return 0
+        while True:
+            time.sleep(max(secs // 6, 5))
+            try:
+                ask(b'ping\n')
+            except OSError as e:
+                print('keepalive: no answer (%s)' % e, flush=True)
     if cmd == 'wait':
         end = time.time() + (float(argv[1]) if len(argv) > 1 else 300)
         while time.time() < end:
