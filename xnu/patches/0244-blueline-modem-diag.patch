@@ -1,0 +1,200 @@
+0244: the modem's DIAG over QRTR (boot-arg bluediag=1). Publishes service 4097 CNTL/DATA as the DIAG master
+(linux-msm/diag peripheral-qrtr.c, diag_cntl.c), answers the feature mask, sends F3 message masks (MED..FATAL, all
+SSID ranges) and real-time mode, prints the F3 packets in hex for tools/diag-decode.py.
+
+diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c	2026-11-27 11:21:53
++++ b/bsd/dev/blueline_wifi.c	2026-11-27 11:22:37
+@@ -1497,6 +1497,169 @@
+ 	return qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, 0, QRTR_PORT_CTRL, pkt, sizeof(pkt));
+ }
+ 
++/*
++ * 0244 (boot-arg bluediag=1): the modem's DIAG over QRTR, as linux-msm/diag router/peripheral-qrtr.c and diag_cntl.c
++ * (BSD-3) do it. We publish service 4097 (DIAG_SERVICE_ID) as the master: CNTL (word 0) and DATA (word 2); the
++ * modem sends its feature mask to CNTL, we answer with ours, then message masks for every SSID range, then real-time
++ * mode. Its F3 messages come to DATA as non-HDLC frames (0x7e, 1, u16 length, packet, 0x7e) and are printed in hex
++ * ("BLUELINE DIAG: <" lines) for tools/diag-decode.py, which looks the QShrink hashes up in qdsp6m.qdb.
++ */
++#define DIAG_SERVICE		4097u
++#define DIAG_CNTL_PORT		0x13u
++#define DIAG_DATA_PORT		0x14u
++#define DIAG_LINES_MAX		8000u
++static struct { bool on, masks_sent; uint32_t lines, dropped, frames, node, port; } dg;
++
++static const uint16_t diag_ssid_first[] = { 0, 500, 1000, 2000, 3000, 4000, 4500, 4600, 5000, 5500, 6000, 6500, 7000, 7100,
++	7200, 8000, 8500, 9000, 9500, 10200, 10251, 10300, 10350, 10400, 0xc000 };
++static const uint16_t diag_ssid_last[] = { 120, 506, 1007, 2008, 3014, 4010, 4573, 4615, 5033, 5516, 6081, 6521, 7003, 7111,
++	7201, 8000, 8529, 9008, 9510, 10210, 10255, 10300, 10377, 10416, 0xc063 };
++
++static void
++diag_hex(const char *what, const uint8_t *d, uint32_t n)
++{
++	char hex[2 * 240 + 1];
++	uint32_t k = MIN(n, 240u);
++
++	if (dg.lines >= DIAG_LINES_MAX) {
++		dg.dropped++;
++		return;
++	}
++	dg.lines++;
++	for (uint32_t i = 0; i < k; i++) {
++		static const char hx[] = "0123456789abcdef";
++		hex[2 * i] = hx[d[i] >> 4];
++		hex[2 * i + 1] = hx[d[i] & 15];
++	}
++	hex[2 * k] = 0;
++	printf("BLUELINE DIAG: %s %u %s%s\n", what, n, hex, k < n ? "..." : "");
++}
++
++static void
++diag_cntl_send(const void *p, uint32_t len)
++{
++	(void)qrtr_send(Q_DATA, DIAG_CNTL_PORT, dg.node, dg.port, p, len);
++}
++
++static void
++diag_send_masks(void)
++{
++	static uint8_t b[16 + 4 * 128];
++	/* struct diag_cntl_cmd_diag_mode (v1): cmd 3, len 36: version 1, sleep_vote, real_time, then zeros */
++	uint32_t mode[11] = { 3, 36, 1, 1, 1, 0, 0, 0, 0, 0, 0 };
++
++	for (unsigned r = 0; r < sizeof(diag_ssid_first) / sizeof(diag_ssid_first[0]); r++) {
++		uint32_t items = (uint32_t)(diag_ssid_last[r] - diag_ssid_first[r] + 1u), len, v;
++
++		items = MIN(items, 128u);
++		len = 8 + 3 + 4 + 4 + 4 * items;
++		/* struct diag_cntl_cmd_msg_mask: cmd 11, len; stream 1, status 3 (VALID), mode 0; range; count; masks */
++		v = 11;
++		memcpy(b, &v, 4);
++		v = len - 8;
++		memcpy(b + 4, &v, 4);
++		b[8] = 1;
++		b[9] = 3;
++		b[10] = 0;
++		memcpy(b + 11, &diag_ssid_first[r], 2);
++		v = (uint32_t)diag_ssid_first[r] + items - 1u;
++		memcpy(b + 13, &v, 2);
++		memcpy(b + 15, &items, 4);
++		v = 0x1eu;	/* MED, HIGH, ERROR, FATAL (LOW is 1) */
++		for (uint32_t i = 0; i < items; i++) {
++			memcpy(b + 19 + 4 * i, &v, 4);
++		}
++		diag_cntl_send(b, len);
++	}
++	diag_cntl_send(mode, sizeof(mode));
++	dg.masks_sent = true;
++	printf("BLUELINE DIAG: masks sent (%u ranges, levels 0x1e), real-time mode\n",
++	    (unsigned)(sizeof(diag_ssid_first) / sizeof(diag_ssid_first[0])));
++}
++
++static void
++diag_cntl(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	uint32_t off = 0;
++
++	dg.node = h->src_node;
++	dg.port = h->src_port;
++	while (off + 8 <= n) {
++		uint32_t cmd, len;
++
++		memcpy(&cmd, d + off, 4);
++		memcpy(&len, d + off + 4, 4);
++		if (off + 8 + len > n) {
++			printf("BLUELINE DIAG: cntl: truncated (cmd %u len %u of %u)\n", cmd, len, n - off);
++			return;
++		}
++		if (cmd == 8 && len >= 8) {	/* FEATURE_MASK: mask_len, mask */
++			uint32_t mask, ours;
++			/* FEATURE_MASK_SUPPORT, MASTER_SETS_COMMON_MASK, APPS_HDLC_ENCODE, SOCKETS_ENABLED */
++			const uint32_t local = (1u << 0) | (1u << 1) | (1u << 6) | (1u << 13);
++			uint32_t pkt[4];
++
++			memcpy(&mask, d + off + 12, 4);
++			ours = mask & local;
++			printf("BLUELINE DIAG: cntl: modem %u:%#x feature mask %#x, ours %#x\n", h->src_node, h->src_port, mask, ours);
++			pkt[0] = 8;
++			pkt[1] = 8 + 2;
++			pkt[2] = 4;
++			pkt[3] = ours;
++			{
++				uint8_t fb[18] = { 0 };
++				memcpy(fb, pkt, sizeof(pkt));
++				diag_cntl_send(fb, sizeof(fb));
++			}
++			diag_send_masks();
++		} else {
++			printf("BLUELINE DIAG: cntl: cmd %u, %u bytes\n", cmd, len);
++			diag_hex("cntl", d + off, MIN(8 + len, 64u));
++		}
++		off += 8 + len;
++	}
++}
++
++static void
++diag_data(const uint8_t *d, uint32_t n)
++{
++	uint16_t len;
++
++	while (n > 0) {	/* one or more frames a packet */
++		dg.frames++;
++		if (n < 5 || d[0] != 0x7e || d[1] != 1) {
++			diag_hex("raw", d, n);
++			return;
++		}
++		memcpy(&len, d + 2, 2);
++		if (4u + len + 1u > n || d[4 + len] != 0x7e) {
++			diag_hex("bad", d, n);
++			return;
++		}
++		diag_hex("<", d + 4, len);
++		d += 5u + len;
++		n -= 5u + len;
++	}
++}
++
++static void
++diag_publish(void)
++{
++	uint32_t on = 0;
++
++	(void)PE_parse_boot_argn("bluediag", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	/* DIAG passes its instance as the version byte (peripheral-qrtr.c) */
++	if (qrtr_new_server(DIAG_SERVICE, 0, 0, DIAG_CNTL_PORT) || qrtr_new_server(DIAG_SERVICE, 2, 0, DIAG_DATA_PORT)) {
++		printf("BLUELINE DIAG: announcing failed\n");
++		return;
++	}
++	dg.on = true;
++	printf("BLUELINE DIAG: serving DIAG cntl at 1:%#x, data at 1:%#x\n", DIAG_CNTL_PORT, DIAG_DATA_PORT);
++}
++
+ static const struct { const char *path, *part; } rmtfs_parts[] = {
+ 	{ "/boot/modem_fs1", "modemst1" },
+ 	{ "/boot/modem_fs2", "modemst2" },
+@@ -1538,6 +1701,7 @@
+ 		printf("BLUELINE WIFI: qrtr: announcing our servers failed\n");
+ 		return;
+ 	}
++	diag_publish();	/* 0244 */
+ 	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x, tftp at 1:%#x\n",
+ 	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT, TFTP_PORT);
+ }
+@@ -2513,6 +2677,14 @@
+ 		if (qmi_parse(d, n, &m)) {
+ 			wlfw_handle(&m, d, n);
+ 		}
++		return;
++	}
++	if (dg.on && h->dst_port == DIAG_CNTL_PORT) {	/* 0244 */
++		diag_cntl(h, d, n);
++		return;
++	}
++	if (dg.on && h->dst_port == DIAG_DATA_PORT) {
++		diag_data(d, n);
+ 		return;
+ 	}
+ 	if (coachz_baseband_qrtr(h->dst_port, h->src_node, h->src_port, d, n)) {	/* 0238: a cellular bridge client */
