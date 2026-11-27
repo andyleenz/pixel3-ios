@@ -37,3 +37,7 @@ done
 xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc \
 	-framework Foundation -framework MobileCoreServices -lsqlite3 -o out/apptest apptest.m
 ENTITLEMENTS=apptest.ent sign out/apptest
+# openurl (Objective-C): open a URL, e.g. a Settings pane (tools/bluerun/openurl.m)
+xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -fobjc-arc \
+	-framework Foundation -framework MobileCoreServices -o out/openurl openurl.m
+ENTITLEMENTS=apptest.ent sign out/openurl

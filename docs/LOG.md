@@ -1514,6 +1514,11 @@ Next: a WMI trace from a Linux/Android boot to diff (needs a boot that keeps use
 `VTCompressionSession` is created, but `VTCompressionSessionEncodeFrame` returns -6661 for the first frame;
 HEVC has no encoder (`VTCompressionSessionCreate` -12908, `kVTCouldNotFindVideoEncoderErr`). iOS has no
 software encoder for either; the SDM845 encoder (Venus) has no iOS driver.
+- Route (2026-11-27, not started): iOS 16.7's VideoToolbox exports the in-process plugin interface,
+  `VTRegisterVideoEncoderWithInfo`, `VTVideoEncoderGetClassID`/`GetCMBaseObject` and the `VTEncoderSession*`
+  callbacks (`EmitEncodedFrame`, `CreateVideoFormatDescription`, `SetPixelBufferAttributes`). No public
+  header or third-party iOS plugin found; the vtable layout has to come from the VideoToolbox binary.
+  Plan: OpenH264 (BSD-2) behind that interface.
 
 **Stability count (2026-11-26).** The 183 test boots of 2026-11-25/26 (each 2-5 min, apps launched in most):
 0 SpringBoard crashes; backboardd crashed (14 times) only in msys4, an experimental Metal build.
