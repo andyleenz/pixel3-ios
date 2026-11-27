@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- a command-line client has no foreground app: without these the session is interrupted and never runs -->
+	<key>com.apple.private.avfoundation.background-camera-access</key><true/>
+	<key>com.apple.private.avfoundation.capture.allow</key><true/>
+	<key>com.apple.private.avfoundation.capture.nonstandard-client.allowed-media-types</key><array><string>vide</string><string>soun</string></array>
+	<key>com.apple.private.tcc.allow</key><array><string>kTCCServiceCamera</string></array>
+</dict>
+</plist>

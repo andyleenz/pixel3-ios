@@ -11,6 +11,9 @@ Writes, for D22 and D221 (Apple-derived: kept in work/, pushed with phonetest --
       every *StabilizationSupported and IrisSupported false, the VideoStabilizationTypeOverride* keys removed.
       Otherwise the graph adds BWVISNode, which needs an ISP processing session (CreateProcessingSession, SessionType 4)
       that the plug-in does not have, and the session stops (cam37).
+      SISSupported, HDRSupported and GNRHDRSupported false, stillImageNoiseReductionAndFusionScheme 0: single-frame
+      stills. Otherwise the shutter asks for SIS brackets that need a DenoiseFusePipeline, which mediaserverd cannot
+      create here ("Unable to create DenoiseFusePipeline"), and no photograph is finished (cam41).
 """
 import os
 import plistlib
@@ -24,6 +27,14 @@ def unstabilise(x):
             if k.endswith('StabilizationSupported') or k == 'IrisSupported':
                 if x[k] is not False:
                     x[k] = False
+                    n += 1
+            elif k in ('SISSupported', 'HDRSupported', 'GNRHDRSupported'):
+                if x[k] is not False:
+                    x[k] = False
+                    n += 1
+            elif k == 'stillImageNoiseReductionAndFusionScheme':
+                if x[k] != 0:
+                    x[k] = 0
                     n += 1
             elif k.startswith('VideoStabilizationTypeOverride'):
                 del x[k]
@@ -50,7 +61,7 @@ def main():
         d = plistlib.load(open(src, 'rb'))
         n = unstabilise(d)
         plistlib.dump(d, open('%s/AVCaptureSession.%s.plist' % (out, m), 'wb'), fmt=plistlib.FMT_BINARY)
-        print('%s: jetsam limit raised, %d stabilisation keys changed' % (m, n))
+        print('%s: jetsam limit raised, %d stabilisation and still-fusion keys changed' % (m, n))
 
 
 if __name__ == '__main__':

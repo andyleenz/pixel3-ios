@@ -1379,7 +1379,26 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
 - cam40: **live preview in the stock Camera app** from the rear sensor (1504x1128 420f, rows 1152 bytes)
   ([screenshot](screenshots/2026-11-27-camera-preview.png)). Not focused (no lens driver yet).
 
-Next: a still capture saved to Photos (assetsd; JPEG, no HEIC encoder), rear focus.
+- Shutter: bluecam answers `StillImageCaptureNow` with the next sensor frame on the StillImage output (4032x3024
+  420f, 35-60 ms to fill). The photo graph then stopped with no error in four ways, fixed in turn:
+  - Live Photo on: the still waits for its movie (Iris is off). `CAMUserPreferenceDesiredIrisMode` 0 and
+    `CAMUserPreferencePreserveLivePhoto` in com.apple.camera.
+  - No HEVC encoder for HEIC: bluecam registers VCPHEVC.videocodec's software encoder for `hvc1` (iOS ships it
+    unregistered; approach from HackiOS/ios-redfin's inject_media.c, MIT).
+  - SIS bracketing: the shutter asked for 4 bracketed frames plus a pre-bracketed one (`AEBracketedCaptureParams`,
+    `ProvidePreBracketedFrame`), and fusing them needs a DenoiseFusePipeline that mediaserverd cannot create here.
+    camera-plists.py now sets `SISSupported`, `HDRSupported`, `GNRHDRSupported` false and
+    `stillImageNoiseReductionAndFusionScheme` 0; the request is then a single frame (`TimeMachineCaptureParams`
+    Count 1). bluecam still sends 1 + N frames when brackets are asked for.
+- Diagnosis tools: with `sweetenv=...;mediaserverd:OS_ACTIVITY_DT_MODE=1` bluecam turns mediaserverd's stderr into
+  a pipe and forwards its os_log lines to the console (`oslog:`; all lines with /private/var/tmp/bluecam_oslog_all).
+  The full blueapps set plus that entry is over the 607-byte boot-arg limit; drop installd's entry for such runs.
+  `tools/camera/photocli` (AVCapturePhotoOutput from the command line) is refused as a background client
+  (interruption reason 1) even with the background-camera entitlements; not used further.
+- cam41: **a photograph saved**: DCIM/100APPLE/IMG_0001.HEIC, 4032x3024 HEIC, 191 KB (kept off the repository).
+  Unfocused, colours as the preview. Camera's thumbnail stays empty and the Photos library grid is black.
+
+Next: Photos thumbnails and grid; Camera's thumbnail; rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
 HID services (usage pairs (0xFF00, 5), (0xFF08, 1), (0x20, 0x31)) by Product = matchName and reads them

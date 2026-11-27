@@ -842,6 +842,11 @@ streamSetProperty(CMBaseObjectRef o, CFStringRef key_, CFTypeRef v)
 					count = MIN([value[c] unsignedIntValue], 8u);
 					break;
 				}
+		/* SIS bracketing: one frame per AEBracketedCaptureParams entry, plus the pre-bracketed frame when asked */
+		if ([value isKindOfClass:[NSDictionary class]] && [value[@"AEBracketedCaptureParams"] isKindOfClass:[NSArray class]] &&
+		    [value[@"AEBracketedCaptureParams"] count] > 0 && getenv("BLUECAM_ONE_STILL") == NULL &&
+		    access("/private/var/tmp/bluecam_one_still", F_OK) != 0)
+			count = MIN((unsigned)[value[@"AEBracketedCaptureParams"] count] + ([value[@"ProvidePreBracketedFrame"] boolValue] ? 1 : 0), 9u);
 		st.stillsWanted += count;
 	} else if (strcmp(k, "VideoOutputsColorInfo") == 0)
 		st.colourInfo = [value isKindOfClass:[NSDictionary class]] ? value : nil;
@@ -1146,10 +1151,10 @@ stderrForward(void *arg)
 	while (in && fgets(line, sizeof line, in)) {
 		if (sent >= 3000)
 			continue;
-		BOOL want = NO;
+		BOOL want = getenv("BLUECAM_OSLOG_ALL") != NULL || access("/private/var/tmp/bluecam_oslog_all", F_OK) == 0;
 		for (int i = 0; keys[i] && !want; i++)
 			want = strstr(line, keys[i]) != NULL;
-		if (!want || strstr(line, "com.apple.coreaudio"))
+		if (!want || strstr(line, "com.apple.coreaudio") || strstr(line, "AppleM2ScalerCSCDriver"))
 			continue;
 		char buf[480];
 		snprintf(buf, sizeof buf, "oslog: %s", line);

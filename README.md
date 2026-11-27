@@ -125,7 +125,9 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   and Live Photo turned off in AVCaptureSession.plist.
 - Done: live preview in Camera (cam40): planar IOSurfaces had 0-byte rows (0247), and test boots must keep
   backboardd's blueeagl in `sweetenv`.
-- Next: a still saved to Photos; rear focus (LC898219XI) later.
+- Done: photographs saved (cam41): 4032x3024 HEIC in DCIM via the software HEVC encoder, single-frame stills (SIS,
+  HDR and fusion off in `camera-plists.py`), Live Photo off.
+- Next: Photos thumbnails (library grid black), Camera's thumbnail; rear focus (LC898219XI) later.
 
 **Next, in order**
 1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery
