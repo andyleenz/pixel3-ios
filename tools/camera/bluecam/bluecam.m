@@ -553,6 +553,30 @@ fillRaw(CVPixelBufferRef pb, const struct blueline_camera_frame *f, const uint8_
 	free(xs);
 }
 
+/* Luma statistics of a filled output, logged every 150 frames: a flat picture shows as a small spread. */
+static void
+frameStats(CVPixelBufferRef pb, unsigned n)
+{
+	CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+	size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+	BOOL nv = CVPixelBufferGetPlaneCount(pb) == 2;
+	const uint8_t *b = nv ? CVPixelBufferGetBaseAddressOfPlane(pb, 0) : CVPixelBufferGetBaseAddress(pb);
+	size_t bpr = nv ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0) : CVPixelBufferGetBytesPerRow(pb);
+	unsigned lo = 255, hi = 0, hist[8] = { 0 };
+	double sum = 0, sq = 0, cnt = 0;
+	for (size_t y = 0; b && y < h; y += 8)
+		for (size_t x = 0; x < w; x += 8) {
+			unsigned v = nv ? b[y * bpr + x] : b[y * bpr + 4 * x + 1];
+			lo = v < lo ? v : lo, hi = v > hi ? v : hi;
+			sum += v, sq += (double)v * v, cnt++;
+			hist[v >> 5]++;
+		}
+	CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+	double m = cnt ? sum / cnt : 0, sd = cnt ? sqrt(sq / cnt - m * m) : 0;
+	say("frame %u luma: min %u max %u mean %.1f sd %.1f, eighths %u %u %u %u %u %u %u %u", n, lo, hi, m, sd, hist[0],
+	    hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
+}
+
 static void *
 frameThread(void *arg)
 {
@@ -634,6 +658,8 @@ frameThread(void *arg)
 				if (raw) {
 					uint64_t c0 = mach_absolute_time();
 					fillRaw(pb, f, raw);
+					if (n % 150 == 1)
+						frameStats(pb, n);
 					if (n < 3 || n % 150 == 0)
 						say("frame %u: %zux%zu filled in %.1f ms", n, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
 						    (mach_absolute_time() - c0) * (double)tb.numer / tb.denom / 1e6);

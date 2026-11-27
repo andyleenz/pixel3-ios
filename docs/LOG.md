@@ -1354,7 +1354,20 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   bands on all cores: 6-7 ms a 1080p frame. CamHello: **229 frames, 29.8 fps, 0 dropped**. Picture black
   (centre mean 0, auto gain at its 32x limit): lens face down; a lit scene is still to be shown.
 
-Next: a lit scene (one frame saved as PGM), the preview layer on screen, then photos (assetsd).
+- cam36: the stock Camera app (lock-screen swipe) starts a session; mediaserverd is killed by jetsam
+  (`per-process-limit`, RunningBoard: `termination reported by launchd (1, 7, 9)`) whenever it goes inactive:
+  D22 jetsamproperties give it `InactiveHardMemoryLimit` 75 MB, and with BlueMetal and Mesa loaded it is larger.
+- cam37: limit raised to 1600 MB (`tools/camera/camera-plists.py`, pushed): mediaserverd stays up (one pid).
+  Camera then configures the stream and calls `CreateProcessingSession {SessionType = 4}` for `BWVISNode` (video
+  stabilisation); the plug-in has none and the session stops.
+- cam37, live pushes: AVCaptureSession.plist with every `*StabilizationSupported` and `IrisSupported` false (same
+  script). **Stock Camera app runs on sensor frames**: stream started (outputs PrimaryScaler and StillImage,
+  1504x1128 420f, format 2), 30 fps, camera indicator on, Photo mode UI
+  ([screenshot](screenshots/2026-11-27-camera-app.png)). `openurl app:BUNDLE-ID` launches an app.
+- The preview is one flat colour that follows the scene, while the frames have a picture (plug-in luma stats,
+  every 150 frames: min 53, max 185, mean 130, sd 50). The preview path (420f surface into the layer) is next.
+
+Next: preview picture, then a still capture saved to Photos (assetsd; JPEG, no HEIC encoder).
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
 HID services (usage pairs (0xFF00, 5), (0xFF08, 1), (0x20, 0x31)) by Product = matchName and reads them

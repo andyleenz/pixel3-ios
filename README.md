@@ -78,7 +78,7 @@ partition.
 | Battery, clocks | Fuel gauge readings, RTC (time of day), CPU frequency and thermal limits, watchdog. thermalmonitord runs by default (0235, 0237, 0245): it reads the SoC (TSENS), board thermistors (PM8998 ADC) and battery, and reports nominal pressure at idle (`bluethermal=0` turns it off) |
 | Wi-Fi | **Works in iOS on 2.4 GHz.** The WCN3990's firmware runs in the modem's WLAN domain (copy engines, HTC/WMI/HTT). Settings lists the networks nearby; joining a WPA2 network with the password typed on the phone associates, does the 4-way handshake in the kernel, gets a DHCP address, and Safari loads pages. `en0` and Apple80211 (ported from ios-topaz/HackiOS) serve Apple's own wifid and configd. 5 GHz scans don't start yet |
 | Audio | **iOS plays through the speaker** (startup sound, ringtone previews). HackiOS's RedwoodAudio HAL plug-in writes to `/dev/redwood-audio`; the kernel feeds the ADSP (ASM → ADM → AFE quaternary TDM) and the two CS35L36 amps, with iOS's volume as a gain. On by default (`bluesnd=0` turns it off). No microphone or headset yet |
-| Camera | **Both cameras take a picture in the kernel** (test boots only, `bluecam=1` rear / `2` front, `bluecam_stream=3`): the sensor streams RAW10 over 4-lane CSI-2 (front IMX355 820x616 on CSIPHY2, rear IMX363 2x2-binned 2016x1512 on CSIPHY0), the CSID and IFE-lite write a frame to memory, and the kernel saves it as a colour snap. No rear focus yet. `/dev/blueline-camera` (kernel 0233) streams the rear sensor at 30 fps to userland (`tools/camera/camtest`). In iOS, mediaserverd loads our capture plug-in (`tools/camera/bluecam`), AVFoundation lists "Back Camera", and an app's `AVCaptureVideoDataOutput` gets the rear sensor's frames at 30 fps, 1920x1080 BGRA (converted on the CPU in 6-7 ms a frame). Not yet shown with a lit scene; no photos, focus or front camera in iOS |
+| Camera | **Both cameras take a picture in the kernel** (test boots only, `bluecam=1` rear / `2` front, `bluecam_stream=3`): the sensor streams RAW10 over 4-lane CSI-2 (front IMX355 820x616 on CSIPHY2, rear IMX363 2x2-binned 2016x1512 on CSIPHY0), the CSID and IFE-lite write a frame to memory, and the kernel saves it as a colour snap. No rear focus yet. `/dev/blueline-camera` (kernel 0233) streams the rear sensor at 30 fps to userland (`tools/camera/camtest`). In iOS, mediaserverd loads our capture plug-in (`tools/camera/bluecam`), AVFoundation lists "Back Camera", and an app's `AVCaptureVideoDataOutput` gets the rear sensor's frames at 30 fps, 1920x1080 BGRA (converted on the CPU in 6-7 ms a frame). The stock Camera app opens and runs on the sensor at 30 fps (jetsam limit and stabilisation keys changed, `tools/camera/camera-plists.py`); its preview is still one flat colour. No photos, focus or front camera in iOS |
 | Passcode | Test boots with `bluepasscode=1` (0246): Settings sets a passcode, the phone locks when the display goes off, swipe up shows the keypad, a wrong code is rejected and the right one unlocks. The stand-in keystore keeps it in kernel memory only (a reboot clears it; no Secure Enclave) |
 | Other | Haptics, modem boot (no cellular data yet) |
 | USB | Device mode (DWC3, CDC-ECM) with `sweetusb=2`: a live kernel log, file and command servers, and `bluesh` for running programs on the phone |
@@ -120,8 +120,10 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Done: TCC grants camera access (sandbox extensions, 0993).
 - Done: the device lists 46 formats and the session takes the input; Core Image's stitchable kernels get
   Metal's function reflection (m2v-0002, amb-0001, am-0007), so mediaserverd no longer aborts in PortraitFilters.
-- Next: the device and stream `Clock`, stream Start with synthetic frames, then frames from the kernel's
-  CSI-2 path (continuous frames, rear focus LC898219XI later).
+- Done: device and stream `Clock`, stream Start, sensor frames to apps at 30 fps (cam35).
+- Done: the stock Camera app runs on sensor frames (cam37): mediaserverd kept from jetsam, video stabilisation
+  and Live Photo turned off in AVCaptureSession.plist.
+- Next: the preview picture (one flat colour now), then a still saved to Photos; rear focus (LC898219XI) later.
 
 **Next, in order**
 1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery

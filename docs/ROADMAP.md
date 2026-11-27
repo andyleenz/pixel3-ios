@@ -5,7 +5,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 
 | Area | Feasibility | Route | Effort |
 |---|---|---|---|
-| Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; plug-in frames reach apps (cam32). Next: sensor frames in apps, then assetsd/Photos so captures save; force JPEG/H.264 (no HEIC/HEVC encoder) | hours |
+| Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; sensor frames reach apps (cam35); stock Camera app runs on them (cam37). Next: preview picture (flat colour now), then assetsd/Photos so captures save; force JPEG/H.264 (no HEIC/HEVC encoder) | hours |
 | Thermals to thermalmonitord | done (default on) | 0235 + 0237 board thermistors + 0245: on by default, thermalmonitord's job kept; therm9/10: nominal pressure at idle; therm11: pressure 30 (critical) under 8-thread load, LMh holds the die at 56-69 C. Left: calibration (critical at 43 C board), pressure falling after load | - |
 | Wi-Fi 5 GHz | needs a reference | ruled out: second rail (stock DT has ch0 only), board data, regulatory (firmware allows ch 36), ath10k pdev params (0236). Next: WMI trace from Android/Linux on this phone to diff; radio in the default boot | 1-2 days |
 | Cellular control, SMS | deferred (2026-11-27) | 0238-0240 (`bluecell=1`): ABM boots the modem (cell4), CommCenter talks QMI to it (UIM, NAS, WDS, DMS); card status reads "SIM absent". Next: SIM detected, NAS registration, SMS | 2-4 days |
