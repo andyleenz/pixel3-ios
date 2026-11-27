@@ -1379,6 +1379,20 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**Passcode (0246, `bluepasscode=1`; builds, not yet booted, 2026-11-27).**
+- libaks selectors (MobileKeyBag disassembly, iOS 16.7): change secret 15 (prederived 32), unlock device 9,
+  unlock bag 12, lock bag 13, lock state 7, get system 14, device state 17/35, verify password 42, bag UUID
+  23. Passcodes are passed as user pointer + length scalars (unlock: [handle, pass, len]; change:
+  [handle, flags, 0xff, old, old_len, new, new_len, 0, 0, 0, 0], 1 scalar out).
+- `MKBGetDeviceLockState` returns the device state's `sls` (0 unlocked, 1 locked, 3 no passcode);
+  `MKBKeyBagChangeSystemSecret` goes through keybagd over XPC, so keybagd's job has to be kept
+  (`launchd-build.py OUT com.apple.mobile.keybagd`); `MKBUnlockDevice` calls the kernel directly.
+  convertAKSErrorToMKB: 0xe00002ce becomes -3 (used for a wrong passcode).
+- 0246: with `bluepasscode=1` the stand-in keeps a salted SHA-256 of the passcode in memory, checks it on
+  unlock and change, locks on lock bag, and reports lock state bits (locked 1, no_pin 2, been_unlocked 4,
+  Security's SecAKSWrappers.h) and `sls`/`sfa`. Without the boot-arg nothing changes.
+- `tools/bluerun/openurl.m`: opens a URL (Settings pane: `prefs:root=PASSCODE`) through LSApplicationWorkspace.
+
 **Thermals on by default (0245; therm9-10, 2026-11-27).**
 - therm9 (`bluethermal=1`, thermalmonitord's job): with 0237's board thermistors (first reads 36.1 C) the os_log
   over 16 min from boot has no thermal pressure change and no backlight cap; its control loop runs (369

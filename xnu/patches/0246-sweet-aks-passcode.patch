@@ -1,0 +1,267 @@
+0246: passcode in the stand-in AppleKeyStore (boot-arg bluepasscode=1): aks_change_secret (15) sets a
+salted SHA-256 in memory, unlock device/bag (9/12) check it, lock bag (13) locks, lock state and the
+device state's sls/sfa follow (no passcode: no_pin bit, sls 3).
+diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-27 14:46:11
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-27 14:47:00
+@@ -24,7 +24,11 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
++#include <libkern/crypto/sha2.h>
++#include <pexpert/pexpert.h>
+ 
++extern "C" void read_random(void *buffer, unsigned int numBytes);
++
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+ 	kAKSOpen             = 0,
+@@ -40,6 +44,7 @@
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
++	kAKSChangeSecret     = 15,      /* aks_change_secret(_se): 11 scalars, 1 out */
+ 	kAKSGetDeviceState   = 17,
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+@@ -59,6 +64,167 @@
+  */
+ #define SWEET_AKS_LOCK_STATE    0x4
+ 
++/*
++ * Passcode (0246, boot-arg bluepasscode=1): the system bag gets a secret. keybag_state bits as libaks
++ * (Security's SecAKSWrappers.h): locked 1, no_pin 2, been_unlocked 4. MKBGetDeviceLockState reads the
++ * device state's "sls": 0 unlocked, 1 locked, 3 disabled (no passcode). A salted SHA-256 of the passcode
++ * is kept in memory only (iOS is RAM-booted here: it is gone at the next boot). A wrong passcode answers
++ * 0xe00002ce, which MobileKeyBag (convertAKSErrorToMKB) turns into -3. Without the boot-arg the old
++ * answers stay: a passcode bit with nothing behind it, always unlocked.
++ */
++#define SWEET_AKS_BAD_PASSCODE  ((IOReturn)0xe00002ce)
++#define SWEET_AKS_PASS_MAX      128
++
++static struct {
++	int             on;             /* bluepasscode= */
++	IOLock          *lock;
++	bool            has_pin;
++	bool            locked;
++	uint32_t        failed;
++	uint8_t         salt[16];
++	uint8_t         digest[SHA256_DIGEST_LENGTH];
++} sweet_pc;
++
++static void
++sweet_pc_hash(const uint8_t *pass, uint32_t len, uint8_t out[SHA256_DIGEST_LENGTH])
++{
++	SHA256_CTX c;
++	SHA256_Init(&c);
++	SHA256_Update(&c, sweet_pc.salt, sizeof(sweet_pc.salt));
++	SHA256_Update(&c, pass, len);
++	SHA256_Final(out, &c);
++}
++
++/* Copy a passcode (user pointer, length) in: 0 or an IOReturn. */
++static IOReturn
++sweet_pc_copyin(uint64_t uaddr, uint64_t len, uint8_t *buf, uint32_t *outlen)
++{
++	*outlen = 0;
++	if (len == 0) {
++		return kIOReturnSuccess;
++	}
++	if (len > SWEET_AKS_PASS_MAX || uaddr == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t)uaddr, buf, (size_t)len) != 0) {
++		return kIOReturnBadArgument;
++	}
++	*outlen = (uint32_t)len;
++	return kIOReturnSuccess;
++}
++
++/* Constant-time compare against the stored digest; call with the lock held. */
++static bool
++sweet_pc_matches(const uint8_t *pass, uint32_t len)
++{
++	uint8_t d[SHA256_DIGEST_LENGTH];
++	uint8_t diff = 0;
++	sweet_pc_hash(pass, len, d);
++	for (unsigned int i = 0; i < sizeof(d); i++) {
++		diff |= d[i] ^ sweet_pc.digest[i];
++	}
++	return diff == 0;
++}
++
++static uint64_t
++sweet_pc_lock_state(void)
++{
++	if (!sweet_pc.on) {
++		return SWEET_AKS_LOCK_STATE;
++	}
++	return 0x4 | (sweet_pc.has_pin ? 0 : 0x2) | (sweet_pc.locked ? 0x1 : 0);
++}
++
++static uint8_t
++sweet_pc_sls(void)
++{
++	if (!sweet_pc.on) {
++		return 0;
++	}
++	return !sweet_pc.has_pin ? 3 : (sweet_pc.locked ? 1 : 0);
++}
++
++/* Unlock (device or bag) with scalars [handle, pass, len]. */
++static IOReturn
++sweet_pc_unlock(IOExternalMethodArguments *args)
++{
++	uint8_t pass[SWEET_AKS_PASS_MAX];
++	uint32_t len;
++	IOReturn ret;
++	if (!sweet_pc.on) {
++		return kIOReturnSuccess;
++	}
++	if (args->scalarInputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	ret = sweet_pc_copyin(args->scalarInput[1], args->scalarInput[2], pass, &len);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	IOLockLock(sweet_pc.lock);
++	if (!sweet_pc.has_pin || sweet_pc_matches(pass, len)) {
++		sweet_pc.locked = false;
++		sweet_pc.failed = 0;
++	} else {
++		sweet_pc.failed++;
++		ret = SWEET_AKS_BAD_PASSCODE;
++	}
++	IOLockUnlock(sweet_pc.lock);
++	IOLog("SWEET AKS: passcode unlock (%u bytes): %s, %u failed\n", len,
++	    ret == kIOReturnSuccess ? "ok" : "wrong", sweet_pc.failed);
++	bzero(pass, sizeof(pass));
++	return ret;
++}
++
++/* aks_change_secret: scalars [handle, flags, 0xff, old, old_len, new, new_len, 0, 0, 0, 0]. */
++static IOReturn
++sweet_pc_change(IOExternalMethodArguments *args)
++{
++	uint8_t old[SWEET_AKS_PASS_MAX], pass[SWEET_AKS_PASS_MAX];
++	uint32_t olen, nlen;
++	IOReturn ret;
++	if (!sweet_pc.on) {
++		return kIOReturnUnsupported;
++	}
++	if (args->scalarInputCount < 7) {
++		return kIOReturnBadArgument;
++	}
++	ret = sweet_pc_copyin(args->scalarInput[3], args->scalarInput[4], old, &olen);
++	if (ret == kIOReturnSuccess) {
++		ret = sweet_pc_copyin(args->scalarInput[5], args->scalarInput[6], pass, &nlen);
++	}
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	IOLockLock(sweet_pc.lock);
++	if (sweet_pc.has_pin && !sweet_pc_matches(old, olen)) {
++		sweet_pc.failed++;
++		ret = SWEET_AKS_BAD_PASSCODE;
++	} else if (nlen == 0) {
++		sweet_pc.has_pin = false;
++		sweet_pc.locked = false;
++		bzero(sweet_pc.digest, sizeof(sweet_pc.digest));
++	} else {
++		read_random(sweet_pc.salt, sizeof(sweet_pc.salt));
++		sweet_pc_hash(pass, nlen, sweet_pc.digest);
++		sweet_pc.has_pin = true;
++		sweet_pc.locked = false;
++		sweet_pc.failed = 0;
++	}
++	bool has = sweet_pc.has_pin;
++	IOLockUnlock(sweet_pc.lock);
++	IOLog("SWEET AKS: passcode change (old %u, new %u bytes): %s, passcode %s\n", olen, nlen,
++	    ret == kIOReturnSuccess ? "ok" : "wrong old passcode", has ? "set" : "none");
++	bzero(old, sizeof(old));
++	bzero(pass, sizeof(pass));
++	if (ret == kIOReturnSuccess) {
++		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++			args->scalarOutput[i] = 0;
++		}
++	}
++	return ret;
++}
++
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+ 
+@@ -75,8 +241,14 @@
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
++	(void)PE_parse_boot_argn("bluepasscode", &sweet_pc.on, sizeof(sweet_pc.on));
++	sweet_pc.lock = IOLockAlloc();
++	if (sweet_pc.lock == NULL) {
++		sweet_pc.on = 0;
++	}
+ 	registerService();
+-	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++	IOLog("SWEET AKS: AppleKeyStore registered (%s)\n", sweet_pc.on ?
++	    "passcode support (bluepasscode=1), no passcode yet" : "no passcode, unlocked");
+ 	return true;
+ }
+ 
+@@ -146,11 +318,12 @@
+ static IOReturn
+ sweet_aks_device_state(IOExternalMethodArguments *args)
+ {
+-	static const struct {
++	const struct {
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", (uint8_t)sweet_pc_lock_state() }, { "sls", sweet_pc_sls() }, { "sb", 0 },
++		{ "sfa", (uint8_t)(sweet_pc.failed > 255 ? 255 : sweet_pc.failed) },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+@@ -246,9 +419,6 @@
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
+-	case kAKSUnlockDevice:
+-	case kAKSUnlockBag:
+-	case kAKSLockBag:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+@@ -256,6 +426,22 @@
+ 	case kAKSNotifyStateSet:
+ 		args->scalarOutputCount = 0;
+ 		break;
++	case kAKSUnlockDevice:
++	case kAKSUnlockBag:
++		args->scalarOutputCount = 0;
++		ret = sweet_pc_unlock(args);
++		break;
++	case kAKSLockBag:
++		args->scalarOutputCount = 0;
++		if (sweet_pc.on) {
++			IOLockLock(sweet_pc.lock);
++			sweet_pc.locked = sweet_pc.has_pin;
++			IOLockUnlock(sweet_pc.lock);
++		}
++		break;
++	case kAKSChangeSecret:
++		ret = sweet_pc_change(args);
++		break;
+ 	case kAKSGetSystem:
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+@@ -269,7 +455,7 @@
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		args->scalarOutput[0] = SWEET_AKS_LOCK_STATE;
++		args->scalarOutput[0] = sweet_pc_lock_state();
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSNotifyStateIsSet:
