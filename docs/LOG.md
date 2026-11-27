@@ -1394,6 +1394,9 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
 - cell7: 8 resends over 8 s, the last two after the MCFG load ended; all DEVICE_NOT_READY. Not (only) timing.
   DMS GET_OPERATING_MODE's answer has the mode TLV alone (no offline-reason TLV); ABM logs the mode as
   "Unknown". 0243 dumps DMS answers in hex.
+- cell8 (0243): GET_OPERATING_MODE answers mode 3, OFFLINE, at the first query, before any host request
+  and before the modem's only EFS write. In QMI's state machine OFFLINE is left only by RESET. Firmware is
+  MPSS.AT.4.0.c2.17-00194 with MCFG g845-00194 (same build). The cause of booting offline is open.
 
 **cell4: Apple's baseband manager boots the Pixel's modem (2026-11-27).**
 - Mav17 in the preboot path: `boot.mod: Baseband bootup succeeded`, Booted -> IsReady (971 ms; the image
