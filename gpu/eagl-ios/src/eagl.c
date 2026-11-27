@@ -919,6 +919,13 @@ surface_to_texture(struct eagl *e, struct image *image)
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
 	    image->format, image->type, base);
+	static unsigned planar_filled;
+	if (planar && planar_filled++ < 12) {	/* (pixel3-ios: camera preview) what a plane's fill gave */
+		say("hakios-gl: planar surface %u plane %u filled: %d x %d, row %zu, seed %u, bytes %u %u %u %u, GL error %#x\n",
+		    IOSurfaceGetID(surface), image->plane, image->width, image->height, row, IOSurfaceGetSeed(surface), base[0],
+		    base[row * (size_t)(image->height / 2) + (size_t)image->width / 2], base[row * (size_t)(image->height / 2)],
+		    base[row * (size_t)(image->height - 1)], glGetError());
+	}
 	free(padded);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
@@ -4582,6 +4589,13 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->height = height;
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
+	static unsigned planar_shown;
+	if (IOSurfaceGetPlaneCount(surface) > 0 && planar_shown++ < 16) {	/* (pixel3-ios: camera preview, 420f) */
+		say("hakios-gl: -texImageIOSurface: planar surface %u ('%.4s' %zu x %zu, %zu planes) as texture %d: %d x %d, plane %u, "
+		    "internal %#lx format %#lx type %#lx\n", IOSurfaceGetID(surface),
+		    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetWidth(surface),
+		    IOSurfaceGetHeight(surface), IOSurfaceGetPlaneCount(surface), texture, width, height, plane, internal, format, type);
+	}
 	if (shown++ < 24) {
 		say("hakios-gl: -texImageIOSurface: surface %u ('%.4s' %zu x %zu, %zu planes) as texture %d: %d x %d, plane %u%s\n",
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) },

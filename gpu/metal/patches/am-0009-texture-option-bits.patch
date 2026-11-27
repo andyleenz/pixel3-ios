@@ -1,0 +1,13 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1368,6 +1368,10 @@
+  if(!d)return false;
+  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
+        textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle),(uint64_t)d.allowGPUOptimizedContents};
++ // pixel3-ios: iOS 16's Core Image makes its small private textures with option bit 19 (0x80000 | private: 0x80020), which no
++ // header names; the runtime refuses any bit outside the cache, storage and hazard fields (UndefinedValue) and the texture is nil.
++ // A texture's options are those three fields.
++ out->options&=0x3ff;
+  if(singleSample() && out->samples>1) {
+   out->samples=1;
+   if(out->type==MTLTextureType2DMultisample)out->type=MTLTextureType2D;

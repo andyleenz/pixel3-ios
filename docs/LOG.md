@@ -1367,7 +1367,19 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
 - The preview is one flat colour that follows the scene, while the frames have a picture (plug-in luma stats,
   every 150 frames: min 53, max 185, mean 130, sd 50). The preview path (420f surface into the layer) is next.
 
-Next: preview picture, then a still capture saved to Photos (assetsd; JPEG, no HEIC encoder).
+- cam38: the flat preview stays with the plug-in's synthetic pattern, so it is the display path. am-0009 masks
+  texture resource options to the three defined fields (Core Image's private textures carry an unnamed bit 19,
+  0x80020, which metal2vulkan refused); no change to the preview.
+- Cause 1: test boots passed their own `sweetenv=` (SpringBoard, mediaserverd), which replaces blueapps' set, so
+  backboardd ran without blueeagl in cam36-38. cam39 without it: the preview is pure green (YCbCr all 0).
+- Cause 2: blueeagl's planar log showed 420f planes with 0 bytes a row in backboardd. iOS 16 IOSurface.framework
+  reads a plane's bytes per row at +0x10 of each 0x80-byte plane entry (IOSurfaceClientGetBytesPerRowOfPlane,
+  client + 0xe0 + i * 0x80); SweetSurface wrote it at +0x08. Every planar surface had 0-byte rows in every
+  process, so the plug-in wrote each 420f picture into one row. Kernel 0247.
+- cam40: **live preview in the stock Camera app** from the rear sensor (1504x1128 420f, rows 1152 bytes)
+  ([screenshot](screenshots/2026-11-27-camera-preview.png)). Not focused (no lens driver yet).
+
+Next: a still capture saved to Photos (assetsd; JPEG, no HEIC encoder), rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
 HID services (usage pairs (0xFF00, 5), (0xFF08, 1), (0x20, 0x31)) by Product = matchName and reads them

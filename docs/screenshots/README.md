@@ -25,3 +25,4 @@ showing; 540x1080, half the panel's resolution, RGB565). Newest first.
 | 2026-11-21-safari.png | Safari on apple.com over Wi-Fi |
 | 2026-11-27-passcode-keypad.png | Lock screen keypad after swipe up with a passcode set (0246, `bluepasscode=1`) |
 | 2026-11-27-camera-app.png | Stock Camera app on sensor frames (cam37); preview still one flat colour |
+| 2026-11-27-camera-preview.png | Stock Camera app live preview from the rear IMX363 (cam40, 0247); unfocused |

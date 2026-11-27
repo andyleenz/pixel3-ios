@@ -1,0 +1,24 @@
+0247: SweetSurface's plane table: bytes per row at +0x10 of each plane entry, where iOS 16's
+IOSurface.framework reads it (IOSurfaceGetBytesPerRowOfPlane), not +0x08. Planar surfaces (420f
+camera buffers) had 0 bytes a row in every process.
+diff -urN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-27 19:52:36
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-27 19:52:37
+@@ -771,10 +771,16 @@
+ 	for (uint32_t i = 0; i < s->planeCount; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
++		/*
++		 * 0247: iOS 16's IOSurface.framework reads a plane's bytes per row at +0x10
++		 * (IOSurfaceClientGetBytesPerRowOfPlane: client + 0xe0 + i * 0x80, the result
++		 * being at client + 0x68); at +0x08 every plane's rows read as 0 bytes, and a
++		 * 420f camera picture was one row written over and over.
++		 */
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
