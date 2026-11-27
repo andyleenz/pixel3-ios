@@ -41,3 +41,7 @@ ENTITLEMENTS=apptest.ent sign out/apptest
 xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -fobjc-arc \
 	-framework Foundation -framework MobileCoreServices -o out/openurl openurl.m
 ENTITLEMENTS=apptest.ent sign out/openurl
+# blf.dylib: a daemon's os_log on the kernel console (tools/bluerun/blf.c)
+xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall -Wextra -dynamiclib -install_name /usr/lib/blf.dylib \
+	-o out/blf.dylib blf.c
+sign out/blf.dylib
