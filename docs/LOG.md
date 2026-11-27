@@ -1423,6 +1423,12 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   (~650 MB freed), memorystatus_level 72-73 %, but kern.memorystatus_vm_pressure_level stays 2 for 6+ minutes.
   With the compressor on, warning returns to normal only when uncompressed available memory exceeds
   1.2 x the compact threshold (half of available memory with the compressor's pages counted).
+- cam48: mediaserverd crashed each time Camera closed (3 in one session; SIGSEGV, far 0x168c, in `_Block_copy` from
+  bluecam's stream setProperty under `-[BWMultiStreamCameraSourceNode _unregisterStreamOutputHandlers]`). The
+  unregister passes NSNull as each output's PixelBufferHandler; keeping it ran objc_retainBlock on it. bluecam now
+  keeps blocks only. cam49: two Camera close cycles, no crash, same mediaserverd.
+- GPU memory with Camera open: BlueGPU's write-combined XNU pages (pool full, 0216) at 256-725 MiB, ~2000 BOs,
+  mostly mediaserverd's; they follow the camera (released when it stops), no leak seen.
 
 Next: memory pressure (more RAM for XNU: 0xa2000000..0xd0000000 is free; or find the wired and compressed
 users), then the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's

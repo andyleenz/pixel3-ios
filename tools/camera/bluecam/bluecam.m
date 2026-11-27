@@ -864,8 +864,16 @@ streamSetProperty(CMBaseObjectRef o, CFStringRef key_, CFTypeRef v)
 				st.config[i] = [one isKindOfClass:[NSDictionary class]] ? one : nil;
 			} else if (k[11] == 's')
 				st.enabled[i] = [one respondsToSelector:@selector(boolValue)] ? [one boolValue] : YES;
-			else
-				st.handler[i] = [one isKindOfClass:[NSDictionary class]] ? one[@"PixelBufferHandler"] : nil;
+			else {
+				/* only a block: on stop BWMultiStreamCameraSourceNode unregisters with a value that is not one, and
+				 * keeping it (objc_retainBlock -> _Block_copy) faulted mediaserverd at 0x168c (cam48) */
+				id h = [one isKindOfClass:[NSDictionary class]] ? one[@"PixelBufferHandler"] : nil;
+				if (h != nil && ![h isKindOfClass:NSClassFromString(@"NSBlock")]) {
+					say("stream set %s: output %d handler is %s, not a block", k, i, object_getClassName(h));
+					h = nil;
+				}
+				st.handler[i] = h;
+			}
 		}
 	} else
 		handled = NO;
