@@ -1401,6 +1401,18 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   and never asks for the passcode. Suspect: keybagd keeps the passcode type ("OpaqueStuff") in the on-disk
   keybag it saves after a change, and never saved one (no sel 3 seen); ManagedConfiguration reads it with
   `MKBKeyBagCopySytemSecretBlob`. The phone then dropped off USB (log ends, no panic).
+- passcode4 (SpringBoard/keybagd os_log via oslog-pull.sh with the dsc, SpringBoard and keybagd uuidtext):
+  keybagd changes the passcode in two phases (`KBChangeSystemNonSeSecret`): aks_change_secret's scalar out
+  is a temporary bag handle, and 0 gave "temp handle is invalid: 0", "Can't change passcode: 0xffffffff";
+  ManagedConfiguration then logged "The passcode cannot be set (-1)" (MCPasscodeErrorDomain 5014) while the
+  kernel held the passcode. 0246: sel 15 returns handle 1, save bag (3) returns a 16-byte marker, change
+  epilogue (105) and load bag (6) answered (only with `bluepasscode=1`). passcode5 panicked
+  ("IOGMD: not wired for the IODMACommand"): save bag's 32 KB output is a descriptor; it is now prepared
+  before writeBytes (input side too).
+- passcode6: keybagd runs 15, 3, 5, 105, 4 (then 87, unsupported); MC "Sending passcode changed
+  notification"; VoiceTrigger "Locked with passcode: Locked" after display off. Swipe up on the lock screen:
+  `unlockUIFromSource:CoverSheet`, "[UIUnlock] Returning YES", then "Dismiss Addendum gesture: Cancelled"
+  and the cover sheet animates back; no keypad, no unlock call (9) reaches the kernel. Home does nothing.
 - `tools/bluerun/openurl.m`: opens a URL (Settings pane: `prefs:root=PASSCODE`) through LSApplicationWorkspace.
 
 **Thermals on by default (0245; therm9-10, 2026-11-27).**

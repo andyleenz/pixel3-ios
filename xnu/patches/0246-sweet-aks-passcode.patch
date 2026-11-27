@@ -24,7 +24,7 @@ diff -urN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrameb
  		break;
 diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
 --- a/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-27 14:46:11
-+++ b/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-27 14:56:59
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-27 16:03:43
 @@ -24,7 +24,11 @@
  #include <IOKit/IOMemoryDescriptor.h>
  #include <libkern/c++/OSString.h>
@@ -52,7 +52,29 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
  	kAKSGetDeviceState   = 17,
  	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
  	kAKSAssertHold       = 26,
-@@ -59,6 +65,189 @@
+@@ -48,10 +54,21 @@
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
+ 	kAKSAssertConsume    = 101,     /* aks_assert_consume */
++	kAKSChangeSecretEpilogue = 105, /* aks_change_secret_epilogue */
+ };
+ 
+ /* The system (device) bag handle. */
+ #define SWEET_AKS_SYSTEM_HANDLE 0
++/*
++ * keybagd changes the passcode in two phases (KBChangeSystemNonSeSecret): aks_change_secret returns a
++ * new temporary bag handle, keybagd saves that bag (3) with the passcode type ("OpaqueStuff") into
++ * /private/var/keybags/systembag.kb, makes it the system bag (5), ends the change (105) and unloads
++ * the old one (4). A 0 handle is "temp handle is invalid" and the change fails with -1. The stand-in
++ * has one bag, so the temporary handle is only a token.
++ */
++#define SWEET_AKS_TEMP_HANDLE   1
++/* What a saved bag holds: a marker; the passcode itself stays in kernel memory (lost at reboot). */
++static const uint8_t sweet_aks_bag_magic[16] = { 'P', 'X', '3', 'B', 'A', 'G', '1', 0 };
+ 
+ /*
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+@@ -59,6 +76,189 @@
   */
  #define SWEET_AKS_LOCK_STATE    0x4
  
@@ -233,7 +255,7 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
 +	bzero(pass, sizeof(pass));
 +	if (ret == kIOReturnSuccess) {
 +		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
-+			args->scalarOutput[i] = 0;
++			args->scalarOutput[i] = i == 0 ? SWEET_AKS_TEMP_HANDLE : 0;
 +		}
 +	}
 +	return ret;
@@ -242,7 +264,7 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
  class AppleKeyStore : public IOService {
  	OSDeclareDefaultStructors(AppleKeyStore);
  
-@@ -75,8 +264,14 @@
+@@ -75,8 +275,14 @@
  		return false;
  	}
  	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
@@ -258,7 +280,22 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
  	return true;
  }
  
-@@ -146,11 +341,12 @@
+@@ -107,7 +313,13 @@
+ 		if (len > args->structureOutputDescriptor->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		/* Large outputs (save bag: 32 KB) come as a descriptor that must be wired first (else "IOGMD: not wired"). */
++		IOMemoryDescriptor *md = args->structureOutputDescriptor;
++		if (md->prepare() != kIOReturnSuccess) {
++			return kIOReturnNoMemory;
++		}
++		md->writeBytes(0, buf, len);
++		md->complete();
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -146,11 +358,12 @@
  static IOReturn
  sweet_aks_device_state(IOExternalMethodArguments *args)
  {
@@ -273,7 +310,24 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
  		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
  	};
  	uint8_t buf[128];
-@@ -246,9 +442,6 @@
+@@ -177,8 +390,14 @@
+ sweet_aks_struct_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t max)
+ {
+ 	if (args->structureInputDescriptor != NULL) {
+-		uint32_t n = (uint32_t)MIN((uint64_t)max, args->structureInputDescriptor->getLength());
+-		return (uint32_t)args->structureInputDescriptor->readBytes(0, buf, n);
++		IOMemoryDescriptor *md = args->structureInputDescriptor;
++		uint32_t n = (uint32_t)MIN((uint64_t)max, md->getLength());
++		if (md->prepare() != kIOReturnSuccess) {
++			return 0;
++		}
++		n = (uint32_t)md->readBytes(0, buf, n);
++		md->complete();
++		return n;
+ 	}
+ 	uint32_t n = MIN(max, args->structureInputSize);
+ 	if (args->structureInput != NULL) {
+@@ -246,9 +465,6 @@
  	case kAKSOpen:
  	case kAKSUnloadBag:
  	case kAKSSetSystem:
@@ -283,7 +337,7 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
  	case kAKSAssertHold:
  	case kAKSAssertDrop:
  	case kAKSAssertConsume:
-@@ -256,6 +449,23 @@
+@@ -256,6 +472,44 @@
  	case kAKSNotifyStateSet:
  		args->scalarOutputCount = 0;
  		break;
@@ -304,10 +358,31 @@ diff -urN a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.
 +	case kAKSChangeSecret:
 +		ret = sweet_pc_change(args);
 +		break;
++	case kAKSChangeSecretEpilogue:
++		/* Only reached after a change (bluepasscode=1); nothing left to commit. */
++		args->scalarOutputCount = 0;
++		ret = sweet_pc.on ? kIOReturnSuccess : kIOReturnUnsupported;
++		break;
++	case kAKSSaveBag:
++		args->scalarOutputCount = 0;
++		ret = sweet_pc.on ? sweet_aks_struct_out(args, sweet_aks_bag_magic, sizeof(sweet_aks_bag_magic)) :
++		    kIOReturnUnsupported;
++		break;
++	case kAKSLoadBag:
++		/* A bag saved by the stand-in (systembag.kb from an earlier bluepasscode=1 boot): the system bag. */
++		if (!sweet_pc.on) {
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		for (uint32_t i = 0; i < out_scalars; i++) {
++			args->scalarOutput[i] = SWEET_AKS_SYSTEM_HANDLE;
++		}
++		args->scalarOutputCount = out_scalars;
++		break;
  	case kAKSGetSystem:
  		if (out_scalars < 1) {
  			ret = kIOReturnBadArgument;
-@@ -269,7 +479,7 @@
+@@ -269,7 +523,7 @@
  			ret = kIOReturnBadArgument;
  			break;
  		}
