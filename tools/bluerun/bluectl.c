@@ -6,6 +6,8 @@
  *   bluectl touch SCRIPT   run touch steps now (sysctl kern.bluetouch),
  *                          bluetouchscript= syntax with times 0, e.g.
  *                          "0:tap,540,1200;0:wait,500;0:snap"
+ *   bluectl sysctl NAME... each integer sysctl's value (4 or 8 bytes), or its
+ *                          string
  */
 #include <errno.h>
 #include <stdio.h>
@@ -44,6 +46,25 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
-	fprintf(stderr, "usage: bluectl snap | bluectl touch SCRIPT\n");
+	if (argc >= 3 && strcmp(argv[1], "sysctl") == 0) {
+		int rc = 0;
+		for (int i = 2; i < argc; i++) {
+			char b[512];
+			size_t n = sizeof(b) - 1;
+			if (sysctlbyname(argv[i], b, &n, NULL, 0) != 0) {
+				printf("%s: %s\n", argv[i], strerror(errno));
+				rc = 1;
+			} else if (n == 4) {
+				printf("%s: %d\n", argv[i], *(int *)b);
+			} else if (n == 8) {
+				printf("%s: %lld\n", argv[i], *(long long *)b);
+			} else {
+				b[n] = 0;
+				printf("%s: %s\n", argv[i], b);
+			}
+		}
+		return rc;
+	}
+	fprintf(stderr, "usage: bluectl snap | bluectl touch SCRIPT | bluectl sysctl NAME...\n");
 	return 2;
 }

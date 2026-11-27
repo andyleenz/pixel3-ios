@@ -1414,9 +1414,19 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   cases correct. bluedrm now answers 14 (`BLUEDRM_HBB` overrides). vtxfer metal: Y mean error 0.05.
 - cam45: a new photograph's Recents key image is the camera frame (edges still show stripes); the Recents grid
   ("6 Photos") is still empty.
+- Grid: the thumbnail tables (3307/3324/4531.ithmb) are 0 bytes and Thumbnails/V2 is empty: no photograph has
+  grid thumbnails. assetsd saves the asset at once and leaves thumbnails to
+  `com.apple.assetsd.backgroundjobservice.discretionaryresource`, which dasd refuses: MemoryPressurePolicy
+  (pressure 2 observed, 1 required), DeviceActivityPolicy, ViewfinderPolicy.
+- Memory (`bluectl sysctl`, new): hw.memsize 2.3 GB (XNU's range is ~2.2 GiB of the 4 GiB). With Camera open,
+  72196 wired pages (1.18 GB) and 290 MB in the compressor; with Camera and Photos closed, 31507 wired
+  (~650 MB freed), memorystatus_level 72-73 %, but kern.memorystatus_vm_pressure_level stays 2 for 6+ minutes.
+  With the compressor on, warning returns to normal only when uncompressed available memory exceeds
+  1.2 x the compact threshold (half of available memory with the compressor's pages counted).
 
-Next: Photos grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's thumbnail;
-rear focus.
+Next: memory pressure (more RAM for XNU: 0xa2000000..0xd0000000 is free; or find the wired and compressed
+users), then the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
+thumbnail; rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
 HID services (usage pairs (0xFF00, 5), (0xFF08, 1), (0x20, 0x31)) by Product = matchName and reads them
