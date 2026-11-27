@@ -3,8 +3,24 @@
 SSID ranges) and real-time mode, prints the F3 packets in hex for tools/diag-decode.py.
 diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 --- a/bsd/dev/blueline_wifi.c	2026-11-27 11:21:53
-+++ b/bsd/dev/blueline_wifi.c	2026-11-27 11:30:31
-@@ -1497,6 +1497,170 @@
++++ b/bsd/dev/blueline_wifi.c	2026-11-27 11:46:23
+@@ -909,6 +909,7 @@
+ #define RX_HEAD	(gl.desc + 12)
+ 
+ static void qrtr_rx(const uint8_t *d, uint32_t n);
++static void diag_new_server(uint32_t service, uint32_t word, uint32_t node, uint32_t port);	/* 0244 */
+ 
+ static bool
+ glink_init(void)
+@@ -1351,6 +1352,7 @@
+ 		printf("BLUELINE WIFI: qrtr: server: service %u (%#x) version %u instance %u at %u:%#x\n", w[1], w[1], w[2] & 0xffu,
+ 		    w[2] >> 8, w[3], w[4]);
+ 		coachz_baseband_new_server(w[1], w[2], w[3], w[4]);	/* 0238 (does nothing without bluecell) */
++		diag_new_server(w[1], w[2], w[3], w[4]);	/* 0244 */
+ 		break;
+ 	case Q_DEL_SERVER:
+ 		coachz_baseband_del_server(w[1], w[3], w[4]);
+@@ -1497,6 +1499,203 @@
  	return qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, 0, QRTR_PORT_CTRL, pkt, sizeof(pkt));
  }
  
@@ -18,8 +34,9 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 +#define DIAG_SERVICE		4097u
 +#define DIAG_CNTL_PORT		0x13u
 +#define DIAG_DATA_PORT		0x14u
++#define DIAG_CMD_PORT		0x15u	/* ours, for the modem's CMD server (4097 word 1) */
 +#define DIAG_LINES_MAX		8000u
-+static struct { bool on, masks_sent; uint32_t lines, dropped, frames, node, port; } dg;
++static struct { bool on, masks_sent, cmd_seen, cmds_sent; uint32_t lines, dropped, frames, node, port, cmd_node, cmd_port; } dg;
 +
 +static const uint16_t diag_ssid_first[] = { 0, 500, 1000, 2000, 3000, 4000, 4500, 4600, 5000, 5500, 6000, 6500, 7000, 7100,
 +	7200, 8000, 8500, 9000, 9500, 10200, 10251, 10300, 10350, 10400, 0xc000 };
@@ -50,6 +67,37 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 +diag_cntl_send(const void *p, uint32_t len)
 +{
 +	(void)qrtr_send(Q_DATA, DIAG_CNTL_PORT, dg.node, dg.port, p, len);
++}
++
++/*
++ * Commands to the modem's CMD server, raw (APPS_HDLC_ENCODE agreed): 0x7c EXT_BUILD_ID (proves the path), then
++ * 0x7d EXT_MSG_CONFIG 5, set all SSIDs' masks (u16 reserved, u32 mask), as fgsect/scat enables F3 messages.
++ */
++static void
++diag_send_cmds(void)
++{
++	uint8_t build[1] = { 0x7c };
++	uint8_t all[8] = { 0x7d, 0x05, 0, 0, 0x1e, 0, 0, 0 };
++
++	if (!dg.masks_sent || !dg.cmd_seen || dg.cmds_sent) {
++		return;
++	}
++	dg.cmds_sent = true;
++	(void)qrtr_send(Q_DATA, DIAG_CMD_PORT, dg.cmd_node, dg.cmd_port, build, sizeof(build));
++	(void)qrtr_send(Q_DATA, DIAG_CMD_PORT, dg.cmd_node, dg.cmd_port, all, sizeof(all));
++	printf("BLUELINE DIAG: cmd: build id, all F3 masks 0x1e -> %u:%#x\n", dg.cmd_node, dg.cmd_port);
++}
++
++static void
++diag_new_server(uint32_t service, uint32_t word, uint32_t node, uint32_t port)
++{
++	if (service != DIAG_SERVICE || (word & 0xffu) != 1u || node == QRTR_NODE_APPS) {
++		return;
++	}
++	dg.cmd_node = node;
++	dg.cmd_port = port;
++	dg.cmd_seen = true;
++	diag_send_cmds();
 +}
 +
 +static void
@@ -84,6 +132,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 +	}
 +	diag_cntl_send(mode, sizeof(mode));
 +	dg.masks_sent = true;
++	diag_send_cmds();
 +	printf("BLUELINE DIAG: masks sent (%u ranges, levels 0x1e), real-time mode\n",
 +	    (unsigned)(sizeof(diag_ssid_first) / sizeof(diag_ssid_first[0])));
 +}
@@ -175,7 +224,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  static const struct { const char *path, *part; } rmtfs_parts[] = {
  	{ "/boot/modem_fs1", "modemst1" },
  	{ "/boot/modem_fs2", "modemst2" },
-@@ -1538,6 +1702,7 @@
+@@ -1538,6 +1737,7 @@
  		printf("BLUELINE WIFI: qrtr: announcing our servers failed\n");
  		return;
  	}
@@ -183,7 +232,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x, tftp at 1:%#x\n",
  	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT, TFTP_PORT);
  }
-@@ -2513,6 +2678,14 @@
+@@ -2513,6 +2713,14 @@
  		if (qmi_parse(d, n, &m)) {
  			wlfw_handle(&m, d, n);
  		}
@@ -193,7 +242,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 +		diag_cntl(h, d, n);
 +		return;
 +	}
-+	if (dg.on && h->dst_port == DIAG_DATA_PORT) {
++	if (dg.on && (h->dst_port == DIAG_DATA_PORT || h->dst_port == DIAG_CMD_PORT)) {
 +		diag_data(d, n);
  		return;
  	}
