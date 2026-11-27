@@ -66,9 +66,11 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
 # CoreTelephony connection every frame, and every failed try resets the idle
 # timer, so the screen never locks by itself (LOG.md 2026-11-23). The cellular
 # CommCenter job (same label, needs a baseband node) stays out.
+# thermalmonitord: kept since kernel 0245 (BlueThermal on by default; therm9: nominal pressure with 0237).
 KEEP_KEYS = ('/System/Library/LaunchDaemons/com.apple.CommCenter-noncellular.plist',
              '/System/Library/LaunchDaemons/com.apple.CommCenterRootHelper.plist',
-             '/System/Library/LaunchDaemons/com.apple.CommCenterMobileHelper.plist')
+             '/System/Library/LaunchDaemons/com.apple.CommCenterMobileHelper.plist',
+             '/System/Library/LaunchDaemons/com.apple.thermalmonitord.plist')
 
 
 def denied(key, job):

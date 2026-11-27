@@ -1379,6 +1379,15 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   therm7 did not run: the phone's fastboot stopped answering USB (`set-active`, `reboot`, `getvar` all hang;
   it enumerates as 0x4ee0). Needs a replug or Power + Volume Down.
 
+**Thermals on by default (0245; therm9-10, 2026-11-27).**
+- therm9 (`bluethermal=1`, thermalmonitord's job): with 0237's board thermistors (first reads 36.1 C) the os_log
+  over 16 min from boot has no thermal pressure change and no backlight cap; its control loop runs (369
+  "Could not send temperature" errors, one a cycle). Before 0237 (therm6): pressure 20 and backlight 90% within
+  a second.
+- 0245: BlueThermal on unless `bluethermal=0`. `iosroot-tweaks.py` keeps com.apple.thermalmonitord.
+- therm10 (default boot-args): BlueThermal starts (24 sensors read), thermalmonitord runs (2927 messages),
+  no pressure or backlight cap. Not yet tested: under load.
+
 **Modem DIAG over QRTR (0244, `bluediag=1`; cell9-19, 2026-11-27). Deferred.**
 - The modem's DIAG uses QRTR service 4097 with the AP as master, as linux-msm/diag and downstream
   `diagfwd_socket.c`: the AP serves CNTL (word 0), DATA (2) and DCI (4); the modem serves CMD (1) and DCI_CMD (3).

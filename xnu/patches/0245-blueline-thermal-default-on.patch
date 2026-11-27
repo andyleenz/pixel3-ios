@@ -1,0 +1,15 @@
+0245: BlueThermal (0235) on by default; bluethermal=0 turns it off. therm9: with 0237 thermalmonitord ran
+16 min with no thermal pressure and no backlight cap.
+
+diff -urN a/iokit/Kernel/arm/hid/BlueThermal.cpp b/iokit/Kernel/arm/hid/BlueThermal.cpp
+--- a/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-27 13:07:40
++++ b/iokit/Kernel/arm/hid/BlueThermal.cpp	2026-11-27 13:07:40
+@@ -388,7 +388,7 @@
+ bool
+ BlueThermal::start(IOService *provider)
+ {
+-	int on = 0;
++	int on = 1;	/* 0245: on by default (therm9: thermalmonitord nominal with 0237's board sensors); bluethermal=0 off */
+ 	(void)PE_parse_boot_argn("bluethermal", &on, sizeof(on));
+ 	if (!on || !IOService::start(provider)) {
+ 		return false;

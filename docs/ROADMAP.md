@@ -1,4 +1,4 @@
-# Roadmap (2026-11-26)
+# Roadmap (2026-11-27)
 
 The areas not yet working, with the cheapest known route for each. Estimates assume the 1-3 min automated
 boot test. These are plans, not results: the tracker and LOG.md record only what was shown.
@@ -6,9 +6,9 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 | Area | Feasibility | Route | Effort |
 |---|---|---|---|
 | Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; plug-in frames reach apps (cam32). Next: sensor frames in apps, then assetsd/Photos so captures save; force JPEG/H.264 (no HEIC/HEVC encoder) | hours |
-| Thermals to thermalmonitord | runs, uncalibrated | 0235 (`bluethermal=1`) + the launchd job: loop runs, reads all sensors, but goes to pressure 20 / backlight 90% at boot (SDM845 die hotter than the A11 tables). 0237 reads the board thermistors (PM8998 ADC): 31.6 C in therm8 (was 55-69 C). Next: thermalmonitord's pressure with it, then on by default | 0.5 day |
+| Thermals to thermalmonitord | done (default on) | 0235 + 0237 board thermistors + 0245: on by default, thermalmonitord's job kept; therm9/10: nominal pressure, no backlight cap. Left: a load test (pressure and CPU caps when hot) | - |
 | Wi-Fi 5 GHz | needs a reference | ruled out: second rail (stock DT has ch0 only), board data, regulatory (firmware allows ch 36), ath10k pdev params (0236). Next: WMI trace from Android/Linux on this phone to diff; radio in the default boot | 1-2 days |
-| Cellular control, SMS | in progress | 0238-0240 (`bluecell=1`): ABM boots the modem (cell4), CommCenter talks QMI to it (UIM, NAS, WDS, DMS); card status reads "SIM absent". Next: SIM detected, NAS registration, SMS | 2-4 days |
+| Cellular control, SMS | deferred (2026-11-27) | 0238-0240 (`bluecell=1`): ABM boots the modem (cell4), CommCenter talks QMI to it (UIM, NAS, WDS, DMS); card status reads "SIM absent". Next: SIM detected, NAS registration, SMS | 2-4 days |
 | Mobile data | more work | IPA v3.5.1 + GSI (Linux `drivers/net/ipa` has SDM845) | +4-6 days |
 | Bluetooth | realistic | WCN3990 on a GENI UART (FIFO mode), init as Linux `btqca.c` / `hci_qca.c` (GPL: reimplement or keep in userland). UniXNU/QcaBluetooth (fa52814) is WCN7850 on iPadOS 27 with Linux code in its kernel and a patched bluetoothd; reusable as design (UART.SK pipe, BlueTool XPC stand-in, Type0 capabilities), not as code; iOS 16 bluetoothd transport still to check | 2-4 days |
 | Sensors / CoreMotion | heaviest | iOS side known (0135 HID usages); hardware behind the SLPI: boot it (0186 loader), FastRPC sensor registry (never write persist), QMI sensor client | ~1 week |
