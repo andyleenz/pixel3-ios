@@ -3,8 +3,21 @@
 SSID ranges) and real-time mode, prints the F3 packets in hex for tools/diag-decode.py.
 diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 --- a/bsd/dev/blueline_wifi.c	2026-11-27 11:21:53
-+++ b/bsd/dev/blueline_wifi.c	2026-11-27 11:53:59
-@@ -909,6 +909,7 @@
++++ b/bsd/dev/blueline_wifi.c	2026-11-27 12:11:46
+@@ -897,10 +897,11 @@
+ 	vm_offset_t desc, tx, rx;
+ 	uint32_t tx_len, rx_len, rcid, rxoff, next_iid, servers, unknown;
+ 	bool open_tx, open_acked, remote_open, version_done, req_acked, up;
+-	struct { uint32_t size, iid; bool busy; } ri[64];
++	struct { uint32_t size, iid, dst; bool busy; } ri[64];	/* dst: 0244's trace, the QRTR port it carried */
+ 	int nri;
+ } gl;
+ static uint8_t gl_rxbuf[65536];
++static struct { bool on; uint32_t intent_reqs, other_rx, big_rx, fails, dst; } gtr;	/* 0244 (bluediag=1): GLINK trace */
+ static uint8_t gl_txbuf[16 + 8192 + 16];
+ 
+ #define TX_TAIL	(gl.desc + 0)
+@@ -909,6 +910,7 @@
  #define RX_HEAD	(gl.desc + 12)
  
  static void qrtr_rx(const uint8_t *d, uint32_t n);
@@ -12,7 +25,72 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  
  static bool
  glink_init(void)
-@@ -1351,6 +1352,7 @@
+@@ -1128,6 +1130,9 @@
+ 		break;
+ 	case G_INTENT_REQ:
+ 		/* data is taken in place, so every request is granted with a fresh intent id */
++		if (gtr.on && gtr.intent_reqs++ < 40) {
++			printf("BLUELINE DIAG: glink: < INTENT_REQ rcid %u size %u\n", p1, p2);
++		}
+ 		if (p1 == gl.rcid) {
+ 			uint32_t p[2] = { MAX(p2, GLINK_INTENT_SIZE), gl.next_iid++ };
+ 			(void)glink_send(G_INTENT, GLINK_LCID, 1, p, sizeof(p));
+@@ -1149,6 +1154,9 @@
+ 		memcpy(&chunk, h + 8, 4);
+ 		memcpy(&left, h + 12, 4);
+ 		if (chunk > gl.rx_len) {
++			if (gtr.on && gtr.big_rx++ < 10) {
++				printf("BLUELINE DIAG: glink: TX_DATA chunk %u > fifo %u: dropped\n", chunk, gl.rx_len);
++			}
+ 			adv = avail;
+ 			break;
+ 		}
+@@ -1161,6 +1169,9 @@
+ 		gl.rxoff += chunk;
+ 		adv = (16 + chunk + 7) & ~7u;
+ 		if (p1 != gl.rcid) {
++			if (gtr.on && gtr.other_rx++ < 20) {
++				printf("BLUELINE DIAG: glink: TX_DATA on rcid %u (not IPCRTR %u), %u bytes: dropped\n", p1, gl.rcid, chunk);
++			}
+ 			gl.rxoff = 0;
+ 			break;
+ 		}
+@@ -1230,6 +1241,7 @@
+ 		delay(1000);
+ 	}
+ 	gl.ri[best].busy = true;
++	gl.ri[best].dst = gtr.dst;
+ 	for (uint32_t off = 0; off < len;) {
+ 		uint32_t chunk = MIN(len - off, 8192u), hdr[2] = { chunk, len - off - chunk };
+ 		static uint8_t b[8 + 8192];
+@@ -1247,6 +1259,18 @@
+ 	return 0;
+ fail:
+ 	printf("BLUELINE WIFI: glink: cannot send %u bytes (%d intents)\n", len, gl.nri);
++	if (gtr.on && gtr.fails++ < 3) {
++		int busy = 0;
++		for (int i = 0; i < gl.nri; i++) {
++			busy += gl.ri[i].busy;
++		}
++		printf("BLUELINE DIAG: glink: tx fail %u: %d of %d intents busy, req_acked %d; first: ", gtr.fails, busy, gl.nri,
++		    gl.req_acked);
++		for (int i = 0; i < MIN(gl.nri, 64); i++) {
++			printf("%u/%u%s@%x ", gl.ri[i].iid, gl.ri[i].size, gl.ri[i].busy ? "b" : "", gl.ri[i].dst);
++		}
++		printf("\n");
++	}
+ 	return -1;
+ }
+ 
+@@ -1264,6 +1288,7 @@
+ 		return -1;
+ 	}
+ 	memcpy(b, &hd, sizeof(hd));
++	gtr.dst = type == Q_DATA ? dst_port : 0xc0000000u | type;	/* 0244 trace: control packets as c000000<type> */
+ 	memcpy(b + sizeof(hd), payload, len);
+ 	bzero(b + sizeof(hd) + len, padded - len);
+ 	return link_send(b, (uint32_t)sizeof(hd) + padded);
+@@ -1351,6 +1376,7 @@
  		printf("BLUELINE WIFI: qrtr: server: service %u (%#x) version %u instance %u at %u:%#x\n", w[1], w[1], w[2] & 0xffu,
  		    w[2] >> 8, w[3], w[4]);
  		coachz_baseband_new_server(w[1], w[2], w[3], w[4]);	/* 0238 (does nothing without bluecell) */
@@ -20,7 +98,7 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  		break;
  	case Q_DEL_SERVER:
  		coachz_baseband_del_server(w[1], w[3], w[4]);
-@@ -1497,6 +1499,246 @@
+@@ -1497,6 +1523,247 @@
  	return qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, 0, QRTR_PORT_CTRL, pkt, sizeof(pkt));
  }
  
@@ -261,13 +339,14 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
 +		return;
 +	}
 +	dg.on = true;
++	gtr.on = true;
 +	printf("BLUELINE DIAG: serving DIAG cntl at 1:%#x, data at 1:%#x\n", DIAG_CNTL_PORT, DIAG_DATA_PORT);
 +}
 +
  static const struct { const char *path, *part; } rmtfs_parts[] = {
  	{ "/boot/modem_fs1", "modemst1" },
  	{ "/boot/modem_fs2", "modemst2" },
-@@ -1538,6 +1780,7 @@
+@@ -1538,6 +1805,7 @@
  		printf("BLUELINE WIFI: qrtr: announcing our servers failed\n");
  		return;
  	}
@@ -275,11 +354,14 @@ diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
  	printf("BLUELINE WIFI: serving rmtfs (read only, writes dropped) at 1:%#x, buffer %#x+%#x; pd-mapper at 1:%#x, tftp at 1:%#x\n",
  	    RMTFS_PORT, RMTFS_MEM_PA, RMTFS_MEM_SIZE, PDMAP_PORT, TFTP_PORT);
  }
-@@ -2513,6 +2756,14 @@
+@@ -2513,6 +2781,17 @@
  		if (qmi_parse(d, n, &m)) {
  			wlfw_handle(&m, d, n);
  		}
 +		return;
++	}
++	if (dg.on && dg.cmd_seen && h->src_node == dg.cmd_node && h->src_port == dg.cmd_port && h->dst_port != DIAG_CMD_PORT) {
++		printf("BLUELINE DIAG: data from the modem's CMD server to port %#x, %u bytes\n", h->dst_port, n);
 +	}
 +	if (dg.on && h->dst_port == DIAG_CNTL_PORT) {	/* 0244 */
 +		diag_cntl(h, d, n);
