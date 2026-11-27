@@ -1398,7 +1398,25 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
 - cam41: **a photograph saved**: DCIM/100APPLE/IMG_0001.HEIC, 4032x3024 HEIC, 191 KB (kept off the repository).
   Unfocused, colours as the preview. Camera's thumbnail stays empty and the Photos library grid is black.
 
-Next: Photos thumbnails and grid; Camera's thumbnail; rear focus.
+- `tools/oslog` (from fpillet/oslog, NCSA): streams os_log on the phone through the ActivityStream API, filtered
+  by process (`-p NAME`, skips the CommCenter flood). Fixes for iOS 16: no strcmp on the format (it can be an
+  offset), subsystem/category pointers range-checked, line-buffered output.
+- cam42-44: Photos lists the photographs (Recents 5), but the key image is a green grid and the grid is empty.
+  The HEIC's embedded 240x320 thumbnail is already green: CMPhoto scales it in mediaserverd with
+  VTPixelTransferSession, which without Apple's scaler runs VideoToolbox's Metal compute kernels. They read two
+  RGBA32Float coefficient tables (15x64, 26x64) uploaded with replaceRegion.
+- `tools/camera/vtxfer`: the same transfer from a synthetic 4032x3024 420f source. CPU: Y mean error 0.03;
+  Metal: 65.77, the 26x64 table zero from row 16. `vtxfer metal tables` (replaceRegion, then a blit back):
+  RGBA32Float textures 16 or more wide lost every second group of 16 rows; width 15 (linear), RGBA8, R32F fine.
+- Cause: the highest bank bit. Turnip tiles on the CPU (VK_EXT_host_image_copy) with the bank swizzle from
+  `MSM_PARAM_HIGHEST_BANK_BIT`; the kernel answers 15 (Linux's sdm845 value) but never writes
+  RB/TPL1/SP_NC_MODE_CNTL, so the GPU uses its reset value. Measured: 13 worse, 15 as before, 14 all 45 table
+  cases correct. bluedrm now answers 14 (`BLUEDRM_HBB` overrides). vtxfer metal: Y mean error 0.05.
+- cam45: a new photograph's Recents key image is the camera frame (edges still show stripes); the Recents grid
+  ("6 Photos") is still empty.
+
+Next: Photos grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's thumbnail;
+rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
 HID services (usage pairs (0xFF00, 5), (0xFF08, 1), (0x20, 0x31)) by Product = matchName and reads them

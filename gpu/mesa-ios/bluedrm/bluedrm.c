@@ -313,6 +313,21 @@ drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
 			error = own_new(data);
 		return -error;
 	}
+	/*
+	 * MSM_PARAM_HIGHEST_BANK_BIT: 14, what the GPU does. The kernel answers 15 (Linux's sdm845 value) but never
+	 * writes RB/TPL1/SP_NC_MODE_CNTL, so the GPU tiles with its reset bank bit. With 15, Turnip's CPU tiling
+	 * (VK_EXT_host_image_copy) put every second group of 16 rows of a tiled RGBA32Float image where the GPU did not
+	 * read it (vtxfer tables); with 14 every row matches. BLUEDRM_HBB=N, BLUEDRM_SWIZZLE=N override (tiling tests).
+	 */
+	if (index == DRM_MSM_GET_PARAM && size >= sizeof(struct drm_msm_param)) {
+		struct drm_msm_param *p = data;
+		const char *v = p->param == MSM_PARAM_HIGHEST_BANK_BIT ? getenv("BLUEDRM_HBB") :
+		    p->param == MSM_PARAM_UBWC_SWIZZLE ? getenv("BLUEDRM_SWIZZLE") : NULL;
+		if (v != NULL || p->param == MSM_PARAM_HIGHEST_BANK_BIT) {
+			p->value = v != NULL ? strtoull(v, NULL, 0) : 14;
+			return 0;
+		}
+	}
 	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
 }
 

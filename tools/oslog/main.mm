@@ -203,6 +203,7 @@ static void NoteExitKQueueCallback(CFFileDescriptorRef f,CFOptionFlags callBackT
 int main(int argc, char **argv, char **envp) {
 
 
+	setvbuf(stdout, NULL, _IOLBF, 0);	// pixel3-ios: keep lines when killed at a timeout
 	if (!LookupSPICalls()){
 		printf("\tError: Could not find os_log required functions. iOS >=10 is required.\n");
 		return -1;
