@@ -1386,7 +1386,12 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
   a second.
 - 0245: BlueThermal on unless `bluethermal=0`. `iosroot-tweaks.py` keeps com.apple.thermalmonitord.
 - therm10 (default boot-args): BlueThermal starts (24 sensors read), thermalmonitord runs (2927 messages),
-  no pressure or backlight cap. Not yet tested: under load.
+  no pressure or backlight cap.
+- therm11 (default boot-args, `tools/thermtest/burn.c`: 8 spinning threads for 600 s, thermtest every 30 s):
+  idle pressure 0; under load 10 at once, 20 by 30 s, 30 (NSProcessInfo state 3, critical) from 90 s on, at
+  board readings of 43-46 C. Die junction (PMU tjunc) 89 C in the first round, then 56-69 C: LMh limits it
+  (thermalmonitord has no CLPC service, so it sets no CPU caps of its own). The fall back after the load was
+  not seen: the phone's timed reset came first. burn's loop counts read 0 (counter not volatile; fixed).
 
 **Modem DIAG over QRTR (0244, `bluediag=1`; cell9-19, 2026-11-27). Deferred.**
 - The modem's DIAG uses QRTR service 4097 with the AP as master, as linux-msm/diag and downstream
