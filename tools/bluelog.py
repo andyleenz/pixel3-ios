@@ -82,8 +82,9 @@ def main(argv):
                 j = json.loads(line)
             except ValueError:
                 continue
-            print(j['boot_uuid'][:6], j['timestamp'][11:23], j['process'].rsplit('/', 1)[-1], '|',
-                  j['message'].replace('\n', ' '), flush=True)
+            print((j.get('boot_uuid') or '?')[:6], (j.get('timestamp') or '')[11:23],
+                  (j.get('process') or 'pid %s' % j.get('pid')).rsplit('/', 1)[-1], '|',
+                  (j.get('message') or '').replace('\n', ' '), flush=True)
         p.wait()
     finally:
         shutil.rmtree(tmp)

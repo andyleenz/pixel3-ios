@@ -36,6 +36,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/sysctl.h>
 
 typedef struct OpaqueCMBaseObject *CMBaseObjectRef;
@@ -265,6 +266,8 @@ static struct {
 	BOOL running;
 	unsigned generation;
 	NSDictionary *metadata;			/* the last frame's, for AddAttachmentsToSampleBuffer */
+	unsigned stillsWanted;			/* StillImageCaptureNow asks not yet answered */
+	uint64_t stillsGiven;
 } st = { .lock = PTHREAD_MUTEX_INITIALIZER, .maxFps = 30 };
 
 static NSDictionary *
@@ -650,7 +653,35 @@ frameThread(void *arg)
 				if ((pbs[i] = outputBuffer(i)) != NULL)
 					hs[i] = st.handler[i];
 			}
+			CVPixelBufferRef still = NULL;
+			PixelBufferHandler stillHandler = nil;
+			if (st.stillsWanted > 0 && st.enabled[2] && st.handler[2] != nil && (still = outputBuffer(2)) != NULL) {
+				stillHandler = st.handler[2];
+				st.stillsWanted--;
+			}
 			pthread_mutex_unlock(&st.lock);
+			if (still != NULL) {
+				uint64_t c0 = mach_absolute_time();
+				if (raw)
+					fillRaw(still, f, raw);
+				else
+					fillSynthetic(still, n, fps);
+				CVBufferSetAttachment(still, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
+				CVBufferSetAttachment(still, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+				CVBufferSetAttachment(still, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+				if (md && attach)
+					CVBufferSetAttachment(still, attach, (__bridge CFTypeRef)[md mutableCopy], kCVAttachmentMode_ShouldPropagate);
+				double ms = (mach_absolute_time() - c0) * (double)tb.numer / tb.denom / 1e6;
+				stillHandler(still, CMClockMakeHostTimeFromSystemUnits(now));
+				OSType pf = CVPixelBufferGetPixelFormatType(still);
+				pthread_mutex_lock(&st.lock);
+				st.delivered[2]++;
+				unsigned long long given = ++st.stillsGiven;
+				pthread_mutex_unlock(&st.lock);
+				say("StillImage: photograph %llu given (%zux%zu %.4s, filled in %.1f ms)", given, CVPixelBufferGetWidth(still),
+				    CVPixelBufferGetHeight(still), (char *)&(OSType){ CFSwapInt32HostToBig(pf) }, ms);
+				CVPixelBufferRelease(still);
+			}
 			for (int i = 0; i < OUTPUTS - 1; i++) {
 				CVPixelBufferRef pb = pbs[i];
 				if (pb == NULL)
@@ -802,7 +833,17 @@ streamSetProperty(CMBaseObjectRef o, CFStringRef key_, CFTypeRef v)
 		st.minFps = [value doubleValue];
 	else if (strcmp(k, "MaximumFrameRate") == 0 && [value isKindOfClass:[NSNumber class]])
 		st.maxFps = [value doubleValue];
-	else if (strcmp(k, "VideoOutputsColorInfo") == 0)
+	else if (strcmp(k, "StillImageCaptureNow") == 0) {
+		/* the shutter: the next sensor frame goes to the StillImage output (one per ask, as redfin) */
+		unsigned count = 1;
+		if ([value isKindOfClass:[NSDictionary class]])
+			for (NSString *c in @[ @"NumberOfCaptures", @"NumberOf", @"Count" ])
+				if ([value[c] respondsToSelector:@selector(unsignedIntValue)] && [value[c] unsignedIntValue] >= 1) {
+					count = MIN([value[c] unsignedIntValue], 8u);
+					break;
+				}
+		st.stillsWanted += count;
+	} else if (strcmp(k, "VideoOutputsColorInfo") == 0)
 		st.colourInfo = [value isKindOfClass:[NSDictionary class]] ? value : nil;
 	else if ((strcmp(k, "VideoOutputConfigurations") == 0 || strcmp(k, "VideoOutputsEnabled") == 0 ||
 		     strcmp(k, "VideoOutputHandlers") == 0) && [value isKindOfClass:[NSDictionary class]]) {
@@ -864,6 +905,7 @@ streamStop(CMBaseObjectRef o)
 	say("stream stop (given %llu / %llu)", (unsigned long long)st.delivered[0], (unsigned long long)st.delivered[1]);
 	st.running = NO;
 	st.generation++;
+	st.stillsWanted = 0;
 	for (int i = 0; i < OUTPUTS; i++)
 		letGo(i);
 	pthread_mutex_unlock(&st.lock);
@@ -1008,10 +1050,42 @@ static const DeviceClass devClass = {
 
 static const CMBaseVTable devVTable = { NULL, &devBase, &devClass };
 
+/*
+ * The photograph's encoder. Camera asks for HEIC (HEVC in a HEIF file, made by CMPhoto through VideoToolbox), and
+ * VideoToolbox lists no HEVC encoder here but the iPhone's AVE ones: the photo encoder node fails and nothing is
+ * saved. iOS ships Apple's software HEVC codec, VCPHEVC.videocodec (its decoder is used for every HEIC picture), whose
+ * encoder HEVCVideoEncoder_CreateInstance is never registered (VCPHEVCRegisterEncoder is empty). Registered here for
+ * 'hvc1', not hardware accelerated. The approach is HackiOS's / ios-redfin's (inject_media.c register_hevc_encoder,
+ * MIT; https://github.com/DenialOfGravity/ios-redfin).
+ */
+static void
+registerHEVCEncoder(void *unused)
+{
+	void *codec = dlopen("/System/Library/VideoCodecs/VCPHEVC.videocodec", RTLD_NOW | RTLD_LOCAL);
+	void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+	void *create = codec ? dlsym(codec, "HEVCVideoEncoder_CreateInstance") : NULL;
+	int (*reg)(uint32_t, CFDictionaryRef, void *) = vt ? dlsym(vt, "VTRegisterVideoEncoderWithInfo") : NULL;
+	CFStringRef *idKey = vt ? dlsym(vt, "kVTVideoEncoderList_EncoderID") : NULL;
+	CFStringRef *nameKey = vt ? dlsym(vt, "kVTVideoEncoderList_EncoderName") : NULL;
+	CFStringRef *hwKey = vt ? dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated") : NULL;
+	if (create == NULL || reg == NULL || idKey == NULL || nameKey == NULL || hwKey == NULL) {
+		say("HEVC encoder not registered (codec %p, create %p, register %p)", codec, create, reg);
+		return;
+	}
+	const void *keys[] = { *idKey, *nameKey, *hwKey };
+	const void *values[] = { CFSTR("com.apple.videotoolbox.videoencoder.hevc.vcp"), CFSTR("HEVC (VCPHEVC, software)"), kCFBooleanFalse };
+	CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	int status = reg('hvc1', info, create);
+	CFRelease(info);
+	say("software HEVC encoder (VCPHEVC) registered for hvc1: %d", status);
+}
+
 __attribute__((visibility("default"))) OSStatus
 H13ISPCaptureDeviceCreate(CFAllocatorRef a, void *arg1, CMBaseObjectRef *out)
 {
 	say("H13ISPCaptureDeviceCreate(%p, %p, %p)", a, arg1, out);
+	static dispatch_once_t hevcOnce;
+	dispatch_once_f(&hevcOnce, NULL, registerHEVCEncoder);
 	if (pCMDerivedObjectCreate == NULL)
 		pCMDerivedObjectCreate = dlsym(RTLD_DEFAULT, "CMDerivedObjectCreate");
 	if (pFigCaptureDeviceGetClassID == NULL)
@@ -1056,9 +1130,49 @@ uncaught(NSException *e)
 		previousHandler(e);
 }
 
+/*
+ * mediaserverd's own log on the console: with OS_ACTIVITY_DT_MODE=1 in its environment (sweetenv) os_log also writes
+ * each line to stderr, which launchd points at /dev/null. Here stderr becomes a pipe, and the lines about stills,
+ * encoding and errors go to kern.bluesay (at most 3000; the rest are read and dropped so logging never blocks).
+ */
+static void *
+stderrForward(void *arg)
+{
+	FILE *in = fdopen((int)(intptr_t)arg, "r");
+	static const char *const keys[] = { "Still", "still", "Photo", "photo", "HEIF", "HEIC", "JPEG", "ncod", "rror", "ailed",
+		"Persist", "persist", "Asset", "asset", "Capture", "BWNode", "-12", "-16", NULL };
+	char line[1024];
+	unsigned sent = 0;
+	while (in && fgets(line, sizeof line, in)) {
+		if (sent >= 3000)
+			continue;
+		BOOL want = NO;
+		for (int i = 0; keys[i] && !want; i++)
+			want = strstr(line, keys[i]) != NULL;
+		if (!want || strstr(line, "com.apple.coreaudio"))
+			continue;
+		char buf[480];
+		snprintf(buf, sizeof buf, "oslog: %s", line);
+		buf[strcspn(buf, "\n")] = 0;
+		sysctlbyname("kern.bluesay", NULL, NULL, buf, strlen(buf));
+		sent++;
+	}
+	return NULL;
+}
+
 __attribute__((constructor)) static void
 loaded(void)
 {
+	if (getenv("OS_ACTIVITY_DT_MODE") != NULL) {
+		int fds[2];
+		pthread_t t;
+		if (pipe(fds) == 0 && dup2(fds[1], 2) >= 0) {
+			close(fds[1]);
+			setvbuf(stderr, NULL, _IOLBF, 0);
+			pthread_create(&t, NULL, stderrForward, (void *)(intptr_t)fds[0]);
+			pthread_detach(t);
+		}
+	}
 	char exe[256] = "?";
 	uint32_t n = sizeof exe;
 	_NSGetExecutablePath(exe, &n);
