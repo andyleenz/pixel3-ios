@@ -109,7 +109,8 @@ main(int argc, char **argv)
 		return 1;
 	}
 	uint64_t last_seq = 0, first_time = 0, last_time = 0, first_seq = 0;
-	int good = 0, again = 0;
+	int good = 0, again = 0, repeats = 0;
+	uint64_t *hashes = calloc((size_t)frames, sizeof(uint64_t));
 	for (int i = 0; i < frames;) {
 		uint64_t r0 = mach_absolute_time();
 		n = read(fd, buf, size);
@@ -131,10 +132,23 @@ main(int argc, char **argv)
 		double mean = (size_t)n >= f->header_bytes + (size_t)f->stride * (f->height / 2 + 1)
 		    ? row_mean(pix + (size_t)f->stride * (f->height / 2), f->width) : -1;
 		double dt = last_time ? ms(f->time - last_time) : 0;
+		/* FNV-1a of the pixels: a frame whose bytes equal an earlier one's is old data handed out again */
+		uint64_t hv = 1469598103934665603ull;
+		for (size_t k = 0; k + f->header_bytes < (size_t)n; k++)
+			hv = (hv ^ pix[k]) * 1099511628211ull;
+		int same = -1;
+		for (int j = 0; j < i && same < 0; j++)
+			if (hashes[j] == hv)
+				same = j + 1;
+		hashes[i] = hv;
+		repeats += same > 0;
+		char sametext[40] = "";
+		if (same > 0)
+			snprintf(sametext, sizeof(sametext), ", SAME PIXELS AS FRAME %d", same);
 		say("frame %d: %zd bytes, seq %llu%s, +%.1f ms (%.1f fps), centre row mean %.1f, exposure %u gain %u frame %u, "
-		    "read %.1f ms", i + 1, n, f->sequence, last_seq && f->sequence != last_seq + 1 ? " (skipped some)" : "", dt,
+		    "read %.1f ms, hash %016llx%s", i + 1, n, f->sequence, last_seq && f->sequence != last_seq + 1 ? " (skipped some)" : "", dt,
 		    dt > 0 ? 1000.0 / dt * (double)(f->sequence - last_seq) : 0, mean, f->exposure_lines, f->gain,
-		    f->frame_lines, ms(r1 - r0));
+		    f->frame_lines, ms(r1 - r0), (unsigned long long)hv, sametext);
 		if (f->sequence > last_seq && (size_t)n == size) {
 			good++;
 		}
@@ -159,6 +173,6 @@ main(int argc, char **argv)
 	free(buf);
 	t0 = mach_absolute_time();
 	close(fd);
-	say("closed in %.1f ms", ms(mach_absolute_time() - t0));
+	say("closed in %.1f ms; %d frame(s) repeated an earlier frame's pixels", ms(mach_absolute_time() - t0), repeats);
 	return good == frames ? 0 : 1;
 }
