@@ -1391,6 +1391,16 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
 - 0246: with `bluepasscode=1` the stand-in keeps a salted SHA-256 of the passcode in memory, checks it on
   unlock and change, locks on lock bag, and reports lock state bits (locked 1, no_pin 2, been_unlocked 4,
   Security's SecAKSWrappers.h) and `sls`/`sfa`. Without the boot-arg nothing changes.
+- passcode2 (`bluepasscode=1`, keybagd kept): Settings' Passcode pane (`openurl App-prefs:PASSCODE`; the
+  `prefs:root=` form fails) set 1234 (keybagd sel 15, "passcode set"); re-entering the pane asked for it on an
+  alphanumeric keyboard; 1235 gave "1 Failed Passcode Attempt" (0xe00002ce), 1234 opened "Turn Passcode Off".
+  Locking never happened: no process called lock device (8) or lock bag (13), so wake showed "Swipe up to open".
+- 0246 now locks when the display goes off (SweetFramebuffer power change, "Require Passcode: Immediately")
+  and on sel 8. passcode3: "display off: locked", the lock screen changes to "Swipe up to unlock", but
+  swiping does nothing (also by hand) and no unlock call arrives: SpringBoard re-reads the device state (35, 17)
+  and never asks for the passcode. Suspect: keybagd keeps the passcode type ("OpaqueStuff") in the on-disk
+  keybag it saves after a change, and never saved one (no sel 3 seen); ManagedConfiguration reads it with
+  `MKBKeyBagCopySytemSecretBlob`. The phone then dropped off USB (log ends, no panic).
 - `tools/bluerun/openurl.m`: opens a URL (Settings pane: `prefs:root=PASSCODE`) through LSApplicationWorkspace.
 
 **Thermals on by default (0245; therm9-10, 2026-11-27).**
