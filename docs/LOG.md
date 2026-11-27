@@ -1397,6 +1397,15 @@ for TG0B, TG0V and mic1 (a callback sensor: it also sends events every ReportInt
 - cell8 (0243): GET_OPERATING_MODE answers mode 3, OFFLINE, at the first query, before any host request
   and before the modem's only EFS write. In QMI's state machine OFFLINE is left only by RESET. Firmware is
   MPSS.AT.4.0.c2.17-00194 with MCFG g845-00194 (same build). The cause of booting offline is open.
+- Ruled out as the trigger: host requests before the first mode query are reads and setup only (DMS
+  Get Revision/IDs/Band Capabilities/Time, Set Event Report, Set Time, two vendor DMS messages; NAS system
+  selection; COEX, DSD, DPM, WDA); the one EFS write comes later. The modem sends no QRTR lookups.
+- Not tried: DMS RESET to leave OFFLINE. It restarts the modem subsystem; our kernel detects ERR-FATAL but
+  cannot reload the modem, so the boot would lose it.
+- Leads: postmarketOS lists the Pixel 3 modem as broken on mainline; one (now 404) report says mainline
+  SDM845 modems come up OFFLINE where Android has them in LPM. Missing on our side vs Android/mainline: the
+  AP's IPA driver and its QMI handshake (service 0x31; the modem's own instance 2 is announced). Next
+  options: modem DIAG/F3 log over GLINK for the modem's own reason; IPA bring-up (needed for data anyway).
 
 **cell4: Apple's baseband manager boots the Pixel's modem (2026-11-27).**
 - Mav17 in the preboot path: `boot.mod: Baseband bootup succeeded`, Booted -> IsReady (971 ms; the image
