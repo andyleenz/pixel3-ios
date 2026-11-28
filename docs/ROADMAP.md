@@ -5,7 +5,7 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 
 | Area | Feasibility | Route | Effort |
 |---|---|---|---|
-| Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; sensor frames reach apps (cam35); stock Camera app shows a live preview (cam40, 0247) and saves 4032x3024 HEIC photos (cam41: software HEVC encoder registered, single-frame stills); Photos lists them with a correct key image (highest bank bit 14, cam45); the viewfinder moves (surface seed bumped after GPU writes, am-0010; it looped 8 frames before). Next: a check with the lens uncovered, grid thumbnails (held by memory pressure, below), focus, video encode | hours |
+| Camera | in progress | `/dev/blueline-camera` (0233) streams 30 fps; sensor frames reach apps (cam35); stock Camera app shows a live preview (cam40, 0247) and saves 4032x3024 HEIC photos (cam41: software HEVC encoder registered, single-frame stills); Photos lists them with a correct key image (highest bank bit 14, cam45); the viewfinder moves (surface seed bumped after GPU writes, am-0010; it looped 8 frames before). live with the real sensor (mem1). Next: grid thumbnails, focus, video encode | hours |
 | Thermals to thermalmonitord | done (default on) | 0235 + 0237 board thermistors + 0245: on by default, thermalmonitord's job kept; therm9/10: nominal pressure at idle; therm11: pressure 30 (critical) under 8-thread load, LMh holds the die at 56-69 C. Left: calibration (critical at 43 C board), pressure falling after load | - |
 | Wi-Fi 5 GHz | needs a reference | ruled out: second rail (stock DT has ch0 only), board data, regulatory (firmware allows ch 36), ath10k pdev params (0236). Next: WMI trace from Android/Linux on this phone to diff; radio in the default boot | 1-2 days |
 | Cellular control, SMS | deferred (2026-11-27) | 0238-0240 (`bluecell=1`): ABM boots the modem (cell4), CommCenter talks QMI to it (UIM, NAS, WDS, DMS); card status reads "SIM absent". Next: SIM detected, NAS registration, SMS | 2-4 days |
@@ -22,9 +22,8 @@ boot test. These are plans, not results: the tracker and LOG.md record only what
 | Passcode | works (`bluepasscode=1`) | 0246: set, lock at display off, keypad, unlock (passcode7). Left: keep it across reboots (keybag on disk), default on | 0.5 day |
 | Face ID, Apple Pay, NFC, USB host | not worth it | no Secure Enclave / TrueDepth | - |
 
-Also: memory pressure stays at warning (2.2 GiB for XNU, ~1.2 GB wired with Camera open), which holds back
-dasd background jobs such as Photos' thumbnails: give XNU more of the free 0xa2000000..0xd0000000 or cut wired
-memory; overnight soak (wired memory, BO pool, daemon restarts); battery shows charging after unplug; app
+Also: memory pressure is normal with Camera open since 0248 (XNU 3.3 GiB, was 2.2 GiB; warning before), but
+Photos' thumbnail job still does not run; overnight soak (wired memory, BO pool, daemon restarts); battery shows charging after unplug; app
 reinstall does not work.
 
 ## Order

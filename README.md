@@ -130,7 +130,11 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Done: the Camera icon shows (MobileGestalt `still-camera` answered, cam50); the Recents key image is right (cam45).
 - Done: the viewfinder moves (cam54): it looped 8 frames because surfaces written by the GPU kept their seed and
   CoreAnimation reused them (am-0010 bumps the seed after a GPU write).
-- Next: Photos thumbnails (grid held by memory pressure), Camera's thumbnail; rear focus (LC898219XI) later.
+- Done: live preview with the real sensor, the room in view (mem1).
+- Done: XNU has 3.3 GiB instead of 2.2 GiB (0248: carve-outs packed into 0xa4000000..0xaa000000, RAM from
+  0xaa000000). With Camera open: pressure normal (was warning), 0.91 GB wired, nothing compressed.
+- Next: Photos thumbnails (grid still empty with pressure normal: dasd's other policies), Camera's thumbnail;
+  rear focus (LC898219XI) later.
 
 **Next, in order**
 1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery

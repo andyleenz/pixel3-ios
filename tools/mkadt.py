@@ -218,7 +218,7 @@ def sqe_firmware(choice, gmu_path):
 # Kernel-managed RAM: above every fixed carve-out in both the mainline and
 # the LineageOS device tree (README, "Second run"), 32 MiB aligned at both
 # ends (XNU maps it with 16K-granule L2 blocks).
-DRAM_BASE = 0xf4000000
+DRAM_BASE = 0xaa000000			# 0248: carve-outs packed into 0xa4000000..0xaa000000
 DRAM_SIZE = 0x17e000000 - DRAM_BASE		# RAM ends at 0x17e0a0000
 
 # /arm-io children are relative to this. It must not be 0: ios-sweet's

@@ -1453,8 +1453,18 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
 - `bluectl mkdir PATH...` (the phone has no mkdir). Recovery on both slots needs no tap again; with an unpatched
   recovery USB stays off until Enable ADB, so the Mac sees no device at all (looked like a cable fault).
 
-Next: memory pressure (more RAM for XNU: 0xa2000000..0xd0000000 is free; or find the wired and compressed
-users), then the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
+- 0248 (mem1): the carve-outs XNU does not manage packed into 0xa4000000..0xaa000000 and XNU's RAM from
+  0xaa000000 (tools/mkadt.py DRAM_BASE, was 0xf4000000): hw.memsize 3556769792 (was ~2.3 GB). GPU pool 0xc0000000
+  -> 0xa4000000, camera ring 0xd0000000 -> 0xa6000000, radio pool 0xe0000000 -> 0xa7000000, audio shm 0xe1000000 ->
+  0xa8000000, modem metadata 0xf2600000 -> 0xa8100000, rmtfs 0xf2701000 -> 0xa8201000; 0xa2000000..0xa4000000 left
+  for the sensors. Booted; camtest 60 of 60 frames; GPU pool in use. With Camera open: pressure level 1 (was 2),
+  memorystatus_level 73, 55811 wired pages (0.91 GB, was 1.18 GB), compressor empty. Radio, modem and audio at
+  their new addresses not yet checked. The Photos grid is still empty after 3 min idle with pressure normal.
+- mem1: the stock Camera viewfinder shows the room live from the sensor (7 distinct of 7 screenshots). Before it,
+  preview frames were black: `bluesh run camtest 60 ; echo` passed ";" and "echo" as LINES and GAIN (bluesh runs no
+  shell), so EXPOSURE 0/0 clamped to 4 lines at 1x, and the kernel keeps an asked exposure for later sessions.
+
+Next: the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
 thumbnail; rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as

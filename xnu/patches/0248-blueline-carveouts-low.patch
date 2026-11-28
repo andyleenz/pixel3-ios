@@ -1,0 +1,120 @@
+0248: the carve-outs XNU does not manage, packed into 0xa4000000..0xaa000000, so XNU's RAM can start at
+0xaa000000 (tools/mkadt.py DRAM_BASE; was 0xf4000000): 3392 MiB instead of 2208 MiB. Memory pressure stayed at
+warning with Camera open and held back Photos' thumbnail jobs. 0xa2000000..0xa4000000 stays free for the sensors.
+  GPU pool     0xc0000000 -> 0xa4000000 (32 MiB; window now 0xa4000000..0xaa000000)
+  camera ring  0xd0000000 -> 0xa6000000 (16 MiB)
+  radio pool   0xe0000000 -> 0xa7000000 (16 MiB)
+  audio shm    0xe1000000 -> 0xa8000000 (64 KiB)
+  modem mdata  0xf2600000 -> 0xa8100000 (16 KiB)
+  rmtfs        0xf2701000 -> 0xa8201000 (2 MiB)
+diff -urN a/bsd/dev/blueline_audio.c b/bsd/dev/blueline_audio.c
+--- a/bsd/dev/blueline_audio.c	2026-11-28 19:02:18
++++ b/bsd/dev/blueline_audio.c	2026-11-28 19:02:19
+@@ -1263,7 +1263,7 @@
+ #define LG_INTENT_SIZE		4096u
+ #define LG_FEAT_REUSE		1u
+ #define SND_SID			0x1821u		/* q6asm / msm-audio-ion: iommus <&apps_smmu 0x1821 0x0> */
+-#define SND_SHM_PA		0xe1000000ull	/* in the gap blueline_wifi.c's radio pool uses (0xe0000000 + 16 MiB) */
++#define SND_SHM_PA		0xa8000000ull	/* 0248: below XNU (0xaa000000+), after the radio pool (0xa7000000 + 16 MiB) */
+ #define SND_SHM_SIZE		0x10000u
+ 
+ enum { LG_VERSION = 0, LG_VERSION_ACK, LG_OPEN, LG_CLOSE, LG_OPEN_ACK, LG_INTENT, LG_RX_DONE, LG_INTENT_REQ,
+diff -urN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c	2026-11-28 19:02:18
++++ b/bsd/dev/blueline_camera_probe.c	2026-11-28 19:02:19
+@@ -1055,17 +1055,17 @@
+ 	/*
+ 	 * A carve-out below 4 GiB that XNU does not manage (as blueline_gpu_mem.c): the write master has 32-bit
+ 	 * addresses and XNU's RAM below 4 GiB (0xf4000000+) has no 4 MiB contiguous left even at boot. 16 MiB at
+-	 * bluecam_pool (0xd0000000): inside the GPU pool's window, clear of the pool (0xc0000000 + 32 MiB) and
+-	 * of Wi-Fi's 0xe0000000. Cacheable (write-combined reads ran at 38 MB/s: 100 ms a frame, camdev10), the one
++	 * bluecam_pool (0xa6000000, 0248): inside the GPU pool's window, clear of the pool (0xa4000000 + 32 MiB) and
++	 * of Wi-Fi's 0xa7000000. Cacheable (write-combined reads ran at 38 MB/s: 100 ms a frame, camdev10), the one
+ 	 * mapping: each buffer is cleaned and invalidated before it is copied out.
+ 	 */
+ 	if (dev_pool_va) {
+ 		return true;
+ 	}
+-	uint64_t base = 0xd0000000ull, size = (uint64_t)DEV_RING * DEV_BUF_BYTES;
++	uint64_t base = 0xa6000000ull, size = (uint64_t)DEV_RING * DEV_BUF_BYTES;
+ 	(void)PE_parse_boot_argn("bluecam_pool", &base, sizeof(base));
+-	if (base < 0xa4000000ull || base + size > 0xe0000000ull || (base & PAGE_MASK)) {
+-		printf("BLUE CAM: dev: bluecam_pool 0x%llx outside 0xa4000000..0xe0000000\n", base);
++	if (base < 0xa4000000ull || base + size > 0xaa000000ull || (base & PAGE_MASK)) {
++		printf("BLUE CAM: dev: bluecam_pool 0x%llx outside 0xa4000000..0xaa000000\n", base);
+ 		return false;
+ 	}
+ 	for (uint64_t pa = base; pa < base + size; pa += PAGE_SIZE) {
+diff -urN a/bsd/dev/blueline_gpu_mem.c b/bsd/dev/blueline_gpu_mem.c
+--- a/bsd/dev/blueline_gpu_mem.c	2026-11-28 19:02:18
++++ b/bsd/dev/blueline_gpu_mem.c	2026-11-28 19:02:19
+@@ -3,7 +3,7 @@
+  * VA windows of the user interface (patch 0153). See blueline_gpu_core.h.
+  *
+  * The pool is a physical carve-out below 4 GiB that XNU does not manage:
+- * XNU's RAM starts at 0xf4000000 (tools/mkadt.py DRAM_BASE, /chosen
++ * XNU's RAM starts at 0xaa000000 (0248; tools/mkadt.py DRAM_BASE, /chosen
+  * dram-base), so a range below it has no physmap alias and the CPU may map
+  * it write-combined (Normal NC) without a cacheable alias anywhere. The
+  * default is 32 MiB at 0xc0000000 (bluegpu_pool_mb, bluegpu_pool_base; at most
+@@ -42,8 +42,8 @@
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);	/* osfmk/vm/pmap.h, kernel-private */
+ 
+ #define GM_WIN_LO		0xa4000000ull	/* the pool must sit inside [GM_WIN_LO, GM_WIN_HI) */
+-#define GM_WIN_HI		0xe0000000ull
+-#define GM_DEFAULT_BASE		0xc0000000ull
++#define GM_WIN_HI		0xaa000000ull	/* 0248: XNU's RAM starts here (tools/mkadt.py DRAM_BASE) */
++#define GM_DEFAULT_BASE		0xa4000000ull	/* 0248: was 0xc0000000 */
+ #define GM_DEFAULT_MB		32u
+ #define GM_IO_MAX_MB		32u	/* ml_io_map region: 64 MiB in all (sailfish 0208), shared */
+ #define GM_MAX			0x40000000ull	/* L1[2]: 1 GiB */
+@@ -136,7 +136,7 @@
+ 	} else if (mb > GM_IO_MAX_MB) {
+ 		why = "over 32 MiB (the kernel view comes from the 64 MiB ml_io_map region, which panics when full)";
+ 	} else if (base < GM_WIN_LO || base + size > GM_WIN_HI) {
+-		why = "outside the free window 0xa4000000..0xe0000000";
++		why = "outside the free window 0xa4000000..0xaa000000";
+ 	} else if ((base + size - 1) >> blue_gpu_core_oas()) {
+ 		why = "above the SMMU's output size";
+ 	}
+diff -urN a/bsd/dev/blueline_wifi.c b/bsd/dev/blueline_wifi.c
+--- a/bsd/dev/blueline_wifi.c	2026-11-28 19:02:18
++++ b/bsd/dev/blueline_wifi.c	2026-11-28 19:02:19
+@@ -306,7 +306,7 @@
+ #define MBA_PA			0x98500000u
+ #define MBA_SIZE		0x00200000u
+ #define MBA_MAX			0x00100000u	/* q6v5_load: MBA is at most 1 MiB */
+-#define MDATA_PA		0xf2600000u	/* free gap below XNU and rmtfs, outside the GPU pool */
++#define MDATA_PA		0xa8100000u	/* 0248: free gap below XNU (0xaa000000+), above the GPU pool, camera, radio and audio */
+ #define MDATA_SIZE		0x4000u
+ 
+ /* QDSP6SS and RMB (pil-q6v55-mss reg: qdsp6_base, rmb_base) */
+@@ -1410,7 +1410,7 @@
+ #define TFTP_PORT		0x12u
+ #define TFTP_XFER_PORT0		0x100u
+ #define TFTP_XFERS		8
+-#define RMTFS_MEM_PA		0xf2701000u
++#define RMTFS_MEM_PA		0xa8201000u	/* 0248: was 0xf2701000 (mainline rmtfs 0xf2700000 + guard page) */
+ #define RMTFS_MEM_SIZE		0x200000u
+ #define RMTFS_LUN		5u
+ #define QMI_REQUEST		0
+@@ -2881,8 +2881,8 @@
+  *    works through it), else the stream gets an identity context bank as topaz does.
+  *  - the WLAN block at 0x18800000 (sdm845.dtsi wifi: membase 0x18800000+0x800000): copy engines
+  *    at +0x240000, the shadow write indices at +0x32000, as on topaz's 0xc800000.
+- *  - host memory: a 16 MiB pool at 0xe0000000 in the free gap below XNU (0xf4000000+) and above
+- *    the GPU pool (0xc0000000+32 MiB), write-combined (Normal NC) like topaz's.
++ *  - host memory: a 16 MiB pool at 0xa7000000 in the free gap below XNU (0xaa000000+, 0248) and above
++ *    the camera ring (0xa6000000+16 MiB), write-combined (Normal NC) like topaz's.
+  * Everything is polled from the watch thread; the scan is passive (nothing is transmitted),
+  * and every BSSID is logged with its last three bytes masked.
+  */
+@@ -2893,7 +2893,7 @@
+ #define RADIO_CB_CBAR		0x0001f000u	/* S1_TRANS_S2_FAULT, S1 memattr WB */
+ #define RADIO_CB_CBA2R		0x00000001u	/* VA64 */
+ #define RADIO_CB_SCTLR		0x000000e0u	/* CFCFG|CFIE|CFRE, M=0: no translation */
+-#define RADIO_POOL_PA		0xe0000000ull
++#define RADIO_POOL_PA		0xa7000000ull	/* 0248: was 0xe0000000 */
+ #define RADIO_POOL_SIZE		0x01000000ull
+ #define RADIO_WLAN_PA		0x18800000ull
+ 
