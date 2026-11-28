@@ -1489,7 +1489,7 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   embedded thumbnail in the HEIC; our captures have neither. The session then ended: a USB bus reset (cable or phone handled, power key up first),
   after which the Mac kept clearing a halt on EP 0x82 and bluesh did not recover; the 180 s link watchdog sent
   the phone to recovery.
-- 0249 (built): the preview was upside down. The sensor now reads out rotated 180 degrees (image_orientation
+- 0249 (mem4: the right way up, checked on the phone; the log shows orientation 0x03, bayer 3): the preview was upside down. The sensor now reads out rotated 180 degrees (image_orientation
   0x0101 = 3, written before stream-on), and the frame header reports Bayer 3 (BGGR) for it. `bluecam_orient=N`
   and `bluecam_bayer=N` override; 0 and 0 give the old readout.
 
