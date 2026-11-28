@@ -5,7 +5,7 @@
  *   vtscale
  *
  * For a 4032x3024 source (420f and BGRA, IOSurface-backed, a gradient): VTPixelTransferSession to the same size, to
- * 480x360, and 420f to BGRA; VTPixelRotationSession by 90 and 180 degrees. Each line: the status, the time and the
+ * 480x360, and 420f to BGRA; VTPixelRotationSession by 90 and 180 degrees, and by 180 into 480x360 (rotate and scale). Each line: the status, the time and the
  * mean of the output's first plane (0 for a buffer left empty). Exit 0 if every call returned 0.
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -101,10 +101,10 @@ transfer(const char *what, CVPixelBufferRef src, int w, int h, OSType f)
 }
 
 static void
-rotate(const char *what, CVPixelBufferRef src, int deg, OSType f)
+rotate(const char *what, CVPixelBufferRef src, int deg, OSType f, int dw, int dh)
 {
 	int w = (int)CVPixelBufferGetWidth(src), h = (int)CVPixelBufferGetHeight(src);
-	CVPixelBufferRef dst = deg % 180 ? make(h, w, f) : make(w, h, f);
+	CVPixelBufferRef dst = dw ? make(dw, dh, f) : deg % 180 ? make(h, w, f) : make(w, h, f);
 	VTPixelRotationSessionRef s = NULL;
 	OSStatus st = VTPixelRotationSessionCreate(NULL, &s);
 	if (st == 0) {
@@ -142,9 +142,14 @@ main(void)
 	transfer("420f -> 4032x3024 BGRA", sy, 4032, 3024, bgra);
 	transfer("420f -> 480x360 BGRA", sy, 480, 360, bgra);
 	transfer("BGRA -> 480x360 BGRA", sb, 480, 360, bgra);
-	rotate("420f 180", sy, 180, yuv);
-	rotate("420f 90", sy, 90, yuv);
-	rotate("BGRA 180", sb, 180, bgra);
-	rotate("BGRA 90", sb, 90, bgra);
+	rotate("420f 180", sy, 180, yuv, 0, 0);
+	rotate("420f 90", sy, 90, yuv, 0, 0);
+	rotate("BGRA 180", sb, 180, bgra, 0, 0);
+	rotate("BGRA 90", sb, 90, bgra, 0, 0);
+	/* Camera's thumbnail: rotated and scaled at once (CAMThumbnailGenerator, {480, 360} in orientation 3) */
+	rotate("420f 180 -> 480x360", sy, 180, yuv, 480, 360);
+	rotate("420f 180 -> 480x360 BGRA", sy, 180, bgra, 480, 360);
+	rotate("BGRA 180 -> 480x360", sb, 180, bgra, 480, 360);
+	rotate("420f 0 -> 480x360", sy, 0, yuv, 480, 360);
 	return bad;
 }
