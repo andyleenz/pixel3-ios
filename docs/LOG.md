@@ -1458,8 +1458,11 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   -> 0xa4000000, camera ring 0xd0000000 -> 0xa6000000, radio pool 0xe0000000 -> 0xa7000000, audio shm 0xe1000000 ->
   0xa8000000, modem metadata 0xf2600000 -> 0xa8100000, rmtfs 0xf2701000 -> 0xa8201000; 0xa2000000..0xa4000000 left
   for the sensors. Booted; camtest 60 of 60 frames; GPU pool in use. With Camera open: pressure level 1 (was 2),
-  memorystatus_level 73, 55811 wired pages (0.91 GB, was 1.18 GB), compressor empty. Radio, modem and audio at
-  their new addresses not yet checked. The Photos grid is still empty after 3 min idle with pressure normal.
+  memorystatus_level 73, 55811 wired pages (0.91 GB, was 1.18 GB), compressor empty. Audio (mem1): the ADSP
+  played from the new shm, 0 amp errors. mem2 (`bluewifi=6 bluewifi_step=4 bluewifi_watch=0 bluecell=1`): MPSS
+  header authentication ok with the metadata at 0xa8100000; MP_ASSIGN rmtfs 0xa8201000 ok and the modem read
+  modemst1/2, fsg, fsc through it; the radio's copy engines from the pool at 0xa7000000 reached HTC READY and WMI
+  SERVICE_READY. (mem2's black screenshots: the display was off, `SWEET FB: display off`, from my power-key presses.) The Photos grid is still empty after 3 min idle with pressure normal.
 - mem1: the stock Camera viewfinder shows the room live from the sensor (7 distinct of 7 screenshots). Before it,
   preview frames were black: `bluesh run camtest 60 ; echo` passed ";" and "echo" as LINES and GAIN (bluesh runs no
   shell), so EXPOSURE 0/0 clamped to 4 lines at 1x, and the kernel keeps an asked exposure for later sessions.
