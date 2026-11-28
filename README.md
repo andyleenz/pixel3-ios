@@ -133,7 +133,8 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
 - Done: live preview with the real sensor, the room in view (mem1), the right way up since 0249 (mem4).
 - Done: XNU has 3.3 GiB instead of 2.2 GiB (0248: carve-outs packed into 0xa4000000..0xaa000000, RAM from
   0xaa000000). With Camera open: pressure normal (was warning), 0.91 GB wired, nothing compressed.
-- Next: Photos thumbnails (grid still empty with pressure normal: dasd's other policies), Camera's thumbnail;
+- Done: Photos thumbnails for new photos (bluevt: VideoToolbox rotate-and-scale without the M2 scaler, 0250).
+- Next: thumbnails for photos taken before it, Camera's thumbnail;
   rear focus (LC898219XI) later.
 
 **Next, in order**

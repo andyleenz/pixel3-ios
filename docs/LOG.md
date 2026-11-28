@@ -1493,7 +1493,21 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   0x0101 = 3, written before stream-on), and the frame header reports Bayer 3 (BGGR) for it. `bluecam_orient=N`
   and `bluecam_bayer=N` override; 0 and 0 give the old readout.
 
-Next: the grid thumbnails (where the import should write them: the capture's preview image, PLImageWriter); the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
+- `tools/camera/vtscale` (mem4): VideoToolbox in software does every transfer (same size, 4032x3024 -> 480x360,
+  420f -> BGRA; 20-85 ms) and every rotation at the rotated size (90 and 180; 13-78 ms), but a rotation into any
+  other size returns -12914 in 0.1 ms, even by 0 degrees. That is Camera's thumbnail call. Only
+  AppleM2ScalerCSCDriver rotates and scales at once.
+- `tools/camera/bluevt` (bluevt.dylib) patches VTPixelRotationSessionRotateImage in place (bluemis' trampoline) and
+  on -12914 does it in two steps: rotate at full size, then VTPixelTransferSession into the caller's buffer.
+  vtscale with it: all four rotate-and-scale cases 0, 63-134 ms, output means as the plain transfers. 0250 adds it
+  to the blueapps set (Camera, mediaserverd, assetsd); a `sweetenv=` with the whole set was 60 bytes over the
+  607-byte boot-args limit.
+- mem5 (0250): Camera's two thumbnail calls went through bluevt (1500x1126 420f -> 360x480 420f and BGRA, quarter
+  turn; 1.9 and 2.3 s, slow). The new photo (IMG_0016) is the first asset with a thumbnail index (0); the
+  .ithmb tables hold 104 KB / 1.0 MB / 923 KB (were empty) and V2/DCIM exists. Photos' All Photos grid draws its
+  cells now (none before). Assets imported earlier still have none (index -1).
+
+Next: the grid thumbnails (older assets: a rebuild; bluevt's 2 s); the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
 thumbnail; rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
