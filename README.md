@@ -127,7 +127,10 @@ Updated as work lands. The detail is in the [engineering log](https://github.com
   backboardd's blueeagl in `sweetenv`.
 - Done: photographs saved (cam41): 4032x3024 HEIC in DCIM via the software HEVC encoder, single-frame stills (SIS,
   HDR and fusion off in `camera-plists.py`), Live Photo off.
-- Next: Photos thumbnails (library grid black), Camera's thumbnail; rear focus (LC898219XI) later.
+- Done: the Camera icon shows (MobileGestalt `still-camera` answered, cam50); the Recents key image is right (cam45).
+- Done: the viewfinder moves (cam54): it looped 8 frames because surfaces written by the GPU kept their seed and
+  CoreAnimation reused them (am-0010 bumps the seed after a GPU write).
+- Next: Photos thumbnails (grid held by memory pressure), Camera's thumbnail; rear focus (LC898219XI) later.
 
 **Next, in order**
 1. Metal for apps. Done: `MTLCreateSystemDefaultDevice` returns the A630 through Metal's plugin discovery

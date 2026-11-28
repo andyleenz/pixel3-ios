@@ -6,6 +6,7 @@
  *   bluectl touch SCRIPT   run touch steps now (sysctl kern.bluetouch),
  *                          bluetouchscript= syntax with times 0, e.g.
  *                          "0:tap,540,1200;0:wait,500;0:snap"
+ *   bluectl mkdir PATH...  each directory and its parents (mode 755); the phone has no mkdir
  *   bluectl sysctl NAME... each integer sysctl's value (4 or 8 bytes), or its
  *                          string
  */
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -46,6 +48,27 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
+	if (argc >= 3 && strcmp(argv[1], "mkdir") == 0) {
+		int bad = 0;
+		for (int i = 2; i < argc; i++) {
+			char p[1024];
+			snprintf(p, sizeof(p), "%s", argv[i]);
+			for (char *c = p + 1; ; c++) {
+				if (*c == '/' || *c == 0) {
+					char was = *c;
+					*c = 0;
+					if (mkdir(p, 0755) != 0 && errno != EEXIST) {
+						printf("mkdir %s: %s\n", p, strerror(errno));
+						bad = 1;
+					}
+					*c = was;
+					if (was == 0)
+						break;
+				}
+			}
+		}
+		return bad;
+	}
 	if (argc >= 3 && strcmp(argv[1], "sysctl") == 0) {
 		int rc = 0;
 		for (int i = 2; i < argc; i++) {
@@ -65,6 +88,6 @@ main(int argc, char **argv)
 		}
 		return rc;
 	}
-	fprintf(stderr, "usage: bluectl snap | bluectl touch SCRIPT | bluectl sysctl NAME...\n");
+	fprintf(stderr, "usage: bluectl snap | bluectl touch SCRIPT | bluectl mkdir PATH... | bluectl sysctl NAME...\n");
 	return 2;
 }

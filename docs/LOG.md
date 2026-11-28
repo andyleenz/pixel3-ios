@@ -1439,6 +1439,19 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   session itself (bluereboot=recovery). It starts armed at 600 s (BLUESH_WATCH), so a boot whose link never comes
   up also ends in recovery. Recovery on both slots needs no Enable ADB tap again (both re-flashed; without the
   patch, recovery keeps USB off and the Mac sees no device at all).
+- Viewfinder loop (Camera and CamHello: about a second of scene, then the first frames over again), cam51-54.
+  Not the sensor path: camtest 300 frames, all whole, in order, 30 fps, no frame's pixels repeated (hash per frame).
+  With bluecam's synthetic bars the preview showed exactly 8 images in turn (20 screenshots), one per pool
+  buffer. Not the kernel's lazy clean (`bluegpu_lazyclean=0`: same), not the YCbCr conversion
+  (`gpu-ycbcr-planes=0`: same), not VideoToolbox's scaler (`vtxfer metal 1080 1440 again`: the destination follows
+  each refill of the same source), not surfaces across processes in general (CamHello's BGRA data output: 240
+  distinct of 250 frames). Cause: a surface the GPU writes keeps its seed. On Apple's driver the seed moves on
+  every GPU write; CoreAnimation takes an unchanged seed for unchanged contents, and mediaserverd's preview buffers
+  are written by its GPU scaler. am-0010: at completion, each surface texture with render-target or shader-write
+  usage gets a write lock and unlock (seed bump), outside the render server. After it: 15 distinct of 16
+  screenshots, the bars moving. No reboot needed (bluemetal.dylib pushed, mediaserverd restarted).
+- `bluectl mkdir PATH...` (the phone has no mkdir). Recovery on both slots needs no tap again; with an unpatched
+  recovery USB stays off until Enable ADB, so the Mac sees no device at all (looked like a cable fault).
 
 Next: memory pressure (more RAM for XNU: 0xa2000000..0xd0000000 is free; or find the wired and compressed
 users), then the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's

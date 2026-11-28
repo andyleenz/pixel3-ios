@@ -6,6 +6,8 @@
  * expected ramp. "metal" sets BLUE_METAL=1 (BlueMetal gives this process a device), "cpu" BLUE_METAL=0, to compare
  * VideoToolbox's Metal path with its CPU path. "trace" (after metal) logs VideoToolbox's Metal calls (BlueMetal's
  * NB* classes swizzled: functions, textures, buffers, dispatches, render passes). VAR=VALUE arguments are set in the environment first (runtime switches).
+ * "again": then the same source is refilled with Y = 200 (a write lock, as a camera pool buffer is) and transferred into
+ * the same destination; its Y mean must follow (the viewfinder loop, cam51-53: each pool buffer showed its first frame).
  *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
  */
@@ -15,6 +17,8 @@
 #import <VideoToolbox/VideoToolbox.h>
 #include <objc/runtime.h>
 #include <mach/mach_time.h>
+#include <math.h>
+#include <string.h>
 
 static CVPixelBufferRef
 make(size_t w, size_t h)
@@ -209,10 +213,12 @@ main(int argc, char **argv)
 	setenv("BLUE_METAL", strcmp(argv[1], "metal") == 0 ? "1" : "0", 1);
 	size_t dw = 240, dh = 320;
 	int n = 0;
-	bool tracing = false;
+	bool tracing = false, again = false;
 	for (int i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "trace") == 0)
 			tracing = true;
+		else if (strcmp(argv[i], "again") == 0)
+			again = true;
 		else if (strcmp(argv[i], "tables") == 0) {
 			tables();
 			return 0;
@@ -287,5 +293,25 @@ main(int argc, char **argv)
 		fclose(f);
 	}
 	CVPixelBufferUnlockBaseAddress(dst, kCVPixelBufferLock_ReadOnly);
+	for (int round = 1; again && round <= 3; round++) {
+		int val = round == 2 ? 40 : 200;
+		CVPixelBufferLockBaseAddress(src, 0);
+		y = CVPixelBufferGetBaseAddressOfPlane(src, 0);
+		yr = CVPixelBufferGetBytesPerRowOfPlane(src, 0);
+		for (size_t j = 0; j < 3024; j++)
+			memset(y + j * yr, val, 4032);
+		CVPixelBufferUnlockBaseAddress(src, 0);
+		st = VTPixelTransferSessionTransferImage(s, src, dst);
+		CVPixelBufferLockBaseAddress(dst, kCVPixelBufferLock_ReadOnly);
+		y = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+		yr = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+		double sum = 0;
+		for (size_t j = 0; j < dh; j++)
+			for (size_t i = 0; i < dw; i++)
+				sum += y[j * yr + i];
+		CVPixelBufferUnlockBaseAddress(dst, kCVPixelBufferLock_ReadOnly);
+		printf("again %d: source Y %d -> transfer %d, destination Y mean %.1f (%s)\n", round, val, (int)st, sum / (dw * dh),
+		    fabs(sum / (dw * dh) - val) < 4 ? "follows" : "STALE");
+	}
 	return 0;
 }

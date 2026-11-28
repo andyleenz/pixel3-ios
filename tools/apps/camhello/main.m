@@ -5,6 +5,8 @@
  * AVCaptureSession with a BGRA video data output and a preview layer for 8 s, and writes one line to
  * Documents/hello.txt: devices, access, frames and fps, frame size, mean and spread of a centre row, and
  * any session error. Every outcome writes the line (no device, no access, no frames, 15 s timeout).
+ * Each BGRA frame's centre row is hashed: "N distinct of M hashed" tells frames handed out again (the viewfinder
+ * loop, cam51-54: the preview cycled through 8 images).
  *
  * Copyright (c) 2026 pixel3-ios. MIT licence.
  */
@@ -27,6 +29,8 @@
 	size_t _w, _h;
 	OSType _fmt;
 	double _mean, _spread;
+	uint64_t _hash[512];
+	unsigned _hashed, _distinct;
 	BOOL _done;
 	const char *volatile _step;	/* the AVFoundation call in progress, named by the timeout */
 }
@@ -52,6 +56,7 @@ note(NSString *line)
 		if (_frames > 1)
 			[_line appendFormat:@" (%.1f fps), %zux%zu fmt %.4s, centre row mean %.0f spread %.0f, %u dropped",
 			    (_frames - 1) / secs, _w, _h, (char *)&(OSType){ CFSwapInt32HostToBig(_fmt) }, _mean, _spread, _dropped];
+		[_line appendFormat:@", %u distinct of %u hashed", _distinct, _hashed];
 		[_line appendString:@"\n"];
 		note(_line);
 	}
@@ -162,6 +167,21 @@ note(NSString *line)
 		if (_frames++ == 0)
 			_first = t;
 		_last = t;
+		if (pb != NULL && CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA && _hashed < 512) {
+			CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+			size_t bpr = CVPixelBufferGetBytesPerRow(pb), hh = CVPixelBufferGetHeight(pb);
+			const uint8_t *r = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+			uint64_t hv = 1469598103934665603ull;
+			for (size_t yy = 0; yy < hh; yy += 37)
+				for (size_t k = 0; k < bpr; k += 3)
+					hv = (hv ^ r[yy * bpr + k]) * 1099511628211ull;
+			CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+			unsigned j = 0;
+			while (j < _hashed && _hash[j] != hv)
+				j++;
+			_distinct += j == _hashed;
+			_hash[_hashed++] = hv;
+		}
 		if (pb == NULL || (_frames % 30) != 1)
 			return;
 		_w = CVPixelBufferGetWidth(pb), _h = CVPixelBufferGetHeight(pb), _fmt = CVPixelBufferGetPixelFormatType(pb);

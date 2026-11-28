@@ -1,0 +1,31 @@
+--- a/NativeBridgeMetalFrontend.mm	2026-11-28 15:44:46
++++ b/NativeBridgeMetalFrontend.mm	2026-11-28 15:45:34
+@@ -1507,6 +1507,20 @@
+ #endif
+ // Diagnostic: while /private/var/ngpu/debug/no-surface-flush exists when the process starts, no surface is flushed here either.
+ static const bool gSkipSurfaceFlush=access("/private/var/ngpu/debug/no-surface-flush",F_OK)==0;
++// pixel3-ios: a surface the GPU wrote gets a new seed at completion, as Apple's driver gives it (IOSurfaceGetSeed moves on
++// every write). CoreAnimation reads an unchanged seed as unchanged contents: the camera preview, whose buffers mediaserverd's
++// scaler writes on the GPU, showed each of its 8 pool buffers' first frame again and again (cam51-54). A write lock and
++// unlock bumps it. Not in the render server (its display buffers nobody else reads; the kernel's lazy clean would clean
++// them at its next submit). NMB_NO_SEED_BUMP=1 turns it off.
++static void bumpWrittenSurfaceSeeds(NSSet *surfaces,bool completed) {
++ static const bool off=getenv("NMB_NO_SEED_BUMP")!=nullptr || nativeIsRenderServer();
++ if(off || !completed || !surfaces.count)return;
++ for(NBTexture *texture in surfaces) {
++  IOSurfaceRef surface=texture.surface;
++  if(!surface || !(texture.descriptor.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite)))continue;
++  if(IOSurfaceLock(surface,0,nullptr)==0)IOSurfaceUnlock(surface,0,nullptr);
++ }
++}
+ static uint64_t flushSurfaces(NSMutableSet *surfaces) {
+  if(!kSurfaceFlush || !surfaces.count || gSkipSurfaceFlush)return 0;
+  std::vector<std::pair<uintptr_t,size_t>> ranges;
+@@ -3875,6 +3889,7 @@
+  frontStage(traceNumber,self.commitIndex,8);
+  const uint64_t flushed=flushSurfaces(_surfaces);
+  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
++ bumpWrittenSurfaceSeeds(_surfaces,self.status==MTLCommandBufferStatusCompleted);
+  if(_dumpAppIndex) {
+   if(self.status==MTLCommandBufferStatusCompleted)for(NSDictionary *read in _dumpPassReads)dumpPrint(_dumpAppIndex,read);
+   else dumpWrite("native-metal dump cb %llu: pass snapshots failed: %s\n",(unsigned long long)_dumpAppIndex,self.error.localizedDescription.UTF8String?:"command refused");
