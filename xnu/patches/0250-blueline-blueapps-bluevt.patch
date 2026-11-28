@@ -1,0 +1,27 @@
+0250: blueapps=1 also loads /usr/lib/bluevt.dylib into Camera, mediaserverd and assetsd. Software
+VTPixelRotationSession cannot rotate into another size (-12914 without AppleM2ScalerCSCDriver), so Camera made no
+thumbnail and Photos' grid stayed empty; bluevt does it in two steps (tools/camera/bluevt). The set's string is
+in the kernel because a sweetenv= boot-arg with the whole set went over the 607-byte boot-args limit.
+diff -urN a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+--- a/pexpert/gen/bootargs.c	2026-11-28 22:19:11
++++ b/pexpert/gen/bootargs.c	2026-11-28 22:19:11
+@@ -195,7 +195,8 @@
+  * 0156: blueui=1 stands for the GPU-rendered UI set (stage 6f), so test and
+  * demo boots stay well inside the 607-byte command line. 0161: bluetest=1
+  * stands for the board set every test boot carries (tools/phonetest.sh). 0214:
+- * blueapps=1 adds bluemis (self-signed app installs and launches) to sweetenv;
++ * blueapps=1 adds bluemis (self-signed app installs and launches) to sweetenv, and (0250) bluevt to Camera,
++ * mediaserverd and assetsd (rotate-and-scale without the M2 scaler, so Camera's thumbnails are made);
+  * the first entry whose set is on wins, so it comes before blueui's. An
+  * argument given on the command line still wins over its value here.
+  */
+@@ -206,7 +207,8 @@
+ 	const char *str;
+ } blue_ui_set[] = {
+ 	{ "blueapps", "sweetenv", 0, "backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/blueeagl.dylib;"
+-	  "installd|com.apple.MobileInstallationHelperService|SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/bluemis.dylib" },
++	  "installd|com.apple.MobileInstallationHelperService|SpringBoard:DYLD_INSERT_LIBRARIES=/usr/lib/bluemis.dylib;"
++	  "Camera|mediaserverd|assetsd:DYLD_INSERT_LIBRARIES=/usr/lib/bluevt.dylib" },	/* 0250: VT rotate-and-scale (tools/camera/bluevt) */
+ 	{ "blueui", "bluegpu", 8, NULL },
+ 	{ "blueui", "bluegpu_mhz", 710, NULL },
+ 	{ "blueui", "bluegpu_dcvs", 1, NULL },		/* 0198: load-based GPU clock with input boost */
