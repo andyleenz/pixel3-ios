@@ -1507,7 +1507,15 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   .ithmb tables hold 104 KB / 1.0 MB / 923 KB (were empty) and V2/DCIM exists. Photos' All Photos grid draws its
   cells now (none before). Assets imported earlier still have none (index -1).
 
-Next: the grid thumbnails (older assets: a rebuild; bluevt's 2 s); the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
+- mem5, a second capture: bluevt's call took 66 ms (the 1.9-2.3 s was the first call in the process). mem6: Photos'
+  All Photos grid shows the two photos taken since 0250 as real thumbnails (checked on the phone; the
+  screenshot is not committed: it shows the room). Older assets are grey placeholder cells.
+- mem3 and mem5 sessions both ended at a USB bus reset: the phone re-enumerates, but the Mac's USB Ethernet
+  interface stays inactive and bluesh gets no answer until the 180 s link watchdog. The gadget probably does not
+  send the link-up notification again after a reset.
+
+Next: thumbnails for the older assets (assetsd's rebuild takes the HEIC's embedded thumbnail, which ours lack);
+the USB link after a bus reset; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
 thumbnail; rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
