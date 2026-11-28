@@ -23,6 +23,9 @@
  *                                  phone gets itself to recovery. "#watch N"
  *   ping                           "#pong" (contact only)
  *
+ * The watchdog starts armed at 600 s (BLUESH_WATCH=N overrides, 0 off), so a
+ * boot whose USB link never comes up also ends in recovery.
+ *
  * Started by bluerun (bluerun=/usr/local/bin/bluesh, bluerun_after=launchd,
  * bluerun_timeout=36000) or by hand. Build: tools/bluerun/build.sh bluesh.c.
  */
@@ -270,6 +273,9 @@ main(void)
 	}
 	listen(s, 4);
 	last_contact = time(NULL);
+	const char *w = getenv("BLUESH_WATCH");
+	watch_secs = w != NULL ? atoi(w) : 600;
+	printf("bluesh: link watchdog %d s\n", watch_secs);
 	pthread_t wt;
 	pthread_create(&wt, NULL, watchdog, NULL);
 	printf("bluesh: listening on 192.168.7.2:2222\n");

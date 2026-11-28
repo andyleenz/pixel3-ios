@@ -1436,7 +1436,9 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   the first frames (camtest now hashes frames to tell repeats).
 - The USB link (bluesh and the live log) stalled with iOS running on, twice while Camera ran (23:11, 10:17).
   bluesh `watch SECONDS` / `ping` and `tools/bluesh.py keepalive`: with no request for SECONDS the phone ends the
-  session itself (bluereboot=recovery).
+  session itself (bluereboot=recovery). It starts armed at 600 s (BLUESH_WATCH), so a boot whose link never comes
+  up also ends in recovery. Recovery on both slots needs no Enable ADB tap again (both re-flashed; without the
+  patch, recovery keeps USB off and the Mac sees no device at all).
 
 Next: memory pressure (more RAM for XNU: 0xa2000000..0xd0000000 is free; or find the wired and compressed
 users), then the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
