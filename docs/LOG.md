@@ -1482,8 +1482,11 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   Camera's `CAMThumbnailGenerator` fails on the preview pixel buffer, "{480, 360} in orientation 3 ... (-12914)",
   which is kVTImageRotationNotSupportedErr (VideoToolbox rotation, no AppleM2ScalerCSCDriver). assetsd then has
   "Missing preview image and data to set as thumbnail", and its fallback "Failed to generate small thumbnail ...
-  'public.heic'" uses UseHardwareAcceleratedDecode, FromImageIfAbsent and MaxPixelSize 0. `heicdec FILE 256 haz`
-  repeats that call (mem4). The session then ended: a USB bus reset (cable or phone handled, power key up first),
+  'public.heic'" uses UseHardwareAcceleratedDecode, FromImageIfAbsent and MaxPixelSize 0. mem4, `heicdec
+  IMG_0012.HEIC 256 OPTS`: the file has no embedded thumbnail; every call with MaxPixelSize 256 decodes (192x256,
+  320-355 ms, hardware-decode option or not), every call with MaxPixelSize 0 fails in 0.2 ms. assetsd's fallback
+  only takes the HEIC's embedded thumbnail. So both paths need the capture: a preview image for assetsd, or an
+  embedded thumbnail in the HEIC; our captures have neither. The session then ended: a USB bus reset (cable or phone handled, power key up first),
   after which the Mac kept clearing a halt on EP 0x82 and bluesh did not recover; the 180 s link watchdog sent
   the phone to recovery.
 - 0249 (built): the preview was upside down. The sensor now reads out rotated 180 degrees (image_orientation
