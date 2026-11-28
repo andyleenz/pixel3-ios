@@ -1467,7 +1467,18 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   preview frames were black: `bluesh run camtest 60 ; echo` passed ";" and "echo" as LINES and GAIN (bluesh runs no
   shell), so EXPOSURE 0/0 clamped to 4 lines at 1x, and the kernel keeps an asked exposure for later sessions.
 
-Next: the grid thumbnails; the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
+- mem3, the grid thumbnails (dasd os_log via `tools/oslog -p dasd`): memory pressure is gone from the
+  refusals. Left were BootTimePolicy (300 s after boot), ThunderingHerdPolicy (300 s) and DeviceActivityPolicy
+  (cleared with the display off). dasd then ran `com.apple.assetsd.backgroundjobservice.discretionaryresource`
+  (20:54, "ran for 0.0 minutes"): the job finds no work. All 12 assets have ZTHUMBNAILINDEX -1 and one
+  ZINTERNALRESOURCE (the original, recipe 0), with new captures too, so the thumbnails are never made at import and
+  nothing marks them as missing. thumbnailConfiguration: formats 5005 (V2 files), 4531, 3324, 3307; all empty. An
+  empty thumbnailConfiguration makes assetsd recreate the tables (still empty). Ruled out: HEIC decoding
+  (`tools/camera/heicdec`: ImageIO gives a 192x256 thumbnail in 390 ms and the 4032x3024 image in 627 ms in
+  software; no hardware HEVC decoder, AppleM2ScalerCSCDriver missing); Metal for assetsd (bluemetal.procs: no
+  change). A capture takes 40-100 s from shutter to file.
+
+Next: the grid thumbnails (where the import should write them: the capture's preview image, PLImageWriter); the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
 thumbnail; rear focus.
 
 **Thermals (0235, `bluethermal=1`, 2026-11-26).** thermalmonitord (D22AP-Info.plist) finds its sensors as
