@@ -1478,6 +1478,18 @@ Launch copies: MetalHello's 8 drawables at launch are all created in one 5 s win
   software; no hardware HEVC decoder, AppleM2ScalerCSCDriver missing); Metal for assetsd (bluemetal.procs: no
   change). A capture takes 40-100 s from shutter to file.
 
+- mem3, all processes' os_log at debug level across one capture: the thumbnails fail at import, both ways.
+  Camera's `CAMThumbnailGenerator` fails on the preview pixel buffer, "{480, 360} in orientation 3 ... (-12914)",
+  which is kVTImageRotationNotSupportedErr (VideoToolbox rotation, no AppleM2ScalerCSCDriver). assetsd then has
+  "Missing preview image and data to set as thumbnail", and its fallback "Failed to generate small thumbnail ...
+  'public.heic'" uses UseHardwareAcceleratedDecode, FromImageIfAbsent and MaxPixelSize 0. `heicdec FILE 256 haz`
+  repeats that call (mem4). The session then ended: a USB bus reset (cable or phone handled, power key up first),
+  after which the Mac kept clearing a halt on EP 0x82 and bluesh did not recover; the 180 s link watchdog sent
+  the phone to recovery.
+- 0249 (built): the preview was upside down. The sensor now reads out rotated 180 degrees (image_orientation
+  0x0101 = 3, written before stream-on), and the frame header reports Bayer 3 (BGGR) for it. `bluecam_orient=N`
+  and `bluecam_bayer=N` override; 0 and 0 give the old readout.
+
 Next: the grid thumbnails (where the import should write them: the capture's preview image, PLImageWriter); the kernel to program NC_MODE_CNTL as Linux and answer 15; Camera's
 thumbnail; rear focus.
 

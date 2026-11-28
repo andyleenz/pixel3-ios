@@ -1,0 +1,47 @@
+0249: the preview was upside down. Before stream-on, write image_orientation (0x0101) = 3 (h-mirror
+and v-flip, 180 degrees) and report the Bayer order the flip gives (3 BGGR) in the frame header. Boot-args
+bluecam_orient=N and bluecam_bayer=N override (0 and 0 give the old readout).
+diff -urN a/bsd/dev/blueline_camera_probe.c b/bsd/dev/blueline_camera_probe.c
+--- a/bsd/dev/blueline_camera_probe.c	2026-11-28 21:39:44
++++ b/bsd/dev/blueline_camera_probe.c	2026-11-28 21:39:44
+@@ -1548,6 +1548,8 @@
+ 	{ 0x0202, 0x0c }, { 0x0203, 0x52 }, { 0x0224, 0x06 }, { 0x0225, 0x29 },
+ 	{ 0x0216, 0x00 }, { 0x0217, 0x00 }, { 0x020e, 0x01 }, { 0x020f, 0x00 }, { 0x0226, 0x01 }, { 0x0227, 0x00 },
+ };
++static int cam_orient = 3;		/* 0249: image_orientation (0x0101): bit 0 h-mirror, bit 1 v-flip; 3 = 180 degrees (the preview was upside down) */
++static uint32_t cam_bayer = 3;		/* 0249: the 2x2 order the flip gives (0 RGGB ... 3 BGGR, blueline_camera.h) */
+ static int cam_rear_gain = 384;	/* IMX363 analog gain code, gain = 512 / (512 - code): 384 = 4x */
+ 
+ /* Settings, stream on, read the sensor's own frame counter (0x0005) for 1 s, stream off. */
+@@ -1644,8 +1646,12 @@
+ 	if (dev_mode && !cap) {
+ 		goto rx_down;
+ 	}
++	if (bus_write(b, addr, 0x0101, (uint8_t)cam_orient)) {
++		printf("BLUE CAM: stream: orientation NACK\n");
++	}
+ 	uint8_t f0 = rd8(b, addr, 0x0005);
+-	printf("BLUE CAM: stream: frame count %u, mode 0x%02x; streaming on\n", f0, rd8(b, addr, 0x0100));
++	printf("BLUE CAM: stream: frame count %u, mode 0x%02x, orientation 0x%02x, bayer %u; streaming on\n", f0, rd8(b, addr, 0x0100),
++	    rd8(b, addr, 0x0101), cam_bayer);
+ 	if (bus_write(b, addr, 0x0100, 1)) {
+ 		printf("BLUE CAM: stream: stream-on NACK\n");
+ 		if (cap) {
+@@ -1994,7 +2000,7 @@
+ 	f.height = dev_h;
+ 	f.stride = dev_stride;
+ 	f.format = BLUELINE_CAMERA_FORMAT_RAW10;
+-	f.bayer = 0;			/* RGGB, as the 0196 colour snap */
++	f.bayer = cam_bayer;		/* 0249: follows the flip (was 0, RGGB) */
+ 	f.black = DEV_BLACK;
+ 	f.sequence = d->seq;
+ 	f.time = d->time;
+@@ -2107,6 +2113,8 @@
+ 	PE_parse_boot_argn("bluecam_gain", &cam_gain, sizeof(cam_gain));
+ 	PE_parse_boot_argn("bluecam_rear_gain", &cam_rear_gain, sizeof(cam_rear_gain));
+ 	PE_parse_boot_argn("bluecam_fll", &cam_fll, sizeof(cam_fll));
++	PE_parse_boot_argn("bluecam_orient", &cam_orient, sizeof(cam_orient));
++	PE_parse_boot_argn("bluecam_bayer", &cam_bayer, sizeof(cam_bayer));
+ 	thread_t th;
+ 	if (kernel_thread_start(cam_thread, NULL, &th) != KERN_SUCCESS) {
+ 		printf("BLUE CAM: no thread\n");

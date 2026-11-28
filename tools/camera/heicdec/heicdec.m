@@ -1,7 +1,11 @@
 /*
  * heicdec: can this phone decode a HEIC (as assetsd must, to make Photos' thumbnails)?
  *
- *   heicdec FILE [MAXPIXELS]
+ *   heicdec FILE [MAXPIXELS [OPTS]]
+ *
+ * OPTS letters change the thumbnail call: h kCGImageSourceUseHardwareAcceleratedDecode, a FromImageIfAbsent instead
+ * of FromImageAlways (an embedded thumbnail first), z MaxPixelSize 0. "haz" is assetsd's import call (mem3 os_log:
+ * "Failed to generate small thumbnail ... public.heic").
  *
  * Through ImageIO: the image's type and size, then a thumbnail (CGImageSourceCreateThumbnailAtIndex, MAXPIXELS
  * default 256, from the full image) and the full image, each with its time and the mean of its pixels (0 for
@@ -48,10 +52,11 @@ main(int argc, char **argv)
 {
 	@autoreleasepool {
 		if (argc < 2) {
-			fprintf(stderr, "usage: heicdec FILE [MAXPIXELS]\n");
+			fprintf(stderr, "usage: heicdec FILE [MAXPIXELS [OPTS: h a z]]\n");
 			return 2;
 		}
 		int maxpx = argc > 2 ? atoi(argv[2]) : 256;
+		const char *opts = argc > 3 ? argv[3] : "";
 		NSURL *url = [NSURL fileURLWithPath:@(argv[1])];
 		CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
 		if (src == NULL) {
@@ -62,12 +67,20 @@ main(int argc, char **argv)
 		printf("source: type %s, %zu image(s), %s x %s\n", [(__bridge NSString *)CGImageSourceGetType(src) UTF8String],
 		    CGImageSourceGetCount(src), [[props[@"PixelWidth"] description] UTF8String],
 		    [[props[@"PixelHeight"] description] UTF8String]);
+		NSArray *emb = props[@"ThumbnailImages"];
+		printf("embedded thumbnail(s): %lu\n", (unsigned long)emb.count);
 
 		int rc = 1;
 		uint64_t t0 = mach_absolute_time();
-		NSDictionary *topt = @{(id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
-				       (id)kCGImageSourceThumbnailMaxPixelSize: @(maxpx),
-				       (id)kCGImageSourceCreateThumbnailWithTransform: @YES};
+		NSMutableDictionary *topt = [NSMutableDictionary dictionary];
+		topt[strchr(opts, 'a') ? (id)kCGImageSourceCreateThumbnailFromImageIfAbsent :
+		    (id)kCGImageSourceCreateThumbnailFromImageAlways] = @YES;
+		topt[(id)kCGImageSourceThumbnailMaxPixelSize] = @(strchr(opts, 'z') ? 0 : maxpx);
+		topt[(id)kCGImageSourceCreateThumbnailWithTransform] = @YES;
+		if (strchr(opts, 'h')) {
+			topt[@"kCGImageSourceUseHardwareAcceleratedDecode"] = @YES;
+		}
+		printf("thumbnail options: %s\n", [[topt description] UTF8String]);
 		CGImageRef th = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)topt);
 		if (th) {
 			printf("thumbnail: %zux%zu in %.1f ms, mean %.1f\n", CGImageGetWidth(th), CGImageGetHeight(th), ms_since(t0),
